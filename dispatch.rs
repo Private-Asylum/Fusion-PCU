@@ -68,7 +68,11 @@ fn initialize_selected_pio_lanes(claim: &PcuLaneMaskClaim, initial_pc: u8) -> Re
     fusion_pal::sys::soc::cortex_m::hal::soc::board::initialize_pcu_lanes(claim, initial_pc)
 }
 
-#[cfg(all(target_os = "none", feature = "sys-cortex-m", not(feature = "soc-rp2350")))]
+#[cfg(all(
+    target_os = "none",
+    feature = "sys-cortex-m",
+    not(feature = "soc-rp2350")
+))]
 fn initialize_selected_pio_lanes(claim: &PcuLaneMaskClaim, initial_pc: u8) -> Result<(), PcuError> {
     let _ = claim;
     let _ = initial_pc;
@@ -86,14 +90,17 @@ fn apply_selected_pio_execution_config(
     if rp2350_execution_is_default(execution) {
         return Ok(());
     }
-    let (clkdiv, execctrl, shiftctrl, pinctrl) =
-        rp2350_build_execution_registers(execution, None)?;
+    let (clkdiv, execctrl, shiftctrl, pinctrl) = rp2350_build_execution_registers(execution, None)?;
     fusion_pal::sys::soc::cortex_m::hal::soc::board::apply_pcu_execution_config(
         claim, clkdiv, execctrl, shiftctrl, pinctrl,
     )
 }
 
-#[cfg(all(target_os = "none", feature = "sys-cortex-m", not(feature = "soc-rp2350")))]
+#[cfg(all(
+    target_os = "none",
+    feature = "sys-cortex-m",
+    not(feature = "soc-rp2350")
+))]
 fn apply_selected_pio_execution_config(
     claim: &PcuLaneMaskClaim,
     execution: &PcuIrExecutionConfig,
