@@ -1,8 +1,8 @@
 //! Generic fusion-pcu wrapper over the selected PCU executor backend.
 
 use fusion_pal::sys::pcu::{
-    PcuBase,
-    PcuControl,
+    PcuBaseContract,
+    PcuControlContract,
     PcuError,
     PcuExecutorClaim,
     PcuExecutorClass,
@@ -48,13 +48,13 @@ impl PcuSystem {
     /// Reports the truthful generic PCU executor surface for the selected backend.
     #[must_use]
     pub fn support(&self) -> PcuSupport {
-        PcuBase::support(&self.inner)
+        PcuBaseContract::support(&self.inner)
     }
 
     /// Returns the surfaced generic PCU executors.
     #[must_use]
     pub fn executors(&self) -> &'static [PcuExecutorDescriptor] {
-        PcuBase::executors(&self.inner)
+        PcuBaseContract::executors(&self.inner)
     }
 
     /// Returns one surfaced executor descriptor by stable id.
@@ -77,7 +77,7 @@ impl PcuSystem {
     ///
     /// Returns any honest backend claim failure.
     pub fn claim_executor(&self, executor: PcuExecutorId) -> Result<PcuExecutorClaim, PcuError> {
-        PcuControl::claim_executor(&self.inner, executor)
+        PcuControlContract::claim_executor(&self.inner, executor)
     }
 
     /// Back-compat alias while higher layers stop saying “device” when they mean “executor.”
@@ -95,7 +95,7 @@ impl PcuSystem {
     ///
     /// Returns any honest backend release failure.
     pub fn release_executor(&self, claim: PcuExecutorClaim) -> Result<(), PcuError> {
-        PcuControl::release_executor(&self.inner, claim)
+        PcuControlContract::release_executor(&self.inner, claim)
     }
 
     /// Back-compat alias while higher layers stop saying “device” when they mean “executor.”

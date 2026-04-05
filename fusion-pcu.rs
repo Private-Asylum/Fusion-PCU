@@ -19,10 +19,10 @@ use core::num::NonZeroU32;
 
 pub use fusion_pal::sys::pcu::{
     PcuAttachmentTableHandle,
-    PcuBase,
+    PcuBaseContract,
     PcuByteStreamBindings,
     PcuCaps,
-    PcuControl,
+    PcuControlContract,
     PcuDeviceClaim,
     PcuDeviceClass,
     PcuDeviceDescriptor,

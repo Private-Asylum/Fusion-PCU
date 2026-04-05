@@ -32,7 +32,7 @@ pub use fusion_pal::sys::pcu::{
     PcuIrKind,
     PcuKernel,
     PcuKernelId,
-    PcuKernelIr,
+    PcuKernelIrContract,
     PcuKernelSignature,
     PcuOp,
     PcuPort,
