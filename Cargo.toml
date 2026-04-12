@@ -13,21 +13,18 @@ crate-type = ["rlib"]
 path = "fusion-pcu.rs"
 
 [features]
-default = ["std", "hosted"]
-std = ["fusion-pal/std"]
-soc = ["fusion-pal/soc"]
-hosted = ["std", "fusion-pal/hosted"]
-critical-safe = ["fusion-pal/critical-safe"]
-debug-profile = ["fusion-pal/debug-profile"]
-debug-insights = ["fusion-pal/debug-insights"]
-sys-cortex-m = ["soc", "fusion-pal/sys-cortex-m"]
-soc-rp2350 = ["sys-cortex-m", "fusion-pal/soc-rp2350"]
-sys-fusion-kn = ["hosted", "fusion-pal/sys-fusion-kn"]
-cortex-m-vector-secure-world = ["fusion-pal/cortex-m-vector-secure-world"]
-cortex-m-vector-nonsecure-world = ["fusion-pal/cortex-m-vector-nonsecure-world"]
-
-[dependencies]
-fusion-pal = { workspace = true, default-features = false }
+default = []
+std = []
+soc = []
+hosted = ["std"]
+critical-safe = []
+debug-profile = []
+debug-insights = []
+sys-cortex-m = ["soc"]
+soc-rp2350 = ["sys-cortex-m"]
+sys-fusion-kn = ["hosted"]
+cortex-m-vector-secure-world = []
+cortex-m-vector-nonsecure-world = []
 
 [lints]
 workspace = true
