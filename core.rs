@@ -8,10 +8,19 @@
 //! - invocation semantics
 //! - kernel identity and signatures
 
+use core::ops::{
+    BitAnd,
+    BitAndAssign,
+    BitOr,
+    BitOrAssign,
+};
+
 /// Scalar element types surfaced by the current PCU core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuScalarType {
     Bool,
+    I4,
+    U4,
     I8,
     U8,
     I16,
@@ -21,6 +30,7 @@ pub enum PcuScalarType {
     I64,
     U64,
     F16,
+    BF16,
     F32,
     F64,
 }
@@ -31,8 +41,9 @@ impl PcuScalarType {
     pub const fn bit_width(self) -> u8 {
         match self {
             Self::Bool => 1,
+            Self::I4 | Self::U4 => 4,
             Self::I8 | Self::U8 => 8,
-            Self::I16 | Self::U16 | Self::F16 => 16,
+            Self::I16 | Self::U16 | Self::F16 | Self::BF16 => 16,
             Self::I32 | Self::U32 | Self::F32 => 32,
             Self::I64 | Self::U64 | Self::F64 => 64,
         }
@@ -43,13 +54,31 @@ impl PcuScalarType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuValueType {
     Scalar(PcuScalarType),
-    Vector { scalar: PcuScalarType, lanes: u8 },
+    Vector {
+        scalar: PcuScalarType,
+        lanes: u8,
+    },
+    Matrix {
+        scalar: PcuScalarType,
+        rows: u8,
+        cols: u8,
+    },
 }
 
 impl PcuValueType {
     #[must_use]
     pub const fn bool() -> Self {
         Self::Scalar(PcuScalarType::Bool)
+    }
+
+    #[must_use]
+    pub const fn i4() -> Self {
+        Self::Scalar(PcuScalarType::I4)
+    }
+
+    #[must_use]
+    pub const fn u4() -> Self {
+        Self::Scalar(PcuScalarType::U4)
     }
 
     #[must_use]
@@ -98,6 +127,11 @@ impl PcuValueType {
     }
 
     #[must_use]
+    pub const fn bf16() -> Self {
+        Self::Scalar(PcuScalarType::BF16)
+    }
+
+    #[must_use]
     pub const fn f32() -> Self {
         Self::Scalar(PcuScalarType::F32)
     }
@@ -108,18 +142,167 @@ impl PcuValueType {
     }
 
     #[must_use]
+    pub const fn vector(scalar: PcuScalarType, lanes: u8) -> Self {
+        Self::Vector { scalar, lanes }
+    }
+
+    #[must_use]
+    pub const fn matrix(scalar: PcuScalarType, rows: u8, cols: u8) -> Self {
+        Self::Matrix { scalar, rows, cols }
+    }
+
+    #[must_use]
     pub const fn scalar_type(self) -> PcuScalarType {
         match self {
-            Self::Scalar(scalar) | Self::Vector { scalar, .. } => scalar,
+            Self::Scalar(scalar) | Self::Vector { scalar, .. } | Self::Matrix { scalar, .. } => {
+                scalar
+            }
         }
     }
 
     #[must_use]
-    pub const fn lanes(self) -> u8 {
+    pub const fn lanes(self) -> u16 {
+        match self {
+            Self::Scalar(_) => 1,
+            Self::Vector { lanes, .. } => lanes as u16,
+            Self::Matrix { rows, cols, .. } => (rows as u16) * (cols as u16),
+        }
+    }
+
+    #[must_use]
+    pub const fn linear_lanes(self) -> Option<u8> {
+        match self {
+            Self::Scalar(_) => Some(1),
+            Self::Vector { lanes, .. } => Some(lanes),
+            Self::Matrix { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn rows(self) -> u8 {
+        match self {
+            Self::Scalar(_) | Self::Vector { .. } => 1,
+            Self::Matrix { rows, .. } => rows,
+        }
+    }
+
+    #[must_use]
+    pub const fn cols(self) -> u8 {
         match self {
             Self::Scalar(_) => 1,
             Self::Vector { lanes, .. } => lanes,
+            Self::Matrix { cols, .. } => cols,
         }
+    }
+}
+
+/// Shared type/shape support truth for PCU value semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PcuValueTypeCaps(u32);
+
+impl PcuValueTypeCaps {
+    pub const BOOL: Self = Self(1 << 0);
+    pub const INT4: Self = Self(1 << 1);
+    pub const UINT4: Self = Self(1 << 2);
+    pub const INT8: Self = Self(1 << 3);
+    pub const UINT8: Self = Self(1 << 4);
+    pub const INT16: Self = Self(1 << 5);
+    pub const UINT16: Self = Self(1 << 6);
+    pub const INT32: Self = Self(1 << 7);
+    pub const UINT32: Self = Self(1 << 8);
+    pub const INT64: Self = Self(1 << 9);
+    pub const UINT64: Self = Self(1 << 10);
+    pub const FLOAT16: Self = Self(1 << 11);
+    pub const BFLOAT16: Self = Self(1 << 12);
+    pub const FLOAT32: Self = Self(1 << 13);
+    pub const FLOAT64: Self = Self(1 << 14);
+    pub const SCALAR_VALUES: Self = Self(1 << 15);
+    pub const VECTOR_VALUES: Self = Self(1 << 16);
+    pub const MATRIX_VALUES: Self = Self(1 << 17);
+
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn for_scalar(scalar: PcuScalarType) -> Self {
+        match scalar {
+            PcuScalarType::Bool => Self::BOOL,
+            PcuScalarType::I4 => Self::INT4,
+            PcuScalarType::U4 => Self::UINT4,
+            PcuScalarType::I8 => Self::INT8,
+            PcuScalarType::U8 => Self::UINT8,
+            PcuScalarType::I16 => Self::INT16,
+            PcuScalarType::U16 => Self::UINT16,
+            PcuScalarType::I32 => Self::INT32,
+            PcuScalarType::U32 => Self::UINT32,
+            PcuScalarType::I64 => Self::INT64,
+            PcuScalarType::U64 => Self::UINT64,
+            PcuScalarType::F16 => Self::FLOAT16,
+            PcuScalarType::BF16 => Self::BFLOAT16,
+            PcuScalarType::F32 => Self::FLOAT32,
+            PcuScalarType::F64 => Self::FLOAT64,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_value_type(value_type: PcuValueType) -> Self {
+        let scalar = Self::for_scalar(value_type.scalar_type());
+        let shape = match value_type {
+            PcuValueType::Scalar(_) => Self::SCALAR_VALUES,
+            PcuValueType::Vector { .. } => Self::VECTOR_VALUES,
+            PcuValueType::Matrix { .. } => Self::MATRIX_VALUES,
+        };
+        scalar.union(shape)
+    }
+
+    #[must_use]
+    pub const fn supports_value_type(self, value_type: PcuValueType) -> bool {
+        self.contains(Self::for_value_type(value_type))
+    }
+}
+
+impl BitOr for PcuValueTypeCaps {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for PcuValueTypeCaps {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl BitAnd for PcuValueTypeCaps {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl BitAndAssign for PcuValueTypeCaps {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
     }
 }
 
@@ -432,6 +615,8 @@ impl<'a> PcuParameter<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuParameterValue {
     Bool(bool),
+    I4(u8),
+    U4(u8),
     I8(i8),
     U8(u8),
     I16(i16),
@@ -441,14 +626,48 @@ pub enum PcuParameterValue {
     I64(i64),
     U64(u64),
     F16(u16),
+    BF16(u16),
     F32(u32),
     F64(u64),
 }
 
 impl PcuParameterValue {
     #[must_use]
+    pub const fn from_i4(value: i8) -> Option<Self> {
+        if value < -8 || value > 7 {
+            None
+        } else {
+            Some(Self::I4((value as u8) & 0x0f))
+        }
+    }
+
+    #[must_use]
+    pub const fn from_i4_bits(bits: u8) -> Self {
+        Self::I4(bits & 0x0f)
+    }
+
+    #[must_use]
+    pub const fn from_u4(value: u8) -> Option<Self> {
+        if value > 0x0f {
+            None
+        } else {
+            Some(Self::U4(value))
+        }
+    }
+
+    #[must_use]
+    pub const fn from_u4_bits(bits: u8) -> Self {
+        Self::U4(bits & 0x0f)
+    }
+
+    #[must_use]
     pub const fn from_f16_bits(bits: u16) -> Self {
         Self::F16(bits)
+    }
+
+    #[must_use]
+    pub const fn from_bf16_bits(bits: u16) -> Self {
+        Self::BF16(bits)
     }
 
     #[must_use]
@@ -475,6 +694,8 @@ impl PcuParameterValue {
     pub const fn value_type(self) -> PcuValueType {
         match self {
             Self::Bool(_) => PcuValueType::bool(),
+            Self::I4(_) => PcuValueType::i4(),
+            Self::U4(_) => PcuValueType::u4(),
             Self::I8(_) => PcuValueType::i8(),
             Self::U8(_) => PcuValueType::u8(),
             Self::I16(_) => PcuValueType::i16(),
@@ -484,6 +705,7 @@ impl PcuParameterValue {
             Self::I64(_) => PcuValueType::i64(),
             Self::U64(_) => PcuValueType::u64(),
             Self::F16(_) => PcuValueType::f16(),
+            Self::BF16(_) => PcuValueType::bf16(),
             Self::F32(_) => PcuValueType::f32(),
             Self::F64(_) => PcuValueType::f64(),
         }
@@ -498,6 +720,45 @@ impl PcuParameterValue {
     pub const fn as_u8(self) -> Option<u8> {
         match self {
             Self::U8(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_i4(self) -> Option<i8> {
+        match self {
+            Self::I4(bits) => {
+                let bits = bits & 0x0f;
+                Some(if (bits & 0x08) != 0 {
+                    (bits | 0xf0) as i8
+                } else {
+                    bits as i8
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_i4_bits(self) -> Option<u8> {
+        match self {
+            Self::I4(bits) => Some(bits & 0x0f),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_u4(self) -> Option<u8> {
+        match self {
+            Self::U4(bits) => Some(bits & 0x0f),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_u4_bits(self) -> Option<u8> {
+        match self {
+            Self::U4(bits) => Some(bits & 0x0f),
             _ => None,
         }
     }
@@ -538,6 +799,14 @@ impl PcuParameterValue {
     pub const fn as_f16_bits(self) -> Option<u16> {
         match self {
             Self::F16(bits) => Some(bits),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_bf16_bits(self) -> Option<u16> {
+        match self {
+            Self::BF16(bits) => Some(bits),
             _ => None,
         }
     }
@@ -837,9 +1106,13 @@ mod tests {
         assert_eq!(PcuScalarType::I64.bit_width(), 64);
         assert_eq!(PcuScalarType::U64.bit_width(), 64);
         assert_eq!(PcuScalarType::F64.bit_width(), 64);
+        assert_eq!(PcuScalarType::I4.bit_width(), 4);
+        assert_eq!(PcuScalarType::U4.bit_width(), 4);
+        assert_eq!(PcuScalarType::BF16.bit_width(), 16);
         assert_eq!(PcuValueType::i64().scalar_type(), PcuScalarType::I64);
         assert_eq!(PcuValueType::u64().scalar_type(), PcuScalarType::U64);
         assert_eq!(PcuValueType::f64().scalar_type(), PcuScalarType::F64);
+        assert_eq!(PcuValueType::bf16().scalar_type(), PcuScalarType::BF16);
     }
 
     #[test]
@@ -854,5 +1127,25 @@ mod tests {
         assert_eq!(signed.as_i64(), Some(-9));
         assert_eq!(unsigned.as_u64(), Some(42));
         assert_eq!(float.as_f64(), Some(3.5));
+    }
+
+    #[test]
+    fn sub_byte_and_matrix_types_are_well_formed() {
+        let i4 = PcuParameterValue::from_i4(-3).expect("i4 range should accept -3");
+        let u4 = PcuParameterValue::from_u4(12).expect("u4 range should accept 12");
+        let bf16 = PcuParameterValue::from_bf16_bits(0x3f80);
+        let matrix = PcuValueType::matrix(PcuScalarType::BF16, 4, 4);
+
+        assert_eq!(i4.value_type(), PcuValueType::i4());
+        assert_eq!(u4.value_type(), PcuValueType::u4());
+        assert_eq!(bf16.value_type(), PcuValueType::bf16());
+        assert_eq!(i4.as_i4(), Some(-3));
+        assert_eq!(u4.as_u4(), Some(12));
+        assert_eq!(bf16.as_bf16_bits(), Some(0x3f80));
+        assert_eq!(matrix.scalar_type(), PcuScalarType::BF16);
+        assert_eq!(matrix.rows(), 4);
+        assert_eq!(matrix.cols(), 4);
+        assert_eq!(matrix.lanes(), 16);
+        assert_eq!(matrix.linear_lanes(), None);
     }
 }

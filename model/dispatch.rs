@@ -9,8 +9,11 @@ use core::ops::{
 
 use crate::{
     PcuBinding,
+    PcuBindingAccess,
+    PcuBindingStorageClass,
     PcuDispatchPolicyCaps,
     PcuDispatchOpCaps,
+    PcuValueTypeCaps,
     PcuError,
     PcuKernel,
     PcuKernelIrContract,
@@ -20,8 +23,6 @@ use crate::{
     PcuPort,
     PcuInvocationModel,
     PcuIrKind,
-    PcuScalarType,
-    PcuValueType,
 };
 
 pub use crate::ir::{
@@ -38,27 +39,15 @@ pub use crate::validation::PcuSampleValidationError;
 
 const DEFAULT_OP_CAPACITY: usize = 32;
 
-/// Coarse dispatch-profile capabilities required by one program unit.
+/// Dispatch-only feature caps required by one program unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct PcuDispatchCapabilities(u32);
+pub struct PcuDispatchFeatureCaps(u32);
 
-impl PcuDispatchCapabilities {
-    pub const INT32: Self = Self(1 << 0);
-    pub const UINT32: Self = Self(1 << 1);
-    pub const FLOAT16: Self = Self(1 << 2);
-    pub const FLOAT32: Self = Self(1 << 3);
-    pub const MUTABLE_RESOURCES: Self = Self(1 << 4);
-    pub const READ_ONLY_RESOURCES: Self = Self(1 << 5);
-    pub const INLINE_PARAMETERS: Self = Self(1 << 6);
-    pub const COOPERATIVE_SCRATCHPAD: Self = Self(1 << 7);
-    pub const BOOL: Self = Self(1 << 8);
-    pub const INT8: Self = Self(1 << 9);
-    pub const UINT8: Self = Self(1 << 10);
-    pub const INT16: Self = Self(1 << 11);
-    pub const UINT16: Self = Self(1 << 12);
-    pub const INT64: Self = Self(1 << 13);
-    pub const UINT64: Self = Self(1 << 14);
-    pub const FLOAT64: Self = Self(1 << 15);
+impl PcuDispatchFeatureCaps {
+    pub const MUTABLE_RESOURCES: Self = Self(1 << 0);
+    pub const READ_ONLY_RESOURCES: Self = Self(1 << 1);
+    pub const INLINE_PARAMETERS: Self = Self(1 << 2);
+    pub const COOPERATIVE_SCRATCHPAD: Self = Self(1 << 3);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -76,26 +65,8 @@ impl PcuDispatchCapabilities {
     }
 
     #[must_use]
-    pub const fn for_scalar(scalar: PcuScalarType) -> Self {
-        match scalar {
-            PcuScalarType::Bool => Self::BOOL,
-            PcuScalarType::I8 => Self::INT8,
-            PcuScalarType::U8 => Self::UINT8,
-            PcuScalarType::I16 => Self::INT16,
-            PcuScalarType::U16 => Self::UINT16,
-            PcuScalarType::I32 => Self::INT32,
-            PcuScalarType::U32 => Self::UINT32,
-            PcuScalarType::I64 => Self::INT64,
-            PcuScalarType::U64 => Self::UINT64,
-            PcuScalarType::F16 => Self::FLOAT16,
-            PcuScalarType::F32 => Self::FLOAT32,
-            PcuScalarType::F64 => Self::FLOAT64,
-        }
-    }
-
-    #[must_use]
-    pub const fn supports_value_type(self, value_type: PcuValueType) -> bool {
-        self.contains(Self::for_scalar(value_type.scalar_type()))
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -126,7 +97,7 @@ impl PcuDispatchOp<'_> {
     }
 }
 
-impl BitOr for PcuDispatchCapabilities {
+impl BitOr for PcuDispatchFeatureCaps {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
@@ -134,13 +105,13 @@ impl BitOr for PcuDispatchCapabilities {
     }
 }
 
-impl BitOrAssign for PcuDispatchCapabilities {
+impl BitOrAssign for PcuDispatchFeatureCaps {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
 }
 
-impl BitAnd for PcuDispatchCapabilities {
+impl BitAnd for PcuDispatchFeatureCaps {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self::Output {
@@ -148,7 +119,7 @@ impl BitAnd for PcuDispatchCapabilities {
     }
 }
 
-impl BitAndAssign for PcuDispatchCapabilities {
+impl BitAndAssign for PcuDispatchFeatureCaps {
     fn bitand_assign(&mut self, rhs: Self) {
         self.0 &= rhs.0;
     }
@@ -170,7 +141,8 @@ pub struct PcuDispatchKernelIr<'a> {
     pub ports: &'a [PcuPort<'a>],
     pub parameters: &'a [PcuParameter<'a>],
     pub ops: &'a [PcuDispatchOp<'a>],
-    pub capabilities: PcuDispatchCapabilities,
+    pub type_caps: PcuValueTypeCaps,
+    pub feature_caps: PcuDispatchFeatureCaps,
 }
 
 impl PcuDispatchKernelIr<'_> {
@@ -191,6 +163,47 @@ impl PcuDispatchKernelIr<'_> {
             flags = flags.union(op.support_flag());
         }
         flags
+    }
+
+    /// Returns the value/type support floor required to execute this dispatch kernel honestly.
+    #[must_use]
+    pub const fn required_type_support(&self) -> PcuValueTypeCaps {
+        self.type_caps
+    }
+
+    /// Returns the dispatch-only feature floor required to execute this kernel honestly.
+    #[must_use]
+    pub fn required_feature_support(&self) -> PcuDispatchFeatureCaps {
+        self.derived_feature_support().union(self.feature_caps)
+    }
+
+    fn derived_feature_support(&self) -> PcuDispatchFeatureCaps {
+        let mut features = PcuDispatchFeatureCaps::empty();
+
+        if !self.parameters.is_empty() {
+            features = features.union(PcuDispatchFeatureCaps::INLINE_PARAMETERS);
+        }
+
+        for binding in self.bindings.iter().copied() {
+            if binding.storage == PcuBindingStorageClass::Shared {
+                features = features.union(PcuDispatchFeatureCaps::COOPERATIVE_SCRATCHPAD);
+            }
+
+            if binding.builtin.is_some() {
+                continue;
+            }
+
+            match binding.access {
+                PcuBindingAccess::ReadOnly => {
+                    features = features.union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES);
+                }
+                PcuBindingAccess::WriteOnly | PcuBindingAccess::ReadWrite => {
+                    features = features.union(PcuDispatchFeatureCaps::MUTABLE_RESOURCES);
+                }
+            }
+        }
+
+        features
     }
 }
 
@@ -227,7 +240,8 @@ pub struct PcuDispatchKernelBuilder<'a, const MAX_OPS: usize = DEFAULT_OP_CAPACI
     parameters: &'a [PcuParameter<'a>],
     ops: [PcuDispatchOp<'a>; MAX_OPS],
     op_len: usize,
-    capabilities: PcuDispatchCapabilities,
+    type_caps: PcuValueTypeCaps,
+    feature_caps: PcuDispatchFeatureCaps,
 }
 
 impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
@@ -245,7 +259,8 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
             parameters: &[],
             ops: [PcuDispatchOp::Control(PcuDispatchControlOp::Return); MAX_OPS],
             op_len: 0,
-            capabilities: PcuDispatchCapabilities::empty(),
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
         }
     }
 
@@ -270,10 +285,17 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
         self
     }
 
-    /// Replaces the required capability set.
+    /// Replaces the required value/type support floor.
     #[must_use]
-    pub const fn with_capabilities(mut self, capabilities: PcuDispatchCapabilities) -> Self {
-        self.capabilities = capabilities;
+    pub const fn with_type_caps(mut self, type_caps: PcuValueTypeCaps) -> Self {
+        self.type_caps = type_caps;
+        self
+    }
+
+    /// Replaces the required dispatch-only feature floor.
+    #[must_use]
+    pub const fn with_feature_caps(mut self, feature_caps: PcuDispatchFeatureCaps) -> Self {
+        self.feature_caps = feature_caps;
         self
     }
 
@@ -378,7 +400,8 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
             ports: self.ports,
             parameters: self.parameters,
             ops: &self.ops[..self.op_len],
-            capabilities: self.capabilities,
+            type_caps: self.type_caps,
+            feature_caps: self.feature_caps,
         }
     }
 
@@ -402,21 +425,25 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
 mod tests {
     use super::{
         PcuDispatchAluOp,
-        PcuDispatchCapabilities,
+        PcuDispatchFeatureCaps,
         PcuDispatchKernelBuilder,
     };
     use crate::{
+        PcuBinding,
+        PcuBindingAccess,
+        PcuBindingStorageClass,
         PcuDispatchPolicyCaps,
         PcuIrKind,
         PcuKernel,
         PcuKernelIrContract,
         PcuValueType,
+        PcuValueTypeCaps,
     };
 
     #[test]
     fn builder_synthesizes_dispatch_kernel_with_ops() {
         let builder = PcuDispatchKernelBuilder::<4>::new(0x21, "main", [32, 1, 1])
-            .with_capabilities(PcuDispatchCapabilities::UINT32)
+            .with_type_caps(PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES)
             .with_arithmetic_op(PcuDispatchAluOp::Add)
             .expect("builder should accept one op");
         let kernel = builder.ir();
@@ -426,11 +453,7 @@ mod tests {
         assert_eq!(kernel.entry.name, "main");
         assert_eq!(kernel.entry.logical_shape, [32, 1, 1]);
         assert_eq!(kernel.ops.len(), 1);
-        assert!(
-            kernel
-                .capabilities
-                .contains(PcuDispatchCapabilities::UINT32)
-        );
+        assert!(kernel.type_caps.contains(PcuValueTypeCaps::UINT32));
         assert_eq!(
             kernel.required_dispatch_policy(),
             PcuDispatchPolicyCaps::ORDERED_SUBMISSION
@@ -452,21 +475,29 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_capabilities_cover_core_scalar_types() {
-        let caps = PcuDispatchCapabilities::BOOL
-            | PcuDispatchCapabilities::INT8
-            | PcuDispatchCapabilities::UINT8
-            | PcuDispatchCapabilities::INT16
-            | PcuDispatchCapabilities::UINT16
-            | PcuDispatchCapabilities::INT32
-            | PcuDispatchCapabilities::UINT32
-            | PcuDispatchCapabilities::INT64
-            | PcuDispatchCapabilities::UINT64
-            | PcuDispatchCapabilities::FLOAT16
-            | PcuDispatchCapabilities::FLOAT32
-            | PcuDispatchCapabilities::FLOAT64;
+    fn value_type_caps_cover_core_scalar_types() {
+        let caps = PcuValueTypeCaps::BOOL
+            | PcuValueTypeCaps::INT4
+            | PcuValueTypeCaps::UINT4
+            | PcuValueTypeCaps::INT8
+            | PcuValueTypeCaps::UINT8
+            | PcuValueTypeCaps::INT16
+            | PcuValueTypeCaps::UINT16
+            | PcuValueTypeCaps::INT32
+            | PcuValueTypeCaps::UINT32
+            | PcuValueTypeCaps::INT64
+            | PcuValueTypeCaps::UINT64
+            | PcuValueTypeCaps::FLOAT16
+            | PcuValueTypeCaps::BFLOAT16
+            | PcuValueTypeCaps::FLOAT32
+            | PcuValueTypeCaps::FLOAT64
+            | PcuValueTypeCaps::SCALAR_VALUES
+            | PcuValueTypeCaps::VECTOR_VALUES
+            | PcuValueTypeCaps::MATRIX_VALUES;
 
         assert!(caps.supports_value_type(PcuValueType::bool()));
+        assert!(caps.supports_value_type(PcuValueType::i4()));
+        assert!(caps.supports_value_type(PcuValueType::u4()));
         assert!(caps.supports_value_type(PcuValueType::i8()));
         assert!(caps.supports_value_type(PcuValueType::u8()));
         assert!(caps.supports_value_type(PcuValueType::i16()));
@@ -476,11 +507,110 @@ mod tests {
         assert!(caps.supports_value_type(PcuValueType::i64()));
         assert!(caps.supports_value_type(PcuValueType::u64()));
         assert!(caps.supports_value_type(PcuValueType::f16()));
+        assert!(caps.supports_value_type(PcuValueType::bf16()));
         assert!(caps.supports_value_type(PcuValueType::f32()));
         assert!(caps.supports_value_type(PcuValueType::f64()));
         assert!(caps.supports_value_type(PcuValueType::Vector {
             scalar: crate::PcuScalarType::F64,
             lanes: 4,
         }));
+        assert!(caps.supports_value_type(PcuValueType::Matrix {
+            scalar: crate::PcuScalarType::BF16,
+            rows: 4,
+            cols: 4,
+        }));
+    }
+
+    #[test]
+    fn kernel_required_type_support_is_fully_explicit() {
+        let scalar_builder = PcuDispatchKernelBuilder::<1>::new(1, "main", [1, 1, 1])
+            .with_type_caps(PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES);
+        let scalar = scalar_builder.ir();
+        let matrix_builder = PcuDispatchKernelBuilder::<1>::new(2, "main", [1, 1, 1])
+            .with_type_caps(PcuValueTypeCaps::BFLOAT16 | PcuValueTypeCaps::MATRIX_VALUES);
+        let matrix = matrix_builder.ir();
+        let unshaped_builder = PcuDispatchKernelBuilder::<1>::new(3, "main", [1, 1, 1])
+            .with_type_caps(PcuValueTypeCaps::UINT32);
+        let unshaped = unshaped_builder.ir();
+
+        assert!(
+            scalar
+                .required_type_support()
+                .contains(PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES)
+        );
+        assert!(
+            matrix
+                .required_type_support()
+                .contains(PcuValueTypeCaps::BFLOAT16 | PcuValueTypeCaps::MATRIX_VALUES)
+        );
+        assert!(
+            !matrix
+                .required_type_support()
+                .contains(PcuValueTypeCaps::SCALAR_VALUES)
+        );
+        assert!(
+            !unshaped
+                .required_type_support()
+                .contains(PcuValueTypeCaps::SCALAR_VALUES)
+        );
+    }
+
+    #[test]
+    fn dispatch_feature_caps_remain_independent_from_type_caps() {
+        let builder = PcuDispatchKernelBuilder::<1>::new(4, "main", [1, 1, 1])
+            .with_type_caps(PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::VECTOR_VALUES)
+            .with_feature_caps(
+                PcuDispatchFeatureCaps::INLINE_PARAMETERS
+                    | PcuDispatchFeatureCaps::COOPERATIVE_SCRATCHPAD,
+            );
+        let kernel = builder.ir();
+
+        assert!(
+            kernel
+                .required_type_support()
+                .contains(PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::VECTOR_VALUES)
+        );
+        assert!(kernel.required_feature_support().contains(
+            PcuDispatchFeatureCaps::INLINE_PARAMETERS
+                | PcuDispatchFeatureCaps::COOPERATIVE_SCRATCHPAD
+        ));
+    }
+
+    #[test]
+    fn dispatch_feature_support_is_derived_from_signature_shape() {
+        let bindings = [
+            PcuBinding::value(
+                Some("readonly"),
+                0,
+                0,
+                PcuBindingStorageClass::Uniform,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::u32(),
+            ),
+            PcuBinding::value(
+                Some("shared"),
+                0,
+                1,
+                PcuBindingStorageClass::Shared,
+                PcuBindingAccess::ReadWrite,
+                PcuValueType::u32(),
+            ),
+        ];
+        let parameters = [crate::PcuParameter {
+            slot: crate::PcuParameterSlot(0),
+            name: Some("scale"),
+            value_type: PcuValueType::u32(),
+        }];
+        let builder = PcuDispatchKernelBuilder::<1>::new(5, "main", [1, 1, 1])
+            .with_bindings(&bindings)
+            .with_parameters(&parameters);
+        let kernel = builder.ir();
+
+        assert!(kernel.required_feature_support().contains(
+            PcuDispatchFeatureCaps::READ_ONLY_RESOURCES
+                | PcuDispatchFeatureCaps::MUTABLE_RESOURCES
+                | PcuDispatchFeatureCaps::INLINE_PARAMETERS
+                | PcuDispatchFeatureCaps::COOPERATIVE_SCRATCHPAD
+        ));
     }
 }

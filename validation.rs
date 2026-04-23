@@ -81,7 +81,13 @@ pub fn validate_sample_op(
     }
 
     let required_lanes = image_type.dimension.coordinate_lanes();
-    let actual_lanes = sample.coordinates.lanes();
+    let Some(actual_lanes) = sample.coordinates.linear_lanes() else {
+        return Err(PcuSampleValidationError::CoordinateTypeMismatch {
+            dimension: image_type.dimension,
+            arrayed: image_type.arrayed,
+            found: sample.coordinates,
+        });
+    };
     let coordinate_lanes_are_valid = actual_lanes == required_lanes
         || (image_type.arrayed && actual_lanes == required_lanes + 1);
     if !coordinate_lanes_are_valid {

@@ -65,6 +65,33 @@ pub trait PcuBaseContract {
             .any(|descriptor| descriptor.supports_kernel_direct(kernel))
     }
 
+    /// Returns whether any surfaced execution substrate can satisfy the supplied dispatch type
+    /// floor directly.
+    #[must_use]
+    fn any_executor_supports_dispatch_types_direct(
+        &self,
+        required: crate::PcuValueTypeCaps,
+    ) -> bool {
+        self.executors()
+            .iter()
+            .copied()
+            .any(|descriptor| descriptor.support.supports_dispatch_types_direct(required))
+    }
+
+    /// Returns whether any surfaced execution substrate can satisfy the supplied dispatch feature
+    /// floor directly.
+    #[must_use]
+    fn any_executor_supports_dispatch_features_direct(
+        &self,
+        required: crate::PcuDispatchFeatureCaps,
+    ) -> bool {
+        self.executors().iter().copied().any(|descriptor| {
+            descriptor
+                .support
+                .supports_dispatch_features_direct(required)
+        })
+    }
+
     /// Returns whether the backend can run the supplied kernel through CPU fallback.
     #[must_use]
     fn supports_kernel_cpu_fallback(&self, kernel: PcuKernel<'_>) -> bool {

@@ -358,11 +358,36 @@ fn validate_direct_kernel_support(
     backend: &impl PcuBaseContract,
     kernel: PcuKernel<'_>,
 ) -> Result<(), PcuError> {
-    if backend.any_executor_supports_kernel_direct(kernel) {
-        Ok(())
-    } else {
-        Err(PcuError::unsupported())
+    let kernel_supported = backend.any_executor_supports_kernel_direct(kernel);
+
+    if let PcuKernel::Dispatch(dispatch) = kernel {
+        if !kernel_supported {
+            let any_structural = backend.executors().iter().copied().any(|descriptor| {
+                descriptor
+                    .support
+                    .supports_dispatch_direct_structure(dispatch)
+            });
+            if any_structural {
+                let any_typed = backend.executors().iter().copied().any(|descriptor| {
+                    descriptor
+                        .support
+                        .supports_dispatch_direct_structure(dispatch)
+                        && descriptor
+                            .support
+                            .supports_dispatch_types_direct(dispatch.required_type_support())
+                });
+                if any_typed {
+                    return Err(PcuError::unsupported_feature_support());
+                }
+                return Err(PcuError::unsupported_type_support());
+            }
+        }
     }
+
+    if kernel_supported {
+        return Ok(());
+    }
+    Err(PcuError::unsupported())
 }
 
 fn validate_parameters(
@@ -597,6 +622,9 @@ mod tests {
                 .union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION)
                 .union(PcuDispatchPolicyCaps::PERSISTENT_INSTALL),
             dispatch_instructions: PcuDispatchOpCaps::ALU_ADD,
+            dispatch_types: crate::PcuValueTypeCaps::UINT32
+                .union(crate::PcuValueTypeCaps::SCALAR_VALUES),
+            dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
             stream_instructions: PcuStreamCapabilities::FIFO_INPUT
                 .union(PcuStreamCapabilities::FIFO_OUTPUT)
                 .union(PcuStreamCapabilities::BIT_INVERT),
@@ -620,6 +648,14 @@ mod tests {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::ALU_ADD,
                 PcuDispatchOpCaps::empty(),
+            ),
+            types: PcuFeatureSupport::new(
+                crate::PcuValueTypeCaps::UINT32.union(crate::PcuValueTypeCaps::SCALAR_VALUES),
+                crate::PcuValueTypeCaps::empty(),
+            ),
+            features: PcuFeatureSupport::new(
+                crate::PcuDispatchFeatureCaps::empty(),
+                crate::PcuDispatchFeatureCaps::empty(),
             ),
         };
         support.stream_support = crate::PcuStreamSupport {
@@ -685,6 +721,9 @@ mod tests {
     fn blanket_impl_validates_dispatch_shape_before_backend_execution() {
         let backend = direct_backend();
         let builder = PcuDispatchKernelBuilder::<2>::new(7, "main", [4, 1, 1])
+            .with_type_caps(
+                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+            )
             .with_arithmetic_op(PcuDispatchAluOp::Add)
             .expect("builder should accept one dispatch op");
         let kernel = builder.ir();
@@ -701,6 +740,68 @@ mod tests {
         assert_eq!(
             result.expect_err("shape mismatch must be rejected").kind(),
             crate::PcuErrorKind::Invalid
+        );
+    }
+
+    #[test]
+    fn blanket_impl_reports_unsupported_dispatch_type_floor() {
+        let backend = direct_backend();
+        let builder = PcuDispatchKernelBuilder::<2>::new(8, "main", [1, 1, 1])
+            .with_type_caps(
+                crate::PcuValueTypeCaps::FLOAT64 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+            )
+            .with_arithmetic_op(PcuDispatchAluOp::Add)
+            .expect("builder should accept one dispatch op");
+        let kernel = builder.ir();
+
+        let result = backend.submit_dispatch(
+            PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::threads(NonZeroU32::new(1).expect("nonzero")),
+            },
+            PcuInvocationBindings::empty(),
+            PcuInvocationParameters::empty(),
+        );
+
+        assert_eq!(
+            result
+                .expect_err("unsupported dispatch types must be rejected")
+                .kind(),
+            crate::PcuErrorKind::UnsupportedTypeSupport
+        );
+    }
+
+    #[test]
+    fn blanket_impl_reports_unsupported_dispatch_feature_floor() {
+        let backend = direct_backend();
+        let parameters = [crate::PcuParameter {
+            slot: crate::PcuParameterSlot(0),
+            name: Some("scale"),
+            value_type: crate::PcuValueType::u32(),
+        }];
+        let builder = PcuDispatchKernelBuilder::<2>::new(9, "main", [1, 1, 1])
+            .with_parameters(&parameters)
+            .with_type_caps(
+                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+            )
+            .with_arithmetic_op(PcuDispatchAluOp::Add)
+            .expect("builder should accept one dispatch op");
+        let kernel = builder.ir();
+
+        let result = backend.submit_dispatch(
+            PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::threads(NonZeroU32::new(1).expect("nonzero")),
+            },
+            PcuInvocationBindings::empty(),
+            PcuInvocationParameters::empty(),
+        );
+
+        assert_eq!(
+            result
+                .expect_err("unsupported dispatch features must be rejected")
+                .kind(),
+            crate::PcuErrorKind::UnsupportedFeatureSupport
         );
     }
 

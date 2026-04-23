@@ -8,7 +8,9 @@ use core::ops::{
 };
 
 use crate::{
+    PcuDispatchFeatureCaps,
     PcuKernel,
+    PcuValueTypeCaps,
     PcuStreamCapabilities,
 };
 
@@ -556,6 +558,8 @@ impl PcuPrimitiveSupport {
 pub struct PcuDispatchSupport {
     pub flags: PcuDispatchPolicyCaps,
     pub instructions: PcuFeatureSupport<PcuDispatchOpCaps>,
+    pub types: PcuFeatureSupport<PcuValueTypeCaps>,
+    pub features: PcuFeatureSupport<PcuDispatchFeatureCaps>,
 }
 
 impl PcuDispatchSupport {
@@ -566,6 +570,11 @@ impl PcuDispatchSupport {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
+            ),
+            types: PcuFeatureSupport::new(PcuValueTypeCaps::empty(), PcuValueTypeCaps::empty()),
+            features: PcuFeatureSupport::new(
+                PcuDispatchFeatureCaps::empty(),
+                PcuDispatchFeatureCaps::empty(),
             ),
         }
     }
@@ -583,6 +592,26 @@ impl PcuDispatchSupport {
     #[must_use]
     pub const fn supports_cpu_fallback_instructions(self, required: PcuDispatchOpCaps) -> bool {
         self.instructions.cpu_fallback.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_direct_types(self, required: PcuValueTypeCaps) -> bool {
+        self.types.direct.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_cpu_fallback_types(self, required: PcuValueTypeCaps) -> bool {
+        self.types.cpu_fallback.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_direct_features(self, required: PcuDispatchFeatureCaps) -> bool {
+        self.features.direct.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_cpu_fallback_features(self, required: PcuDispatchFeatureCaps) -> bool {
+        self.features.cpu_fallback.contains(required)
     }
 }
 
@@ -749,6 +778,12 @@ impl PcuSupport {
                     && self.dispatch_support.allows(required_policy)
                     && self
                         .dispatch_support
+                        .supports_direct_types(kernel.required_type_support())
+                    && self
+                        .dispatch_support
+                        .supports_direct_features(kernel.required_feature_support())
+                    && self
+                        .dispatch_support
                         .supports_direct_instructions(kernel.required_instruction_support())
             }
             PcuKernel::Stream(kernel) => {
@@ -795,6 +830,12 @@ impl PcuSupport {
                 self.primitive_support
                     .supports_cpu_fallback(PcuPrimitiveCaps::DISPATCH)
                     && self.dispatch_support.allows(required_policy)
+                    && self
+                        .dispatch_support
+                        .supports_cpu_fallback_types(kernel.required_type_support())
+                    && self
+                        .dispatch_support
+                        .supports_cpu_fallback_features(kernel.required_feature_support())
                     && self
                         .dispatch_support
                         .supports_cpu_fallback_instructions(kernel.required_instruction_support())
@@ -852,10 +893,14 @@ mod tests {
         PcuCommandKernelIr,
         PcuCommandOp,
         PcuCommandStep,
+        PcuDispatchFeatureCaps,
         PcuKernel,
         PcuKernelId,
         PcuTarget,
+        PcuValueType,
+        PcuValueTypeCaps,
     };
+    use crate::model::PcuDispatchKernelBuilder;
 
     fn command_kernel() -> PcuKernel<'static> {
         PcuKernel::Command(PcuCommandKernelIr {
@@ -892,6 +937,14 @@ mod tests {
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
             ),
+            types: PcuFeatureSupport::new(
+                crate::PcuValueTypeCaps::empty(),
+                crate::PcuValueTypeCaps::empty(),
+            ),
+            features: PcuFeatureSupport::new(
+                crate::PcuDispatchFeatureCaps::empty(),
+                crate::PcuDispatchFeatureCaps::empty(),
+            ),
         };
 
         let kernel = command_kernel();
@@ -921,11 +974,104 @@ mod tests {
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
             ),
+            types: PcuFeatureSupport::new(
+                crate::PcuValueTypeCaps::empty(),
+                crate::PcuValueTypeCaps::empty(),
+            ),
+            features: PcuFeatureSupport::new(
+                crate::PcuDispatchFeatureCaps::empty(),
+                crate::PcuDispatchFeatureCaps::empty(),
+            ),
         };
 
         let kernel = command_kernel();
 
         assert!(!support.supports_kernel_direct(kernel));
         assert!(support.supports_kernel_cpu_fallback(kernel));
+    }
+
+    #[test]
+    fn support_reports_dispatch_type_gating_for_direct_and_fallback() {
+        let mut support = PcuSupport::unsupported();
+        support.primitive_support = PcuPrimitiveSupport {
+            primitives: PcuFeatureSupport::new(
+                PcuPrimitiveCaps::DISPATCH,
+                PcuPrimitiveCaps::DISPATCH,
+            ),
+        };
+        support.dispatch_support = PcuDispatchSupport {
+            flags: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+            instructions: PcuFeatureSupport::new(
+                PcuDispatchOpCaps::ALU_ADD,
+                PcuDispatchOpCaps::ALU_ADD,
+            ),
+            types: PcuFeatureSupport::new(
+                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+                crate::PcuValueTypeCaps::empty(),
+            ),
+            features: PcuFeatureSupport::new(
+                crate::PcuDispatchFeatureCaps::empty(),
+                crate::PcuDispatchFeatureCaps::empty(),
+            ),
+        };
+        let kernel_builder = PcuDispatchKernelBuilder::<1>::new(4, "main", [1, 1, 1])
+            .with_type_caps(PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES)
+            .with_arithmetic_op(crate::PcuDispatchAluOp::Add)
+            .expect("builder should accept one dispatch op");
+        let kernel = kernel_builder.ir();
+        let matrix_kernel_builder = PcuDispatchKernelBuilder::<1>::new(5, "main", [1, 1, 1])
+            .with_type_caps(PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::MATRIX_VALUES)
+            .with_arithmetic_op(crate::PcuDispatchAluOp::Add)
+            .expect("builder should accept one dispatch op");
+        let matrix_kernel = matrix_kernel_builder.ir();
+
+        assert!(support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
+        assert!(!support.supports_kernel_direct(PcuKernel::Dispatch(matrix_kernel)));
+        assert!(!support.supports_kernel_cpu_fallback(PcuKernel::Dispatch(matrix_kernel)));
+    }
+
+    #[test]
+    fn support_reports_dispatch_feature_gating_for_direct_and_fallback() {
+        let mut support = PcuSupport::unsupported();
+        support.primitive_support = PcuPrimitiveSupport {
+            primitives: PcuFeatureSupport::new(
+                PcuPrimitiveCaps::DISPATCH,
+                PcuPrimitiveCaps::DISPATCH,
+            ),
+        };
+        support.dispatch_support = PcuDispatchSupport {
+            flags: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+            instructions: PcuFeatureSupport::new(
+                PcuDispatchOpCaps::ALU_ADD,
+                PcuDispatchOpCaps::ALU_ADD,
+            ),
+            types: PcuFeatureSupport::new(
+                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+            ),
+            features: PcuFeatureSupport::new(
+                crate::PcuDispatchFeatureCaps::empty(),
+                crate::PcuDispatchFeatureCaps::empty(),
+            ),
+        };
+        let parameters = [crate::PcuParameter {
+            slot: crate::PcuParameterSlot(0),
+            name: Some("scale"),
+            value_type: PcuValueType::u32(),
+        }];
+        let builder = PcuDispatchKernelBuilder::<1>::new(6, "main", [1, 1, 1])
+            .with_parameters(&parameters)
+            .with_type_caps(PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES)
+            .with_arithmetic_op(crate::PcuDispatchAluOp::Add)
+            .expect("builder should accept one dispatch op");
+        let kernel = builder.ir();
+
+        assert!(
+            kernel
+                .required_feature_support()
+                .contains(PcuDispatchFeatureCaps::INLINE_PARAMETERS)
+        );
+        assert!(!support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
+        assert!(!support.supports_kernel_cpu_fallback(PcuKernel::Dispatch(kernel)));
     }
 }

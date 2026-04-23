@@ -40,6 +40,7 @@ pub use crate::core::{
     PcuSamplerFilter,
     PcuSamplerMipmapMode,
     PcuScalarType,
+    PcuValueTypeCaps,
     PcuValueType,
 };
 pub use crate::ir::{
@@ -53,8 +54,8 @@ pub use crate::model::{
     PcuCommandOp,
     PcuCommandPredicate,
     PcuCommandStep,
-    PcuDispatchCapabilities,
     PcuDispatchEntryPoint,
+    PcuDispatchFeatureCaps,
     PcuDispatchKernelIr,
     PcuDispatchOp,
     PcuDispatchAluOp,

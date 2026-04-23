@@ -6,6 +6,8 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuErrorKind {
     Unsupported,
+    UnsupportedTypeSupport,
+    UnsupportedFeatureSupport,
     Invalid,
     Busy,
     ResourceExhausted,
@@ -24,6 +26,20 @@ impl PcuError {
     pub const fn unsupported() -> Self {
         Self {
             kind: PcuErrorKind::Unsupported,
+        }
+    }
+
+    #[must_use]
+    pub const fn unsupported_type_support() -> Self {
+        Self {
+            kind: PcuErrorKind::UnsupportedTypeSupport,
+        }
+    }
+
+    #[must_use]
+    pub const fn unsupported_feature_support() -> Self {
+        Self {
+            kind: PcuErrorKind::UnsupportedFeatureSupport,
         }
     }
 
@@ -72,6 +88,12 @@ impl fmt::Display for PcuErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Unsupported => f.write_str("pcu operation unsupported"),
+            Self::UnsupportedTypeSupport => {
+                f.write_str("pcu backend does not support required value/type floor")
+            }
+            Self::UnsupportedFeatureSupport => {
+                f.write_str("pcu backend does not support required dispatch feature floor")
+            }
             Self::Invalid => f.write_str("invalid pcu request"),
             Self::Busy => f.write_str("pcu resource busy"),
             Self::ResourceExhausted => f.write_str("pcu resources exhausted"),
