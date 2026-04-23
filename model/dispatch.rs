@@ -20,6 +20,8 @@ use crate::{
     PcuPort,
     PcuInvocationModel,
     PcuIrKind,
+    PcuScalarType,
+    PcuValueType,
 };
 
 pub use crate::ir::{
@@ -49,6 +51,14 @@ impl PcuDispatchCapabilities {
     pub const READ_ONLY_RESOURCES: Self = Self(1 << 5);
     pub const INLINE_PARAMETERS: Self = Self(1 << 6);
     pub const COOPERATIVE_SCRATCHPAD: Self = Self(1 << 7);
+    pub const BOOL: Self = Self(1 << 8);
+    pub const INT8: Self = Self(1 << 9);
+    pub const UINT8: Self = Self(1 << 10);
+    pub const INT16: Self = Self(1 << 11);
+    pub const UINT16: Self = Self(1 << 12);
+    pub const INT64: Self = Self(1 << 13);
+    pub const UINT64: Self = Self(1 << 14);
+    pub const FLOAT64: Self = Self(1 << 15);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -63,6 +73,29 @@ impl PcuDispatchCapabilities {
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
+    }
+
+    #[must_use]
+    pub const fn for_scalar(scalar: PcuScalarType) -> Self {
+        match scalar {
+            PcuScalarType::Bool => Self::BOOL,
+            PcuScalarType::I8 => Self::INT8,
+            PcuScalarType::U8 => Self::UINT8,
+            PcuScalarType::I16 => Self::INT16,
+            PcuScalarType::U16 => Self::UINT16,
+            PcuScalarType::I32 => Self::INT32,
+            PcuScalarType::U32 => Self::UINT32,
+            PcuScalarType::I64 => Self::INT64,
+            PcuScalarType::U64 => Self::UINT64,
+            PcuScalarType::F16 => Self::FLOAT16,
+            PcuScalarType::F32 => Self::FLOAT32,
+            PcuScalarType::F64 => Self::FLOAT64,
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_value_type(self, value_type: PcuValueType) -> bool {
+        self.contains(Self::for_scalar(value_type.scalar_type()))
     }
 }
 
@@ -377,6 +410,7 @@ mod tests {
         PcuIrKind,
         PcuKernel,
         PcuKernelIrContract,
+        PcuValueType,
     };
 
     #[test]
@@ -415,5 +449,38 @@ mod tests {
             }
             _ => panic!("expected dispatch kernel"),
         }
+    }
+
+    #[test]
+    fn dispatch_capabilities_cover_core_scalar_types() {
+        let caps = PcuDispatchCapabilities::BOOL
+            | PcuDispatchCapabilities::INT8
+            | PcuDispatchCapabilities::UINT8
+            | PcuDispatchCapabilities::INT16
+            | PcuDispatchCapabilities::UINT16
+            | PcuDispatchCapabilities::INT32
+            | PcuDispatchCapabilities::UINT32
+            | PcuDispatchCapabilities::INT64
+            | PcuDispatchCapabilities::UINT64
+            | PcuDispatchCapabilities::FLOAT16
+            | PcuDispatchCapabilities::FLOAT32
+            | PcuDispatchCapabilities::FLOAT64;
+
+        assert!(caps.supports_value_type(PcuValueType::bool()));
+        assert!(caps.supports_value_type(PcuValueType::i8()));
+        assert!(caps.supports_value_type(PcuValueType::u8()));
+        assert!(caps.supports_value_type(PcuValueType::i16()));
+        assert!(caps.supports_value_type(PcuValueType::u16()));
+        assert!(caps.supports_value_type(PcuValueType::i32()));
+        assert!(caps.supports_value_type(PcuValueType::u32()));
+        assert!(caps.supports_value_type(PcuValueType::i64()));
+        assert!(caps.supports_value_type(PcuValueType::u64()));
+        assert!(caps.supports_value_type(PcuValueType::f16()));
+        assert!(caps.supports_value_type(PcuValueType::f32()));
+        assert!(caps.supports_value_type(PcuValueType::f64()));
+        assert!(caps.supports_value_type(PcuValueType::Vector {
+            scalar: crate::PcuScalarType::F64,
+            lanes: 4,
+        }));
     }
 }

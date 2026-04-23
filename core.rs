@@ -18,8 +18,11 @@ pub enum PcuScalarType {
     U16,
     I32,
     U32,
+    I64,
+    U64,
     F16,
     F32,
+    F64,
 }
 
 impl PcuScalarType {
@@ -31,6 +34,7 @@ impl PcuScalarType {
             Self::I8 | Self::U8 => 8,
             Self::I16 | Self::U16 | Self::F16 => 16,
             Self::I32 | Self::U32 | Self::F32 => 32,
+            Self::I64 | Self::U64 | Self::F64 => 64,
         }
     }
 }
@@ -79,6 +83,16 @@ impl PcuValueType {
     }
 
     #[must_use]
+    pub const fn i64() -> Self {
+        Self::Scalar(PcuScalarType::I64)
+    }
+
+    #[must_use]
+    pub const fn u64() -> Self {
+        Self::Scalar(PcuScalarType::U64)
+    }
+
+    #[must_use]
     pub const fn f16() -> Self {
         Self::Scalar(PcuScalarType::F16)
     }
@@ -86,6 +100,11 @@ impl PcuValueType {
     #[must_use]
     pub const fn f32() -> Self {
         Self::Scalar(PcuScalarType::F32)
+    }
+
+    #[must_use]
+    pub const fn f64() -> Self {
+        Self::Scalar(PcuScalarType::F64)
     }
 
     #[must_use]
@@ -419,8 +438,11 @@ pub enum PcuParameterValue {
     U16(u16),
     I32(i32),
     U32(u32),
+    I64(i64),
+    U64(u64),
     F16(u16),
     F32(u32),
+    F64(u64),
 }
 
 impl PcuParameterValue {
@@ -440,6 +462,16 @@ impl PcuParameterValue {
     }
 
     #[must_use]
+    pub fn from_f64(value: f64) -> Self {
+        Self::F64(value.to_bits())
+    }
+
+    #[must_use]
+    pub const fn from_f64_bits(bits: u64) -> Self {
+        Self::F64(bits)
+    }
+
+    #[must_use]
     pub const fn value_type(self) -> PcuValueType {
         match self {
             Self::Bool(_) => PcuValueType::bool(),
@@ -449,8 +481,11 @@ impl PcuParameterValue {
             Self::U16(_) => PcuValueType::u16(),
             Self::I32(_) => PcuValueType::i32(),
             Self::U32(_) => PcuValueType::u32(),
+            Self::I64(_) => PcuValueType::i64(),
+            Self::U64(_) => PcuValueType::u64(),
             Self::F16(_) => PcuValueType::f16(),
             Self::F32(_) => PcuValueType::f32(),
+            Self::F64(_) => PcuValueType::f64(),
         }
     }
 
@@ -484,6 +519,22 @@ impl PcuParameterValue {
     }
 
     #[must_use]
+    pub const fn as_i64(self) -> Option<i64> {
+        match self {
+            Self::I64(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_u64(self) -> Option<u64> {
+        match self {
+            Self::U64(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
     pub const fn as_f16_bits(self) -> Option<u16> {
         match self {
             Self::F16(bits) => Some(bits),
@@ -503,6 +554,22 @@ impl PcuParameterValue {
     pub const fn as_f32_bits(self) -> Option<u32> {
         match self {
             Self::F32(bits) => Some(bits),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_f64(self) -> Option<f64> {
+        match self {
+            Self::F64(bits) => Some(f64::from_bits(bits)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_f64_bits(self) -> Option<u64> {
+        match self {
+            Self::F64(bits) => Some(bits),
             _ => None,
         }
     }
@@ -755,4 +822,37 @@ pub trait PcuKernelIrContract {
     fn kind(&self) -> PcuIrKind;
     fn entry_point(&self) -> &str;
     fn signature(&self) -> PcuKernelSignature<'_>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PcuParameterValue,
+        PcuScalarType,
+        PcuValueType,
+    };
+
+    #[test]
+    fn scalar_types_cover_64_bit_widths() {
+        assert_eq!(PcuScalarType::I64.bit_width(), 64);
+        assert_eq!(PcuScalarType::U64.bit_width(), 64);
+        assert_eq!(PcuScalarType::F64.bit_width(), 64);
+        assert_eq!(PcuValueType::i64().scalar_type(), PcuScalarType::I64);
+        assert_eq!(PcuValueType::u64().scalar_type(), PcuScalarType::U64);
+        assert_eq!(PcuValueType::f64().scalar_type(), PcuScalarType::F64);
+    }
+
+    #[test]
+    fn parameter_values_round_trip_64_bit_types() {
+        let signed = PcuParameterValue::I64(-9);
+        let unsigned = PcuParameterValue::U64(42);
+        let float = PcuParameterValue::from_f64(3.5);
+
+        assert_eq!(signed.value_type(), PcuValueType::i64());
+        assert_eq!(unsigned.value_type(), PcuValueType::u64());
+        assert_eq!(float.value_type(), PcuValueType::f64());
+        assert_eq!(signed.as_i64(), Some(-9));
+        assert_eq!(unsigned.as_u64(), Some(42));
+        assert_eq!(float.as_f64(), Some(3.5));
+    }
 }
