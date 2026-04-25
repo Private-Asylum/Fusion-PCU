@@ -65,7 +65,15 @@ pub use crate::model::{
     PcuDispatchSyncOp,
     PcuDispatchValueOp,
     PcuKernel,
+    PcuMeshFeatureCaps,
+    PcuMeshKernelIr,
     PcuOperand,
+    PcuRasterFeatureCaps,
+    PcuRasterKernelIr,
+    PcuRayTraceFeatureCaps,
+    PcuRayTraceKernelIr,
+    PcuRenderFamilyCaps,
+    PcuRenderKernel,
     PcuSignalKernelIr,
     PcuSignalOp,
     PcuSignalTriggerKind,
@@ -95,6 +103,9 @@ mod tests {
         PcuKernel,
         PcuKernelId,
         PcuKernelIrContract,
+        PcuRasterFeatureCaps,
+        PcuRasterKernelIr,
+        PcuRenderKernel,
         PcuOperand,
         PcuParameterSlot,
         PcuSignalKernelIr,
@@ -166,5 +177,24 @@ mod tests {
         assert_eq!(command.kind(), PcuIrKind::Command);
         assert_eq!(transaction.kind(), PcuIrKind::Transaction);
         assert_eq!(signal.kind(), PcuIrKind::Signal);
+    }
+
+    #[test]
+    fn render_kernels_report_render_kind() {
+        let render = PcuKernel::Render(PcuRenderKernel::Raster(PcuRasterKernelIr {
+            id: PcuKernelId(4),
+            entry_point: "raster",
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            vertex_entry: "vs_main",
+            fragment_entry: Some("fs_main"),
+            type_caps: crate::PcuValueTypeCaps::FLOAT32
+                .union(crate::PcuValueTypeCaps::VECTOR_VALUES),
+            features: PcuRasterFeatureCaps::VERTEX_STAGE
+                .union(PcuRasterFeatureCaps::FRAGMENT_STAGE),
+        }));
+
+        assert_eq!(render.kind(), PcuIrKind::Render);
     }
 }

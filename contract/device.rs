@@ -11,6 +11,10 @@ use super::caps::{
 use crate::{
     PcuDispatchFeatureCaps,
     PcuKernel,
+    PcuMeshFeatureCaps,
+    PcuRasterFeatureCaps,
+    PcuRayTraceFeatureCaps,
+    PcuRenderFamilyCaps,
     PcuValueTypeCaps,
     PcuStreamCapabilities,
 };
@@ -63,9 +67,13 @@ impl PcuExecutorDescriptor {
 pub struct PcuExecutorSupport {
     pub primitives: PcuPrimitiveCaps,
     pub dispatch_policy: PcuDispatchPolicyCaps,
+    pub value_types: PcuValueTypeCaps,
     pub dispatch_instructions: PcuDispatchOpCaps,
-    pub dispatch_types: PcuValueTypeCaps,
     pub dispatch_features: PcuDispatchFeatureCaps,
+    pub render_families: PcuRenderFamilyCaps,
+    pub raster_features: PcuRasterFeatureCaps,
+    pub mesh_features: PcuMeshFeatureCaps,
+    pub ray_trace_features: PcuRayTraceFeatureCaps,
     pub stream_instructions: PcuStreamCapabilities,
     pub command_instructions: PcuCommandOpCaps,
     pub transaction_features: PcuTransactionFeatureCaps,
@@ -78,9 +86,13 @@ impl PcuExecutorSupport {
         Self {
             primitives: PcuPrimitiveCaps::empty(),
             dispatch_policy: PcuDispatchPolicyCaps::empty(),
+            value_types: PcuValueTypeCaps::empty(),
             dispatch_instructions: PcuDispatchOpCaps::empty(),
-            dispatch_types: PcuValueTypeCaps::empty(),
             dispatch_features: PcuDispatchFeatureCaps::empty(),
+            render_families: PcuRenderFamilyCaps::empty(),
+            raster_features: PcuRasterFeatureCaps::empty(),
+            mesh_features: PcuMeshFeatureCaps::empty(),
+            ray_trace_features: PcuRayTraceFeatureCaps::empty(),
             stream_instructions: PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::empty(),
             transaction_features: PcuTransactionFeatureCaps::empty(),
@@ -89,13 +101,36 @@ impl PcuExecutorSupport {
     }
 
     #[must_use]
-    pub const fn supports_dispatch_types_direct(self, required: PcuValueTypeCaps) -> bool {
-        self.dispatch_types.contains(required)
+    pub const fn supports_value_types_direct(self, required: PcuValueTypeCaps) -> bool {
+        self.value_types.contains(required)
     }
 
     #[must_use]
     pub const fn supports_dispatch_features_direct(self, required: PcuDispatchFeatureCaps) -> bool {
         self.dispatch_features.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_render_families_direct(self, required: PcuRenderFamilyCaps) -> bool {
+        self.render_families.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_raster_features_direct(self, required: PcuRasterFeatureCaps) -> bool {
+        self.raster_features.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_mesh_features_direct(self, required: PcuMeshFeatureCaps) -> bool {
+        self.mesh_features.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_ray_trace_features_direct(
+        self,
+        required: PcuRayTraceFeatureCaps,
+    ) -> bool {
+        self.ray_trace_features.contains(required)
     }
 
     #[must_use]
@@ -117,7 +152,7 @@ impl PcuExecutorSupport {
         match kernel {
             PcuKernel::Dispatch(kernel) => {
                 self.supports_dispatch_direct_structure(kernel)
-                    && self.supports_dispatch_types_direct(kernel.required_type_support())
+                    && self.supports_value_types_direct(kernel.required_type_support())
                     && self.supports_dispatch_features_direct(kernel.required_feature_support())
             }
             PcuKernel::Stream(kernel) => {
@@ -156,6 +191,33 @@ impl PcuExecutorSupport {
                         .signal_instructions
                         .contains(kernel.required_instruction_support())
             }
+            PcuKernel::Render(kernel) => {
+                self.primitives.contains(PcuPrimitiveCaps::RENDER)
+                    && self
+                        .dispatch_policy
+                        .contains(kernel.required_dispatch_policy())
+                    && self.supports_value_types_direct(kernel.required_type_support())
+                    && match kernel {
+                        crate::PcuRenderKernel::Raster(kernel) => {
+                            self.supports_render_families_direct(PcuRenderFamilyCaps::RASTER)
+                                && self.supports_raster_features_direct(
+                                    kernel.required_feature_support(),
+                                )
+                        }
+                        crate::PcuRenderKernel::Mesh(kernel) => {
+                            self.supports_render_families_direct(PcuRenderFamilyCaps::MESH)
+                                && self.supports_mesh_features_direct(
+                                    kernel.required_feature_support(),
+                                )
+                        }
+                        crate::PcuRenderKernel::RayTrace(kernel) => {
+                            self.supports_render_families_direct(PcuRenderFamilyCaps::RAY_TRACE)
+                                && self.supports_ray_trace_features_direct(
+                                    kernel.required_feature_support(),
+                                )
+                        }
+                    }
+            }
         }
     }
 }
@@ -178,6 +240,10 @@ mod tests {
         PcuDispatchPolicyCaps,
         PcuKernel,
         PcuKernelId,
+        PcuRasterFeatureCaps,
+        PcuRasterKernelIr,
+        PcuRenderFamilyCaps,
+        PcuRenderKernel,
         PcuPrimitiveCaps,
         PcuTarget,
         PcuValueTypeCaps,
@@ -207,9 +273,13 @@ mod tests {
         let support = PcuExecutorSupport {
             primitives: PcuPrimitiveCaps::COMMAND,
             dispatch_policy: PcuDispatchPolicyCaps::empty(),
+            value_types: crate::PcuValueTypeCaps::empty(),
             dispatch_instructions: crate::PcuDispatchOpCaps::empty(),
-            dispatch_types: crate::PcuValueTypeCaps::empty(),
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
+            render_families: crate::PcuRenderFamilyCaps::empty(),
+            raster_features: crate::PcuRasterFeatureCaps::empty(),
+            mesh_features: crate::PcuMeshFeatureCaps::empty(),
+            ray_trace_features: crate::PcuRayTraceFeatureCaps::empty(),
             stream_instructions: crate::PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::WRITE,
             transaction_features: crate::PcuTransactionFeatureCaps::empty(),
@@ -229,9 +299,13 @@ mod tests {
             support: PcuExecutorSupport {
                 primitives: PcuPrimitiveCaps::COMMAND,
                 dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+                value_types: crate::PcuValueTypeCaps::empty(),
                 dispatch_instructions: crate::PcuDispatchOpCaps::empty(),
-                dispatch_types: crate::PcuValueTypeCaps::empty(),
                 dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
+                render_families: crate::PcuRenderFamilyCaps::empty(),
+                raster_features: crate::PcuRasterFeatureCaps::empty(),
+                mesh_features: crate::PcuMeshFeatureCaps::empty(),
+                ray_trace_features: crate::PcuRayTraceFeatureCaps::empty(),
                 stream_instructions: crate::PcuStreamCapabilities::empty(),
                 command_instructions: PcuCommandOpCaps::WRITE,
                 transaction_features: crate::PcuTransactionFeatureCaps::empty(),
@@ -247,10 +321,13 @@ mod tests {
         let support = PcuExecutorSupport {
             primitives: PcuPrimitiveCaps::DISPATCH,
             dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+            value_types: crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
             dispatch_instructions: crate::PcuDispatchOpCaps::ALU_ADD,
-            dispatch_types: crate::PcuValueTypeCaps::UINT32
-                | crate::PcuValueTypeCaps::SCALAR_VALUES,
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
+            render_families: crate::PcuRenderFamilyCaps::empty(),
+            raster_features: crate::PcuRasterFeatureCaps::empty(),
+            mesh_features: crate::PcuMeshFeatureCaps::empty(),
+            ray_trace_features: crate::PcuRayTraceFeatureCaps::empty(),
             stream_instructions: crate::PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::empty(),
             transaction_features: crate::PcuTransactionFeatureCaps::empty(),
@@ -264,7 +341,7 @@ mod tests {
 
         assert!(support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
         assert!(
-            !support.supports_dispatch_types_direct(crate::PcuValueTypeCaps::for_value_type(
+            !support.supports_value_types_direct(crate::PcuValueTypeCaps::for_value_type(
                 PcuValueType::Vector {
                     scalar: crate::PcuScalarType::U32,
                     lanes: 4,
@@ -278,10 +355,13 @@ mod tests {
         let support = PcuExecutorSupport {
             primitives: PcuPrimitiveCaps::DISPATCH,
             dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+            value_types: crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
             dispatch_instructions: crate::PcuDispatchOpCaps::ALU_ADD,
-            dispatch_types: crate::PcuValueTypeCaps::UINT32
-                | crate::PcuValueTypeCaps::SCALAR_VALUES,
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
+            render_families: crate::PcuRenderFamilyCaps::empty(),
+            raster_features: crate::PcuRasterFeatureCaps::empty(),
+            mesh_features: crate::PcuMeshFeatureCaps::empty(),
+            ray_trace_features: crate::PcuRayTraceFeatureCaps::empty(),
             stream_instructions: crate::PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::empty(),
             transaction_features: crate::PcuTransactionFeatureCaps::empty(),
@@ -310,6 +390,40 @@ mod tests {
         assert!(
             !support.supports_dispatch_features_direct(PcuDispatchFeatureCaps::INLINE_PARAMETERS)
         );
+    }
+
+    #[test]
+    fn executor_support_reports_render_family_admission() {
+        let support = PcuExecutorSupport {
+            primitives: PcuPrimitiveCaps::RENDER,
+            dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+            value_types: crate::PcuValueTypeCaps::FLOAT32 | crate::PcuValueTypeCaps::VECTOR_VALUES,
+            dispatch_instructions: crate::PcuDispatchOpCaps::empty(),
+            dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
+            render_families: PcuRenderFamilyCaps::RASTER,
+            raster_features: PcuRasterFeatureCaps::VERTEX_STAGE
+                .union(PcuRasterFeatureCaps::FRAGMENT_STAGE),
+            mesh_features: crate::PcuMeshFeatureCaps::empty(),
+            ray_trace_features: crate::PcuRayTraceFeatureCaps::empty(),
+            stream_instructions: crate::PcuStreamCapabilities::empty(),
+            command_instructions: crate::PcuCommandOpCaps::empty(),
+            transaction_features: crate::PcuTransactionFeatureCaps::empty(),
+            signal_instructions: crate::PcuSignalOpCaps::empty(),
+        };
+        let kernel = PcuKernel::Render(PcuRenderKernel::Raster(PcuRasterKernelIr {
+            id: PcuKernelId(12),
+            entry_point: "raster",
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            vertex_entry: "vs_main",
+            fragment_entry: Some("fs_main"),
+            type_caps: crate::PcuValueTypeCaps::FLOAT32 | crate::PcuValueTypeCaps::VECTOR_VALUES,
+            features: PcuRasterFeatureCaps::VERTEX_STAGE
+                .union(PcuRasterFeatureCaps::FRAGMENT_STAGE),
+        }));
+
+        assert!(support.supports_kernel_direct(kernel));
     }
 }
 

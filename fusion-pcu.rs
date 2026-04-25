@@ -20,7 +20,9 @@ pub mod dispatch;
 pub mod ir;
 #[path = "model/model.rs"]
 pub mod model;
+pub mod render;
 pub mod validation;
 
 pub use contract::*;
 pub use dispatch::*;
+pub use render::*;

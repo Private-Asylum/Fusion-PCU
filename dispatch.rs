@@ -374,7 +374,7 @@ fn validate_direct_kernel_support(
                         .supports_dispatch_direct_structure(dispatch)
                         && descriptor
                             .support
-                            .supports_dispatch_types_direct(dispatch.required_type_support())
+                            .supports_value_types_direct(dispatch.required_type_support())
                 });
                 if any_typed {
                     return Err(PcuError::unsupported_feature_support());
@@ -390,7 +390,7 @@ fn validate_direct_kernel_support(
     Err(PcuError::unsupported())
 }
 
-fn validate_parameters(
+pub(crate) fn validate_parameters(
     signature: PcuKernelSignature<'_>,
     parameters: PcuInvocationParameters<'_>,
 ) -> Result<(), PcuError> {
@@ -401,7 +401,7 @@ fn validate_parameters(
     }
 }
 
-fn validate_invocation_bindings(
+pub(crate) fn validate_invocation_bindings(
     signature: PcuKernelSignature<'_>,
     bindings: PcuInvocationBindings<'_>,
 ) -> Result<(), PcuError> {
@@ -621,10 +621,14 @@ mod tests {
             dispatch_policy: PcuDispatchPolicyCaps::SERIAL
                 .union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION)
                 .union(PcuDispatchPolicyCaps::PERSISTENT_INSTALL),
-            dispatch_instructions: PcuDispatchOpCaps::ALU_ADD,
-            dispatch_types: crate::PcuValueTypeCaps::UINT32
+            value_types: crate::PcuValueTypeCaps::UINT32
                 .union(crate::PcuValueTypeCaps::SCALAR_VALUES),
+            dispatch_instructions: PcuDispatchOpCaps::ALU_ADD,
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
+            render_families: crate::PcuRenderFamilyCaps::empty(),
+            raster_features: crate::PcuRasterFeatureCaps::empty(),
+            mesh_features: crate::PcuMeshFeatureCaps::empty(),
+            ray_trace_features: crate::PcuRayTraceFeatureCaps::empty(),
             stream_instructions: PcuStreamCapabilities::FIFO_INPUT
                 .union(PcuStreamCapabilities::FIFO_OUTPUT)
                 .union(PcuStreamCapabilities::BIT_INVERT),
@@ -641,6 +645,10 @@ mod tests {
         support.primitive_support = PcuPrimitiveSupport {
             primitives: PcuFeatureSupport::new(PcuPrimitiveCaps::all(), PcuPrimitiveCaps::all()),
         };
+        support.value_type_support = PcuFeatureSupport::new(
+            crate::PcuValueTypeCaps::UINT32.union(crate::PcuValueTypeCaps::SCALAR_VALUES),
+            crate::PcuValueTypeCaps::empty(),
+        );
         support.dispatch_support = PcuDispatchSupport {
             flags: PcuDispatchPolicyCaps::SERIAL
                 .union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION)
@@ -648,10 +656,6 @@ mod tests {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::ALU_ADD,
                 PcuDispatchOpCaps::empty(),
-            ),
-            types: PcuFeatureSupport::new(
-                crate::PcuValueTypeCaps::UINT32.union(crate::PcuValueTypeCaps::SCALAR_VALUES),
-                crate::PcuValueTypeCaps::empty(),
             ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),

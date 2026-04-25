@@ -10,6 +10,10 @@ use core::ops::{
 use crate::{
     PcuDispatchFeatureCaps,
     PcuKernel,
+    PcuMeshFeatureCaps,
+    PcuRasterFeatureCaps,
+    PcuRayTraceFeatureCaps,
+    PcuRenderFamilyCaps,
     PcuValueTypeCaps,
     PcuStreamCapabilities,
 };
@@ -94,6 +98,7 @@ impl PcuPrimitiveCaps {
     pub const COMMAND: Self = Self(1 << 2);
     pub const TRANSACTION: Self = Self(1 << 3);
     pub const SIGNAL: Self = Self(1 << 4);
+    pub const RENDER: Self = Self(1 << 5);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -107,6 +112,7 @@ impl PcuPrimitiveCaps {
             .union(Self::COMMAND)
             .union(Self::TRANSACTION)
             .union(Self::SIGNAL)
+            .union(Self::RENDER)
     }
 
     #[must_use]
@@ -558,7 +564,6 @@ impl PcuPrimitiveSupport {
 pub struct PcuDispatchSupport {
     pub flags: PcuDispatchPolicyCaps,
     pub instructions: PcuFeatureSupport<PcuDispatchOpCaps>,
-    pub types: PcuFeatureSupport<PcuValueTypeCaps>,
     pub features: PcuFeatureSupport<PcuDispatchFeatureCaps>,
 }
 
@@ -571,7 +576,6 @@ impl PcuDispatchSupport {
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
             ),
-            types: PcuFeatureSupport::new(PcuValueTypeCaps::empty(), PcuValueTypeCaps::empty()),
             features: PcuFeatureSupport::new(
                 PcuDispatchFeatureCaps::empty(),
                 PcuDispatchFeatureCaps::empty(),
@@ -595,16 +599,6 @@ impl PcuDispatchSupport {
     }
 
     #[must_use]
-    pub const fn supports_direct_types(self, required: PcuValueTypeCaps) -> bool {
-        self.types.direct.contains(required)
-    }
-
-    #[must_use]
-    pub const fn supports_cpu_fallback_types(self, required: PcuValueTypeCaps) -> bool {
-        self.types.cpu_fallback.contains(required)
-    }
-
-    #[must_use]
     pub const fn supports_direct_features(self, required: PcuDispatchFeatureCaps) -> bool {
         self.features.direct.contains(required)
     }
@@ -612,6 +606,172 @@ impl PcuDispatchSupport {
     #[must_use]
     pub const fn supports_cpu_fallback_features(self, required: PcuDispatchFeatureCaps) -> bool {
         self.features.cpu_fallback.contains(required)
+    }
+}
+
+/// Raster-family render support surfaced by one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuRasterSupport {
+    pub features: PcuFeatureSupport<PcuRasterFeatureCaps>,
+}
+
+impl PcuRasterSupport {
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            features: PcuFeatureSupport::new(
+                PcuRasterFeatureCaps::empty(),
+                PcuRasterFeatureCaps::empty(),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_direct_features(self, required: PcuRasterFeatureCaps) -> bool {
+        self.features.direct.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_cpu_fallback_features(self, required: PcuRasterFeatureCaps) -> bool {
+        self.features.cpu_fallback.contains(required)
+    }
+}
+
+/// Mesh-family render support surfaced by one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuMeshSupport {
+    pub features: PcuFeatureSupport<PcuMeshFeatureCaps>,
+}
+
+impl PcuMeshSupport {
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            features: PcuFeatureSupport::new(
+                PcuMeshFeatureCaps::empty(),
+                PcuMeshFeatureCaps::empty(),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_direct_features(self, required: PcuMeshFeatureCaps) -> bool {
+        self.features.direct.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_cpu_fallback_features(self, required: PcuMeshFeatureCaps) -> bool {
+        self.features.cpu_fallback.contains(required)
+    }
+}
+
+/// Ray-trace-family render support surfaced by one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuRayTraceSupport {
+    pub features: PcuFeatureSupport<PcuRayTraceFeatureCaps>,
+}
+
+impl PcuRayTraceSupport {
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            features: PcuFeatureSupport::new(
+                PcuRayTraceFeatureCaps::empty(),
+                PcuRayTraceFeatureCaps::empty(),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_direct_features(self, required: PcuRayTraceFeatureCaps) -> bool {
+        self.features.direct.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_cpu_fallback_features(self, required: PcuRayTraceFeatureCaps) -> bool {
+        self.features.cpu_fallback.contains(required)
+    }
+}
+
+/// Render-family support surfaced by one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuRenderSupport {
+    pub families: PcuFeatureSupport<PcuRenderFamilyCaps>,
+    pub raster: PcuRasterSupport,
+    pub mesh: PcuMeshSupport,
+    pub ray_trace: PcuRayTraceSupport,
+}
+
+impl PcuRenderSupport {
+    #[must_use]
+    pub const fn unsupported() -> Self {
+        Self {
+            families: PcuFeatureSupport::new(
+                PcuRenderFamilyCaps::empty(),
+                PcuRenderFamilyCaps::empty(),
+            ),
+            raster: PcuRasterSupport::unsupported(),
+            mesh: PcuMeshSupport::unsupported(),
+            ray_trace: PcuRayTraceSupport::unsupported(),
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_direct_family(self, required: PcuRenderFamilyCaps) -> bool {
+        self.families.direct.contains(required)
+    }
+
+    #[must_use]
+    pub const fn supports_cpu_fallback_family(self, required: PcuRenderFamilyCaps) -> bool {
+        self.families.cpu_fallback.contains(required)
+    }
+
+    #[must_use]
+    pub fn supports_direct(self, kernel: crate::PcuRenderKernel<'_>) -> bool {
+        match kernel {
+            crate::PcuRenderKernel::Raster(kernel) => {
+                self.supports_direct_family(PcuRenderFamilyCaps::RASTER)
+                    && self
+                        .raster
+                        .supports_direct_features(kernel.required_feature_support())
+            }
+            crate::PcuRenderKernel::Mesh(kernel) => {
+                self.supports_direct_family(PcuRenderFamilyCaps::MESH)
+                    && self
+                        .mesh
+                        .supports_direct_features(kernel.required_feature_support())
+            }
+            crate::PcuRenderKernel::RayTrace(kernel) => {
+                self.supports_direct_family(PcuRenderFamilyCaps::RAY_TRACE)
+                    && self
+                        .ray_trace
+                        .supports_direct_features(kernel.required_feature_support())
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn supports_cpu_fallback(self, kernel: crate::PcuRenderKernel<'_>) -> bool {
+        match kernel {
+            crate::PcuRenderKernel::Raster(kernel) => {
+                self.supports_cpu_fallback_family(PcuRenderFamilyCaps::RASTER)
+                    && self
+                        .raster
+                        .supports_cpu_fallback_features(kernel.required_feature_support())
+            }
+            crate::PcuRenderKernel::Mesh(kernel) => {
+                self.supports_cpu_fallback_family(PcuRenderFamilyCaps::MESH)
+                    && self
+                        .mesh
+                        .supports_cpu_fallback_features(kernel.required_feature_support())
+            }
+            crate::PcuRenderKernel::RayTrace(kernel) => {
+                self.supports_cpu_fallback_family(PcuRenderFamilyCaps::RAY_TRACE)
+                    && self
+                        .ray_trace
+                        .supports_cpu_fallback_features(kernel.required_feature_support())
+            }
+        }
     }
 }
 
@@ -738,8 +898,12 @@ pub struct PcuSupport {
     pub executor_count: u8,
     /// Primitive-family support.
     pub primitive_support: PcuPrimitiveSupport,
+    /// Shared value-type support surfaced by the backend.
+    pub value_type_support: PcuFeatureSupport<PcuValueTypeCaps>,
     /// Dispatch-model support.
     pub dispatch_support: PcuDispatchSupport,
+    /// Render-family support.
+    pub render_support: PcuRenderSupport,
     /// Stream-model support.
     pub stream_support: PcuStreamSupport,
     /// Command-model support.
@@ -759,7 +923,12 @@ impl PcuSupport {
             implementation: PcuImplementationKind::Unsupported,
             executor_count: 0,
             primitive_support: PcuPrimitiveSupport::unsupported(),
+            value_type_support: PcuFeatureSupport::new(
+                PcuValueTypeCaps::empty(),
+                PcuValueTypeCaps::empty(),
+            ),
             dispatch_support: PcuDispatchSupport::unsupported(),
+            render_support: PcuRenderSupport::unsupported(),
             stream_support: PcuStreamSupport::unsupported(),
             command_support: PcuCommandSupport::unsupported(),
             transaction_support: PcuTransactionSupport::unsupported(),
@@ -777,8 +946,9 @@ impl PcuSupport {
                     .supports_direct(PcuPrimitiveCaps::DISPATCH)
                     && self.dispatch_support.allows(required_policy)
                     && self
-                        .dispatch_support
-                        .supports_direct_types(kernel.required_type_support())
+                        .value_type_support
+                        .direct
+                        .contains(kernel.required_type_support())
                     && self
                         .dispatch_support
                         .supports_direct_features(kernel.required_feature_support())
@@ -818,6 +988,16 @@ impl PcuSupport {
                         .signal_support
                         .supports_direct_instructions(kernel.required_instruction_support())
             }
+            PcuKernel::Render(kernel) => {
+                self.primitive_support
+                    .supports_direct(PcuPrimitiveCaps::RENDER)
+                    && self.dispatch_support.allows(required_policy)
+                    && self
+                        .value_type_support
+                        .direct
+                        .contains(kernel.required_type_support())
+                    && self.render_support.supports_direct(kernel)
+            }
         }
     }
 
@@ -831,8 +1011,9 @@ impl PcuSupport {
                     .supports_cpu_fallback(PcuPrimitiveCaps::DISPATCH)
                     && self.dispatch_support.allows(required_policy)
                     && self
-                        .dispatch_support
-                        .supports_cpu_fallback_types(kernel.required_type_support())
+                        .value_type_support
+                        .cpu_fallback
+                        .contains(kernel.required_type_support())
                     && self
                         .dispatch_support
                         .supports_cpu_fallback_features(kernel.required_feature_support())
@@ -872,6 +1053,16 @@ impl PcuSupport {
                         .signal_support
                         .supports_cpu_fallback_instructions(kernel.required_instruction_support())
             }
+            PcuKernel::Render(kernel) => {
+                self.primitive_support
+                    .supports_cpu_fallback(PcuPrimitiveCaps::RENDER)
+                    && self.dispatch_support.allows(required_policy)
+                    && self
+                        .value_type_support
+                        .cpu_fallback
+                        .contains(kernel.required_type_support())
+                    && self.render_support.supports_cpu_fallback(kernel)
+            }
         }
     }
 }
@@ -896,6 +1087,10 @@ mod tests {
         PcuDispatchFeatureCaps,
         PcuKernel,
         PcuKernelId,
+        PcuRasterFeatureCaps,
+        PcuRasterKernelIr,
+        PcuRenderFamilyCaps,
+        PcuRenderKernel,
         PcuTarget,
         PcuValueType,
         PcuValueTypeCaps,
@@ -937,15 +1132,15 @@ mod tests {
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
             ),
-            types: PcuFeatureSupport::new(
-                crate::PcuValueTypeCaps::empty(),
-                crate::PcuValueTypeCaps::empty(),
-            ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
                 crate::PcuDispatchFeatureCaps::empty(),
             ),
         };
+        support.value_type_support = PcuFeatureSupport::new(
+            crate::PcuValueTypeCaps::empty(),
+            crate::PcuValueTypeCaps::empty(),
+        );
 
         let kernel = command_kernel();
 
@@ -974,15 +1169,15 @@ mod tests {
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
             ),
-            types: PcuFeatureSupport::new(
-                crate::PcuValueTypeCaps::empty(),
-                crate::PcuValueTypeCaps::empty(),
-            ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
                 crate::PcuDispatchFeatureCaps::empty(),
             ),
         };
+        support.value_type_support = PcuFeatureSupport::new(
+            crate::PcuValueTypeCaps::empty(),
+            crate::PcuValueTypeCaps::empty(),
+        );
 
         let kernel = command_kernel();
 
@@ -1005,15 +1200,15 @@ mod tests {
                 PcuDispatchOpCaps::ALU_ADD,
                 PcuDispatchOpCaps::ALU_ADD,
             ),
-            types: PcuFeatureSupport::new(
-                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
-                crate::PcuValueTypeCaps::empty(),
-            ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
                 crate::PcuDispatchFeatureCaps::empty(),
             ),
         };
+        support.value_type_support = PcuFeatureSupport::new(
+            crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+            crate::PcuValueTypeCaps::empty(),
+        );
         let kernel_builder = PcuDispatchKernelBuilder::<1>::new(4, "main", [1, 1, 1])
             .with_type_caps(PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES)
             .with_arithmetic_op(crate::PcuDispatchAluOp::Add)
@@ -1045,15 +1240,15 @@ mod tests {
                 PcuDispatchOpCaps::ALU_ADD,
                 PcuDispatchOpCaps::ALU_ADD,
             ),
-            types: PcuFeatureSupport::new(
-                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
-                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
-            ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
                 crate::PcuDispatchFeatureCaps::empty(),
             ),
         };
+        support.value_type_support = PcuFeatureSupport::new(
+            crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+            crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+        );
         let parameters = [crate::PcuParameter {
             slot: crate::PcuParameterSlot(0),
             name: Some("scale"),
@@ -1073,5 +1268,56 @@ mod tests {
         );
         assert!(!support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
         assert!(!support.supports_kernel_cpu_fallback(PcuKernel::Dispatch(kernel)));
+    }
+
+    #[test]
+    fn support_reports_render_family_gating() {
+        let mut support = PcuSupport::unsupported();
+        support.primitive_support = PcuPrimitiveSupport {
+            primitives: PcuFeatureSupport::new(PcuPrimitiveCaps::RENDER, PcuPrimitiveCaps::empty()),
+        };
+        support.value_type_support = PcuFeatureSupport::new(
+            crate::PcuValueTypeCaps::FLOAT32 | crate::PcuValueTypeCaps::VECTOR_VALUES,
+            crate::PcuValueTypeCaps::empty(),
+        );
+        support.dispatch_support = PcuDispatchSupport {
+            flags: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+            instructions: PcuFeatureSupport::new(
+                PcuDispatchOpCaps::empty(),
+                PcuDispatchOpCaps::empty(),
+            ),
+            features: PcuFeatureSupport::new(
+                crate::PcuDispatchFeatureCaps::empty(),
+                crate::PcuDispatchFeatureCaps::empty(),
+            ),
+        };
+        support.render_support = crate::PcuRenderSupport {
+            families: PcuFeatureSupport::new(
+                PcuRenderFamilyCaps::RASTER,
+                PcuRenderFamilyCaps::empty(),
+            ),
+            raster: crate::PcuRasterSupport {
+                features: PcuFeatureSupport::new(
+                    PcuRasterFeatureCaps::VERTEX_STAGE.union(PcuRasterFeatureCaps::FRAGMENT_STAGE),
+                    PcuRasterFeatureCaps::empty(),
+                ),
+            },
+            mesh: crate::PcuMeshSupport::unsupported(),
+            ray_trace: crate::PcuRayTraceSupport::unsupported(),
+        };
+        let kernel = PcuKernel::Render(PcuRenderKernel::Raster(PcuRasterKernelIr {
+            id: PcuKernelId(8),
+            entry_point: "raster",
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            vertex_entry: "vs_main",
+            fragment_entry: Some("fs_main"),
+            type_caps: crate::PcuValueTypeCaps::FLOAT32 | crate::PcuValueTypeCaps::VECTOR_VALUES,
+            features: PcuRasterFeatureCaps::VERTEX_STAGE
+                .union(PcuRasterFeatureCaps::FRAGMENT_STAGE),
+        }));
+
+        assert!(support.supports_kernel_direct(kernel));
     }
 }

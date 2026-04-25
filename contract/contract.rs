@@ -68,14 +68,11 @@ pub trait PcuBaseContract {
     /// Returns whether any surfaced execution substrate can satisfy the supplied dispatch type
     /// floor directly.
     #[must_use]
-    fn any_executor_supports_dispatch_types_direct(
-        &self,
-        required: crate::PcuValueTypeCaps,
-    ) -> bool {
+    fn any_executor_supports_value_types_direct(&self, required: crate::PcuValueTypeCaps) -> bool {
         self.executors()
             .iter()
             .copied()
-            .any(|descriptor| descriptor.support.supports_dispatch_types_direct(required))
+            .any(|descriptor| descriptor.support.supports_value_types_direct(required))
     }
 
     /// Returns whether any surfaced execution substrate can satisfy the supplied dispatch feature
