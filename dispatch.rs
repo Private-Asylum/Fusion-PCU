@@ -625,10 +625,6 @@ mod tests {
                 .union(crate::PcuValueTypeCaps::SCALAR_VALUES),
             dispatch_instructions: PcuDispatchOpCaps::ALU_ADD,
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
-            render_families: crate::PcuRenderFamilyCaps::empty(),
-            raster_features: crate::PcuRasterFeatureCaps::empty(),
-            mesh_features: crate::PcuMeshFeatureCaps::empty(),
-            ray_trace_features: crate::PcuRayTraceFeatureCaps::empty(),
             stream_instructions: PcuStreamCapabilities::FIFO_INPUT
                 .union(PcuStreamCapabilities::FIFO_OUTPUT)
                 .union(PcuStreamCapabilities::BIT_INVERT),

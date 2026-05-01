@@ -2,7 +2,6 @@
 
 pub mod command;
 pub mod dispatch;
-pub mod render;
 pub mod signal;
 pub mod stream;
 pub mod transaction;
@@ -17,7 +16,6 @@ use crate::{
 
 pub use command::*;
 pub use dispatch::*;
-pub use render::*;
 pub use signal::*;
 pub use stream::*;
 pub use transaction::*;
@@ -30,7 +28,6 @@ pub enum PcuKernel<'a> {
     Command(PcuCommandKernelIr<'a>),
     Transaction(PcuTransactionKernelIr<'a>),
     Signal(PcuSignalKernelIr<'a>),
-    Render(PcuRenderKernel<'a>),
 }
 
 impl<'a> PcuKernel<'a> {
@@ -42,7 +39,6 @@ impl<'a> PcuKernel<'a> {
             Self::Command(_) => PcuPrimitiveCaps::COMMAND,
             Self::Transaction(_) => PcuPrimitiveCaps::TRANSACTION,
             Self::Signal(_) => PcuPrimitiveCaps::SIGNAL,
-            Self::Render(_) => PcuPrimitiveCaps::RENDER,
         }
     }
 
@@ -54,18 +50,13 @@ impl<'a> PcuKernel<'a> {
             Self::Command(kernel) => kernel.required_dispatch_policy(),
             Self::Transaction(kernel) => kernel.required_dispatch_policy(),
             Self::Signal(kernel) => kernel.required_dispatch_policy(),
-            Self::Render(kernel) => kernel.required_dispatch_policy(),
         }
     }
 
     #[must_use]
     pub const fn as_stream(self) -> Option<PcuStreamKernelIr<'a>> {
         match self {
-            Self::Dispatch(_)
-            | Self::Command(_)
-            | Self::Transaction(_)
-            | Self::Signal(_)
-            | Self::Render(_) => None,
+            Self::Dispatch(_) | Self::Command(_) | Self::Transaction(_) | Self::Signal(_) => None,
             Self::Stream(kernel) => Some(kernel),
         }
     }
@@ -74,11 +65,7 @@ impl<'a> PcuKernel<'a> {
     pub const fn as_dispatch(self) -> Option<PcuDispatchKernelIr<'a>> {
         match self {
             Self::Dispatch(kernel) => Some(kernel),
-            Self::Stream(_)
-            | Self::Command(_)
-            | Self::Transaction(_)
-            | Self::Signal(_)
-            | Self::Render(_) => None,
+            Self::Stream(_) | Self::Command(_) | Self::Transaction(_) | Self::Signal(_) => None,
         }
     }
 
@@ -86,11 +73,7 @@ impl<'a> PcuKernel<'a> {
     pub const fn as_command(self) -> Option<PcuCommandKernelIr<'a>> {
         match self {
             Self::Command(kernel) => Some(kernel),
-            Self::Dispatch(_)
-            | Self::Stream(_)
-            | Self::Transaction(_)
-            | Self::Signal(_)
-            | Self::Render(_) => None,
+            Self::Dispatch(_) | Self::Stream(_) | Self::Transaction(_) | Self::Signal(_) => None,
         }
     }
 
@@ -98,11 +81,7 @@ impl<'a> PcuKernel<'a> {
     pub const fn as_transaction(self) -> Option<PcuTransactionKernelIr<'a>> {
         match self {
             Self::Transaction(kernel) => Some(kernel),
-            Self::Dispatch(_)
-            | Self::Stream(_)
-            | Self::Command(_)
-            | Self::Signal(_)
-            | Self::Render(_) => None,
+            Self::Dispatch(_) | Self::Stream(_) | Self::Command(_) | Self::Signal(_) => None,
         }
     }
 
@@ -110,23 +89,7 @@ impl<'a> PcuKernel<'a> {
     pub const fn as_signal(self) -> Option<PcuSignalKernelIr<'a>> {
         match self {
             Self::Signal(kernel) => Some(kernel),
-            Self::Dispatch(_)
-            | Self::Stream(_)
-            | Self::Command(_)
-            | Self::Transaction(_)
-            | Self::Render(_) => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn as_render(self) -> Option<PcuRenderKernel<'a>> {
-        match self {
-            Self::Render(kernel) => Some(kernel),
-            Self::Dispatch(_)
-            | Self::Stream(_)
-            | Self::Command(_)
-            | Self::Transaction(_)
-            | Self::Signal(_) => None,
+            Self::Dispatch(_) | Self::Stream(_) | Self::Command(_) | Self::Transaction(_) => None,
         }
     }
 }
@@ -139,7 +102,6 @@ impl PcuKernelIrContract for PcuKernel<'_> {
             Self::Command(kernel) => kernel.id(),
             Self::Transaction(kernel) => kernel.id(),
             Self::Signal(kernel) => kernel.id(),
-            Self::Render(kernel) => kernel.id(),
         }
     }
 
@@ -150,7 +112,6 @@ impl PcuKernelIrContract for PcuKernel<'_> {
             Self::Command(kernel) => kernel.kind(),
             Self::Transaction(kernel) => kernel.kind(),
             Self::Signal(kernel) => kernel.kind(),
-            Self::Render(kernel) => kernel.kind(),
         }
     }
 
@@ -161,7 +122,6 @@ impl PcuKernelIrContract for PcuKernel<'_> {
             Self::Command(kernel) => kernel.entry_point(),
             Self::Transaction(kernel) => kernel.entry_point(),
             Self::Signal(kernel) => kernel.entry_point(),
-            Self::Render(kernel) => kernel.entry_point(),
         }
     }
 
@@ -172,7 +132,6 @@ impl PcuKernelIrContract for PcuKernel<'_> {
             Self::Command(kernel) => kernel.signature(),
             Self::Transaction(kernel) => kernel.signature(),
             Self::Signal(kernel) => kernel.signature(),
-            Self::Render(kernel) => kernel.signature(),
         }
     }
 }

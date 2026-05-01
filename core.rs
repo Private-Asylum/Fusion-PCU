@@ -1074,7 +1074,6 @@ pub enum PcuIrKind {
     Command,
     Transaction,
     Signal,
-    Render,
 }
 
 /// Program-unit-facing signature over memory truth, dataflow truth, and invocation truth.
