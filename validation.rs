@@ -1,6 +1,7 @@
 //! Backend-neutral validation helpers for PCU model payloads.
 
 use crate::{
+    PcuAccelerationStructureLevel,
     PcuBinding,
     PcuBindingAccess,
     PcuBindingRef,
@@ -12,6 +13,7 @@ use crate::{
     PcuStreamKernelIr,
     PcuStreamPattern,
     PcuStreamValueType,
+    PcuTraceRayOp,
     PcuValueType,
 };
 
@@ -102,6 +104,63 @@ pub fn validate_sample_op(
             expected: required_lanes,
             found: sample.offset_components,
         });
+    }
+
+    Ok(())
+}
+
+/// Contract failures surfaced when one ray trace op does not match the binding graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuTraceRayValidationError {
+    MissingAccelerationStructureBinding(PcuBindingRef),
+    BindingIsNotAccelerationStructure(PcuBindingRef),
+    AccelerationStructureNotReadable(PcuBindingRef),
+    AccelerationStructureIsNotTraceable(PcuBindingRef),
+    ZeroMaxRecursionDepth,
+}
+
+/// Validates that one trace op targets one readable top-level acceleration-structure binding.
+///
+/// # Errors
+///
+/// Returns the first contract mismatch that makes the trace operation dishonest.
+pub fn validate_trace_ray_op(
+    trace: PcuTraceRayOp,
+    bindings: &[PcuBinding<'_>],
+) -> Result<(), PcuTraceRayValidationError> {
+    if trace.max_recursion_depth == 0 {
+        return Err(PcuTraceRayValidationError::ZeroMaxRecursionDepth);
+    }
+
+    let acceleration_structure = find_binding(bindings, trace.acceleration_structure).ok_or(
+        PcuTraceRayValidationError::MissingAccelerationStructureBinding(
+            trace.acceleration_structure,
+        ),
+    )?;
+    let Some(acceleration_structure_type) = acceleration_structure.acceleration_structure_type()
+    else {
+        return Err(
+            PcuTraceRayValidationError::BindingIsNotAccelerationStructure(
+                trace.acceleration_structure,
+            ),
+        );
+    };
+    if matches!(acceleration_structure.access, PcuBindingAccess::WriteOnly) {
+        return Err(
+            PcuTraceRayValidationError::AccelerationStructureNotReadable(
+                trace.acceleration_structure,
+            ),
+        );
+    }
+    if matches!(
+        acceleration_structure_type.level,
+        PcuAccelerationStructureLevel::BottomLevel
+    ) {
+        return Err(
+            PcuTraceRayValidationError::AccelerationStructureIsNotTraceable(
+                trace.acceleration_structure,
+            ),
+        );
     }
 
     Ok(())

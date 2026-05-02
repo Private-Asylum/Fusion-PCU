@@ -7,6 +7,8 @@
 //! - backend-neutral validation results from `fusion-pcu::validation`
 
 pub use crate::core::{
+    PcuAccelerationStructureBindingType,
+    PcuAccelerationStructureLevel,
     PcuBinding,
     PcuBindingAccess,
     PcuBindingRef,
@@ -44,8 +46,13 @@ pub use crate::core::{
     PcuValueType,
 };
 pub use crate::ir::{
+    PcuCoordinateOp,
+    PcuDispatchInstruction,
+    PcuRayFlags,
+    PcuRayTraceOp,
     PcuSampleLevel,
     PcuSampleOp,
+    PcuTraceRayOp,
 };
 pub use crate::model::{
     PcuCommandEffectKind,
@@ -55,17 +62,22 @@ pub use crate::model::{
     PcuCommandPredicate,
     PcuCommandStep,
     PcuDispatchEntryPoint,
+    PcuDispatchCoordinateOp,
     PcuDispatchFeatureCaps,
+    PcuDispatchInstructionContract,
     PcuDispatchKernelIr,
     PcuDispatchOp,
     PcuDispatchAluOp,
     PcuDispatchControlOp,
     PcuDispatchPortOp,
+    PcuDispatchRayTraceOp,
     PcuDispatchResourceOp,
     PcuDispatchSyncOp,
     PcuDispatchValueOp,
     PcuKernel,
+    PcuCoordinateInstructionContract,
     PcuOperand,
+    PcuRayTraceInstructionContract,
     PcuSignalKernelIr,
     PcuSignalOp,
     PcuSignalTriggerKind,
@@ -82,6 +94,7 @@ pub use crate::model::{
 pub use crate::validation::{
     PcuSampleValidationError,
     PcuStreamSimpleTransformValidationError,
+    PcuTraceRayValidationError,
 };
 
 #[cfg(test)]

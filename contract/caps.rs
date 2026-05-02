@@ -252,6 +252,25 @@ impl PcuDispatchOpCaps {
     pub const SYNC_BARRIER: Self = Self(1 << 29);
     pub const SYNC_FENCE: Self = Self(1 << 30);
     pub const INTRINSIC: Self = Self(1 << 31);
+    pub const COORDINATE_LOAD: Self = Self(1 << 32);
+    pub const POSITION_STORE: Self = Self(1 << 33);
+    pub const INTERPOLANT_LOAD: Self = Self(1 << 34);
+    pub const OUTPUT_STORE: Self = Self(1 << 35);
+    pub const DERIVATIVE_X: Self = Self(1 << 36);
+    pub const DERIVATIVE_Y: Self = Self(1 << 37);
+    pub const SAMPLE_MASK: Self = Self(1 << 38);
+    pub const RAY_TRACE: Self = Self(1 << 39);
+    pub const RAY_TRACE_INLINE: Self = Self(1 << 40);
+    pub const RAY_QUERY_PROCEED: Self = Self(1 << 41);
+    pub const RAY_QUERY_COMMITTED_STATUS: Self = Self(1 << 42);
+    pub const RAY_QUERY_COMMITTED_DISTANCE: Self = Self(1 << 43);
+    pub const RAY_QUERY_COMMITTED_INSTANCE: Self = Self(1 << 44);
+    pub const RAY_QUERY_COMMITTED_PRIMITIVE: Self = Self(1 << 45);
+    pub const RAY_REPORT_HIT: Self = Self(1 << 46);
+    pub const RAY_IGNORE_HIT: Self = Self(1 << 47);
+    pub const RAY_ACCEPT_HIT_AND_END_SEARCH: Self = Self(1 << 48);
+    pub const RAY_PAYLOAD_READ: Self = Self(1 << 49);
+    pub const RAY_PAYLOAD_WRITE: Self = Self(1 << 50);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -260,7 +279,7 @@ impl PcuDispatchOpCaps {
 
     #[must_use]
     pub const fn all() -> Self {
-        Self((1u64 << 32) - 1)
+        Self((1u64 << 51) - 1)
     }
 
     #[must_use]
@@ -885,13 +904,19 @@ mod tests {
         PcuSupport,
     };
     use crate::{
+        PcuAccelerationStructureBindingType,
+        PcuAccelerationStructureLevel,
+        PcuBinding,
+        PcuBindingAccess,
         PcuCommandKernelIr,
         PcuCommandOp,
         PcuCommandStep,
         PcuDispatchFeatureCaps,
+        PcuDispatchRayTraceOp,
         PcuKernel,
         PcuKernelId,
         PcuTarget,
+        PcuTraceRayOp,
         PcuValueType,
         PcuValueTypeCaps,
     };
@@ -1068,5 +1093,53 @@ mod tests {
         );
         assert!(!support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
         assert!(!support.supports_kernel_cpu_fallback(PcuKernel::Dispatch(kernel)));
+    }
+
+    #[test]
+    fn support_reports_dispatch_instruction_extension_gating() {
+        let acceleration_structure = PcuBinding::acceleration_structure(
+            Some("scene"),
+            0,
+            0,
+            PcuBindingAccess::ReadOnly,
+            PcuAccelerationStructureBindingType {
+                level: PcuAccelerationStructureLevel::TopLevel,
+                mutable: false,
+            },
+        );
+        let bindings = [acceleration_structure];
+        let trace = PcuTraceRayOp::new(acceleration_structure.reference());
+        let builder = PcuDispatchKernelBuilder::<1>::new(8, "trace", [1, 1, 1])
+            .with_bindings(&bindings)
+            .with_type_caps(PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::VECTOR_VALUES)
+            .with_ray_trace_op(PcuDispatchRayTraceOp::TraceRay(trace))
+            .expect("builder should accept one ray op");
+        let kernel = builder.ir();
+
+        let mut support = PcuSupport::unsupported();
+        support.primitive_support = PcuPrimitiveSupport {
+            primitives: PcuFeatureSupport::new(
+                PcuPrimitiveCaps::DISPATCH,
+                PcuPrimitiveCaps::DISPATCH,
+            ),
+        };
+        support.dispatch_support = PcuDispatchSupport {
+            flags: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
+            instructions: PcuFeatureSupport::new(
+                PcuDispatchOpCaps::empty(),
+                PcuDispatchOpCaps::RAY_TRACE,
+            ),
+            features: PcuFeatureSupport::new(
+                PcuDispatchFeatureCaps::READ_ONLY_RESOURCES,
+                PcuDispatchFeatureCaps::READ_ONLY_RESOURCES,
+            ),
+        };
+        support.value_type_support = PcuFeatureSupport::new(
+            PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::VECTOR_VALUES,
+            PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::VECTOR_VALUES,
+        );
+
+        assert!(!support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
+        assert!(support.supports_kernel_cpu_fallback(PcuKernel::Dispatch(kernel)));
     }
 }

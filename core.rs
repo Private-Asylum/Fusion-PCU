@@ -318,6 +318,7 @@ pub enum PcuBindingStorageClass {
     Private,
     Image,
     Sampler,
+    AccelerationStructure,
     Constant,
 }
 
@@ -428,12 +429,28 @@ pub struct PcuSamplerBindingType {
     pub address_w: PcuSamplerAddressMode,
 }
 
+/// Acceleration-structure hierarchy level surfaced by one binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuAccelerationStructureLevel {
+    Generic,
+    TopLevel,
+    BottomLevel,
+}
+
+/// Typed acceleration-structure resource description for one binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuAccelerationStructureBindingType {
+    pub level: PcuAccelerationStructureLevel,
+    pub mutable: bool,
+}
+
 /// Honest resource payload carried by one binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuBindingType {
     Value(PcuValueType),
     Image(PcuImageBindingType),
     Sampler(PcuSamplerBindingType),
+    AccelerationStructure(PcuAccelerationStructureBindingType),
 }
 
 impl PcuBindingType {
@@ -441,7 +458,7 @@ impl PcuBindingType {
     pub const fn value_type(self) -> Option<PcuValueType> {
         match self {
             Self::Value(value_type) => Some(value_type),
-            Self::Image(_) | Self::Sampler(_) => None,
+            Self::Image(_) | Self::Sampler(_) | Self::AccelerationStructure(_) => None,
         }
     }
 
@@ -449,7 +466,7 @@ impl PcuBindingType {
     pub const fn image_type(self) -> Option<PcuImageBindingType> {
         match self {
             Self::Image(image_type) => Some(image_type),
-            Self::Value(_) | Self::Sampler(_) => None,
+            Self::Value(_) | Self::Sampler(_) | Self::AccelerationStructure(_) => None,
         }
     }
 
@@ -457,7 +474,17 @@ impl PcuBindingType {
     pub const fn sampler_type(self) -> Option<PcuSamplerBindingType> {
         match self {
             Self::Sampler(sampler_type) => Some(sampler_type),
-            Self::Value(_) | Self::Image(_) => None,
+            Self::Value(_) | Self::Image(_) | Self::AccelerationStructure(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn acceleration_structure_type(self) -> Option<PcuAccelerationStructureBindingType> {
+        match self {
+            Self::AccelerationStructure(acceleration_structure_type) => {
+                Some(acceleration_structure_type)
+            }
+            Self::Value(_) | Self::Image(_) | Self::Sampler(_) => None,
         }
     }
 }
@@ -544,6 +571,25 @@ impl<'a> PcuBinding<'a> {
     }
 
     #[must_use]
+    pub const fn acceleration_structure(
+        name: Option<&'a str>,
+        set: u32,
+        binding: u32,
+        access: PcuBindingAccess,
+        acceleration_structure_type: PcuAccelerationStructureBindingType,
+    ) -> Self {
+        Self {
+            name,
+            set,
+            binding,
+            storage: PcuBindingStorageClass::AccelerationStructure,
+            access,
+            binding_type: PcuBindingType::AccelerationStructure(acceleration_structure_type),
+            builtin: None,
+        }
+    }
+
+    #[must_use]
     pub const fn reference(self) -> PcuBindingRef {
         PcuBindingRef::new(self.set, self.binding)
     }
@@ -564,16 +610,27 @@ impl<'a> PcuBinding<'a> {
     }
 
     #[must_use]
+    pub const fn acceleration_structure_type(self) -> Option<PcuAccelerationStructureBindingType> {
+        self.binding_type.acceleration_structure_type()
+    }
+
+    #[must_use]
     pub const fn is_well_formed(self) -> bool {
         match (self.storage, self.binding_type) {
             (PcuBindingStorageClass::Image, PcuBindingType::Image(_)) => true,
             (PcuBindingStorageClass::Sampler, PcuBindingType::Sampler(_)) => {
                 matches!(self.access, PcuBindingAccess::ReadOnly)
             }
+            (
+                PcuBindingStorageClass::AccelerationStructure,
+                PcuBindingType::AccelerationStructure(_),
+            ) => true,
             (PcuBindingStorageClass::Image, _)
             | (PcuBindingStorageClass::Sampler, _)
+            | (PcuBindingStorageClass::AccelerationStructure, _)
             | (_, PcuBindingType::Image(_))
-            | (_, PcuBindingType::Sampler(_)) => false,
+            | (_, PcuBindingType::Sampler(_))
+            | (_, PcuBindingType::AccelerationStructure(_)) => false,
             (_, PcuBindingType::Value(_)) => true,
         }
     }
@@ -1096,6 +1153,11 @@ pub trait PcuKernelIrContract {
 #[cfg(test)]
 mod tests {
     use super::{
+        PcuAccelerationStructureBindingType,
+        PcuAccelerationStructureLevel,
+        PcuBinding,
+        PcuBindingAccess,
+        PcuBindingStorageClass,
         PcuParameterValue,
         PcuScalarType,
         PcuValueType,
@@ -1147,5 +1209,37 @@ mod tests {
         assert_eq!(matrix.cols(), 4);
         assert_eq!(matrix.lanes(), 16);
         assert_eq!(matrix.linear_lanes(), None);
+    }
+
+    #[test]
+    fn acceleration_structure_bindings_are_typed_resources() {
+        let acceleration_structure = PcuBinding::acceleration_structure(
+            Some("scene"),
+            0,
+            3,
+            PcuBindingAccess::ReadOnly,
+            PcuAccelerationStructureBindingType {
+                level: PcuAccelerationStructureLevel::TopLevel,
+                mutable: false,
+            },
+        );
+        let malformed = PcuBinding::value(
+            Some("wrong"),
+            0,
+            4,
+            PcuBindingStorageClass::AccelerationStructure,
+            PcuBindingAccess::ReadOnly,
+            PcuValueType::u64(),
+        );
+
+        assert!(acceleration_structure.is_well_formed());
+        assert_eq!(
+            acceleration_structure
+                .acceleration_structure_type()
+                .expect("acceleration structure binding should expose its type")
+                .level,
+            PcuAccelerationStructureLevel::TopLevel
+        );
+        assert!(!malformed.is_well_formed());
     }
 }

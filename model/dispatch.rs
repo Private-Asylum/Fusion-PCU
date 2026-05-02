@@ -28,11 +28,15 @@ use crate::{
 pub use crate::ir::{
     PcuAluOp as PcuDispatchAluOp,
     PcuBindingOp as PcuDispatchResourceOp,
+    PcuCoordinateOp as PcuDispatchCoordinateOp,
     PcuControlOp as PcuDispatchControlOp,
     PcuPortOp as PcuDispatchPortOp,
+    PcuRayFlags,
+    PcuRayTraceOp as PcuDispatchRayTraceOp,
     PcuSampleLevel,
     PcuSampleOp,
     PcuSyncOp as PcuDispatchSyncOp,
+    PcuTraceRayOp,
     PcuValueOp as PcuDispatchValueOp,
 };
 pub use crate::validation::PcuSampleValidationError;
@@ -77,6 +81,8 @@ pub enum PcuDispatchOp<'a> {
     Arithmetic(PcuDispatchAluOp),
     Control(PcuDispatchControlOp),
     Resource(PcuDispatchResourceOp),
+    Coordinate(PcuDispatchCoordinateOp),
+    RayTrace(PcuDispatchRayTraceOp),
     Port(PcuDispatchPortOp),
     Sync(PcuDispatchSyncOp),
     Intrinsic { name: &'a str },
@@ -90,10 +96,32 @@ impl PcuDispatchOp<'_> {
             Self::Arithmetic(op) => op.support_flag(),
             Self::Control(op) => op.support_flag(),
             Self::Resource(op) => op.support_flag(),
+            Self::Coordinate(op) => op.support_flag(),
+            Self::RayTrace(op) => op.support_flag(),
             Self::Port(op) => op.support_flag(),
             Self::Sync(op) => op.support_flag(),
             Self::Intrinsic { .. } => PcuDispatchOpCaps::INTRINSIC,
         }
+    }
+}
+
+/// Instruction-support contract for one dispatch kernel.
+pub trait PcuDispatchInstructionContract {
+    fn required_dispatch_instruction_support(&self) -> PcuDispatchOpCaps;
+}
+
+/// Coordinate-instruction contract for one dispatch kernel used by a graphics composition layer.
+pub trait PcuCoordinateInstructionContract {
+    fn required_coordinate_instruction_support(&self) -> PcuDispatchOpCaps;
+}
+
+/// Ray-tracing instruction contract for one dispatch kernel used by a graphics composition layer.
+pub trait PcuRayTraceInstructionContract {
+    fn required_ray_trace_instruction_support(&self) -> PcuDispatchOpCaps;
+
+    #[must_use]
+    fn uses_ray_tracing(&self) -> bool {
+        self.required_ray_trace_instruction_support().bits() != 0
     }
 }
 
@@ -165,6 +193,30 @@ impl PcuDispatchKernelIr<'_> {
         flags
     }
 
+    /// Returns only the coordinate-instruction support flags required by this dispatch kernel.
+    #[must_use]
+    pub fn required_coordinate_instruction_support(&self) -> PcuDispatchOpCaps {
+        let mut flags = PcuDispatchOpCaps::empty();
+        for op in self.ops.iter().copied() {
+            if let PcuDispatchOp::Coordinate(op) = op {
+                flags = flags.union(op.support_flag());
+            }
+        }
+        flags
+    }
+
+    /// Returns only the ray-tracing instruction support flags required by this dispatch kernel.
+    #[must_use]
+    pub fn required_ray_trace_instruction_support(&self) -> PcuDispatchOpCaps {
+        let mut flags = PcuDispatchOpCaps::empty();
+        for op in self.ops.iter().copied() {
+            if let PcuDispatchOp::RayTrace(op) = op {
+                flags = flags.union(op.support_flag());
+            }
+        }
+        flags
+    }
+
     /// Returns the value/type support floor required to execute this dispatch kernel honestly.
     #[must_use]
     pub const fn required_type_support(&self) -> PcuValueTypeCaps {
@@ -204,6 +256,24 @@ impl PcuDispatchKernelIr<'_> {
         }
 
         features
+    }
+}
+
+impl PcuDispatchInstructionContract for PcuDispatchKernelIr<'_> {
+    fn required_dispatch_instruction_support(&self) -> PcuDispatchOpCaps {
+        self.required_instruction_support()
+    }
+}
+
+impl PcuCoordinateInstructionContract for PcuDispatchKernelIr<'_> {
+    fn required_coordinate_instruction_support(&self) -> PcuDispatchOpCaps {
+        PcuDispatchKernelIr::required_coordinate_instruction_support(self)
+    }
+}
+
+impl PcuRayTraceInstructionContract for PcuDispatchKernelIr<'_> {
+    fn required_ray_trace_instruction_support(&self) -> PcuDispatchOpCaps {
+        PcuDispatchKernelIr::required_ray_trace_instruction_support(self)
     }
 }
 
@@ -345,6 +415,24 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
         self.with_op(PcuDispatchOp::Resource(op))
     }
 
+    /// Appends one coordinate-oriented operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceExhausted` when the builder op capacity is exhausted.
+    pub fn with_coordinate_op(self, op: PcuDispatchCoordinateOp) -> Result<Self, PcuError> {
+        self.with_op(PcuDispatchOp::Coordinate(op))
+    }
+
+    /// Appends one ray-tracing operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceExhausted` when the builder op capacity is exhausted.
+    pub fn with_ray_trace_op(self, op: PcuDispatchRayTraceOp) -> Result<Self, PcuError> {
+        self.with_op(PcuDispatchOp::RayTrace(op))
+    }
+
     /// Appends one port/dataflow operation.
     ///
     /// # Errors
@@ -425,13 +513,20 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
 mod tests {
     use super::{
         PcuDispatchAluOp,
+        PcuDispatchCoordinateOp,
         PcuDispatchFeatureCaps,
         PcuDispatchKernelBuilder,
+        PcuDispatchRayTraceOp,
+        PcuRayTraceInstructionContract,
+        PcuTraceRayOp,
     };
     use crate::{
+        PcuAccelerationStructureBindingType,
+        PcuAccelerationStructureLevel,
         PcuBinding,
         PcuBindingAccess,
         PcuBindingStorageClass,
+        PcuDispatchOpCaps,
         PcuDispatchPolicyCaps,
         PcuIrKind,
         PcuKernel,
@@ -611,6 +706,79 @@ mod tests {
                 | PcuDispatchFeatureCaps::MUTABLE_RESOURCES
                 | PcuDispatchFeatureCaps::INLINE_PARAMETERS
                 | PcuDispatchFeatureCaps::COOPERATIVE_SCRATCHPAD
+        ));
+    }
+
+    #[test]
+    fn coordinate_ops_are_dispatch_instruction_extensions() {
+        let builder = PcuDispatchKernelBuilder::<3>::new(6, "coordinate", [1, 1, 1])
+            .with_coordinate_op(PcuDispatchCoordinateOp::LoadCoordinate)
+            .expect("builder should accept coordinate load")
+            .with_coordinate_op(PcuDispatchCoordinateOp::DerivativeX)
+            .expect("builder should accept derivative op")
+            .with_coordinate_op(PcuDispatchCoordinateOp::StoreOutput)
+            .expect("builder should accept output store");
+        let kernel = builder.ir();
+
+        assert!(kernel.required_instruction_support().contains(
+            PcuDispatchOpCaps::COORDINATE_LOAD
+                | PcuDispatchOpCaps::DERIVATIVE_X
+                | PcuDispatchOpCaps::OUTPUT_STORE
+        ));
+        assert!(kernel.required_coordinate_instruction_support().contains(
+            PcuDispatchOpCaps::COORDINATE_LOAD
+                | PcuDispatchOpCaps::DERIVATIVE_X
+                | PcuDispatchOpCaps::OUTPUT_STORE
+        ));
+        assert_eq!(
+            kernel.required_ray_trace_instruction_support(),
+            PcuDispatchOpCaps::empty()
+        );
+    }
+
+    #[test]
+    fn ray_trace_ops_are_dispatch_instruction_extensions() {
+        let acceleration_structure = PcuBinding::acceleration_structure(
+            Some("scene"),
+            0,
+            0,
+            PcuBindingAccess::ReadOnly,
+            PcuAccelerationStructureBindingType {
+                level: PcuAccelerationStructureLevel::TopLevel,
+                mutable: false,
+            },
+        );
+        let trace = PcuTraceRayOp::new(acceleration_structure.reference())
+            .with_payload_bytes(16)
+            .with_max_recursion_depth(1);
+        let bindings = [acceleration_structure];
+        let builder = PcuDispatchKernelBuilder::<3>::new(7, "trace", [1, 1, 1])
+            .with_bindings(&bindings)
+            .with_ray_trace_op(PcuDispatchRayTraceOp::TraceRay(trace))
+            .expect("builder should accept trace op")
+            .with_ray_trace_op(PcuDispatchRayTraceOp::PayloadRead {
+                byte_offset: 0,
+                byte_len: 16,
+            })
+            .expect("builder should accept payload read")
+            .with_ray_trace_op(PcuDispatchRayTraceOp::PayloadWrite {
+                byte_offset: 0,
+                byte_len: 16,
+            })
+            .expect("builder should accept payload write");
+        let kernel = builder.ir();
+
+        assert!(trace.validate(kernel.bindings).is_ok());
+        assert!(kernel.uses_ray_tracing());
+        assert!(kernel.required_instruction_support().contains(
+            PcuDispatchOpCaps::RAY_TRACE
+                | PcuDispatchOpCaps::RAY_PAYLOAD_READ
+                | PcuDispatchOpCaps::RAY_PAYLOAD_WRITE
+        ));
+        assert!(kernel.required_ray_trace_instruction_support().contains(
+            PcuDispatchOpCaps::RAY_TRACE
+                | PcuDispatchOpCaps::RAY_PAYLOAD_READ
+                | PcuDispatchOpCaps::RAY_PAYLOAD_WRITE
         ));
     }
 }

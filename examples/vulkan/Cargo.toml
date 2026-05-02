@@ -1,0 +1,23 @@
+[package]
+name = "fusion-example-hosted-graphics-vulkan"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fusion-vulkan-example"
+path = "main.rs"
+
+[features]
+default = ["std", "hosted"]
+hosted = ["fusion-pcu/hosted"]
+std = ["fusion-pcu/std"]
+
+[dependencies]
+fusion-pcu = { workspace = true, features = ["backend-spirv", "runner-vulkan"] }
+winit.workspace = true
+
+[lints]
+workspace = true
