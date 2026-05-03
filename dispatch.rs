@@ -428,7 +428,9 @@ pub(crate) fn validate_invocation_bindings(
     Ok(())
 }
 
-fn validate_dispatch_submission(submission: PcuDispatchSubmission<'_>) -> Result<(), PcuError> {
+pub(crate) fn validate_dispatch_submission(
+    submission: PcuDispatchSubmission<'_>,
+) -> Result<(), PcuError> {
     let PcuInvocationTopology::Indexed { logical_shape } =
         submission.kernel.signature().invocation.topology
     else {

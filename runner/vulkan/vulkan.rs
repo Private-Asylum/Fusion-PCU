@@ -7,23 +7,43 @@
 use core::fmt;
 use core::mem;
 use core::ptr;
+use std::boxed::Box;
 use std::error::Error;
 use std::ffi::CStr;
 use std::string::String;
 
 use ash::vk;
 
+use crate::runner::{
+    PcuComputeRunner,
+    PcuLoweredSpirvDispatch,
+    PcuResourceAddressingModel,
+    PcuRunnerDescriptor,
+    PcuRunnerError,
+    PcuRunnerExecutionReport,
+    PcuRunnerHandle,
+};
+use crate::{
+    PcuDispatchSubmission,
+    PcuInvocationBinding,
+    PcuInvocationBuffer,
+    PcuInvocationParameters,
+    PcuInvocationTarget,
+};
+
 const RUNNER_APP_NAME: &CStr = c"fusion-pcu-vulkan-runner";
 const RUNNER_ENGINE_NAME: &CStr = c"fusion-pcu";
 const SHADER_ENTRY_POINT: &CStr = c"main";
 
-/// Abstract resource-addressing models that a runner may select for a resource class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PcuResourceAddressingModel {
-    FixedDescriptors,
-    DescriptorIndex,
-    BufferDeviceAddress,
-}
+pub const PCU_VULKAN_RUNNER_ID: &str = "Vulkan";
+pub const PCU_VULKAN_RUNNER_PRIORITY: i32 = 1000;
+
+pub const PCU_VULKAN_RUNNER_DESCRIPTOR: PcuRunnerDescriptor = PcuRunnerDescriptor {
+    id: PCU_VULKAN_RUNNER_ID,
+    priority: PCU_VULKAN_RUNNER_PRIORITY,
+    probe: probe_runner,
+    open: open_runner,
+};
 
 /// Descriptor class used for heap budgeting and registration failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,12 +160,12 @@ pub struct PcuVulkanRunnerCaps {
     pub selected_storage_buffer_model: PcuResourceAddressingModel,
 }
 
-/// Result metadata returned by the narrow current fixed-descriptor float dispatch path.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PcuVulkanParallelF32Report {
-    pub element_count: usize,
-    pub dispatch_groups_x: u32,
-    pub sample_output: f32,
+/// Result metadata returned by the current fixed-descriptor dispatch path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcuVulkanDispatchReport {
+    pub work_items: u32,
+    pub dispatch_groups: [u32; 3],
+    pub bound_byte_len: usize,
     pub resource_model: PcuResourceAddressingModel,
 }
 
@@ -161,6 +181,22 @@ pub struct PcuVulkanRunner {
     physical_device_name: String,
 }
 
+fn probe_runner() -> Result<(), PcuRunnerError> {
+    PcuVulkanRunner::probe().map_err(|error| PcuRunnerError::RunnerUnavailable {
+        id: PCU_VULKAN_RUNNER_ID,
+        reason: error.to_string(),
+    })?;
+    Ok(())
+}
+
+fn open_runner() -> Result<PcuRunnerHandle, PcuRunnerError> {
+    let runner = PcuVulkanRunner::new().map_err(|error| PcuRunnerError::RunnerUnavailable {
+        id: PCU_VULKAN_RUNNER_ID,
+        reason: error.to_string(),
+    })?;
+    Ok(PcuRunnerHandle::new(Box::new(runner)))
+}
+
 impl PcuVulkanRunner {
     /// Creates a Vulkan runner using the first compute-capable physical device.
     ///
@@ -169,6 +205,42 @@ impl PcuVulkanRunner {
     /// Returns loader, device-enumeration, queue-family, memory, or Vulkan platform failures.
     pub fn new() -> Result<Self, PcuVulkanError> {
         Self::with_descriptor_heap_budget(PcuVulkanDescriptorHeapBudget::portable_default())
+    }
+
+    /// Probes whether a Vulkan runner can be opened without keeping a live device.
+    ///
+    /// # Errors
+    ///
+    /// Returns loader/device/queue errors when Vulkan is unavailable for compute.
+    pub fn probe() -> Result<PcuVulkanRunnerCaps, PcuVulkanError> {
+        Self::probe_with_descriptor_heap_budget(PcuVulkanDescriptorHeapBudget::portable_default())
+    }
+
+    /// Probes whether a Vulkan runner can be opened with a caller-specified heap budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns loader/device/queue errors when Vulkan is unavailable for compute.
+    pub fn probe_with_descriptor_heap_budget(
+        requested_heap_budget: PcuVulkanDescriptorHeapBudget,
+    ) -> Result<PcuVulkanRunnerCaps, PcuVulkanError> {
+        let entry = unsafe {
+            // SAFETY: Loading the Vulkan loader is process-local and ash validates entry points.
+            ash::Entry::load()
+        }
+        .map_err(PcuVulkanError::Loader)?;
+        let instance_api_version = choose_instance_api_version(&entry)?;
+        let instance = create_instance(&entry, instance_api_version)?;
+        let instance = VulkanProbeInstance { handle: instance };
+        let selected = select_compute_device(&instance.handle)?;
+        let caps = query_runner_caps(
+            &instance.handle,
+            selected.physical_device,
+            &selected.properties,
+            instance_api_version,
+            requested_heap_budget,
+        )?;
+        Ok(caps)
     }
 
     /// Creates a Vulkan runner with a caller-specified descriptor-heap budget request.
@@ -236,60 +308,46 @@ impl PcuVulkanRunner {
         self.physical_device
     }
 
-    /// Executes the current narrow PCU-generated SPIR-V float map kernel.
+    /// Executes one PCU-generated SPIR-V dispatch through the current fixed-descriptor path.
     ///
-    /// The kernel contract is:
-    ///
-    /// `output[i] = source[i] * 2.0 + bias[i] + 1.0`
-    ///
-    /// This is intentionally a runner-owned Tier 0 fixed-descriptor path. Descriptor-indexed and
-    /// BDA execution require different SPIR-V lowering and are reported as caps, not faked here.
+    /// Descriptor-indexed and BDA execution require different SPIR-V lowering and are reported as
+    /// caps, not faked here.
     ///
     /// # Errors
     ///
     /// Returns shape, memory, Vulkan, or output-transfer failures.
-    pub fn run_parallel_f32_spirv(
+    pub fn submit_dispatch_spirv(
         &self,
-        spirv: &[u32],
-        local_size_x: u32,
-        source: &[f32],
-        bias: &[f32],
-        output: &mut [f32],
-    ) -> Result<PcuVulkanParallelF32Report, PcuVulkanError> {
-        if local_size_x == 0 || source.len() != bias.len() || source.len() != output.len() {
-            return Err(PcuVulkanError::InvalidDispatchShape);
-        }
-        let element_count = source.len();
-        let element_count_u32 =
-            u32::try_from(element_count).map_err(|_| PcuVulkanError::BufferTooLarge)?;
-        if !element_count_u32.is_multiple_of(local_size_x) {
-            return Err(PcuVulkanError::InvalidDispatchShape);
-        }
-        let dispatch_groups_x = element_count_u32 / local_size_x;
+        dispatch: &PcuLoweredSpirvDispatch<'_>,
+        submission: PcuDispatchSubmission<'_>,
+        bindings: &mut [PcuInvocationBinding<'_>],
+        _parameters: PcuInvocationParameters<'_>,
+    ) -> Result<PcuVulkanDispatchReport, PcuVulkanError> {
+        let execution = fixed_descriptor_execution(dispatch, submission, bindings)?;
 
-        let source_buffer = VulkanBuffer::new_storage_f32_buffer(
+        let source_buffer = VulkanBuffer::new_storage_buffer(
             &self.instance,
             self.physical_device,
             &self.device,
-            element_count,
+            execution.bound_byte_len,
         )?;
-        let bias_buffer = VulkanBuffer::new_storage_f32_buffer(
+        let bias_buffer = VulkanBuffer::new_storage_buffer(
             &self.instance,
             self.physical_device,
             &self.device,
-            element_count,
+            execution.bound_byte_len,
         )?;
-        let output_buffer = VulkanBuffer::new_storage_f32_buffer(
+        let output_buffer = VulkanBuffer::new_storage_buffer(
             &self.instance,
             self.physical_device,
             &self.device,
-            element_count,
+            execution.bound_byte_len,
         )?;
 
-        source_buffer.write_f32s(source)?;
-        bias_buffer.write_f32s(bias)?;
+        write_binding_buffer(bindings, 0, &source_buffer)?;
+        write_binding_buffer(bindings, 1, &bias_buffer)?;
 
-        let shader_module = create_shader_module(&self.device, spirv)?;
+        let shader_module = create_shader_module(&self.device, dispatch.words)?;
         let descriptor_set_layout = create_descriptor_set_layout(&self.device)?;
         let pipeline_layout = create_pipeline_layout(&self.device, descriptor_set_layout.handle)?;
         let pipeline = create_compute_pipeline(
@@ -304,7 +362,7 @@ impl PcuVulkanRunner {
             descriptor_pool.handle,
             descriptor_set_layout.handle,
         )?;
-        update_float_storage_descriptors(
+        update_storage_descriptors(
             &self.device,
             descriptor_set,
             &source_buffer,
@@ -320,23 +378,249 @@ impl PcuVulkanRunner {
             pipeline.handle,
             pipeline_layout.handle,
             descriptor_set,
-            dispatch_groups_x,
+            execution.dispatch_groups[0],
         )?;
 
         let fence = create_fence(&self.device)?;
         submit_and_wait(&self.device, self.queue, command_buffer, fence.handle)?;
-        output_buffer.read_f32s(output)?;
+        read_binding_buffer(bindings, 2, &output_buffer)?;
 
-        let sample_output = output
-            .last()
-            .copied()
-            .ok_or(PcuVulkanError::InvalidDispatchShape)?;
-        Ok(PcuVulkanParallelF32Report {
-            element_count,
-            dispatch_groups_x,
-            sample_output,
+        Ok(PcuVulkanDispatchReport {
+            work_items: execution.work_items,
+            dispatch_groups: execution.dispatch_groups,
+            bound_byte_len: execution.bound_byte_len,
             resource_model: self.caps.selected_storage_buffer_model,
         })
+    }
+}
+
+impl PcuComputeRunner for PcuVulkanRunner {
+    fn id(&self) -> &'static str {
+        PCU_VULKAN_RUNNER_ID
+    }
+
+    fn priority(&self) -> i32 {
+        PCU_VULKAN_RUNNER_PRIORITY
+    }
+
+    fn device_name(&self) -> Option<&str> {
+        Some(self.physical_device_name())
+    }
+
+    fn submit_spirv_dispatch(
+        &self,
+        dispatch: &PcuLoweredSpirvDispatch<'_>,
+        submission: PcuDispatchSubmission<'_>,
+        bindings: &mut [PcuInvocationBinding<'_>],
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<PcuRunnerExecutionReport, PcuRunnerError> {
+        let report = self
+            .submit_dispatch_spirv(dispatch, submission, bindings, parameters)
+            .map_err(|error| PcuRunnerError::RunnerExecution {
+                id: PCU_VULKAN_RUNNER_ID,
+                reason: error.to_string(),
+            })?;
+
+        Ok(PcuRunnerExecutionReport {
+            work_items: report.work_items,
+            dispatch_groups: report.dispatch_groups,
+            resource_model: report.resource_model,
+        })
+    }
+}
+
+struct FixedDescriptorExecution {
+    work_items: u32,
+    dispatch_groups: [u32; 3],
+    bound_byte_len: usize,
+}
+
+fn fixed_descriptor_execution(
+    dispatch: &PcuLoweredSpirvDispatch<'_>,
+    submission: PcuDispatchSubmission<'_>,
+    bindings: &[PcuInvocationBinding<'_>],
+) -> Result<FixedDescriptorExecution, PcuVulkanError> {
+    if dispatch.local_size[0] == 0 || dispatch.local_size[1] != 1 || dispatch.local_size[2] != 1 {
+        return Err(PcuVulkanError::InvalidDispatchShape);
+    }
+
+    let work_items = submission.shape.thread_count().get();
+    if !work_items.is_multiple_of(dispatch.local_size[0]) {
+        return Err(PcuVulkanError::InvalidDispatchShape);
+    }
+
+    let source_len = binding_byte_len(bindings, 0)?;
+    let bias_len = binding_byte_len(bindings, 1)?;
+    let output_len = binding_byte_len(bindings, 2)?;
+    if source_len == 0 || source_len != bias_len || source_len != output_len {
+        return Err(PcuVulkanError::InvalidInvocationBinding);
+    }
+
+    let Some(word_count) = source_len.checked_div(mem::size_of::<u32>()) else {
+        return Err(PcuVulkanError::InvalidInvocationBinding);
+    };
+    if word_count != usize::try_from(work_items).map_err(|_| PcuVulkanError::BufferTooLarge)?
+        || word_count * mem::size_of::<u32>() != source_len
+    {
+        return Err(PcuVulkanError::InvalidDispatchShape);
+    }
+
+    Ok(FixedDescriptorExecution {
+        work_items,
+        dispatch_groups: [work_items / dispatch.local_size[0], 1, 1],
+        bound_byte_len: source_len,
+    })
+}
+
+fn write_binding_buffer(
+    bindings: &[PcuInvocationBinding<'_>],
+    binding_slot: u32,
+    buffer: &VulkanBuffer<'_>,
+) -> Result<(), PcuVulkanError> {
+    let binding = binding_for_slot(bindings, binding_slot)?;
+    let (source, byte_len) = input_buffer_bytes(&binding.buffer)?;
+    buffer.write_bytes(source, byte_len)
+}
+
+fn read_binding_buffer(
+    bindings: &mut [PcuInvocationBinding<'_>],
+    binding_slot: u32,
+    buffer: &VulkanBuffer<'_>,
+) -> Result<(), PcuVulkanError> {
+    let binding = binding_for_slot_mut(bindings, binding_slot)?;
+    let (target, byte_len) = output_buffer_bytes(&mut binding.buffer)?;
+    buffer.read_bytes(target, byte_len)
+}
+
+fn binding_byte_len(
+    bindings: &[PcuInvocationBinding<'_>],
+    binding_slot: u32,
+) -> Result<usize, PcuVulkanError> {
+    invocation_buffer_byte_len(&binding_for_slot(bindings, binding_slot)?.buffer)
+}
+
+fn binding_for_slot<'a, 'b>(
+    bindings: &'a [PcuInvocationBinding<'b>],
+    binding_slot: u32,
+) -> Result<&'a PcuInvocationBinding<'b>, PcuVulkanError> {
+    for binding in bindings {
+        if matches!(
+            binding.target,
+            PcuInvocationTarget::Binding(reference)
+                if reference.set == 0 && reference.binding == binding_slot
+        ) {
+            return Ok(binding);
+        }
+    }
+    Err(PcuVulkanError::InvalidInvocationBinding)
+}
+
+fn binding_for_slot_mut<'a, 'b>(
+    bindings: &'a mut [PcuInvocationBinding<'b>],
+    binding_slot: u32,
+) -> Result<&'a mut PcuInvocationBinding<'b>, PcuVulkanError> {
+    for binding in bindings {
+        if matches!(
+            binding.target,
+            PcuInvocationTarget::Binding(reference)
+                if reference.set == 0 && reference.binding == binding_slot
+        ) {
+            return Ok(binding);
+        }
+    }
+    Err(PcuVulkanError::InvalidInvocationBinding)
+}
+
+fn invocation_buffer_byte_len(buffer: &PcuInvocationBuffer<'_>) -> Result<usize, PcuVulkanError> {
+    match buffer {
+        PcuInvocationBuffer::BytesIn(values) => Ok(values.len()),
+        PcuInvocationBuffer::BytesOut(values) => Ok(values.len()),
+        PcuInvocationBuffer::BytesInOut { input, output } => {
+            equal_byte_len(input.len(), output.len())
+        }
+        PcuInvocationBuffer::HalfWordsIn(values) => typed_byte_len::<u16>(values.len()),
+        PcuInvocationBuffer::HalfWordsOut(values) => typed_byte_len::<u16>(values.len()),
+        PcuInvocationBuffer::HalfWordsInOut { input, output } => {
+            let input_len = typed_byte_len::<u16>(input.len())?;
+            let output_len = typed_byte_len::<u16>(output.len())?;
+            equal_byte_len(input_len, output_len)
+        }
+        PcuInvocationBuffer::WordsIn(values) => typed_byte_len::<u32>(values.len()),
+        PcuInvocationBuffer::WordsOut(values) => typed_byte_len::<u32>(values.len()),
+        PcuInvocationBuffer::WordsInOut { input, output } => {
+            let input_len = typed_byte_len::<u32>(input.len())?;
+            let output_len = typed_byte_len::<u32>(output.len())?;
+            equal_byte_len(input_len, output_len)
+        }
+    }
+}
+
+fn input_buffer_bytes(
+    buffer: &PcuInvocationBuffer<'_>,
+) -> Result<(*const u8, usize), PcuVulkanError> {
+    match buffer {
+        PcuInvocationBuffer::BytesIn(values) => Ok((values.as_ptr(), values.len())),
+        PcuInvocationBuffer::BytesInOut { input, .. } => Ok((input.as_ptr(), input.len())),
+        PcuInvocationBuffer::HalfWordsIn(values) => Ok((
+            values.as_ptr().cast::<u8>(),
+            typed_byte_len::<u16>(values.len())?,
+        )),
+        PcuInvocationBuffer::HalfWordsInOut { input, .. } => Ok((
+            input.as_ptr().cast::<u8>(),
+            typed_byte_len::<u16>(input.len())?,
+        )),
+        PcuInvocationBuffer::WordsIn(values) => Ok((
+            values.as_ptr().cast::<u8>(),
+            typed_byte_len::<u32>(values.len())?,
+        )),
+        PcuInvocationBuffer::WordsInOut { input, .. } => Ok((
+            input.as_ptr().cast::<u8>(),
+            typed_byte_len::<u32>(input.len())?,
+        )),
+        PcuInvocationBuffer::BytesOut(_)
+        | PcuInvocationBuffer::HalfWordsOut(_)
+        | PcuInvocationBuffer::WordsOut(_) => Err(PcuVulkanError::InvalidInvocationBinding),
+    }
+}
+
+fn output_buffer_bytes(
+    buffer: &mut PcuInvocationBuffer<'_>,
+) -> Result<(*mut u8, usize), PcuVulkanError> {
+    match buffer {
+        PcuInvocationBuffer::BytesOut(values) => Ok((values.as_mut_ptr(), values.len())),
+        PcuInvocationBuffer::BytesInOut { output, .. } => Ok((output.as_mut_ptr(), output.len())),
+        PcuInvocationBuffer::HalfWordsOut(values) => Ok((
+            values.as_mut_ptr().cast::<u8>(),
+            typed_byte_len::<u16>(values.len())?,
+        )),
+        PcuInvocationBuffer::HalfWordsInOut { output, .. } => Ok((
+            output.as_mut_ptr().cast::<u8>(),
+            typed_byte_len::<u16>(output.len())?,
+        )),
+        PcuInvocationBuffer::WordsOut(values) => Ok((
+            values.as_mut_ptr().cast::<u8>(),
+            typed_byte_len::<u32>(values.len())?,
+        )),
+        PcuInvocationBuffer::WordsInOut { output, .. } => Ok((
+            output.as_mut_ptr().cast::<u8>(),
+            typed_byte_len::<u32>(output.len())?,
+        )),
+        PcuInvocationBuffer::BytesIn(_)
+        | PcuInvocationBuffer::HalfWordsIn(_)
+        | PcuInvocationBuffer::WordsIn(_) => Err(PcuVulkanError::InvalidInvocationBinding),
+    }
+}
+
+fn typed_byte_len<T>(len: usize) -> Result<usize, PcuVulkanError> {
+    len.checked_mul(mem::size_of::<T>())
+        .ok_or(PcuVulkanError::BufferTooLarge)
+}
+
+const fn equal_byte_len(left: usize, right: usize) -> Result<usize, PcuVulkanError> {
+    if left == right {
+        Ok(left)
+    } else {
+        Err(PcuVulkanError::InvalidInvocationBinding)
     }
 }
 
@@ -365,6 +649,7 @@ pub enum PcuVulkanError {
     NoCommandBuffer,
     NoComputePipeline,
     InvalidDispatchShape,
+    InvalidInvocationBinding,
     BufferTooLarge,
     BufferTooSmall,
     DescriptorHeapFull {
@@ -399,6 +684,9 @@ impl fmt::Display for PcuVulkanError {
                 formatter.write_str("Vulkan compute pipeline creation returned no pipelines")
             }
             Self::InvalidDispatchShape => formatter.write_str("invalid Vulkan dispatch shape"),
+            Self::InvalidInvocationBinding => {
+                formatter.write_str("invalid Vulkan invocation binding")
+            }
             Self::BufferTooLarge => {
                 formatter.write_str("buffer size does not fit Vulkan device size")
             }
@@ -428,6 +716,19 @@ struct SelectedPhysicalDevice {
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
     properties: vk::PhysicalDeviceProperties,
+}
+
+struct VulkanProbeInstance {
+    handle: ash::Instance,
+}
+
+impl Drop for VulkanProbeInstance {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: This guard owns the probe instance and destroys it exactly once.
+            self.handle.destroy_instance(None);
+        }
+    }
 }
 
 fn choose_instance_api_version(entry: &ash::Entry) -> Result<u32, PcuVulkanError> {
@@ -747,7 +1048,7 @@ fn allocate_descriptor_set(
     sets.first().copied().ok_or(PcuVulkanError::NoDescriptorSet)
 }
 
-fn update_float_storage_descriptors(
+fn update_storage_descriptors(
     device: &ash::Device,
     descriptor_set: vk::DescriptorSet,
     source: &VulkanBuffer<'_>,
@@ -1017,13 +1318,13 @@ struct VulkanBuffer<'a> {
 }
 
 impl<'a> VulkanBuffer<'a> {
-    fn new_storage_f32_buffer(
+    fn new_storage_buffer(
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: &'a ash::Device,
-        element_count: usize,
+        byte_len: usize,
     ) -> Result<Self, PcuVulkanError> {
-        let size = f32_slice_byte_len(element_count)?;
+        let size = byte_len_to_device_size(byte_len)?;
         let create_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
@@ -1090,37 +1391,39 @@ impl<'a> VulkanBuffer<'a> {
         })
     }
 
-    fn write_f32s(&self, values: &[f32]) -> Result<(), PcuVulkanError> {
-        let byte_len = f32_slice_byte_len(values.len())?;
-        if byte_len > self.size {
+    fn write_bytes(&self, source: *const u8, byte_len: usize) -> Result<(), PcuVulkanError> {
+        let byte_len_device = byte_len_to_device_size(byte_len)?;
+        if byte_len_device > self.size {
             return Err(PcuVulkanError::BufferTooSmall);
         }
         let mapped = vk_try("map Vulkan buffer memory for write", unsafe {
             // SAFETY: The memory is host-visible and this runner maps the whole write range exclusively.
             self.device
-                .map_memory(self.memory, 0, byte_len, vk::MemoryMapFlags::empty())
+                .map_memory(self.memory, 0, byte_len_device, vk::MemoryMapFlags::empty())
         })?;
         unsafe {
-            // SAFETY: The mapped range is at least `values.len() * size_of::<f32>()` bytes and both regions are non-overlapping.
-            ptr::copy_nonoverlapping(values.as_ptr(), mapped.cast::<f32>(), values.len());
+            // SAFETY: `source` comes from a live invocation slice, the mapped range is at least
+            // `byte_len` bytes, and host/device mapped memory does not overlap caller storage.
+            ptr::copy_nonoverlapping(source, mapped.cast::<u8>(), byte_len);
             self.device.unmap_memory(self.memory);
         }
         Ok(())
     }
 
-    fn read_f32s(&self, values: &mut [f32]) -> Result<(), PcuVulkanError> {
-        let byte_len = f32_slice_byte_len(values.len())?;
-        if byte_len > self.size {
+    fn read_bytes(&self, target: *mut u8, byte_len: usize) -> Result<(), PcuVulkanError> {
+        let byte_len_device = byte_len_to_device_size(byte_len)?;
+        if byte_len_device > self.size {
             return Err(PcuVulkanError::BufferTooSmall);
         }
         let mapped = vk_try("map Vulkan buffer memory for read", unsafe {
             // SAFETY: The memory is host-visible and GPU execution has completed before this read.
             self.device
-                .map_memory(self.memory, 0, byte_len, vk::MemoryMapFlags::empty())
+                .map_memory(self.memory, 0, byte_len_device, vk::MemoryMapFlags::empty())
         })?;
         unsafe {
-            // SAFETY: The mapped range is at least `values.len() * size_of::<f32>()` bytes and both regions are non-overlapping.
-            ptr::copy_nonoverlapping(mapped.cast::<f32>(), values.as_mut_ptr(), values.len());
+            // SAFETY: `target` comes from a live mutable invocation slice, GPU work has completed,
+            // the mapped range is at least `byte_len` bytes, and the regions do not overlap.
+            ptr::copy_nonoverlapping(mapped.cast::<u8>(), target, byte_len);
             self.device.unmap_memory(self.memory);
         }
         Ok(())
@@ -1144,11 +1447,11 @@ impl Drop for VulkanBuffer<'_> {
     }
 }
 
-fn f32_slice_byte_len(count: usize) -> Result<vk::DeviceSize, PcuVulkanError> {
-    let Some(bytes) = count.checked_mul(mem::size_of::<f32>()) else {
-        return Err(PcuVulkanError::BufferTooLarge);
-    };
-    vk::DeviceSize::try_from(bytes).map_err(|_| PcuVulkanError::BufferTooLarge)
+fn byte_len_to_device_size(byte_len: usize) -> Result<vk::DeviceSize, PcuVulkanError> {
+    if byte_len == 0 {
+        return Err(PcuVulkanError::InvalidInvocationBinding);
+    }
+    vk::DeviceSize::try_from(byte_len).map_err(|_| PcuVulkanError::BufferTooLarge)
 }
 
 fn find_memory_type(
