@@ -1,5 +1,6 @@
 [package]
 name = "fusion-pcu"
+autoexamples = false
 description = ""
 documentation = ""
 version.workspace = true
@@ -19,3 +20,48 @@ hosted = ["std"]
 
 [lints]
 workspace = true
+
+[workspace]
+resolver = "3"
+members = [
+    ".",
+    "macros",
+    "backends/rocm",
+    "backends/spirv",
+    "runner",
+    "dialects/tensor",
+    "dialects/vm-reference",
+    "examples/rocm",
+    "examples/vulkan",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Lance Wallis <walance@pvas.me>"]
+license = ""
+repository = "https://github.com/Private-Asylum/Fusion-PCU"
+
+[workspace.dependencies]
+fusion-pcu = { path = ".", default-features = false }
+fusion-pcu-macros = { path = "macros" }
+fusion-pcu-rocm = { path = "backends/rocm", default-features = false }
+fusion-pcu-spirv = { path = "backends/spirv", default-features = false }
+fusion-pcu-runner = { path = "runner", default-features = false }
+
+ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
+proc-macro2 = "1.0.103"
+quote = "1.0.41"
+syn = { version = "2.0.108", features = ["full"] }
+winit = "0.30"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[profile.bench]
+debug = 2

@@ -1,0 +1,12 @@
+# Import ordering is manual. Convention:
+#   1. core
+#   2. alloc
+#   3. std
+#   4. External crates
+#   5. Adjacent owned crates (fusion-pal, fusion-sys, etc.)
+#   6. Intra-module (crate::, super::, self::)
+# Keep ordering manual because rustfmt cannot distinguish third-party crates from adjacent owned
+# crates honestly.
+reorder_imports = false
+imports_granularity = "Item"
+imports_layout = "Vertical"

@@ -21,10 +21,10 @@ The currently tested executable profiles are deliberately small:
 | Adapter | Executable evidence | Important limit |
 | --- | --- | --- |
 | Hosted CPU Stream | Shared U32 reference vectors pass | The common PIO profile permits one pattern and no parameters or bindings; broader CPU Stream behavior is separate. |
-| RP2350 PIO Stream | Adapter compiles for `thumbv8m.main-none-eabihf` | Hardware parity on a board is not yet demonstrated. |
+| Fusion RP2350 PIO Stream integration | Adapter compiles for `thumbv8m.main-none-eabihf` in the Fusion repository | Hardware parity on a board is not yet demonstrated; the Cortex-M adapter stays in Fusion. |
 | ROCm Dispatch | RX 6900 XT runs a 65-value f32 map and Rust rocBLAS SGEMM | Only a bounded f32 indexed-map subset lowers to HIP; architecture is supplied by the caller. |
 | SPIR-V/Vulkan Dispatch | Vulkan example runs a 256-value map on RX 6900 XT | SPIR-V 1.0–1.3 only; current emitter uses LocalSize `[1, 1, 1]` and the runner is a synchronous, fixed three-buffer, one-dimensional adapter. |
-| AML Command/Signal | Firmware VM fixtures execute; target declarations exist | No AML method is lowered and executed through PCU yet. |
+| Fusion AML Command/Signal integration | Firmware VM fixtures execute in the Fusion repository | No AML method is lowered and executed through PCU yet; the ACPI integration stays in Fusion. |
 
 `PcuRuntimeDiscovery` exposes backend, target, device, context, and memory-domain facts with
 generation-scoped references. `PcuDeviceActivation` opens an owned session from an explicitly
@@ -84,6 +84,7 @@ program ports and immediates are supplied through the program wrapper. The optio
 reference graph with shape checks and reverse-mode gradients. It does not yet lower through PCU or
 run on a device backend.
 
-For the precise first Stream semantics and test vectors, see
-[`STREAM-U32-PIO-PROFILE.md`](STREAM-U32-PIO-PROFILE.md). For the remaining architecture work,
-see `/volumes/projects/rust/fusion-pcu-plan.md` in this workspace.
+The Cortex-M, PIO hardware adapter, AML, HAL/PAL, and driver integrations remain in Fusion.
+The PIO-named U32 Stream profile here is a shared IR conformance subset used by that consumer;
+it contains no board driver. For its precise semantics and test vectors, see
+[`STREAM-U32-PIO-PROFILE.md`](STREAM-U32-PIO-PROFILE.md).
