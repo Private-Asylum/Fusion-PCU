@@ -15,8 +15,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Lance Wallis <walance@pvas.me>"]
-license = ""
+authors = ["Private Asylum LLC"]
+license = "Apache-2.0"
 repository = "https://github.com/Private-Asylum/Fusion-PCU"
 
 [workspace.dependencies]

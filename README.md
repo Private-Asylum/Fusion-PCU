@@ -92,3 +92,8 @@ The Cortex-M, PIO hardware adapter, AML, HAL/PAL, and driver integrations remain
 The PIO-named U32 Stream profile here is a shared IR conformance subset used by that consumer;
 it contains no board driver. For its precise semantics and test vectors, see
 [`STREAM-U32-PIO-PROFILE.md`](STREAM-U32-PIO-PROFILE.md).
+
+## License
+
+Copyright 2026 Private Asylum LLC. Licensed under the Apache License, Version 2.0.
+See [LICENSE](LICENSE) and [NOTICE](NOTICE).

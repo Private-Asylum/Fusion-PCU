@@ -2,6 +2,8 @@
 name = "fusion-example-hosted-compute-rocm"
 version = "0.1.0"
 edition = "2024"
+authors.workspace = true
+license.workspace = true
 publish = false
 
 [[bin]]
