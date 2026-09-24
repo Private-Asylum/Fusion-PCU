@@ -1,0 +1,19 @@
+error[E0080]: evaluation panicked: PCU invocation count must be nonzero
+ --> tests/ui/invocation_zero.rs:5:1
+  |
+5 | #[pcu_dispatch(invocations = R * C)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `kernel::<0, 2>::{constant#1}` failed here
+
+note: erroneous constant encountered
+ --> tests/ui/invocation_zero.rs:5:1
+  |
+5 | #[pcu_dispatch(invocations = R * C)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the attribute macro `pcu_dispatch` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: the above error was encountered while instantiating `fn kernel::<0, 2>`
+  --> tests/ui/invocation_zero.rs:16:13
+   |
+16 |     let _ = kernel::<0, 2>(&bindings);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^

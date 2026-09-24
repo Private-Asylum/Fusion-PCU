@@ -58,14 +58,20 @@ binding checks, argument allocation, access gates, and events remain; no zero-ov
 made. The original synchronous helper remains available. Command has a
 typed read-result verifier, but there is no AML-to-PCU executor yet.
 
+`PcuScalar` is sealed to `f32` and `u32` for now, with explicit host layout and lossless
+little-endian encoding; it does not grant a backend a zero-copy device ABI or arithmetic support.
 `F32MapBuilder` constructs the current scalar f32 indexed-map subset without heap allocation and
 with automatic nonzero value IDs. Both ROCm and SPIR-V lowerers accept its output in tests. It is
 not a Rust-to-PCU compiler, and value handles are scoped by caller-assigned kernel ID rather than
 by a generative Rust lifetime. The optional dispatch macro has compile-fail tests for unsupported
-statements and expressions and a renamed-crate compile-pass test. The macro accepts only
-`invocations = N`; the old logical-thread spelling is rejected. The core shape and context use
-invocation terminology directly. The macro still accepts only a literal count and its narrow f32
-assignment body; generic `R * C` expressions and grid-stride loops remain planned frontend work.
+statements and expressions and a renamed-crate compile-pass test. The macro accepts literal counts
+and checked const-generic `usize` expressions such as `invocations = R * C`; specialization rejects
+zero, overflow, and counts beyond `u32`. The old logical-thread spelling is rejected. The core
+shape and context use invocation terminology directly. Macro resources use `&[f32]` for read-only
+access and `&mut [f32]` for read/write access. The macro still accepts only its narrow f32
+assignment body; grid-stride loops and generic element types remain planned frontend work.
+These references are parsed into IR access descriptors; the generated builder does not yet
+borrow host buffers or enforce their lifetime and exclusivity through Rust's borrow checker.
 
 The additive `dialect` module describes namespaced, versioned external operations with typed
 operands/results and declared effects. A consumer supplies the authoritative operation signatures;

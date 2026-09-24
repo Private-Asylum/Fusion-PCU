@@ -1,0 +1,19 @@
+error[E0080]: evaluation panicked: PCU invocation count exceeds u32
+ --> tests/ui/invocation_too_large.rs:5:1
+  |
+5 | #[pcu_dispatch(invocations = R)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `kernel::<4294967296>::{constant#1}` failed here
+
+note: erroneous constant encountered
+ --> tests/ui/invocation_too_large.rs:5:1
+  |
+5 | #[pcu_dispatch(invocations = R)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the attribute macro `pcu_dispatch` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: the above error was encountered while instantiating `fn kernel::<4294967296>`
+  --> tests/ui/invocation_too_large.rs:13:13
+   |
+13 |     let _ = kernel::<{ u32::MAX as usize + 1 }>(&bindings);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -20,14 +20,14 @@ use syn::{
     ExprIndex,
     ExprLit,
     FnArg,
-    GenericArgument,
+    GenericParam,
     Ident,
     ItemFn,
     Lit,
     LitFloat,
     Pat,
     Path,
-    PathArguments,
+    ReturnType,
     Stmt,
     Token,
     Type,
@@ -36,7 +36,7 @@ use syn::{
 
 struct PcuDispatchArgs {
     kernel_id: u32,
-    invocations: u32,
+    invocations: Expr,
     crate_path: Path,
 }
 
@@ -50,20 +50,19 @@ impl Parse for PcuDispatchArgs {
             let key: Ident = input.parse()?;
             let _: Token![=] = input.parse()?;
             match key.to_string().as_str() {
-                "kernel_id" | "invocations" => {
+                "kernel_id" => {
                     let value: syn::LitInt = input.parse()?;
                     let parsed = value.base10_parse::<u32>()?;
-                    if key == "kernel_id" {
-                        if kernel_id.is_some() {
-                            return Err(Error::new(key.span(), "duplicate `kernel_id` argument"));
-                        }
-                        kernel_id = Some(parsed);
-                    } else {
-                        if invocations.is_some() {
-                            return Err(Error::new(key.span(), "duplicate `invocations` argument"));
-                        }
-                        invocations = Some(parsed);
+                    if kernel_id.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `kernel_id` argument"));
                     }
+                    kernel_id = Some(parsed);
+                }
+                "invocations" => {
+                    if invocations.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `invocations` argument"));
+                    }
+                    invocations = Some(input.parse::<Expr>()?);
                 }
                 "crate_path" => {
                     if crate_path.is_some() {
@@ -74,7 +73,7 @@ impl Parse for PcuDispatchArgs {
                 _ => {
                     return Err(Error::new(
                         key.span(),
-                        "#[pcu_dispatch] supports `kernel_id = <u32>`, `invocations = <u32>`, and `crate_path = <path>`",
+                        "#[pcu_dispatch] supports `kernel_id = <u32>`, `invocations = <const expression>`, and `crate_path = <path>`",
                     ));
                 }
             }
@@ -88,16 +87,9 @@ impl Parse for PcuDispatchArgs {
         let invocations = invocations.ok_or_else(|| {
             Error::new(
                 input.span(),
-                "#[pcu_dispatch] requires `invocations = <u32>`",
+                "#[pcu_dispatch] requires `invocations = <const expression>`",
             )
         })?;
-        if invocations == 0 {
-            return Err(Error::new(
-                input.span(),
-                "#[pcu_dispatch] requires a non-zero invocation count",
-            ));
-        }
-
         Ok(Self {
             kernel_id: kernel_id.map_or(1, core::convert::identity),
             invocations,
@@ -108,8 +100,8 @@ impl Parse for PcuDispatchArgs {
 
 #[derive(Clone, Copy)]
 enum BindingAccess {
-    Read,
-    Write,
+    ReadOnly,
+    ReadWrite,
 }
 
 struct BindingSpec {
@@ -190,7 +182,9 @@ impl<'a> ExprEmitter<'a> {
                 "PCU binding load must use `binding[invocation]`",
             ));
         };
-        let slot = self.binding(binding_ident, BindingAccess::Read)?.binding;
+        let slot = self
+            .binding(binding_ident, BindingAccess::ReadOnly)?
+            .binding;
         let result = self.alloc_value(index.span())?;
         let pcu = self.crate_path;
         self.ops.push(quote! {
@@ -228,8 +222,10 @@ impl<'a> ExprEmitter<'a> {
         };
         if !matches!(
             (binding.access, required),
-            (BindingAccess::Read, BindingAccess::Read)
-                | (BindingAccess::Write, BindingAccess::Write)
+            (
+                BindingAccess::ReadOnly | BindingAccess::ReadWrite,
+                BindingAccess::ReadOnly
+            ) | (BindingAccess::ReadWrite, BindingAccess::ReadWrite)
         ) {
             return Err(Error::new(
                 ident.span(),
@@ -263,6 +259,14 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
     let function_ident = function.sig.ident.clone();
     let bindings_ident = format_ident!("{}_bindings", function_ident);
     let crate_path = args.crate_path;
+    let const_generics = validate_const_generics(function)?;
+    let invocation_expr = lower_invocation_expr(&args.invocations, &const_generics)?;
+    let generated_generics = if function.sig.generics.params.is_empty() {
+        quote! { <'a> }
+    } else {
+        let params = &function.sig.generics.params;
+        quote! { <'a, #params> }
+    };
     let binding_specs = parse_bindings(&function.sig.inputs)?;
     let (invocation_ident, assignment) = validate_body(function)?;
     let output_binding = validate_assignment_target(assignment, &binding_specs, &invocation_ident)?;
@@ -286,29 +290,132 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
     let binding_count = binding_items.len();
     let op_count = data_ops.len() + 1;
     let kernel_id = args.kernel_id;
-    let invocations = args.invocations;
-
     Ok(quote! {
         #vis const fn #bindings_ident() -> [#pcu::PcuBinding<'static>; #binding_count] {
             [#(#binding_items),*]
         }
 
-        #vis fn #function_ident<'a>(
+        #vis fn #function_ident #generated_generics(
             bindings: &'a [#pcu::PcuBinding<'a>],
         ) -> ::core::result::Result<
             #pcu::model::PcuDispatchKernelBuilder<'a, #op_count>,
             #pcu::PcuError,
         > {
+            let invocations: u32 = const {
+                let count: usize = #invocation_expr;
+                assert!(count != 0, "PCU invocation count must be nonzero");
+                assert!(count <= u32::MAX as usize, "PCU invocation count exceeds u32");
+                count as u32
+            };
             let builder = #pcu::model::PcuDispatchKernelBuilder::<#op_count>::new(
                 #kernel_id,
                 "main",
-                [#invocations, 1, 1],
+                [invocations, 1, 1],
             )
             .with_bindings(bindings);
             #(let builder = builder.with_data_op(#data_ops)?;)*
             builder.with_control_op(#pcu::PcuDispatchControlOp::Return)
         }
     })
+}
+
+fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
+    if function.sig.asyncness.is_some()
+        || function.sig.constness.is_some()
+        || function.sig.unsafety.is_some()
+        || function.sig.abi.is_some()
+        || !matches!(function.sig.output, ReturnType::Default)
+        || function.sig.generics.where_clause.is_some()
+    {
+        return Err(Error::new(
+            function.sig.span(),
+            "PCU dispatch source must be a plain function without a return type or where clause",
+        ));
+    }
+    let mut names = Vec::new();
+    for parameter in &function.sig.generics.params {
+        let GenericParam::Const(parameter) = parameter else {
+            return Err(Error::new(
+                parameter.span(),
+                "PCU dispatch currently supports only `const NAME: usize` generics",
+            ));
+        };
+        let Type::Path(ty) = &parameter.ty else {
+            return Err(Error::new(
+                parameter.ty.span(),
+                "PCU invocation const generics must have type `usize`",
+            ));
+        };
+        if !ty.path.is_ident("usize") || parameter.default.is_some() {
+            return Err(Error::new(
+                parameter.ty.span(),
+                "PCU invocation const generics must have type `usize` and no default",
+            ));
+        }
+        names.push(parameter.ident.clone());
+    }
+    Ok(names)
+}
+
+fn lower_invocation_expr(expr: &Expr, const_generics: &[Ident]) -> Result<TokenStream2, Error> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(value),
+            ..
+        }) => {
+            let parsed = value.base10_parse::<usize>()?;
+            Ok(quote! { #parsed })
+        }
+        Expr::Path(path) if path.qself.is_none() && path.path.get_ident().is_some() => {
+            let ident = path.path.get_ident().expect("guard checked the identifier");
+            if !const_generics.contains(ident) {
+                return Err(Error::new(
+                    ident.span(),
+                    "PCU invocation identifier must be a `const NAME: usize` generic",
+                ));
+            }
+            Ok(quote! { #ident })
+        }
+        Expr::Paren(paren) => lower_invocation_expr(&paren.expr, const_generics),
+        Expr::Group(group) => lower_invocation_expr(&group.expr, const_generics),
+        Expr::Binary(binary) => {
+            let lhs = lower_invocation_expr(&binary.left, const_generics)?;
+            let rhs = lower_invocation_expr(&binary.right, const_generics)?;
+            let (method, failure) = match binary.op {
+                BinOp::Add(_) => (
+                    format_ident!("checked_add"),
+                    "PCU invocation addition overflow",
+                ),
+                BinOp::Sub(_) => (
+                    format_ident!("checked_sub"),
+                    "PCU invocation subtraction underflow",
+                ),
+                BinOp::Mul(_) => (
+                    format_ident!("checked_mul"),
+                    "PCU invocation multiplication overflow",
+                ),
+                BinOp::Div(_) => (
+                    format_ident!("checked_div"),
+                    "PCU invocation division by zero",
+                ),
+                BinOp::Rem(_) => (
+                    format_ident!("checked_rem"),
+                    "PCU invocation remainder by zero",
+                ),
+                _ => {
+                    return Err(Error::new(
+                        binary.op.span(),
+                        "PCU invocation expression supports only +, -, *, /, and %",
+                    ));
+                }
+            };
+            Ok(quote! { (#lhs).#method(#rhs).expect(#failure) })
+        }
+        _ => Err(Error::new(
+            expr.span(),
+            "PCU invocation expression supports usize literals, const generics, parentheses, and checked + - * / %",
+        )),
+    }
 }
 
 fn parse_bindings(
@@ -341,58 +448,41 @@ fn parse_bindings(
 }
 
 fn parse_binding_type(ty: &Type) -> Result<BindingAccess, Error> {
-    let Type::Path(path) = ty else {
+    let Type::Reference(reference) = ty else {
         return Err(Error::new(
             ty.span(),
-            "PCU binding types must be read_storage<f32> or write_storage<f32>",
+            "PCU binding types must be `&[f32]` or `&mut [f32]`",
         ));
     };
-    let Some(segment) = path.path.segments.last() else {
-        return Err(Error::new(ty.span(), "invalid PCU binding type"));
+    if reference.lifetime.is_some() {
+        return Err(Error::new(
+            reference.span(),
+            "explicit lifetimes on PCU dispatch bindings are unsupported",
+        ));
+    }
+    let Type::Slice(slice) = reference.elem.as_ref() else {
+        return Err(Error::new(
+            reference.elem.span(),
+            "PCU dispatch resources must be slices of f32",
+        ));
     };
-    let access = if segment.ident == "read_storage" {
-        BindingAccess::Read
-    } else if segment.ident == "write_storage" {
-        BindingAccess::Write
+    let Type::Path(element) = slice.elem.as_ref() else {
+        return Err(Error::new(
+            slice.elem.span(),
+            "this PCU dispatch macro currently supports only f32 elements",
+        ));
+    };
+    if !element.path.is_ident("f32") {
+        return Err(Error::new(
+            element.span(),
+            "this PCU dispatch macro currently supports only f32 elements",
+        ));
+    }
+    Ok(if reference.mutability.is_some() {
+        BindingAccess::ReadWrite
     } else {
-        return Err(Error::new(
-            segment.ident.span(),
-            "PCU binding types must be read_storage<f32> or write_storage<f32>",
-        ));
-    };
-    validate_f32_generic(&segment.arguments)?;
-    Ok(access)
-}
-
-fn validate_f32_generic(arguments: &PathArguments) -> Result<(), Error> {
-    let PathArguments::AngleBracketed(arguments) = arguments else {
-        return Err(Error::new(
-            arguments.span(),
-            "PCU binding type must specify `<f32>`",
-        ));
-    };
-    if arguments.args.len() != 1 {
-        return Err(Error::new(
-            arguments.span(),
-            "PCU binding type must specify exactly one value type",
-        ));
-    }
-    let Some(GenericArgument::Type(Type::Path(ty))) = arguments.args.first() else {
-        return Err(Error::new(
-            arguments.span(),
-            "PCU binding generic must be a type",
-        ));
-    };
-    let Some(segment) = ty.path.segments.last() else {
-        return Err(Error::new(ty.span(), "invalid PCU binding value type"));
-    };
-    if segment.ident != "f32" {
-        return Err(Error::new(
-            segment.ident.span(),
-            "this first PCU dispatch macro cut only supports f32 bindings",
-        ));
-    }
-    Ok(())
+        BindingAccess::ReadOnly
+    })
 }
 
 fn validate_body(function: &ItemFn) -> Result<(Ident, &ExprAssign), Error> {
@@ -490,10 +580,10 @@ fn validate_assignment_target<'a>(
             "unknown PCU output binding",
         ));
     };
-    if !matches!(binding.access, BindingAccess::Write) {
+    if !matches!(binding.access, BindingAccess::ReadWrite) {
         return Err(Error::new(
             output_ident.span(),
-            "PCU assignment target must be a write_storage<f32> binding",
+            "PCU assignment target must be an `&mut [f32]` binding",
         ));
     }
     Ok(binding)
@@ -535,17 +625,16 @@ fn binding_tokens(binding: &BindingSpec, pcu: &Path) -> TokenStream2 {
     let name = binding.ident.to_string();
     let slot = binding.binding;
     let access = match binding.access {
-        BindingAccess::Read => quote! { #pcu::PcuBindingAccess::ReadOnly },
-        BindingAccess::Write => quote! { #pcu::PcuBindingAccess::WriteOnly },
+        BindingAccess::ReadOnly => quote! { #pcu::PcuBindingAccess::ReadOnly },
+        BindingAccess::ReadWrite => quote! { #pcu::PcuBindingAccess::ReadWrite },
     };
     quote! {
-        #pcu::PcuBinding::value(
+        #pcu::PcuBinding::scalar::<f32>(
             ::core::option::Option::Some(#name),
             0,
             #slot,
             #pcu::PcuBindingStorageClass::Storage,
             #access,
-            #pcu::PcuValueType::f32(),
         )
     }
 }
@@ -560,7 +649,7 @@ mod tests {
 
     fn expand(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
         let function = syn::parse_str::<ItemFn>(&format!(
-            "fn kernel(input: read_storage<f32>, output: write_storage<f32>) {{ {body} }}"
+            "fn kernel(input: &[f32], output: &mut [f32]) {{ {body} }}"
         ))
         .expect("test function parses");
         let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
@@ -582,7 +671,7 @@ mod tests {
     #[test]
     fn accepts_invocation_spelling() {
         let function = syn::parse_str::<ItemFn>(
-            "fn kernel(input: read_storage<f32>, output: write_storage<f32>) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0; }",
+            "fn kernel(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0; }",
         )
         .expect("test function parses");
         let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
@@ -614,9 +703,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invocation_expressions_outside_the_checked_const_subset() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel<const R: usize>(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation]; }",
+        )
+        .expect("test function parses");
+        for source in [
+            "invocations = R << 1",
+            "invocations = R + C",
+            "invocations = size()",
+        ] {
+            let args = syn::parse_str::<PcuDispatchArgs>(source).expect("attribute parses");
+            assert!(expand_pcu_dispatch(args, &function).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_type_generic_sources_until_element_semantics_exist() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel<T>(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation]; }",
+        )
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 8").expect("attribute parses");
+        let error = expand_pcu_dispatch(args, &function).expect_err("type generic is unsupported");
+        assert!(error.to_string().contains("const NAME: usize"));
+    }
+
+    #[test]
     fn emits_all_runtime_references_through_configured_crate_path() {
         let function = syn::parse_str::<ItemFn>(
-            "fn kernel(input: read_storage<f32>, output: write_storage<f32>) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0; }",
+            "fn kernel(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0; }",
         )
         .expect("test function parses");
         let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64, crate_path = ::pcu_alias")

@@ -178,11 +178,7 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
 }
 
 #[pcu_dispatch(kernel_id = 1, invocations = 256)]
-fn parallel_float_kernel(
-    input_a: read_storage<f32>,
-    input_b: read_storage<f32>,
-    output: write_storage<f32>,
-) {
+fn parallel_float_kernel(input_a: &[f32], input_b: &[f32], output: &mut [f32]) {
     let invocation = context.global_invocation_id;
     output[invocation] = input_a[invocation] * 2.0 + input_b[invocation] + 1.0;
 }

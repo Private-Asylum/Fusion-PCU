@@ -32,6 +32,7 @@ pub mod memory;
 pub mod model;
 pub mod owned;
 pub mod registry;
+pub mod scalar;
 pub mod validation;
 
 pub use contract::*;
@@ -45,3 +46,4 @@ pub use discovery::*;
 pub use memory::*;
 pub use owned::*;
 pub use registry::*;
+pub use scalar::*;

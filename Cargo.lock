@@ -352,6 +352,8 @@ name = "fusion-pcu-macros"
 version = "0.1.0"
 dependencies = [
  "fusion-pcu",
+ "fusion-pcu-rocm",
+ "fusion-pcu-spirv",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

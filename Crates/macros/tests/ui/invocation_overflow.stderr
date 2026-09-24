@@ -1,0 +1,21 @@
+error[E0080]: evaluation panicked: PCU invocation multiplication overflow
+ --> tests/ui/invocation_overflow.rs:5:1
+  |
+5 | #[pcu_dispatch(invocations = R * C)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `kernel::<usize::MAX, 2>::{constant#1}` failed here
+  |
+  = note: this error originates in the attribute macro `pcu_dispatch` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/ui/invocation_overflow.rs:5:1
+  |
+5 | #[pcu_dispatch(invocations = R * C)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the attribute macro `pcu_dispatch` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: the above error was encountered while instantiating `fn kernel::<usize::MAX, 2>`
+  --> tests/ui/invocation_overflow.rs:16:13
+   |
+16 |     let _ = kernel::<{ usize::MAX }, 2>(&bindings);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
