@@ -8,13 +8,13 @@ type read_storage<T> = T;
 type write_storage<T> = T;
 
 struct Context {
-    thread: usize,
+    global_invocation_id: usize,
 }
 
-#[pcu_dispatch(threads = 8, crate_path = ::renamed_pcu)]
+#[pcu_dispatch(invocations = 8, crate_path = ::renamed_pcu)]
 fn kernel(input: read_storage<f32>, output: write_storage<f32>) {
-    let thread = context.thread;
-    output[thread] = input[thread] * 2.0;
+    let invocation = context.global_invocation_id;
+    output[invocation] = input[invocation] * 2.0;
 }
 
 fn main() {}

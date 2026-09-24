@@ -6,14 +6,14 @@ type read_storage<T> = T;
 type write_storage<T> = T;
 
 struct Context {
-    thread: usize,
+    global_invocation_id: usize,
 }
 
-#[pcu_dispatch(threads = 8)]
+#[pcu_dispatch(invocations = 8)]
 fn kernel(input: read_storage<f32>, output: write_storage<f32>) {
-    let thread = context.thread;
-    if thread > 0 {
-        output[thread] = input[thread];
+    let invocation = context.global_invocation_id;
+    if invocation > 0 {
+        output[invocation] = input[invocation];
     }
 }
 

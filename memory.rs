@@ -387,6 +387,20 @@ pub enum PcuMemoryImportOwnership {
     Transferred,
 }
 
+/// Accounting and lifetime origin of a resource returned by a memory provider.
+///
+/// This describes who is responsible for the backing allocation's accounting and lifetime. It
+/// does not assert that `size_bytes` corresponds to resident physical bytes: providers may return
+/// lazy or framework-managed resources. An imported borrowed resource remains externally owned;
+/// a transferred import is owned by the provider after successful import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuMemoryResourceOrigin {
+    /// The provider created or adopted the resource and is responsible for its lifetime.
+    ProviderManaged,
+    /// The resource remains owned by an external party whose import lease is retained.
+    ExternallyOwnedBorrowed,
+}
+
 /// Backend-defined, already validated external memory import descriptor.
 ///
 /// The descriptor must carry any OS/API ownership lease needed to keep the imported allocation
@@ -411,6 +425,9 @@ pub trait PcuMemoryResource {
     fn alignment_bytes(&self) -> u64;
     fn access(&self) -> PcuMemoryAccess;
     fn is_device_local(&self) -> Option<bool>;
+    /// Identifies the accounting/lifetime owner for this resource. Implementers must state this
+    /// explicitly so a borrowed import cannot silently appear provider-managed.
+    fn origin(&self) -> PcuMemoryResourceOrigin;
 }
 
 /// Scoped mapped view. The view must not outlive the provider's mapping guard.
@@ -439,6 +456,9 @@ pub enum PcuMemoryProviderFailure {
     Unsupported,
     InvalidRequest(PcuMemoryRequestError),
     PoolUnavailable,
+    /// The device generation backing this pool/resource is gone. Existing handles are stale;
+    /// callers must rediscover and re-import or reallocate rather than retry this handle.
+    DeviceLost,
     DeviceLocalRequired,
     IncompatibleImport,
     OutOfMemory,
@@ -466,8 +486,21 @@ pub struct PcuMemoryProviderError {
 /// caller performs ratio admission with [`PcuMemoryReservationLedger`] before allocation: reserve
 /// using the matching pool snapshot, call the provider, then release the reservation if the
 /// provider fails. On success, keep the reservation accounted until telemetry represents those
-/// bytes or the resource is released. Providers must not silently convert a device-local request
-/// into a weaker placement.
+/// bytes or the resource is released. These reservations account for requested logical bytes;
+/// they do not reserve externally owned backing or guarantee that a backend's hidden workspace is
+/// included in telemetry. Providers must not silently convert a device-local request into a weaker
+/// placement. For imported resources, borrowed imports remain charged to their external owner;
+/// transferred imports become provider-managed after successful import. Callers that need ratio
+/// admission for an import must explicitly reserve the imported size and retain that reservation
+/// with the resource, since `import` itself has no ledger parameter.
+///
+/// `Defer` means retry may succeed after pressure/busy state changes; `Reject` means changing
+/// timing alone is not expected to help. Providers should use `DeviceLost` with `Reject` for a
+/// vanished device generation. A lost device invalidates pool snapshots and resource handles,
+/// but does not prove that submitted work has stopped accessing backing memory. Implementations
+/// must retain or quarantine resources until quiescence is known; ledger reservations likewise
+/// remain held until the consumer can safely release them. Re-discovery creates a new identity or
+/// generation and never revives an old resource handle.
 pub trait PcuMemoryProvider {
     type Resource: PcuMemoryResource;
     type ImportDescriptor: PcuMemoryImportDescriptor;
@@ -875,6 +908,9 @@ mod tests {
         fn is_device_local(&self) -> Option<bool> {
             self.device_local
         }
+        fn origin(&self) -> PcuMemoryResourceOrigin {
+            PcuMemoryResourceOrigin::ProviderManaged
+        }
     }
 
     struct MockImport;
@@ -1092,6 +1128,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(admitted.resource().size_bytes(), 10);
+        assert_eq!(
+            admitted.resource().origin(),
+            PcuMemoryResourceOrigin::ProviderManaged
+        );
         assert_eq!(admitted.reservations().len(), 1);
         assert_eq!(ledger.reserved_bytes(PcuMemoryPoolId(3)), Some(10));
         admitted.release(&mut ledger).unwrap();

@@ -18,20 +18,20 @@ use super::{
 /// Invocation geometry for one profile dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuInvocationShape {
-    threads: NonZeroU32,
+    invocations: NonZeroU32,
 }
 
 impl PcuInvocationShape {
-    /// Creates one checked invocation shape.
+    /// Creates one checked logical invocation shape.
     #[must_use]
-    pub const fn threads(threads: NonZeroU32) -> Self {
-        Self { threads }
+    pub const fn invocations(invocations: NonZeroU32) -> Self {
+        Self { invocations }
     }
 
-    /// Returns the requested logical thread count.
+    /// Returns the requested logical invocation count, independent of physical launch padding.
     #[must_use]
-    pub const fn thread_count(self) -> NonZeroU32 {
-        self.threads
+    pub const fn invocation_count(self) -> NonZeroU32 {
+        self.invocations
     }
 }
 

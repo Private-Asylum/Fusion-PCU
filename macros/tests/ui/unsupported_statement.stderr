@@ -1,7 +1,7 @@
-error: second PCU dispatch statement must be `output[thread] = <expr>;`
+error: second PCU dispatch statement must be `output[invocation] = <expr>;`
   --> tests/ui/unsupported_statement.rs:15:5
    |
-15 | /     if thread > 0 {
-16 | |         output[thread] = input[thread];
+15 | /     if invocation > 0 {
+16 | |         output[invocation] = input[invocation];
 17 | |     }
    | |_____^

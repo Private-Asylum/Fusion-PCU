@@ -1,5 +1,5 @@
 error: unsupported PCU expression; supported subset is binding[index], f32 literals, parentheses, and + - * /
-  --> tests/ui/unsupported_expression.rs:15:22
+  --> tests/ui/unsupported_expression.rs:15:26
    |
-15 |     output[thread] = input[thread].abs();
-   |                      ^^^^^^^^^^^^^^^^^^^
+15 |     output[invocation] = input[invocation].abs();
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^

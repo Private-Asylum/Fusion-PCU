@@ -163,7 +163,7 @@ pub struct PcuVulkanRunnerCaps {
 /// Result metadata returned by the current fixed-descriptor dispatch path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcuVulkanDispatchReport {
-    pub work_items: u32,
+    pub invocations: u32,
     pub dispatch_groups: [u32; 3],
     pub bound_byte_len: usize,
     pub resource_model: PcuResourceAddressingModel,
@@ -386,7 +386,7 @@ impl PcuVulkanRunner {
         read_binding_buffer(bindings, 2, &output_buffer)?;
 
         Ok(PcuVulkanDispatchReport {
-            work_items: execution.work_items,
+            invocations: execution.invocations,
             dispatch_groups: execution.dispatch_groups,
             bound_byte_len: execution.bound_byte_len,
             resource_model: self.caps.selected_storage_buffer_model,
@@ -422,7 +422,7 @@ impl PcuComputeRunner for PcuVulkanRunner {
             })?;
 
         Ok(PcuRunnerExecutionReport {
-            work_items: report.work_items,
+            invocations: report.invocations,
             dispatch_groups: report.dispatch_groups,
             resource_model: report.resource_model,
         })
@@ -430,7 +430,7 @@ impl PcuComputeRunner for PcuVulkanRunner {
 }
 
 struct FixedDescriptorExecution {
-    work_items: u32,
+    invocations: u32,
     dispatch_groups: [u32; 3],
     bound_byte_len: usize,
 }
@@ -444,8 +444,8 @@ fn fixed_descriptor_execution(
         return Err(PcuVulkanError::InvalidDispatchShape);
     }
 
-    let work_items = submission.shape.thread_count().get();
-    if !work_items.is_multiple_of(dispatch.local_size[0]) {
+    let invocations = submission.shape.invocation_count().get();
+    if !invocations.is_multiple_of(dispatch.local_size[0]) {
         return Err(PcuVulkanError::InvalidDispatchShape);
     }
 
@@ -459,15 +459,15 @@ fn fixed_descriptor_execution(
     let Some(word_count) = source_len.checked_div(mem::size_of::<u32>()) else {
         return Err(PcuVulkanError::InvalidInvocationBinding);
     };
-    if word_count != usize::try_from(work_items).map_err(|_| PcuVulkanError::BufferTooLarge)?
+    if word_count != usize::try_from(invocations).map_err(|_| PcuVulkanError::BufferTooLarge)?
         || word_count * mem::size_of::<u32>() != source_len
     {
         return Err(PcuVulkanError::InvalidDispatchShape);
     }
 
     Ok(FixedDescriptorExecution {
-        work_items,
-        dispatch_groups: [work_items / dispatch.local_size[0], 1, 1],
+        invocations,
+        dispatch_groups: [invocations / dispatch.local_size[0], 1, 1],
         bound_byte_len: source_len,
     })
 }

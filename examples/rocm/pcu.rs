@@ -2,6 +2,7 @@
 
 use std::process::ExitCode;
 use std::num::NonZeroU32;
+use std::time::Instant;
 
 use fusion_pcu::{
     F32MapBuilder,
@@ -35,10 +36,8 @@ use fusion_pcu::{
     PcuBindingType,
     PcuCompletionOutcome,
     PcuDispatchSubmission,
-    PcuInvocationParameters,
     PcuInvocationShape,
     PcuOwnedCompletion,
-    PcuOwnedDispatchBackend,
     PcuValueType,
     allocate_with_policy,
 };
@@ -240,16 +239,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             async_input.resource().device_buffer().clone(),
         )?,
     ];
-    let mut completion = async_backend
-        .submit_dispatch_owned(
-            PcuDispatchSubmission {
-                kernel: &kernel,
-                shape: PcuInvocationShape::threads(NonZeroU32::new(65).unwrap()),
-            },
-            async_bindings,
-            PcuInvocationParameters::empty(),
-        )
-        .map_err(|error| format!("PCU owned async submission: {error:?}"))?;
+    let submission = PcuDispatchSubmission {
+        kernel: &kernel,
+        shape: PcuInvocationShape::invocations(NonZeroU32::new(65).unwrap()),
+    };
+    let prepare_started = Instant::now();
+    let prepared = async_backend.prepare_dispatch(submission)?;
+    let prepare_elapsed = prepare_started.elapsed();
+    let mut completion = prepared
+        .submit(&async_bindings)
+        .map_err(|error| format!("PCU prepared async submission: {error:?}"))?;
     let mut async_output_bytes = vec![0_u8; input_bytes.len()];
     if !matches!(
         async_readback.copy_to(&mut async_output_bytes),
@@ -260,6 +259,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if completion.wait()? != PcuCompletionOutcome::Succeeded {
         return Err("owned async dispatch did not succeed".into());
     }
+    let mut warm_samples = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let warm_started = Instant::now();
+        let bindings = vec![
+            async_backend.binding(
+                PcuBindingRef::new(0, 1),
+                PcuBindingAccess::WriteOnly,
+                PcuBindingType::Value(PcuValueType::f32()),
+                async_output.resource().device_buffer().clone(),
+            )?,
+            async_backend.binding(
+                PcuBindingRef::new(0, 0),
+                PcuBindingAccess::ReadOnly,
+                PcuBindingType::Value(PcuValueType::f32()),
+                async_input.resource().device_buffer().clone(),
+            )?,
+        ];
+        let mut repeated = prepared.submit(&bindings)?;
+        if repeated.wait()? != PcuCompletionOutcome::Succeeded {
+            return Err("repeated prepared dispatch did not succeed".into());
+        }
+        warm_samples.push(warm_started.elapsed());
+    }
+    warm_samples.sort_unstable();
+    println!(
+        "PCU prepared ROCm cold prepare: {:.3} ms; warm bind+submit+wait p50/p95: {:.3}/{:.3} us (32 runs)",
+        prepare_elapsed.as_secs_f64() * 1_000.0,
+        warm_samples[15].as_secs_f64() * 1_000_000.0,
+        warm_samples[30].as_secs_f64() * 1_000_000.0,
+    );
     async_memory_provider
         .transfer_from(async_output.resource(), 0, &mut async_output_bytes)
         .map_err(|error| format!("PCU async output transfer: {error:?}"))?;

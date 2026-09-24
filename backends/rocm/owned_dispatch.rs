@@ -235,21 +235,98 @@ impl RocmOwnedDispatchBackend {
         submission: PcuDispatchSubmission<'_>,
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
+        let prepared = self.prepare_dispatch(submission)?;
+        prepared.submit(bindings)
+    }
+
+    /// Lower, compile, load, and resolve one Dispatch kernel for repeated submissions.
+    ///
+    /// The returned reusable executable captures this session's generation-bound device
+    /// identity and HIP runtime. It may outlive this backend value, but every submission remains
+    /// tied to that same runtime/device. Keep it alive across warm launches to avoid repeating
+    /// source lowering, code-object compilation, module loading, function lookup, stream creation,
+    /// and ABI binding-order construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel profile cannot be lowered or HIP cannot compile/load it.
+    pub fn prepare_dispatch<'kernel>(
+        &self,
+        submission: PcuDispatchSubmission<'kernel>,
+    ) -> Result<RocmPreparedDispatch<'kernel>, RocmOwnedDispatchError> {
         let kernel = submission.kernel;
-        validate_owned_dispatch_bindings(kernel, submission.shape, self.device, bindings)
-            .map_err(RocmOwnedDispatchError::Binding)?;
         let source = lower_dispatch_to_hip_source(kernel)?;
-        let logical_threads = submission.shape.thread_count().get();
-        if kernel.entry.logical_shape != [logical_threads, 1, 1] {
+        let logical_invocations = submission.shape.invocation_count().get();
+        if kernel.entry.logical_shape != [logical_invocations, 1, 1] {
             return Err(RocmOwnedDispatchError::Lower(
                 RocmLowerError::InvalidKernelShape,
             ));
         }
-        let required = usize::try_from(logical_threads)
+        let required = usize::try_from(logical_invocations)
             .ok()
-            .and_then(|threads| threads.checked_mul(size_of::<f32>()))
+            .and_then(|invocations| invocations.checked_mul(size_of::<f32>()))
             .ok_or(RocmOwnedDispatchError::GeometryOverflow)?;
 
+        let grid_x = launch_grid(logical_invocations, self.block_size)?;
+        let image = compile_hip_source(&source, &self.architecture)?;
+        let module = self.runtime.load_module(&image)?;
+        let function = module.function(c"fusion_kernel")?;
+        let stream = self.runtime.create_stream()?;
+        let binding_targets = kernel
+            .bindings
+            .iter()
+            .map(|binding| PcuBindingRef::new(binding.set, binding.binding))
+            .collect();
+        Ok(RocmPreparedDispatch {
+            runtime: self.runtime.clone(),
+            device: self.device,
+            kernel,
+            shape: submission.shape,
+            required,
+            grid_x,
+            block_size: self.block_size,
+            function,
+            stream,
+            binding_targets,
+        })
+    }
+}
+
+/// Reusable compiled `ROCm` executable for one borrowed PCU Dispatch kernel.
+///
+/// This is distinct from the core `PcuPreparedDispatch` assessment value: it owns the compiled
+/// HIP function and reusable stream needed to submit the same kernel repeatedly.
+pub struct RocmPreparedDispatch<'kernel> {
+    runtime: HipRuntime,
+    device: PcuDeviceIdentity,
+    kernel: &'kernel fusion_pcu::PcuDispatchKernelIr<'kernel>,
+    shape: fusion_pcu::PcuInvocationShape,
+    required: usize,
+    grid_x: u32,
+    block_size: u32,
+    function: crate::HipKernel,
+    stream: crate::HipStreamHandle,
+    binding_targets: Vec<PcuBindingRef>,
+}
+
+impl RocmPreparedDispatch<'_> {
+    /// Submit this executable with a fresh set of owned bindings.
+    ///
+    /// Binding metadata, allocation size, and captured runtime/device identity are checked on
+    /// every call. A stale or unavailable device is reported through HIP operation failures; this
+    /// warm path does not query a fresh device snapshot. HIP launch argument storage, access
+    /// leases, and completion events remain per launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bindings, a mismatched runtime/device identity, or HIP launch
+    /// failure. A HIP error after enqueue is conservatively handled by the HIP launch contract.
+    pub fn submit(
+        &self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+    ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
+        validate_owned_dispatch_bindings(self.kernel, self.shape, self.device, bindings)
+            .map_err(RocmOwnedDispatchError::Binding)?;
         for binding in bindings {
             let actual = binding.resource.len();
             if binding.byte_len != actual as u64 {
@@ -262,28 +339,16 @@ impl RocmOwnedDispatchBackend {
             self.runtime
                 .ensure_same_runtime(&binding.resource.allocation.runtime)
                 .map_err(|_| RocmOwnedDispatchError::DifferentRuntime(binding.target))?;
-            if actual < required {
+            if actual < self.required {
                 return Err(RocmOwnedDispatchError::BufferTooSmall {
                     binding: binding.target,
-                    required,
+                    required: self.required,
                     available: actual,
                 });
             }
         }
-
-        let grid_x = launch_grid(logical_threads, self.block_size)?;
-        let image = compile_hip_source(&source, &self.architecture)?;
-        let module = self.runtime.load_module(&image)?;
-        let function = module.function(c"fusion_kernel")?;
-        let stream = self.runtime.create_stream()?;
-        let indices = binding_order(
-            kernel
-                .bindings
-                .iter()
-                .map(|binding| PcuBindingRef::new(binding.set, binding.binding)),
-            bindings,
-        )
-        .map_err(RocmOwnedDispatchError::Binding)?;
+        let indices = binding_order(self.binding_targets.iter().copied(), bindings)
+            .map_err(RocmOwnedDispatchError::Binding)?;
         let arguments = indices
             .into_iter()
             .map(|index| HipKernelArgument::Buffer(&bindings[index].resource))
@@ -295,9 +360,9 @@ impl RocmOwnedDispatchBackend {
         // length and HIP runtime identity, and HipKernel::launch acquires the shared exclusive
         // allocation gates and retains module, stream, and allocations through event completion.
         let hip = unsafe {
-            function.launch(
-                &stream,
-                [grid_x, 1, 1],
+            self.function.launch(
+                &self.stream,
+                [self.grid_x, 1, 1],
                 [self.block_size, 1, 1],
                 0,
                 &arguments,
@@ -377,11 +442,11 @@ impl PcuOwnedCompletion for RocmOwnedCompletion {
     }
 }
 
-fn launch_grid(threads: u32, block_size: u32) -> Result<u32, RocmOwnedDispatchError> {
+fn launch_grid(invocations: u32, block_size: u32) -> Result<u32, RocmOwnedDispatchError> {
     if block_size == 0 {
         return Err(RocmOwnedDispatchError::InvalidBlockSize);
     }
-    let grid = u64::from(threads).div_ceil(u64::from(block_size));
+    let grid = u64::from(invocations).div_ceil(u64::from(block_size));
     if grid * u64::from(block_size) > u64::from(u32::MAX) {
         return Err(RocmOwnedDispatchError::GeometryOverflow);
     }

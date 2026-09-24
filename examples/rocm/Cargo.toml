@@ -16,6 +16,10 @@ path = "pcu.rs"
 name = "fusion-rocm-discover"
 path = "discover.rs"
 
+[[bin]]
+name = "fusion-rocm-dispatch-bench"
+path = "dispatch_bench.rs"
+
 [dependencies]
 fusion-pcu.workspace = true
 fusion-pcu-rocm.workspace = true
@@ -26,4 +30,4 @@ pedantic = "warn"
 nursery = "warn"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"

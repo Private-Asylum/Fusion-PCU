@@ -7,8 +7,10 @@ interpret, or delegate work. The core neither selects a backend nor owns a physi
 
 ## Contract status
 
-The public API is **experimental**. The core checks on Rust 1.93.1 with default features
-disabled, but no MSRV or publication guarantee is established yet.
+The public API is **experimental**. The core checks and passes strict Clippy on Rust 1.93.1 with
+default features disabled, but 1.93.1 is only the oldest installed stable toolchain tested here;
+no MSRV or publication guarantee is established yet. Inert Fusion target-feature aliases were
+removed from the core manifest; the retained `hosted` feature forwards to `std`.
 Its current five built-in families are Dispatch, Stream, Command, Transaction, and Signal; they
 are vocabulary, not a promise that every backend executes every operation. Unknown binary plugin
 loading and a stable executable ABI are outside the current registry. The registry selects among
@@ -43,22 +45,44 @@ resources through uncertain waits and releases them only after quiescence. ROCm 
 that contract for the bounded f32 map subset. Cloned ROCm device buffers share an access gate,
 so safe copies and rocBLAS reject overlapping use while a launched kernel owns an allocation.
 The host example proves asynchronous submission, pre-wait access rejection, completion, and
-readback on the RX 6900 XT. The original synchronous helper remains available. Command has a
+readback on the RX 6900 XT. ROCm now also exposes a reusable prepared executable for this f32
+profile: lowering, HIP compilation, module/function resolution, and stream creation happen at
+prepare time, while each launch owns its bindings and completion. The hosted proof submits it
+repeatedly and reports cold preparation separately from warm bind/submit/wait samples. Per-launch
+binding checks, argument allocation, access gates, and events remain; no zero-overhead claim is
+made. The original synchronous helper remains available. Command has a
 typed read-result verifier, but there is no AML-to-PCU executor yet.
 
 `F32MapBuilder` constructs the current scalar f32 indexed-map subset without heap allocation and
 with automatic nonzero value IDs. Both ROCm and SPIR-V lowerers accept its output in tests. It is
 not a Rust-to-PCU compiler, and value handles are scoped by caller-assigned kernel ID rather than
 by a generative Rust lifetime. The optional dispatch macro has compile-fail tests for unsupported
-statements and expressions and a renamed-crate compile-pass test.
+statements and expressions and a renamed-crate compile-pass test. The macro accepts only
+`invocations = N`; the old logical-thread spelling is rejected. The core shape and context use
+invocation terminology directly. The macro still accepts only a literal count and its narrow f32
+assignment body; generic `R * C` expressions and grid-stride loops remain planned frontend work.
 
 The additive `dialect` module describes namespaced, versioned external operations with typed
 operands/results and declared effects. A consumer supplies the authoritative operation signatures;
-the core validates local value flow and can compose fragments with value-ID remapping. VM-style
-and Stream-style test consumers exercise the protocol, but it does not execute external opcodes or
-define a binary plugin ABI. The optional `fusion-pcu-tensor` crate is a separate f32 CPU reference
-graph with shape checks and reverse-mode gradients. It does not yet lower through PCU or run on a
-device backend.
+the core validates local value flow and can compose fragments with value-ID remapping. An external
+Stream integration test executes two composed fragments, and the separate `no_std`
+`fusion-pcu-vm-reference` crate executes a bounded input/add/emit program using caller-owned
+storage. Their operation meanings remain consumer-owned; the core does not execute those opcodes.
+`PcuDialectProgram` adds exact named, typed input/output ports and per-operation typed scalar
+immediates around a fragment. The consumer defines the port and immediate schema; validation
+checks those contracts and SSA flow before execution. Port-bearing programs can form a
+straight-line pipeline by explicitly binding every input of the second program to an output of
+the first. Composition checks both source programs, the projected contract, caller storage, and
+ID remapping before writing output buffers. The public boundary is the first program's inputs
+and the second program's outputs. General graph wiring and region/control flow remain open.
+Neither reference consumer establishes a general VM ABI or binary plugin interface.
+`PcuDialectBuilder` is a bounded, caller-storage-backed Rust surface for fragment operations.
+Its typed `bool`, `u32`, and `f32` SSA handles support fan-out; callers give separate builders
+distinct scope IDs. It validates each append against the selected consumer support table, while
+program ports and immediates are supplied through the program wrapper. The optional
+`fusion-pcu-tensor` crate is a separate f32 CPU
+reference graph with shape checks and reverse-mode gradients. It does not yet lower through PCU or
+run on a device backend.
 
 For the precise first Stream semantics and test vectors, see
 [`STREAM-U32-PIO-PROFILE.md`](STREAM-U32-PIO-PROFILE.md). For the remaining architecture work,

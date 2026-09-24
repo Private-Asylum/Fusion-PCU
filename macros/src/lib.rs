@@ -36,27 +36,33 @@ use syn::{
 
 struct PcuDispatchArgs {
     kernel_id: u32,
-    threads: u32,
+    invocations: u32,
     crate_path: Path,
 }
 
 impl Parse for PcuDispatchArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self, Error> {
         let mut kernel_id = None;
-        let mut threads = None;
+        let mut invocations = None;
         let mut crate_path = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             let _: Token![=] = input.parse()?;
             match key.to_string().as_str() {
-                "kernel_id" | "threads" => {
+                "kernel_id" | "invocations" => {
                     let value: syn::LitInt = input.parse()?;
                     let parsed = value.base10_parse::<u32>()?;
                     if key == "kernel_id" {
+                        if kernel_id.is_some() {
+                            return Err(Error::new(key.span(), "duplicate `kernel_id` argument"));
+                        }
                         kernel_id = Some(parsed);
                     } else {
-                        threads = Some(parsed);
+                        if invocations.is_some() {
+                            return Err(Error::new(key.span(), "duplicate `invocations` argument"));
+                        }
+                        invocations = Some(parsed);
                     }
                 }
                 "crate_path" => {
@@ -68,7 +74,7 @@ impl Parse for PcuDispatchArgs {
                 _ => {
                     return Err(Error::new(
                         key.span(),
-                        "#[pcu_dispatch] supports `kernel_id = <u32>`, `threads = <u32>`, and `crate_path = <path>`",
+                        "#[pcu_dispatch] supports `kernel_id = <u32>`, `invocations = <u32>`, and `crate_path = <path>`",
                     ));
                 }
             }
@@ -79,19 +85,22 @@ impl Parse for PcuDispatchArgs {
             let _: Token![,] = input.parse()?;
         }
 
-        let threads = threads.ok_or_else(|| {
-            Error::new(input.span(), "#[pcu_dispatch] requires `threads = <u32>`")
+        let invocations = invocations.ok_or_else(|| {
+            Error::new(
+                input.span(),
+                "#[pcu_dispatch] requires `invocations = <u32>`",
+            )
         })?;
-        if threads == 0 {
+        if invocations == 0 {
             return Err(Error::new(
                 input.span(),
-                "#[pcu_dispatch] requires a non-zero thread count",
+                "#[pcu_dispatch] requires a non-zero invocation count",
             ));
         }
 
         Ok(Self {
             kernel_id: kernel_id.map_or(1, core::convert::identity),
-            threads,
+            invocations,
             crate_path: crate_path.unwrap_or_else(|| syn::parse_quote!(::fusion_pcu)),
         })
     }
@@ -111,7 +120,7 @@ struct BindingSpec {
 
 struct ExprEmitter<'a> {
     bindings: &'a [BindingSpec],
-    thread_ident: &'a Ident,
+    invocation_ident: &'a Ident,
     crate_path: &'a Path,
     next_value: u16,
     ops: Vec<TokenStream2>,
@@ -120,12 +129,12 @@ struct ExprEmitter<'a> {
 impl<'a> ExprEmitter<'a> {
     const fn new(
         bindings: &'a [BindingSpec],
-        thread_ident: &'a Ident,
+        invocation_ident: &'a Ident,
         crate_path: &'a Path,
     ) -> Self {
         Self {
             bindings,
-            thread_ident,
+            invocation_ident,
             crate_path,
             next_value: 1,
             ops: Vec::new(),
@@ -174,11 +183,11 @@ impl<'a> ExprEmitter<'a> {
     }
 
     fn emit_index_load(&mut self, index: &ExprIndex) -> Result<u16, Error> {
-        validate_thread_index(&index.index, self.thread_ident)?;
+        validate_invocation_index(&index.index, self.invocation_ident)?;
         let Some(binding_ident) = expr_ident(&index.expr) else {
             return Err(Error::new(
                 index.expr.span(),
-                "PCU binding load must use `binding[thread]`",
+                "PCU binding load must use `binding[invocation]`",
             ));
         };
         let slot = self.binding(binding_ident, BindingAccess::Read)?.binding;
@@ -255,9 +264,9 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
     let bindings_ident = format_ident!("{}_bindings", function_ident);
     let crate_path = args.crate_path;
     let binding_specs = parse_bindings(&function.sig.inputs)?;
-    let (thread_ident, assignment) = validate_body(function)?;
-    let output_binding = validate_assignment_target(assignment, &binding_specs, &thread_ident)?;
-    let mut emitter = ExprEmitter::new(&binding_specs, &thread_ident, &crate_path);
+    let (invocation_ident, assignment) = validate_body(function)?;
+    let output_binding = validate_assignment_target(assignment, &binding_specs, &invocation_ident)?;
+    let mut emitter = ExprEmitter::new(&binding_specs, &invocation_ident, &crate_path);
     let result_value = emitter.emit_expr(&assignment.right)?;
     let output_slot = output_binding.binding;
     let mut data_ops = emitter.ops;
@@ -277,7 +286,7 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
     let binding_count = binding_items.len();
     let op_count = data_ops.len() + 1;
     let kernel_id = args.kernel_id;
-    let threads = args.threads;
+    let invocations = args.invocations;
 
     Ok(quote! {
         #vis const fn #bindings_ident() -> [#pcu::PcuBinding<'static>; #binding_count] {
@@ -293,7 +302,7 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
             let builder = #pcu::model::PcuDispatchKernelBuilder::<#op_count>::new(
                 #kernel_id,
                 "main",
-                [#threads, 1, 1],
+                [#invocations, 1, 1],
             )
             .with_bindings(bindings);
             #(let builder = builder.with_data_op(#data_ops)?;)*
@@ -394,14 +403,14 @@ fn validate_body(function: &ItemFn) -> Result<(Ident, &ExprAssign), Error> {
             .map_or_else(|| function.block.span(), syn::spanned::Spanned::span);
         return Err(Error::new(
             span,
-            "PCU dispatch body supports exactly `let thread = context.thread;` followed by one `output[thread] = <expr>;` assignment",
+            "PCU dispatch body supports exactly `let invocation = context.global_invocation_id;` followed by one `output[invocation] = <expr>;` assignment",
         ));
     }
 
     let Stmt::Local(local) = &statements[0] else {
         return Err(Error::new(
             statements[0].span(),
-            "first PCU dispatch statement must be `let thread = context.thread;`",
+            "first PCU dispatch statement must be `let invocation = context.global_invocation_id;`",
         ));
     };
     if !local.attrs.is_empty() {
@@ -413,63 +422,63 @@ fn validate_body(function: &ItemFn) -> Result<(Ident, &ExprAssign), Error> {
     let Pat::Ident(pat) = &local.pat else {
         return Err(Error::new(
             local.pat.span(),
-            "PCU dispatch thread binding must be a plain identifier",
+            "PCU dispatch invocation binding must be a plain identifier",
         ));
     };
     if pat.by_ref.is_some() || pat.mutability.is_some() || pat.subpat.is_some() {
         return Err(Error::new(
             pat.span(),
-            "PCU dispatch thread binding must be an immutable plain identifier",
+            "PCU dispatch invocation binding must be an immutable plain identifier",
         ));
     }
     let Some(init) = &local.init else {
         return Err(Error::new(
             local.pat.span(),
-            "PCU dispatch thread binding must initialize from `context.thread`",
+            "PCU dispatch invocation binding must initialize from `context.global_invocation_id`",
         ));
     };
-    if init.diverge.is_some() || !is_context_thread_expr(&init.expr) {
+    if init.diverge.is_some() || !is_context_invocation_expr(&init.expr) {
         return Err(Error::new(
             init.expr.span(),
-            "PCU dispatch thread binding must initialize from `context.thread`",
+            "PCU dispatch invocation binding must initialize from `context.global_invocation_id`",
         ));
     }
 
     let Stmt::Expr(Expr::Assign(assignment), Some(_)) = &statements[1] else {
         return Err(Error::new(
             statements[1].span(),
-            "second PCU dispatch statement must be `output[thread] = <expr>;`",
+            "second PCU dispatch statement must be `output[invocation] = <expr>;`",
         ));
     };
     Ok((pat.ident.clone(), assignment))
 }
 
-fn is_context_thread_expr(expr: &Expr) -> bool {
+fn is_context_invocation_expr(expr: &Expr) -> bool {
     let Expr::Field(ExprField { base, member, .. }) = expr else {
         return false;
     };
     let Some(base_ident) = expr_ident(base) else {
         return false;
     };
-    base_ident == "context" && member.to_token_stream().to_string() == "thread"
+    base_ident == "context" && member.to_token_stream().to_string() == "global_invocation_id"
 }
 
 fn validate_assignment_target<'a>(
     assignment: &ExprAssign,
     bindings: &'a [BindingSpec],
-    thread_ident: &Ident,
+    invocation_ident: &Ident,
 ) -> Result<&'a BindingSpec, Error> {
     let Expr::Index(ExprIndex { expr, index, .. }) = assignment.left.as_ref() else {
         return Err(Error::new(
             assignment.left.span(),
-            "PCU dispatch assignment target must be `output[thread]`",
+            "PCU dispatch assignment target must be `output[invocation]`",
         ));
     };
-    validate_thread_index(index, thread_ident)?;
+    validate_invocation_index(index, invocation_ident)?;
     let Some(output_ident) = expr_ident(expr) else {
         return Err(Error::new(
             expr.span(),
-            "PCU dispatch assignment target must be `output[thread]`",
+            "PCU dispatch assignment target must be `output[invocation]`",
         ));
     };
     let Some(binding) = bindings
@@ -490,19 +499,19 @@ fn validate_assignment_target<'a>(
     Ok(binding)
 }
 
-fn validate_thread_index(expr: &Expr, thread_ident: &Ident) -> Result<(), Error> {
+fn validate_invocation_index(expr: &Expr, invocation_ident: &Ident) -> Result<(), Error> {
     let Some(index_ident) = expr_ident(expr) else {
         return Err(Error::new(
             expr.span(),
-            "PCU binding index must be the thread identifier",
+            "PCU binding index must be the invocation identifier",
         ));
     };
-    if index_ident == thread_ident {
+    if index_ident == invocation_ident {
         Ok(())
     } else {
         Err(Error::new(
             expr.span(),
-            "PCU binding index must be the thread identifier",
+            "PCU binding index must be the invocation identifier",
         ))
     }
 }
@@ -554,14 +563,14 @@ mod tests {
             "fn kernel(input: read_storage<f32>, output: write_storage<f32>) {{ {body} }}"
         ))
         .expect("test function parses");
-        let args = syn::parse_str::<PcuDispatchArgs>("threads = 64")
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
             .expect("default crate path arguments parse");
         expand_pcu_dispatch(args, &function)
     }
 
     #[test]
     fn lowers_supported_indexed_f32_map() {
-        let tokens = expand("let thread = context.thread; output[thread] = input[thread] * 2.0;")
+        let tokens = expand("let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0;")
             .expect("supported map lowers");
         let generated = tokens.to_string();
         assert!(generated.contains("BindingLoad"));
@@ -571,12 +580,46 @@ mod tests {
     }
 
     #[test]
-    fn emits_all_runtime_references_through_configured_crate_path() {
+    fn accepts_invocation_spelling() {
         let function = syn::parse_str::<ItemFn>(
-            "fn kernel(input: read_storage<f32>, output: write_storage<f32>) { let thread = context.thread; output[thread] = input[thread] * 2.0; }",
+            "fn kernel(input: read_storage<f32>, output: write_storage<f32>) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0; }",
         )
         .expect("test function parses");
-        let args = syn::parse_str::<PcuDispatchArgs>("threads = 64, crate_path = ::pcu_alias")
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("invocation spelling parses");
+        let tokens = expand_pcu_dispatch(args, &function).expect("invocation spelling expands");
+        assert!(tokens.to_string().contains("64"));
+    }
+
+    #[test]
+    fn rejects_duplicate_invocation_arguments() {
+        for source in [
+            "invocations = 8, invocations = 8",
+            "kernel_id = 1, kernel_id = 2, invocations = 8",
+            "invocations = 8, crate_path = ::pcu, crate_path = ::other",
+        ] {
+            assert!(
+                syn::parse_str::<PcuDispatchArgs>(source).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_removed_thread_count_spelling() {
+        let error = syn::parse_str::<PcuDispatchArgs>("threads = 8")
+            .err()
+            .expect("logical invocation count must use the new spelling");
+        assert!(error.to_string().contains("invocations"));
+    }
+
+    #[test]
+    fn emits_all_runtime_references_through_configured_crate_path() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel(input: read_storage<f32>, output: write_storage<f32>) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0; }",
+        )
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64, crate_path = ::pcu_alias")
             .expect("renamed crate path arguments parse");
         let tokens = expand_pcu_dispatch(args, &function).expect("alias path expands");
         let generated = tokens.to_string();
@@ -588,7 +631,7 @@ mod tests {
     #[test]
     fn rejects_extra_let_instead_of_silently_dropping_it() {
         let error = expand(
-            "let thread = context.thread; let ignored = 1.0; output[thread] = input[thread];",
+            "let invocation = context.global_invocation_id; let ignored = 1.0; output[invocation] = input[invocation];",
         )
         .expect_err("extra local must be rejected");
         assert!(error.to_string().contains("exactly"));
@@ -597,7 +640,7 @@ mod tests {
     #[test]
     fn rejects_extra_expression_statement() {
         let error =
-            expand("let thread = context.thread; log(thread); output[thread] = input[thread];")
+            expand("let invocation = context.global_invocation_id; log(invocation); output[invocation] = input[invocation];")
                 .expect_err("unsupported expression must be rejected");
         assert!(error.to_string().contains("exactly"));
     }
@@ -605,7 +648,7 @@ mod tests {
     #[test]
     fn rejects_multiple_assignments() {
         let error = expand(
-            "let thread = context.thread; output[thread] = input[thread]; output[thread] = 0.0;",
+            "let invocation = context.global_invocation_id; output[invocation] = input[invocation]; output[invocation] = 0.0;",
         )
         .expect_err("second assignment must be rejected");
         assert!(error.to_string().contains("exactly"));
@@ -613,7 +656,7 @@ mod tests {
 
     #[test]
     fn rejects_non_assignment_body_statement() {
-        let error = expand("let thread = context.thread; if thread > 0 { output[thread] = 1.0; }")
+        let error = expand("let invocation = context.global_invocation_id; if invocation > 0 { output[invocation] = 1.0; }")
             .expect_err("control flow must be rejected in this subset");
         assert!(error.to_string().contains("second PCU dispatch statement"));
     }

@@ -17,6 +17,7 @@ use fusion_pcu::{
     PcuMemoryRange,
     PcuMemoryRequestError,
     PcuMemoryResource,
+    PcuMemoryResourceOrigin,
 };
 
 use crate::{
@@ -108,6 +109,10 @@ impl PcuMemoryResource for RocmMemoryResource {
     // placement across discrete and unified-memory devices.
     fn is_device_local(&self) -> Option<bool> {
         None
+    }
+
+    fn origin(&self) -> PcuMemoryResourceOrigin {
+        PcuMemoryResourceOrigin::ProviderManaged
     }
 }
 

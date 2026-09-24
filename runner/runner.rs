@@ -369,7 +369,7 @@ pub struct PcuLoweredSpirvDispatch<'a> {
 /// Runner execution details for one dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PcuRunnerExecutionReport {
-    pub work_items: u32,
+    pub invocations: u32,
     pub dispatch_groups: [u32; 3],
     pub resource_model: PcuResourceAddressingModel,
 }
@@ -486,7 +486,7 @@ mod tests {
             _parameters: PcuInvocationParameters<'_>,
         ) -> Result<PcuRunnerExecutionReport, PcuRunnerError> {
             Ok(PcuRunnerExecutionReport {
-                work_items: 0,
+                invocations: 0,
                 dispatch_groups: [0, 0, 0],
                 resource_model: PcuResourceAddressingModel::FixedDescriptors,
             })

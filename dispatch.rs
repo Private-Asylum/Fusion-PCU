@@ -35,18 +35,30 @@ use crate::validation::validate_command_kernel;
 /// Logical invocation context surfaced to one dispatch-style kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuDispatchContext {
-    pub thread_id: u32,
-    pub thread_count: NonZeroU32,
+    pub global_invocation_id: u32,
+    pub invocation_count: NonZeroU32,
 }
 
 impl PcuDispatchContext {
     /// Creates one checked logical invocation context.
     #[must_use]
-    pub const fn new(thread_id: u32, thread_count: NonZeroU32) -> Self {
+    pub const fn new(global_invocation_id: u32, invocation_count: NonZeroU32) -> Self {
         Self {
-            thread_id,
-            thread_count,
+            global_invocation_id,
+            invocation_count,
         }
+    }
+
+    /// Returns this invocation's global logical identifier.
+    #[must_use]
+    pub const fn global_invocation_id(self) -> u32 {
+        self.global_invocation_id
+    }
+
+    /// Returns the requested logical invocation count, independent of physical launch padding.
+    #[must_use]
+    pub const fn invocation_count(self) -> NonZeroU32 {
+        self.invocation_count
     }
 }
 
@@ -849,7 +861,7 @@ pub fn validate_invocation_bindings(
     Ok(())
 }
 
-/// Checks that a dispatch submission's thread count matches its logical shape.
+/// Checks that a dispatch submission's invocation count matches its logical shape.
 ///
 /// # Errors
 ///
@@ -861,12 +873,13 @@ pub fn validate_dispatch_submission(submission: PcuDispatchSubmission<'_>) -> Re
         return Err(PcuError::invalid());
     };
 
-    let expected_threads = logical_shape
+    let expected_invocations = logical_shape
         .into_iter()
         .try_fold(1_u64, |product, axis| product.checked_mul(u64::from(axis)))
         .ok_or_else(PcuError::invalid)?;
 
-    if expected_threads == 0 || expected_threads != u64::from(submission.shape.thread_count().get())
+    if expected_invocations == 0
+        || expected_invocations != u64::from(submission.shape.invocation_count().get())
     {
         return Err(PcuError::invalid());
     }
@@ -1395,7 +1408,7 @@ mod tests {
         let result = backend.submit_dispatch(
             PcuDispatchSubmission {
                 kernel: &kernel,
-                shape: PcuInvocationShape::threads(NonZeroU32::new(3).expect("nonzero")),
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
             },
             PcuInvocationBindings::empty(),
             PcuInvocationParameters::empty(),
@@ -1421,7 +1434,7 @@ mod tests {
         let result = backend.submit_dispatch(
             PcuDispatchSubmission {
                 kernel: &kernel,
-                shape: PcuInvocationShape::threads(NonZeroU32::new(1).expect("nonzero")),
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(1).expect("nonzero")),
             },
             PcuInvocationBindings::empty(),
             PcuInvocationParameters::empty(),
@@ -1455,7 +1468,7 @@ mod tests {
         let result = backend.submit_dispatch(
             PcuDispatchSubmission {
                 kernel: &kernel,
-                shape: PcuInvocationShape::threads(NonZeroU32::new(1).expect("nonzero")),
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(1).expect("nonzero")),
             },
             PcuInvocationBindings::empty(),
             PcuInvocationParameters::empty(),
@@ -1667,7 +1680,7 @@ mod tests {
             &backend,
             PcuDispatchSubmission {
                 kernel: &kernel,
-                shape: PcuInvocationShape::threads(NonZeroU32::new(1).expect("nonzero")),
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(1).expect("nonzero")),
             },
             PcuInvocationBindings::empty(),
             PcuInvocationParameters::empty(),

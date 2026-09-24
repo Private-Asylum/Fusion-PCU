@@ -106,8 +106,8 @@ pub fn execute_pcu_dispatch(
     if block_size == 0 {
         return Err(RocmDispatchError::InvalidBlockSize);
     }
-    let threads = kernel.entry.logical_shape[0];
-    let required = usize::try_from(threads)
+    let invocations = kernel.entry.logical_shape[0];
+    let required = usize::try_from(invocations)
         .ok()
         .and_then(|count| count.checked_mul(size_of::<f32>()))
         .ok_or(RocmDispatchError::GeometryOverflow)?;
@@ -141,7 +141,7 @@ pub fn execute_pcu_dispatch(
         ordered.push(HipKernelArgument::Buffer(buffer));
     }
 
-    let grid_x = launch_grid(threads, block_size)?;
+    let grid_x = launch_grid(invocations, block_size)?;
     let image = compile_hip_source(&source, architecture)?;
     let module = runtime.load_module(&image)?;
     let function = module.function(c"fusion_kernel")?;
@@ -155,11 +155,11 @@ pub fn execute_pcu_dispatch(
     Ok(())
 }
 
-fn launch_grid(threads: u32, block_size: u32) -> Result<u32, RocmDispatchError> {
+fn launch_grid(invocations: u32, block_size: u32) -> Result<u32, RocmDispatchError> {
     if block_size == 0 {
         return Err(RocmDispatchError::InvalidBlockSize);
     }
-    let grid = u64::from(threads).div_ceil(u64::from(block_size));
+    let grid = u64::from(invocations).div_ceil(u64::from(block_size));
     // The generated kernel computes its invocation ID in u32, and HIP requires each rounded
     // grid dimension to contain fewer than 2^32 work items. Reject instead of wrapping IDs.
     if grid * u64::from(block_size) > u64::from(u32::MAX) {

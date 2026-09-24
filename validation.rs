@@ -149,7 +149,9 @@ pub fn validate_command_kernel(
         }
 
         match step.op {
-            PcuCommandOp::Write { value, .. } | PcuCommandOp::Modify { value, .. } => {
+            PcuCommandOp::Write { value, .. }
+            | PcuCommandOp::Modify { value, .. }
+            | PcuCommandOp::Return { value: Some(value) } => {
                 validate_command_result_use(kernel, index, value)?;
             }
             PcuCommandOp::Invoke { args, .. } => {
@@ -167,9 +169,6 @@ pub fn validate_command_kernel(
                 }
                 PcuCommandPredicate::Ready(_) | PcuCommandPredicate::Named(_) => {}
             },
-            PcuCommandOp::Return { value: Some(value) } => {
-                validate_command_result_use(kernel, index, value)?;
-            }
             PcuCommandOp::Read { .. }
             | PcuCommandOp::ReadResult { .. }
             | PcuCommandOp::Copy { .. }

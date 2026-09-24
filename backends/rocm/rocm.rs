@@ -62,6 +62,7 @@ pub use owned_dispatch::{
     RocmOwnedCompletion,
     RocmOwnedDispatchBackend,
     RocmOwnedDispatchError,
+    RocmPreparedDispatch,
 };
 
 type HipResult = c_int;

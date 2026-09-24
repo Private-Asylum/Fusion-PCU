@@ -1,6 +1,6 @@
 [package]
-name = "fusion-pcu"
-description = ""
+name = "fusion-pcu-vm-reference"
+description = "no_std reference consumer for typed PCU dialect fragments"
 documentation = ""
 version.workspace = true
 edition.workspace = true
@@ -10,12 +10,10 @@ repository.workspace = true
 
 [lib]
 crate-type = ["rlib"]
-path = "fusion-pcu.rs"
+path = "vm_reference.rs"
 
-[features]
-default = []
-std = []
-hosted = ["std"]
+[dependencies]
+fusion-pcu = { workspace = true }
 
 [lints]
 workspace = true

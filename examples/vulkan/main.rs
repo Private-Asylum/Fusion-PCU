@@ -34,7 +34,7 @@ use winit::window::{
 const WINDOW_WIDTH: f64 = 960.0;
 const WINDOW_HEIGHT: f64 = 540.0;
 const ELEMENT_COUNT: usize = 256;
-const WORK_ITEMS: u32 = 256;
+const INVOCATIONS: u32 = 256;
 
 fn main() {
     if let Err(error) = run() {
@@ -78,8 +78,8 @@ impl ExampleApp {
 
         let report = result?;
         println!(
-            "fusion-vulkan-example: dispatched {} PCU work items through {} on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
-            report.dispatch.execution.work_items,
+            "fusion-vulkan-example: dispatched {} PCU invocations through {} on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
+            report.dispatch.execution.invocations,
             report.dispatch.runner_id,
             report
                 .device_name
@@ -152,7 +152,7 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
     let builder = parallel_float_kernel(&bindings).map_err(ExampleError::Pcu)?;
     let kernel = builder.ir();
     let runtime = PcuRuntime::auto().map_err(ExampleError::Runner)?;
-    let work_items = NonZeroU32::new(WORK_ITEMS).ok_or(ExampleError::BufferTooLarge)?;
+    let invocations = NonZeroU32::new(INVOCATIONS).ok_or(ExampleError::BufferTooLarge)?;
     let dispatch = {
         let mut invocation_bindings =
             parallel_float_invocation_bindings(&source, &bias, &mut output);
@@ -160,7 +160,7 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
             .submit_dispatch(
                 PcuDispatchSubmission {
                     kernel: &kernel,
-                    shape: PcuInvocationShape::threads(work_items),
+                    shape: PcuInvocationShape::invocations(invocations),
                 },
                 &mut invocation_bindings,
                 PcuInvocationParameters::empty(),
@@ -177,14 +177,14 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
     })
 }
 
-#[pcu_dispatch(kernel_id = 1, threads = 256)]
+#[pcu_dispatch(kernel_id = 1, invocations = 256)]
 fn parallel_float_kernel(
     input_a: read_storage<f32>,
     input_b: read_storage<f32>,
     output: write_storage<f32>,
 ) {
-    let thread = context.thread;
-    output[thread] = input_a[thread] * 2.0 + input_b[thread] + 1.0;
+    let invocation = context.global_invocation_id;
+    output[invocation] = input_a[invocation] * 2.0 + input_b[invocation] + 1.0;
 }
 
 const fn parallel_float_invocation_bindings<'a>(

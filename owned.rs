@@ -210,7 +210,7 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
 /// Validates complete owned binding coverage and metadata for scalar value buffers.
 ///
 /// This v1 sizing rule assumes a tightly packed, contiguous buffer with one scalar element per
-/// logical thread. Vector, matrix, image, sampler, and acceleration-structure layouts are rejected
+/// logical invocation. Vector, matrix, image, sampler, and acceleration-structure layouts are rejected
 /// until a backend-specific layout contract can describe their actual storage size and stride.
 ///
 /// # Errors
@@ -250,7 +250,8 @@ pub fn validate_owned_dispatch_bindings<R>(
                 binding.target,
             ));
         };
-        let Some(required) = bytes_per_element.checked_mul(u64::from(shape.thread_count().get()))
+        let Some(required) =
+            bytes_per_element.checked_mul(u64::from(shape.invocation_count().get()))
         else {
             return Err(PcuOwnedDispatchBindingError::UnsupportedLayout(
                 binding.target,
@@ -517,7 +518,7 @@ mod tests {
     fn owned_dispatch_admission_rejects_wrong_device_access_size_and_missing_binding() {
         let declarations = [declared_binding()];
         let kernel = make_kernel(&declarations);
-        let shape = PcuInvocationShape::threads(core::num::NonZeroU32::new(4).unwrap());
+        let shape = PcuInvocationShape::invocations(core::num::NonZeroU32::new(4).unwrap());
         let target = PcuBindingRef::new(0, 0);
         let not_dropped = || Rc::new(Cell::new(false));
 
@@ -596,7 +597,7 @@ mod tests {
         assert_eq!(
             validate_owned_dispatch_bindings(
                 &kernel,
-                PcuInvocationShape::threads(core::num::NonZeroU32::new(4).unwrap()),
+                PcuInvocationShape::invocations(core::num::NonZeroU32::new(4).unwrap()),
                 device(1),
                 &[binding],
             ),
@@ -639,7 +640,7 @@ mod tests {
         let binding = owned_binding(device, 16, PcuBindingAccess::ReadOnly, Rc::clone(&dropped));
         let submission = PcuDispatchSubmission {
             kernel: &kernel,
-            shape: PcuInvocationShape::threads(core::num::NonZeroU32::new(4).unwrap()),
+            shape: PcuInvocationShape::invocations(core::num::NonZeroU32::new(4).unwrap()),
         };
         let mut completion = backend
             .submit_dispatch_owned(submission, [binding], PcuInvocationParameters::empty())

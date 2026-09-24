@@ -73,8 +73,8 @@ pub struct PcuDispatchPreparationRequest<'a> {
 /// Dispatch limit fields currently represented by the common assessment vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuDispatchLimits {
-    /// Maximum total logical threads in one PCU submission.
-    pub max_logical_threads: Option<u32>,
+    /// Maximum total logical invocations in one PCU submission.
+    pub max_logical_invocations: Option<u32>,
     pub max_bindings: Option<u32>,
     pub max_parameters: Option<u32>,
 }
@@ -82,7 +82,7 @@ pub struct PcuDispatchLimits {
 /// One common backend limit that can be exceeded or left unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuDispatchLimitKind {
-    LogicalThreads,
+    LogicalInvocations,
     Bindings,
     Parameters,
 }
@@ -188,7 +188,7 @@ pub trait PcuDispatchPreparationBackend: PcuBaseContract {
     fn device_identity(&self) -> PcuDeviceIdentity;
 
     /// Limits for this executor. `None` means no limit record or field was surfaced; if the
-    /// request requires known limits, the first unknown diagnostic is `LogicalThreads` for a missing
+    /// request requires known limits, the first unknown diagnostic is `LogicalInvocations` for a missing
     /// record, otherwise it names the missing field.
     fn dispatch_limits(&self, executor: PcuExecutorId) -> Option<PcuDispatchLimits>;
 
@@ -291,7 +291,7 @@ fn assess_limits(
     limits: Option<PcuDispatchLimits>,
     request: PcuDispatchPreparationRequest<'_>,
 ) -> Result<(), PcuDispatchAssessmentIssue> {
-    let threads = request.submission.shape.thread_count().get();
+    let invocations = request.submission.shape.invocation_count().get();
     let bindings = u32::try_from(request.submission.kernel.bindings.len())
         .map_err(|_| PcuDispatchAssessmentIssue::CountOverflow(PcuDispatchLimitKind::Bindings))?;
     let parameters = u32::try_from(request.submission.kernel.parameters.len())
@@ -299,16 +299,16 @@ fn assess_limits(
     let Some(limits) = limits else {
         return if request.require_known_limits {
             Err(PcuDispatchAssessmentIssue::LimitUnknown(
-                PcuDispatchLimitKind::LogicalThreads,
+                PcuDispatchLimitKind::LogicalInvocations,
             ))
         } else {
             Ok(())
         };
     };
     check_limit(
-        PcuDispatchLimitKind::LogicalThreads,
-        threads,
-        limits.max_logical_threads,
+        PcuDispatchLimitKind::LogicalInvocations,
+        invocations,
+        limits.max_logical_invocations,
         request.require_known_limits,
     )?;
     check_limit(
@@ -489,7 +489,7 @@ mod tests {
                 },
             },
             limits: PcuDispatchLimits {
-                max_logical_threads: Some(4),
+                max_logical_invocations: Some(4),
                 max_bindings: Some(0),
                 max_parameters: Some(0),
             },
@@ -503,7 +503,7 @@ mod tests {
             executor: PcuExecutorId(3),
             submission: PcuDispatchSubmission {
                 kernel,
-                shape: crate::PcuInvocationShape::threads(NonZeroU32::new(4).unwrap()),
+                shape: crate::PcuInvocationShape::invocations(NonZeroU32::new(4).unwrap()),
             },
             parameters: PcuInvocationParameters::empty(),
             capability_floor: PcuDispatchCapabilityFloor::empty(),
@@ -530,13 +530,13 @@ mod tests {
         let builder = PcuDispatchKernelBuilder::<4>::new(1, "entry", [4, 1, 1]);
         let kernel = builder.ir();
         let mut backend = backend();
-        backend.limits.max_logical_threads = Some(3);
+        backend.limits.max_logical_invocations = Some(3);
         let error = backend.prepare_dispatch(request(&kernel)).unwrap_err();
         assert!(matches!(
             error,
             PcuDispatchPreparationError::Assessment(PcuDispatchAssessmentError {
                 issue: PcuDispatchAssessmentIssue::LimitExceeded {
-                    kind: PcuDispatchLimitKind::LogicalThreads,
+                    kind: PcuDispatchLimitKind::LogicalInvocations,
                     requested: 4,
                     maximum: 3,
                 },
