@@ -1,0 +1,21 @@
+[package]
+name = "fusion-pcu"
+description = ""
+documentation = ""
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "fusion-pcu.rs"
+
+[features]
+default = []
+std = []
+hosted = ["std"]
+
+[lints]
+workspace = true

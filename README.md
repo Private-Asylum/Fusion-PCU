@@ -5,6 +5,10 @@ program vocabulary, capability and discovery descriptors, bounded runtime regist
 activation law, and explicit memory admission types. A backend may compile, synthesize,
 interpret, or delegate work. The core neither selects a backend nor owns a physical allocator.
 
+The repository root is a virtual Cargo workspace. The public library package lives in
+`Crates/fusion-pcu`; its Rust modules sit beside that package's manifest without a `src` directory.
+The macros, runner, backends, dialects, and hosted examples remain separate workspace packages.
+
 ## Contract status
 
 The public API is **experimental**. The core checks and passes strict Clippy on Rust 1.93.1 with

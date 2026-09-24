@@ -8,7 +8,7 @@ repository.workspace = true
 
 [lib]
 proc-macro = true
-path = "src/lib.rs"
+path = "fusion-pcu-macros.rs"
 
 [dependencies]
 proc-macro2.workspace = true
@@ -16,7 +16,7 @@ quote.workspace = true
 syn = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-pcu_alias = { package = "fusion-pcu", path = "..", default-features = false }
+pcu_alias = { package = "fusion-pcu", path = "../Crates/fusion-pcu", default-features = false }
 trybuild = "1.0"
 
 [lints]

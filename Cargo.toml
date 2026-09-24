@@ -1,30 +1,7 @@
-[package]
-name = "fusion-pcu"
-autoexamples = false
-description = ""
-documentation = ""
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-
-[lib]
-crate-type = ["rlib"]
-path = "fusion-pcu.rs"
-
-[features]
-default = []
-std = []
-hosted = ["std"]
-
-[lints]
-workspace = true
-
 [workspace]
 resolver = "3"
 members = [
-    ".",
+    "Crates/fusion-pcu",
     "macros",
     "backends/rocm",
     "backends/spirv",
@@ -43,7 +20,7 @@ license = ""
 repository = "https://github.com/Private-Asylum/Fusion-PCU"
 
 [workspace.dependencies]
-fusion-pcu = { path = ".", default-features = false }
+fusion-pcu = { path = "Crates/fusion-pcu", default-features = false }
 fusion-pcu-macros = { path = "macros" }
 fusion-pcu-rocm = { path = "backends/rocm", default-features = false }
 fusion-pcu-spirv = { path = "backends/spirv", default-features = false }
