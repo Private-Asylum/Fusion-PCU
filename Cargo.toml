@@ -15,8 +15,6 @@ path = "fusion-pcu.rs"
 [features]
 default = []
 std = []
-backend-spirv = []
-runner-vulkan = ["std", "backend-spirv", "dep:ash"]
 soc = []
 hosted = ["std"]
 critical-safe = []
@@ -27,9 +25,6 @@ soc-rp2350 = ["sys-cortex-m"]
 sys-fusion-kn = ["hosted"]
 cortex-m-vector-secure-world = []
 cortex-m-vector-nonsecure-world = []
-
-[dependencies]
-ash = { workspace = true, optional = true }
 
 [lints]
 workspace = true

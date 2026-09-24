@@ -1,18 +1,23 @@
 //! PCU dispatch to SPIR-V lowering entry points.
 
-use crate::{
+use fusion_pcu::{
+    PcuBindingRef,
     PcuBindingAccess,
     PcuBindingStorageClass,
     PcuBindingType,
     PcuDispatchAluOp,
     PcuDispatchControlOp,
+    PcuDispatchDataOp,
     PcuDispatchFeatureCaps,
+    PcuDispatchIndex,
     PcuDispatchKernelIr,
     PcuDispatchOp,
     PcuDispatchOpCaps,
     PcuDispatchRayTraceOp,
     PcuDispatchResourceOp,
     PcuDispatchValueOp,
+    PcuDispatchValueId,
+    PcuParameterValue,
     PcuScalarType,
     PcuValueType,
 };
@@ -43,14 +48,13 @@ pub fn lower_dispatch_to_spirv<S: PcuSpirvSink>(
     validate_dispatch_for_spirv(kernel, options)?;
 
     let mut writer = PcuSpirvWriter::new(sink);
-    if is_parallel_float_map_kernel(kernel) {
-        return writer.emit_parallel_float_map_module(
-            kernel.entry.name,
-            kernel.entry.logical_shape,
-            options,
-        );
+    if has_f32_dataflow_ops(kernel) {
+        return writer.emit_f32_dataflow_map_module(kernel, options);
     }
-    writer.emit_minimal_compute_module(kernel.entry.name, kernel.entry.logical_shape, options)
+    if is_legacy_parallel_float_map_kernel(kernel) {
+        return writer.emit_parallel_float_map_module(kernel.entry.name, options);
+    }
+    writer.emit_minimal_compute_module(kernel.entry.name, options)
 }
 
 /// Validates that one dispatch kernel is admissible for the current SPIR-V lowering subset.
@@ -63,10 +67,15 @@ pub fn validate_dispatch_for_spirv(
     options: PcuSpirvLoweringOptions,
 ) -> Result<(), PcuSpirvError> {
     require_capability(options, PcuSpirvCapability::Shader)?;
+    validate_spirv_version(options)?;
     validate_kernel_signature(kernel, options)?;
     validate_dispatch_features(kernel.required_feature_support())?;
 
-    if is_parallel_float_map_kernel(kernel) {
+    if has_f32_dataflow_ops(kernel) {
+        return validate_f32_dataflow_kernel(kernel);
+    }
+
+    if is_legacy_parallel_float_map_kernel(kernel) {
         return Ok(());
     }
 
@@ -75,6 +84,21 @@ pub fn validate_dispatch_for_spirv(
     }
 
     Ok(())
+}
+
+fn validate_spirv_version(options: PcuSpirvLoweringOptions) -> Result<(), PcuSpirvError> {
+    let version = options.version.0;
+    // SPIR-V's header encodes major/minor/revision in the low 24 bits. This backend
+    // advertises the core 1.0 through 1.3 versions only. Newer SPIR-V requires
+    // Block/StorageBuffer emission instead of the BufferBlock representation here.
+    let major = (version >> 16) & 0xff;
+    let minor = (version >> 8) & 0xff;
+    let revision = version & 0xff;
+    if version & 0xff00_0000 == 0 && major == 1 && minor <= 3 && revision == 0 {
+        Ok(())
+    } else {
+        Err(PcuSpirvError::UnsupportedVersion(options.version))
+    }
 }
 
 fn validate_kernel_signature(
@@ -145,6 +169,9 @@ fn validate_op_for_spirv(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return) => Ok(()),
         PcuDispatchOp::Control(_) => unsupported(op),
         PcuDispatchOp::Resource(resource) => validate_resource_op(resource, options),
+        PcuDispatchOp::Data(data) => {
+            Err(PcuSpirvError::UnsupportedInstruction(data.support_flag()))
+        }
         PcuDispatchOp::Coordinate(coordinate) => {
             let flag = coordinate.support_flag();
             if flag.contains(PcuDispatchOpCaps::DERIVATIVE_X)
@@ -285,7 +312,7 @@ fn unsupported(op: PcuDispatchOp<'_>) -> Result<(), PcuSpirvError> {
     Err(PcuSpirvError::UnsupportedInstruction(op.support_flag()))
 }
 
-fn is_parallel_float_map_kernel(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+fn is_legacy_parallel_float_map_kernel(kernel: &PcuDispatchKernelIr<'_>) -> bool {
     has_parallel_float_bindings(kernel) && has_parallel_float_ops(kernel)
 }
 
@@ -304,7 +331,7 @@ fn has_parallel_float_bindings(kernel: &PcuDispatchKernelIr<'_>) -> bool {
 }
 
 fn is_storage_f32_binding(
-    binding: crate::PcuBinding<'_>,
+    binding: fusion_pcu::PcuBinding<'_>,
     set: u32,
     slot: u32,
     access: PcuBindingAccess,
@@ -312,7 +339,7 @@ fn is_storage_f32_binding(
     binding.access == access && is_storage_f32_binding_type(binding, set, slot)
 }
 
-fn is_storage_f32_binding_type(binding: crate::PcuBinding<'_>, set: u32, slot: u32) -> bool {
+fn is_storage_f32_binding_type(binding: fusion_pcu::PcuBinding<'_>, set: u32, slot: u32) -> bool {
     binding.set == set
         && binding.binding == slot
         && binding.storage == PcuBindingStorageClass::Storage
@@ -335,6 +362,185 @@ fn has_parallel_float_ops(kernel: &PcuDispatchKernelIr<'_>) -> bool {
     )
 }
 
+fn has_f32_dataflow_ops(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    kernel
+        .ops
+        .iter()
+        .any(|op| matches!(op, PcuDispatchOp::Data(_)))
+}
+
+fn validate_f32_dataflow_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), PcuSpirvError> {
+    if !kernel
+        .bindings
+        .iter()
+        .copied()
+        .all(is_storage_f32_dataflow_binding)
+    {
+        return Err(PcuSpirvError::InvalidBinding);
+    }
+
+    let mut saw_return = false;
+    let mut saw_store = false;
+    for (op_index, op) in kernel.ops.iter().copied().enumerate() {
+        if saw_return {
+            return Err(PcuSpirvError::InvalidKernelSignature);
+        }
+        match op {
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result,
+                binding,
+                index: data_index,
+            }) => {
+                validate_result_slot(kernel, op_index, result)?;
+                validate_dataflow_binding(kernel, binding, PcuBindingAccess::ReadOnly)?;
+                validate_invocation_index(data_index)?;
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
+                validate_result_slot(kernel, op_index, result)?;
+                if !matches!(value, PcuParameterValue::F32(_)) {
+                    return Err(PcuSpirvError::UnsupportedValueType(value.value_type()));
+                }
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                result,
+                op,
+                lhs,
+                rhs,
+            }) => {
+                validate_result_slot(kernel, op_index, result)?;
+                validate_defined_before(kernel, op_index, lhs)?;
+                validate_defined_before(kernel, op_index, rhs)?;
+                match op {
+                    PcuDispatchAluOp::Add
+                    | PcuDispatchAluOp::Sub
+                    | PcuDispatchAluOp::Mul
+                    | PcuDispatchAluOp::Div => {}
+                    _ => return Err(PcuSpirvError::UnsupportedInstruction(op.support_flag())),
+                }
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding,
+                index: data_index,
+                value,
+            }) => {
+                validate_dataflow_binding(kernel, binding, PcuBindingAccess::WriteOnly)?;
+                validate_invocation_index(data_index)?;
+                validate_defined_before(kernel, op_index, value)?;
+                saw_store = true;
+            }
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return) => saw_return = true,
+            _ => return Err(PcuSpirvError::UnsupportedInstruction(op.support_flag())),
+        }
+    }
+
+    if saw_return && saw_store {
+        Ok(())
+    } else {
+        Err(PcuSpirvError::InvalidKernelSignature)
+    }
+}
+
+fn is_storage_f32_dataflow_binding(binding: fusion_pcu::PcuBinding<'_>) -> bool {
+    binding.storage == PcuBindingStorageClass::Storage
+        && matches!(
+            binding.access,
+            PcuBindingAccess::ReadOnly | PcuBindingAccess::WriteOnly | PcuBindingAccess::ReadWrite
+        )
+        && binding.binding_type == PcuBindingType::Value(PcuValueType::f32())
+}
+
+fn validate_dataflow_binding(
+    kernel: &PcuDispatchKernelIr<'_>,
+    binding: PcuBindingRef,
+    required: PcuBindingAccess,
+) -> Result<(), PcuSpirvError> {
+    let Some(candidate) = kernel
+        .bindings
+        .iter()
+        .copied()
+        .find(|candidate| candidate.set == binding.set && candidate.binding == binding.binding)
+    else {
+        return Err(PcuSpirvError::InvalidBinding);
+    };
+
+    let access_allowed = matches!(
+        (candidate.access, required),
+        (PcuBindingAccess::ReadOnly, PcuBindingAccess::ReadOnly)
+            | (PcuBindingAccess::WriteOnly, PcuBindingAccess::WriteOnly)
+            | (PcuBindingAccess::ReadWrite, PcuBindingAccess::ReadOnly)
+            | (PcuBindingAccess::ReadWrite, PcuBindingAccess::WriteOnly)
+    );
+    if access_allowed && is_storage_f32_dataflow_binding(candidate) {
+        Ok(())
+    } else {
+        Err(PcuSpirvError::InvalidBinding)
+    }
+}
+
+fn validate_invocation_index(index: PcuDispatchIndex) -> Result<(), PcuSpirvError> {
+    match index {
+        PcuDispatchIndex::InvocationId => Ok(()),
+        PcuDispatchIndex::Value(_) => Err(PcuSpirvError::UnsupportedInstruction(
+            PcuDispatchOpCaps::BINDING_LOAD | PcuDispatchOpCaps::BINDING_STORE,
+        )),
+    }
+}
+
+fn validate_value_result(value: PcuDispatchValueId) -> Result<(), PcuSpirvError> {
+    if value.0 == 0 {
+        Err(PcuSpirvError::InvalidKernelSignature)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_result_slot(
+    kernel: &PcuDispatchKernelIr<'_>,
+    op_index: usize,
+    value: PcuDispatchValueId,
+) -> Result<(), PcuSpirvError> {
+    validate_value_result(value)?;
+    if kernel
+        .ops
+        .iter()
+        .take(op_index)
+        .copied()
+        .any(|op| dataflow_result(op) == Some(value))
+    {
+        Err(PcuSpirvError::InvalidKernelSignature)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_defined_before(
+    kernel: &PcuDispatchKernelIr<'_>,
+    op_index: usize,
+    value: PcuDispatchValueId,
+) -> Result<(), PcuSpirvError> {
+    validate_value_result(value)?;
+    if kernel
+        .ops
+        .iter()
+        .take(op_index)
+        .copied()
+        .any(|op| dataflow_result(op) == Some(value))
+    {
+        Ok(())
+    } else {
+        Err(PcuSpirvError::InvalidKernelSignature)
+    }
+}
+
+fn dataflow_result(op: PcuDispatchOp<'_>) -> Option<PcuDispatchValueId> {
+    match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { result, .. })
+        | PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, .. })
+        | PcuDispatchOp::Data(PcuDispatchDataOp::Alu { result, .. }) => Some(result),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -349,27 +555,32 @@ mod tests {
         PcuSpirvLoweringOptions,
         SPIRV_MAGIC,
     };
-    use crate::{
+    use fusion_pcu::{
         PcuAccelerationStructureBindingType,
         PcuAccelerationStructureLevel,
         PcuBinding,
         PcuBindingAccess,
+        PcuBindingRef,
         PcuBindingStorageClass,
         PcuDispatchAluOp,
         PcuDispatchCoordinateOp,
+        PcuDispatchDataOp,
+        PcuDispatchIndex,
         PcuDispatchOpCaps,
         PcuDispatchResourceOp,
         PcuDispatchRayTraceOp,
+        PcuDispatchValueId,
         PcuDispatchValueOp,
+        PcuParameterValue,
         PcuTraceRayOp,
         PcuValueType,
     };
-    use crate::model::PcuDispatchKernelBuilder;
+    use fusion_pcu::model::PcuDispatchKernelBuilder;
 
     #[test]
     fn minimal_dispatch_lowers_to_spirv_header_and_compute_entry() {
         let builder = PcuDispatchKernelBuilder::<1>::new(1, "main", [1, 1, 1])
-            .with_control_op(crate::PcuDispatchControlOp::Return)
+            .with_control_op(fusion_pcu::PcuDispatchControlOp::Return)
             .expect("test builder should accept return");
         let kernel = builder.ir();
         let mut sink = PcuSpirvFixedSink::<64>::new();
@@ -385,6 +596,32 @@ mod tests {
         assert_eq!(info.bound, 5);
         assert_eq!(info.word_count, sink.len());
         assert!(sink.as_slice().contains(&0x6e69_616d));
+        assert_eq!(execution_local_size(sink.as_slice()), [1, 1, 1]);
+    }
+
+    #[test]
+    fn unsupported_spirv_versions_fail_before_writing_words() {
+        let builder = PcuDispatchKernelBuilder::<1>::new(1, "main", [64, 1, 1]);
+        let kernel = builder.ir();
+        for version in [
+            super::super::PcuSpirvVersion(0),
+            super::super::PcuSpirvVersion(0x0002_0000),
+            super::super::PcuSpirvVersion(0x0001_0700),
+            super::super::PcuSpirvVersion(0x0001_0400),
+            super::super::PcuSpirvVersion(0x0001_0500),
+            super::super::PcuSpirvVersion(0x0001_0600),
+            super::super::PcuSpirvVersion(0x0001_0001),
+            super::super::PcuSpirvVersion(0x0101_0000),
+        ] {
+            let mut sink = PcuSpirvFixedSink::<64>::new();
+            let result = lower_dispatch_to_spirv(
+                &kernel,
+                PcuSpirvLoweringOptions::minimal_shader().with_version(version),
+                &mut sink,
+            );
+            assert_eq!(result, Err(PcuSpirvError::UnsupportedVersion(version)));
+            assert!(sink.is_empty());
+        }
     }
 
     #[test]
@@ -431,7 +668,7 @@ mod tests {
             .expect("test builder should accept add")
             .with_resource_op(PcuDispatchResourceOp::Store)
             .expect("test builder should accept output store")
-            .with_control_op(crate::PcuDispatchControlOp::Return)
+            .with_control_op(fusion_pcu::PcuDispatchControlOp::Return)
             .expect("test builder should accept return");
         let kernel = builder.ir();
         let mut sink = PcuSpirvFixedSink::<256>::new();
@@ -446,6 +683,7 @@ mod tests {
         assert_eq!(sink.as_slice()[0], SPIRV_MAGIC);
         assert_eq!(info.bound, super::super::PARALLEL_FLOAT_BOUND);
         assert_eq!(info.word_count, sink.len());
+        assert_eq!(execution_local_size(sink.as_slice()), [1, 1, 1]);
         assert!(
             sink.as_slice()
                 .iter()
@@ -456,6 +694,145 @@ mod tests {
                 .iter()
                 .any(|word| (*word & 0xffff) == u32::from(super::super::OP_STORE))
         );
+    }
+
+    #[test]
+    fn operandful_parallel_float_map_lowers_to_storage_buffer_compute() {
+        let bindings = [
+            PcuBinding::value(
+                Some("input_a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::f32(),
+            ),
+            PcuBinding::value(
+                Some("input_b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::f32(),
+            ),
+            PcuBinding::value(
+                Some("output"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                PcuValueType::f32(),
+            ),
+        ];
+        let builder = PcuDispatchKernelBuilder::<9>::new(8, "main", [64, 1, 1])
+            .with_bindings(&bindings)
+            .with_data_op(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            })
+            .expect("test builder should accept input load")
+            .with_data_op(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(2),
+                value: PcuParameterValue::from_f32_bits(0x4000_0000),
+            })
+            .expect("test builder should accept constant")
+            .with_data_op(PcuDispatchDataOp::Alu {
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Mul,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            })
+            .expect("test builder should accept multiply")
+            .with_data_op(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(4),
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+            })
+            .expect("test builder should accept input load")
+            .with_data_op(PcuDispatchDataOp::Alu {
+                result: PcuDispatchValueId(5),
+                op: PcuDispatchAluOp::Add,
+                lhs: PcuDispatchValueId(3),
+                rhs: PcuDispatchValueId(4),
+            })
+            .expect("test builder should accept add")
+            .with_data_op(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(6),
+                value: PcuParameterValue::from_f32_bits(0x3f80_0000),
+            })
+            .expect("test builder should accept constant")
+            .with_data_op(PcuDispatchDataOp::Alu {
+                result: PcuDispatchValueId(7),
+                op: PcuDispatchAluOp::Add,
+                lhs: PcuDispatchValueId(5),
+                rhs: PcuDispatchValueId(6),
+            })
+            .expect("test builder should accept add")
+            .with_data_op(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(7),
+            })
+            .expect("test builder should accept output store")
+            .with_control_op(fusion_pcu::PcuDispatchControlOp::Return)
+            .expect("test builder should accept return");
+        let kernel = builder.ir();
+        let mut sink = PcuSpirvFixedSink::<256>::new();
+
+        let info = lower_dispatch_to_spirv(
+            &kernel,
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut sink,
+        )
+        .expect("operandful parallel float map should lower");
+
+        assert_eq!(sink.as_slice()[0], SPIRV_MAGIC);
+        assert_eq!(info.bound, 37);
+        assert_eq!(info.word_count, sink.len());
+        assert_eq!(execution_local_size(sink.as_slice()), [1, 1, 1]);
+        assert!(
+            sink.as_slice()
+                .iter()
+                .any(|word| (*word & 0xffff) == u32::from(super::super::OP_F_ADD))
+        );
+    }
+
+    #[test]
+    fn typed_f32_builder_program_lowers_to_spirv() {
+        let bindings = [
+            PcuBinding::value(
+                Some("input"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::f32(),
+            ),
+            PcuBinding::value(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                PcuValueType::f32(),
+            ),
+        ];
+        let (builder, input) =
+            fusion_pcu::F32MapBuilder::<8>::new(9, "main", [64, 1, 1], &bindings)
+                .load_f32(PcuBindingRef::new(0, 0))
+                .unwrap();
+        let (builder, bias) = builder.constant(0.5).unwrap();
+        let (builder, result) = builder.add(input, bias).unwrap();
+        let builder = builder.store_f32(PcuBindingRef::new(0, 1), result).unwrap();
+        let mut sink = PcuSpirvFixedSink::<256>::new();
+        lower_dispatch_to_spirv(
+            &builder.ir(),
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.as_slice()[0], SPIRV_MAGIC);
     }
 
     #[test]
@@ -549,8 +926,8 @@ mod tests {
 
     #[test]
     fn unsupported_value_type_is_reported() {
-        let parameter = [crate::PcuParameter {
-            slot: crate::PcuParameterSlot(0),
+        let parameter = [fusion_pcu::PcuParameter {
+            slot: fusion_pcu::PcuParameterSlot(0),
             name: Some("wide"),
             value_type: PcuValueType::f64(),
         }];
@@ -597,5 +974,22 @@ mod tests {
             error,
             PcuSpirvError::UnsupportedCapability(PcuSpirvCapability::CoordinateDerivative)
         );
+    }
+
+    fn execution_local_size(words: &[u32]) -> [u32; 3] {
+        let mut offset = 5;
+        while offset < words.len() {
+            let instruction = words[offset];
+            let word_count = (instruction >> 16) as usize;
+            let opcode = instruction as u16;
+            assert!(word_count > 0, "malformed SPIR-V instruction");
+            if opcode == super::super::OP_EXECUTION_MODE
+                && words[offset + 2] == super::super::EXECUTION_MODE_LOCAL_SIZE
+            {
+                return [words[offset + 3], words[offset + 4], words[offset + 5]];
+            }
+            offset += word_count;
+        }
+        panic!("module has no LocalSize execution mode");
     }
 }

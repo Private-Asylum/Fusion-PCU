@@ -1,0 +1,19 @@
+[package]
+name = "fusion-pcu-spirv"
+description = "SPIR-V lowering backend for Fusion PCU"
+documentation = ""
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "spirv.rs"
+
+[dependencies]
+fusion-pcu.workspace = true
+
+[lints]
+workspace = true

@@ -16,7 +16,9 @@ hosted = ["fusion-pcu/hosted"]
 std = ["fusion-pcu/std"]
 
 [dependencies]
-fusion-pcu = { workspace = true, features = ["backend-spirv", "runner-vulkan"] }
+fusion-pcu.workspace = true
+fusion-pcu-runner = { workspace = true, features = ["runner-vulkan"] }
+fusion-pcu-macros.workspace = true
 winit.workspace = true
 
 [lints]

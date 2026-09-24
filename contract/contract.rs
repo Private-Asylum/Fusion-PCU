@@ -95,20 +95,3 @@ pub trait PcuBaseContract {
         self.support().supports_kernel_cpu_fallback(kernel)
     }
 }
-
-/// Control contract for generic PCU backends.
-pub trait PcuControlContract: PcuBaseContract {
-    /// Claims one PCU execution substrate exclusively.
-    ///
-    /// # Errors
-    ///
-    /// Returns an honest error when the executor is unknown, unsupported, or already claimed.
-    fn claim_executor(&self, executor: PcuExecutorId) -> Result<PcuExecutorClaim, PcuError>;
-
-    /// Releases one previously claimed execution substrate.
-    ///
-    /// # Errors
-    ///
-    /// Returns an honest error when the claim no longer matches backend state.
-    fn release_executor(&self, claim: PcuExecutorClaim) -> Result<(), PcuError>;
-}

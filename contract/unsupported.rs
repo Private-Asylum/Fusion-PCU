@@ -2,11 +2,7 @@
 
 use super::{
     PcuBaseContract,
-    PcuControlContract,
-    PcuError,
-    PcuExecutorClaim,
     PcuExecutorDescriptor,
-    PcuExecutorId,
     PcuSupport,
 };
 
@@ -29,15 +25,5 @@ impl PcuBaseContract for UnsupportedPcu {
 
     fn executors(&self) -> &'static [PcuExecutorDescriptor] {
         &[]
-    }
-}
-
-impl PcuControlContract for UnsupportedPcu {
-    fn claim_executor(&self, _executor: PcuExecutorId) -> Result<PcuExecutorClaim, PcuError> {
-        Err(PcuError::unsupported())
-    }
-
-    fn release_executor(&self, _claim: PcuExecutorClaim) -> Result<(), PcuError> {
-        Err(PcuError::unsupported())
     }
 }

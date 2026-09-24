@@ -2,30 +2,22 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
-use fusion_pcu::model::PcuDispatchKernelBuilder;
-use fusion_pcu::runner::{
+use fusion_pcu_runner::{
     PcuDispatchReport,
     PcuRunnerError,
     PcuRuntime,
 };
 use fusion_pcu::{
-    PcuBinding,
-    PcuBindingAccess,
     PcuBindingRef,
-    PcuBindingStorageClass,
-    PcuDispatchAluOp,
-    PcuDispatchControlOp,
-    PcuDispatchResourceOp,
     PcuDispatchSubmission,
-    PcuDispatchValueOp,
     PcuError,
     PcuInvocationBinding,
     PcuInvocationBuffer,
     PcuInvocationParameters,
     PcuInvocationShape,
     PcuInvocationTarget,
-    PcuValueType,
 };
+use fusion_pcu_macros::pcu_dispatch;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -43,7 +35,6 @@ const WINDOW_WIDTH: f64 = 960.0;
 const WINDOW_HEIGHT: f64 = 540.0;
 const ELEMENT_COUNT: usize = 256;
 const WORK_ITEMS: u32 = 256;
-const LOCAL_SIZE_X: u32 = WORK_ITEMS;
 
 fn main() {
     if let Err(error) = run() {
@@ -90,7 +81,10 @@ impl ExampleApp {
             "fusion-vulkan-example: dispatched {} PCU work items through {} on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
             report.dispatch.execution.work_items,
             report.dispatch.runner_id,
-            report.device_name.as_deref().unwrap_or("unknown device"),
+            report
+                .device_name
+                .as_deref()
+                .map_or("unknown device", core::convert::identity),
             report.dispatch.execution.resource_model,
             report.dispatch.execution.dispatch_groups,
             report.dispatch.spirv_words,
@@ -154,8 +148,8 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
     let mut output = [0_u32; ELEMENT_COUNT];
     fill_inputs(&mut source, &mut bias)?;
 
-    let bindings = parallel_float_bindings();
-    let builder = build_parallel_float_kernel(&bindings)?;
+    let bindings = parallel_float_kernel_bindings();
+    let builder = parallel_float_kernel(&bindings).map_err(ExampleError::Pcu)?;
     let kernel = builder.ir();
     let runtime = PcuRuntime::auto().map_err(ExampleError::Runner)?;
     let work_items = NonZeroU32::new(WORK_ITEMS).ok_or(ExampleError::BufferTooLarge)?;
@@ -183,33 +177,14 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
     })
 }
 
-const fn parallel_float_bindings() -> [PcuBinding<'static>; 3] {
-    [
-        PcuBinding::value(
-            Some("input_a"),
-            0,
-            0,
-            PcuBindingStorageClass::Storage,
-            PcuBindingAccess::ReadOnly,
-            PcuValueType::f32(),
-        ),
-        PcuBinding::value(
-            Some("input_b"),
-            0,
-            1,
-            PcuBindingStorageClass::Storage,
-            PcuBindingAccess::ReadOnly,
-            PcuValueType::f32(),
-        ),
-        PcuBinding::value(
-            Some("output"),
-            0,
-            2,
-            PcuBindingStorageClass::Storage,
-            PcuBindingAccess::WriteOnly,
-            PcuValueType::f32(),
-        ),
-    ]
+#[pcu_dispatch(kernel_id = 1, threads = 256)]
+fn parallel_float_kernel(
+    input_a: read_storage<f32>,
+    input_b: read_storage<f32>,
+    output: write_storage<f32>,
+) {
+    let thread = context.thread;
+    output[thread] = input_a[thread] * 2.0 + input_b[thread] + 1.0;
 }
 
 const fn parallel_float_invocation_bindings<'a>(
@@ -231,29 +206,6 @@ const fn parallel_float_invocation_bindings<'a>(
             buffer: PcuInvocationBuffer::WordsOut(output),
         },
     ]
-}
-
-fn build_parallel_float_kernel<'a>(
-    bindings: &'a [PcuBinding<'a>],
-) -> Result<PcuDispatchKernelBuilder<'a, 8>, ExampleError> {
-    PcuDispatchKernelBuilder::<8>::new(1, "main", [LOCAL_SIZE_X, 1, 1])
-        .with_bindings(bindings)
-        .with_resource_op(PcuDispatchResourceOp::Load)
-        .map_err(ExampleError::Pcu)?
-        .with_resource_op(PcuDispatchResourceOp::Load)
-        .map_err(ExampleError::Pcu)?
-        .with_arithmetic_op(PcuDispatchAluOp::Mul)
-        .map_err(ExampleError::Pcu)?
-        .with_arithmetic_op(PcuDispatchAluOp::Add)
-        .map_err(ExampleError::Pcu)?
-        .with_value_op(PcuDispatchValueOp::Constant)
-        .map_err(ExampleError::Pcu)?
-        .with_arithmetic_op(PcuDispatchAluOp::Add)
-        .map_err(ExampleError::Pcu)?
-        .with_resource_op(PcuDispatchResourceOp::Store)
-        .map_err(ExampleError::Pcu)?
-        .with_control_op(PcuDispatchControlOp::Return)
-        .map_err(ExampleError::Pcu)
 }
 
 fn fill_inputs(

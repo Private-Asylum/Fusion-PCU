@@ -310,23 +310,3 @@ mod tests {
         );
     }
 }
-
-/// Exclusive execution-substrate claim returned by one backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PcuExecutorClaim {
-    pub(crate) executor: PcuExecutorId,
-}
-
-impl PcuExecutorClaim {
-    /// Creates one exclusive execution-substrate claim from one validated executor id.
-    #[must_use]
-    pub const fn new(executor: PcuExecutorId) -> Self {
-        Self { executor }
-    }
-
-    /// Returns the claimed execution substrate identifier.
-    #[must_use]
-    pub const fn executor(self) -> PcuExecutorId {
-        self.executor
-    }
-}

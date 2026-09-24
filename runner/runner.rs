@@ -6,24 +6,24 @@ use std::error::Error;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::backends::spirv::{
-    lower_dispatch_to_spirv,
-    PcuSpirvError,
-    PcuSpirvFixedSink,
-    PcuSpirvLoweringOptions,
-};
-use crate::dispatch::{
+use fusion_pcu::dispatch::{
     validate_dispatch_submission,
     validate_invocation_bindings,
     validate_parameters,
 };
-use crate::{
+use fusion_pcu::{
     PcuDispatchSubmission,
     PcuError,
     PcuInvocationBinding,
     PcuInvocationBindings,
     PcuInvocationParameters,
     PcuKernelIrContract,
+};
+use fusion_pcu_spirv::{
+    lower_dispatch_to_spirv,
+    PcuSpirvError,
+    PcuSpirvFixedSink,
+    PcuSpirvLoweringOptions,
 };
 
 #[cfg(feature = "runner-vulkan")]
@@ -152,14 +152,15 @@ impl PcuRunnerRegistry {
         (descriptor.open)()
     }
 
+    #[cfg(feature = "runner-vulkan")]
     fn register_unchecked(&mut self, descriptor: PcuRunnerDescriptor) {
         self.descriptors.push(descriptor);
     }
 }
 
-fn register_compiled_runners(registry: &mut PcuRunnerRegistry) {
+fn register_compiled_runners(_registry: &mut PcuRunnerRegistry) {
     #[cfg(feature = "runner-vulkan")]
-    registry.register_unchecked(vulkan::PCU_VULKAN_RUNNER_DESCRIPTOR);
+    _registry.register_unchecked(vulkan::PCU_VULKAN_RUNNER_DESCRIPTOR);
 }
 
 /// Opened PCU runtime selected from a runner registry.
@@ -258,7 +259,9 @@ impl PcuRuntime {
             words: sink.as_slice(),
             word_count: info.word_count,
             bound: info.bound,
-            local_size: submission.kernel.entry.logical_shape,
+            // The current SPIR-V profile emits one invocation per workgroup. The kernel's
+            // logical shape describes the total work, not the shader's LocalSize.
+            local_size: [1, 1, 1],
         };
         let execution = self
             .runner

@@ -1,0 +1,25 @@
+[package]
+name = "fusion-pcu-runner"
+description = "Hosted runner and runtime selection for Fusion PCU"
+documentation = ""
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "runner.rs"
+
+[features]
+default = []
+runner-vulkan = ["dep:ash"]
+
+[dependencies]
+fusion-pcu.workspace = true
+fusion-pcu-spirv.workspace = true
+ash = { workspace = true, optional = true }
+
+[lints]
+workspace = true

@@ -4,6 +4,11 @@
 //! may consume the generated words elsewhere; this backend only lowers PCU dispatch IR into
 //! backend-neutral SPIR-V module bytes.
 
+#![no_std]
+
+#[cfg(test)]
+extern crate std;
+
 pub mod error;
 pub mod lower;
 pub mod module;

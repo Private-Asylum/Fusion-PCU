@@ -14,6 +14,7 @@ use crate::{
     PcuParameter,
     PcuParameterSlot,
     PcuParameterValue,
+    PcuValueType,
     PcuPort,
     PcuBindingRef,
 };
@@ -47,6 +48,19 @@ pub enum PcuOperand<'a> {
     Parameter(PcuParameterSlot),
     Target(PcuTarget<'a>),
     PreviousResult,
+    /// Explicitly references the result of an earlier typed command read.
+    Result(PcuCommandResultId),
+}
+
+/// Stable ID for a value produced by a typed command operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuCommandResultId(pub u16);
+
+/// Typed value produced by a command operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuCommandResult {
+    pub id: PcuCommandResultId,
+    pub value_type: PcuValueType,
 }
 
 /// Mutation operation applied by one command step.
@@ -79,6 +93,16 @@ pub enum PcuCommandPredicate<'a> {
 pub enum PcuCommandOp<'a> {
     Read {
         target: PcuTarget<'a>,
+    },
+    /// Reads a typed scalar value and defines an explicitly addressable result.
+    ///
+    /// `width_bits` and `effect` are retained as declared operation metadata so the shared
+    /// validator can reject inconsistent model payloads before a backend sees them.
+    ReadResult {
+        target: PcuTarget<'a>,
+        result: PcuCommandResult,
+        width_bits: u8,
+        effect: PcuCommandEffectKind,
     },
     Write {
         target: PcuTarget<'a>,
@@ -116,7 +140,7 @@ impl PcuCommandOp<'_> {
     #[must_use]
     pub const fn effect_kind(self) -> PcuCommandEffectKind {
         match self {
-            Self::Read { .. } => PcuCommandEffectKind::Read,
+            Self::Read { .. } | Self::ReadResult { .. } => PcuCommandEffectKind::Read,
             Self::Write { .. } | Self::Copy { .. } => PcuCommandEffectKind::Write,
             Self::Modify { .. } => PcuCommandEffectKind::Transform,
             Self::Invoke { .. } => PcuCommandEffectKind::Control,
@@ -129,7 +153,7 @@ impl PcuCommandOp<'_> {
     #[must_use]
     pub const fn support_flag(self) -> PcuCommandOpCaps {
         match self {
-            Self::Read { .. } => PcuCommandOpCaps::READ,
+            Self::Read { .. } | Self::ReadResult { .. } => PcuCommandOpCaps::READ,
             Self::Write { .. } => PcuCommandOpCaps::WRITE,
             Self::Modify { .. } => PcuCommandOpCaps::MODIFY,
             Self::Copy { .. } => PcuCommandOpCaps::COPY,

@@ -108,3 +108,5 @@ impl fmt::Display for PcuError {
         self.kind.fmt(f)
     }
 }
+
+impl core::error::Error for PcuError {}

@@ -4,8 +4,6 @@
 //! - generic PCU contract law
 //! - generic execution-profile IR law
 //! - backend-neutral validation vocabulary
-//! - optional target-IR compiler backends
-//! - optional hosted/device runners behind explicit feature gates
 //!
 //! It intentionally does not own:
 //! - platform/provider selection
@@ -18,20 +16,30 @@
 #[cfg(test)]
 extern crate std;
 
-#[cfg(feature = "backend-spirv")]
-#[path = "backends/backends.rs"]
-pub mod backends;
+pub mod activation;
+pub mod assessment;
+pub mod builder;
 #[path = "contract/contract.rs"]
 pub mod contract;
 pub mod core;
+pub mod dialect;
+pub mod discovery;
 pub mod dispatch;
 pub mod ir;
+pub mod memory;
 #[path = "model/model.rs"]
 pub mod model;
-#[cfg(feature = "runner-vulkan")]
-#[path = "runner/runner.rs"]
-pub mod runner;
+pub mod owned;
+pub mod registry;
 pub mod validation;
 
 pub use contract::*;
+pub use activation::*;
+pub use assessment::*;
+pub use builder::*;
 pub use dispatch::*;
+pub use dialect::*;
+pub use discovery::*;
+pub use memory::*;
+pub use owned::*;
+pub use registry::*;

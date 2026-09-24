@@ -1,0 +1,20 @@
+[package]
+name = "fusion-pcu-rocm"
+description = "HIP runtime substrate for Fusion PCU on AMD GPUs"
+documentation = ""
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "rocm.rs"
+
+[dependencies]
+fusion-pcu.workspace = true
+libloading = "0.8"
+
+[lints]
+workspace = true

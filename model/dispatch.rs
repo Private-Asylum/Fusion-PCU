@@ -10,6 +10,7 @@ use core::ops::{
 use crate::{
     PcuBinding,
     PcuBindingAccess,
+    PcuBindingRef,
     PcuBindingStorageClass,
     PcuDispatchPolicyCaps,
     PcuDispatchOpCaps,
@@ -20,6 +21,7 @@ use crate::{
     PcuKernelId,
     PcuKernelSignature,
     PcuParameter,
+    PcuParameterValue,
     PcuPort,
     PcuInvocationModel,
     PcuIrKind,
@@ -81,6 +83,7 @@ pub enum PcuDispatchOp<'a> {
     Arithmetic(PcuDispatchAluOp),
     Control(PcuDispatchControlOp),
     Resource(PcuDispatchResourceOp),
+    Data(PcuDispatchDataOp),
     Coordinate(PcuDispatchCoordinateOp),
     RayTrace(PcuDispatchRayTraceOp),
     Port(PcuDispatchPortOp),
@@ -96,11 +99,60 @@ impl PcuDispatchOp<'_> {
             Self::Arithmetic(op) => op.support_flag(),
             Self::Control(op) => op.support_flag(),
             Self::Resource(op) => op.support_flag(),
+            Self::Data(op) => op.support_flag(),
             Self::Coordinate(op) => op.support_flag(),
             Self::RayTrace(op) => op.support_flag(),
             Self::Port(op) => op.support_flag(),
             Self::Sync(op) => op.support_flag(),
             Self::Intrinsic { .. } => PcuDispatchOpCaps::INTRINSIC,
+        }
+    }
+}
+
+/// Virtual value id inside one operandful dispatch program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuDispatchValueId(pub u16);
+
+/// Index expression for binding loads/stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuDispatchIndex {
+    InvocationId,
+    Value(PcuDispatchValueId),
+}
+
+/// Operandful dispatch instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuDispatchDataOp {
+    BindingLoad {
+        result: PcuDispatchValueId,
+        binding: PcuBindingRef,
+        index: PcuDispatchIndex,
+    },
+    Constant {
+        result: PcuDispatchValueId,
+        value: PcuParameterValue,
+    },
+    Alu {
+        result: PcuDispatchValueId,
+        op: PcuDispatchAluOp,
+        lhs: PcuDispatchValueId,
+        rhs: PcuDispatchValueId,
+    },
+    BindingStore {
+        binding: PcuBindingRef,
+        index: PcuDispatchIndex,
+        value: PcuDispatchValueId,
+    },
+}
+
+impl PcuDispatchDataOp {
+    #[must_use]
+    pub const fn support_flag(self) -> PcuDispatchOpCaps {
+        match self {
+            Self::BindingLoad { .. } => PcuDispatchOpCaps::BINDING_LOAD,
+            Self::Constant { .. } => PcuDispatchOpCaps::VALUE_CONSTANT,
+            Self::Alu { op, .. } => op.support_flag(),
+            Self::BindingStore { .. } => PcuDispatchOpCaps::BINDING_STORE,
         }
     }
 }
@@ -217,10 +269,34 @@ impl PcuDispatchKernelIr<'_> {
         flags
     }
 
-    /// Returns the value/type support floor required to execute this dispatch kernel honestly.
+    /// Returns the value/type support floor derived from the kernel's typed interface and
+    /// constants, plus any explicitly requested capabilities.
     #[must_use]
-    pub const fn required_type_support(&self) -> PcuValueTypeCaps {
-        self.type_caps
+    pub fn required_type_support(&self) -> PcuValueTypeCaps {
+        let mut required = self.type_caps;
+        for binding in self.bindings {
+            if let Some(value_type) = binding.value_type() {
+                required = required.union(PcuValueTypeCaps::for_value_type(value_type));
+            }
+            if let Some(image_type) = binding.image_type() {
+                required = required.union(PcuValueTypeCaps::for_value_type(image_type.texel_type));
+                required = required.union(PcuValueTypeCaps::for_value_type(
+                    image_type.coordinate_type(),
+                ));
+            }
+        }
+        for port in self.ports {
+            required = required.union(PcuValueTypeCaps::for_value_type(port.value_type));
+        }
+        for parameter in self.parameters {
+            required = required.union(PcuValueTypeCaps::for_value_type(parameter.value_type));
+        }
+        for op in self.ops {
+            if let PcuDispatchOp::Data(PcuDispatchDataOp::Constant { value, .. }) = op {
+                required = required.union(PcuValueTypeCaps::for_value_type(value.value_type()));
+            }
+        }
+        required
     }
 
     /// Returns the dispatch-only feature floor required to execute this kernel honestly.
@@ -415,6 +491,15 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
         self.with_op(PcuDispatchOp::Resource(op))
     }
 
+    /// Appends one operandful data operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceExhausted` when the builder op capacity is exhausted.
+    pub fn with_data_op(self, op: PcuDispatchDataOp) -> Result<Self, PcuError> {
+        self.with_op(PcuDispatchOp::Data(op))
+    }
+
     /// Appends one coordinate-oriented operation.
     ///
     /// # Errors
@@ -527,10 +612,13 @@ mod tests {
         PcuBindingAccess,
         PcuBindingStorageClass,
         PcuDispatchOpCaps,
+        PcuDispatchDataOp,
+        PcuDispatchValueId,
         PcuDispatchPolicyCaps,
         PcuIrKind,
         PcuKernel,
         PcuKernelIrContract,
+        PcuParameterValue,
         PcuValueType,
         PcuValueTypeCaps,
     };
@@ -648,6 +736,30 @@ mod tests {
                 .required_type_support()
                 .contains(PcuValueTypeCaps::SCALAR_VALUES)
         );
+    }
+
+    #[test]
+    fn dispatch_type_requirements_include_bindings_and_constants() {
+        let bindings = [PcuBinding::value(
+            Some("input"),
+            0,
+            0,
+            PcuBindingStorageClass::Storage,
+            PcuBindingAccess::ReadOnly,
+            PcuValueType::f32(),
+        )];
+        let builder = PcuDispatchKernelBuilder::<1>::new(6, "main", [1, 1, 1])
+            .with_bindings(&bindings)
+            .with_data_op(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(1),
+                value: PcuParameterValue::U32(1),
+            })
+            .expect("one constant fits");
+        let kernel = builder.ir();
+
+        assert!(kernel.required_type_support().contains(
+            PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES
+        ));
     }
 
     #[test]

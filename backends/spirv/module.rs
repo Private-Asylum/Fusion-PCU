@@ -7,6 +7,18 @@ use super::{
     PcuSpirvModuleInfo,
     PcuSpirvSink,
 };
+use fusion_pcu::{
+    PcuBindingAccess,
+    PcuBindingRef,
+    PcuDispatchAluOp,
+    PcuDispatchControlOp,
+    PcuDispatchDataOp,
+    PcuDispatchIndex,
+    PcuDispatchKernelIr,
+    PcuDispatchOp,
+    PcuDispatchValueId,
+    PcuParameterValue,
+};
 
 pub const SPIRV_MAGIC: u32 = 0x0723_0203;
 
@@ -32,7 +44,9 @@ pub(crate) const OP_ACCESS_CHAIN: u16 = 65;
 pub(crate) const OP_DECORATE: u16 = 71;
 pub(crate) const OP_MEMBER_DECORATE: u16 = 72;
 pub(crate) const OP_F_ADD: u16 = 129;
+pub(crate) const OP_F_SUB: u16 = 131;
 pub(crate) const OP_F_MUL: u16 = 133;
+pub(crate) const OP_F_DIV: u16 = 136;
 pub(crate) const OP_LABEL: u16 = 248;
 pub(crate) const OP_RETURN: u16 = 253;
 
@@ -41,6 +55,9 @@ pub(crate) const ADDRESSING_MODEL_LOGICAL: u32 = 0;
 pub(crate) const MEMORY_MODEL_GLSL450: u32 = 1;
 pub(crate) const EXECUTION_MODEL_GL_COMPUTE: u32 = 5;
 pub(crate) const EXECUTION_MODE_LOCAL_SIZE: u32 = 17;
+/// The first bounded lowering profile uses one invocation per workgroup. The PCU logical
+/// shape describes the dispatch extent and is supplied by the host through group counts.
+pub(crate) const DEFAULT_LOCAL_SIZE: [u32; 3] = [1, 1, 1];
 pub(crate) const FUNCTION_CONTROL_NONE: u32 = 0;
 pub(crate) const STORAGE_CLASS_INPUT: u32 = 1;
 pub(crate) const STORAGE_CLASS_UNIFORM: u32 = 2;
@@ -86,6 +103,21 @@ pub(crate) const PARALLEL_FLOAT_SUM_ID: u32 = 29;
 pub(crate) const PARALLEL_FLOAT_RESULT_ID: u32 = 30;
 pub(crate) const PARALLEL_FLOAT_BOUND: u32 = 31;
 
+const DATAFLOW_UINT_TYPE_ID: u32 = 5;
+const DATAFLOW_UINT_ZERO_ID: u32 = 6;
+const DATAFLOW_FLOAT_TYPE_ID: u32 = 7;
+const DATAFLOW_VEC3_UINT_TYPE_ID: u32 = 8;
+const DATAFLOW_PTR_INPUT_VEC3_UINT_TYPE_ID: u32 = 9;
+const DATAFLOW_PTR_INPUT_UINT_TYPE_ID: u32 = 10;
+const DATAFLOW_RUNTIME_ARRAY_TYPE_ID: u32 = 11;
+const DATAFLOW_BUFFER_TYPE_ID: u32 = 12;
+const DATAFLOW_PTR_UNIFORM_BUFFER_TYPE_ID: u32 = 13;
+const DATAFLOW_PTR_UNIFORM_FLOAT_TYPE_ID: u32 = 14;
+const DATAFLOW_GLOBAL_INVOCATION_ID_VAR_ID: u32 = 15;
+const DATAFLOW_INDEX_PTR_ID: u32 = 16;
+const DATAFLOW_INDEX_ID: u32 = 17;
+const DATAFLOW_BINDING_VAR_BASE_ID: u32 = 18;
+
 /// Stateful SPIR-V writer over a caller-owned sink.
 pub(crate) struct PcuSpirvWriter<'a, S: PcuSpirvSink> {
     sink: &'a mut S,
@@ -103,7 +135,6 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
     pub(crate) fn emit_minimal_compute_module(
         &mut self,
         entry_point: &str,
-        local_size: [u32; 3],
         options: PcuSpirvLoweringOptions,
     ) -> Result<PcuSpirvModuleInfo, PcuSpirvError> {
         self.push_header(options, DEFAULT_BOUND)?;
@@ -118,9 +149,9 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
             &[
                 ENTRY_POINT_ID,
                 EXECUTION_MODE_LOCAL_SIZE,
-                local_size[0],
-                local_size[1],
-                local_size[2],
+                DEFAULT_LOCAL_SIZE[0],
+                DEFAULT_LOCAL_SIZE[1],
+                DEFAULT_LOCAL_SIZE[2],
             ],
         )?;
         self.push_instruction(OP_TYPE_VOID, &[VOID_TYPE_ID])?;
@@ -149,7 +180,6 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
     pub(crate) fn emit_parallel_float_map_module(
         &mut self,
         entry_point: &str,
-        local_size: [u32; 3],
         options: PcuSpirvLoweringOptions,
     ) -> Result<PcuSpirvModuleInfo, PcuSpirvError> {
         self.push_header(options, PARALLEL_FLOAT_BOUND)?;
@@ -167,9 +197,9 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
             &[
                 ENTRY_POINT_ID,
                 EXECUTION_MODE_LOCAL_SIZE,
-                local_size[0],
-                local_size[1],
-                local_size[2],
+                DEFAULT_LOCAL_SIZE[0],
+                DEFAULT_LOCAL_SIZE[1],
+                DEFAULT_LOCAL_SIZE[2],
             ],
         )?;
         self.push_parallel_float_decorations()?;
@@ -179,6 +209,44 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
         Ok(PcuSpirvModuleInfo {
             version: options.version,
             bound: PARALLEL_FLOAT_BOUND,
+            word_count: self.word_count,
+            capabilities: PcuSpirvCapabilityCaps::SHADER,
+        })
+    }
+
+    pub(crate) fn emit_f32_dataflow_map_module(
+        &mut self,
+        kernel: &PcuDispatchKernelIr<'_>,
+        options: PcuSpirvLoweringOptions,
+    ) -> Result<PcuSpirvModuleInfo, PcuSpirvError> {
+        let bound = dataflow_bound(kernel)?;
+        self.push_header(options, bound)?;
+        self.push_instruction(OP_CAPABILITY, &[CAPABILITY_SHADER])?;
+        self.push_instruction(
+            OP_MEMORY_MODEL,
+            &[ADDRESSING_MODEL_LOGICAL, MEMORY_MODEL_GLSL450],
+        )?;
+        self.push_entry_point_with_interface(
+            kernel.entry.name,
+            &[DATAFLOW_GLOBAL_INVOCATION_ID_VAR_ID],
+        )?;
+        self.push_instruction(
+            OP_EXECUTION_MODE,
+            &[
+                ENTRY_POINT_ID,
+                EXECUTION_MODE_LOCAL_SIZE,
+                DEFAULT_LOCAL_SIZE[0],
+                DEFAULT_LOCAL_SIZE[1],
+                DEFAULT_LOCAL_SIZE[2],
+            ],
+        )?;
+        self.push_f32_dataflow_decorations(kernel)?;
+        self.push_f32_dataflow_types_constants_and_variables(kernel)?;
+        self.push_f32_dataflow_function(kernel)?;
+
+        Ok(PcuSpirvModuleInfo {
+            version: options.version,
+            bound,
             word_count: self.word_count,
             capabilities: PcuSpirvCapabilityCaps::SHADER,
         })
@@ -257,6 +325,40 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
             &[variable_id, DECORATION_DESCRIPTOR_SET, descriptor_set],
         )?;
         self.push_instruction(OP_DECORATE, &[variable_id, DECORATION_BINDING, binding])
+    }
+
+    fn push_f32_dataflow_decorations(
+        &mut self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<(), PcuSpirvError> {
+        self.push_instruction(
+            OP_DECORATE,
+            &[
+                DATAFLOW_GLOBAL_INVOCATION_ID_VAR_ID,
+                DECORATION_BUILT_IN,
+                BUILT_IN_GLOBAL_INVOCATION_ID,
+            ],
+        )?;
+        self.push_instruction(
+            OP_DECORATE,
+            &[DATAFLOW_RUNTIME_ARRAY_TYPE_ID, DECORATION_ARRAY_STRIDE, 4],
+        )?;
+        self.push_instruction(
+            OP_MEMBER_DECORATE,
+            &[DATAFLOW_BUFFER_TYPE_ID, 0, DECORATION_OFFSET, 0],
+        )?;
+        self.push_instruction(
+            OP_DECORATE,
+            &[DATAFLOW_BUFFER_TYPE_ID, DECORATION_BUFFER_BLOCK],
+        )?;
+        for (index, binding) in kernel.bindings.iter().copied().enumerate() {
+            self.push_descriptor_decorations(
+                dataflow_binding_var_id(index)?,
+                binding.set,
+                binding.binding,
+            )?;
+        }
+        Ok(())
     }
 
     fn push_parallel_float_types_and_variables(&mut self) -> Result<(), PcuSpirvError> {
@@ -369,6 +471,98 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
         )
     }
 
+    fn push_f32_dataflow_types_constants_and_variables(
+        &mut self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<(), PcuSpirvError> {
+        self.push_instruction(OP_TYPE_VOID, &[VOID_TYPE_ID])?;
+        self.push_instruction(OP_TYPE_FUNCTION, &[VOID_FUNCTION_TYPE_ID, VOID_TYPE_ID])?;
+        self.push_instruction(OP_TYPE_INT, &[DATAFLOW_UINT_TYPE_ID, 32, 0])?;
+        self.push_instruction(
+            OP_CONSTANT,
+            &[DATAFLOW_UINT_TYPE_ID, DATAFLOW_UINT_ZERO_ID, 0],
+        )?;
+        self.push_instruction(OP_TYPE_FLOAT, &[DATAFLOW_FLOAT_TYPE_ID, 32])?;
+        for op in kernel.ops.iter().copied() {
+            if let PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result,
+                value: PcuParameterValue::F32(bits),
+            }) = op
+            {
+                self.push_instruction(
+                    OP_CONSTANT,
+                    &[
+                        DATAFLOW_FLOAT_TYPE_ID,
+                        dataflow_value_id(kernel, result)?,
+                        bits,
+                    ],
+                )?;
+            }
+        }
+        self.push_instruction(
+            OP_TYPE_VECTOR,
+            &[DATAFLOW_VEC3_UINT_TYPE_ID, DATAFLOW_UINT_TYPE_ID, 3],
+        )?;
+        self.push_instruction(
+            OP_TYPE_POINTER,
+            &[
+                DATAFLOW_PTR_INPUT_VEC3_UINT_TYPE_ID,
+                STORAGE_CLASS_INPUT,
+                DATAFLOW_VEC3_UINT_TYPE_ID,
+            ],
+        )?;
+        self.push_instruction(
+            OP_TYPE_POINTER,
+            &[
+                DATAFLOW_PTR_INPUT_UINT_TYPE_ID,
+                STORAGE_CLASS_INPUT,
+                DATAFLOW_UINT_TYPE_ID,
+            ],
+        )?;
+        self.push_instruction(
+            OP_TYPE_RUNTIME_ARRAY,
+            &[DATAFLOW_RUNTIME_ARRAY_TYPE_ID, DATAFLOW_FLOAT_TYPE_ID],
+        )?;
+        self.push_instruction(
+            OP_TYPE_STRUCT,
+            &[DATAFLOW_BUFFER_TYPE_ID, DATAFLOW_RUNTIME_ARRAY_TYPE_ID],
+        )?;
+        self.push_instruction(
+            OP_TYPE_POINTER,
+            &[
+                DATAFLOW_PTR_UNIFORM_BUFFER_TYPE_ID,
+                STORAGE_CLASS_UNIFORM,
+                DATAFLOW_BUFFER_TYPE_ID,
+            ],
+        )?;
+        self.push_instruction(
+            OP_TYPE_POINTER,
+            &[
+                DATAFLOW_PTR_UNIFORM_FLOAT_TYPE_ID,
+                STORAGE_CLASS_UNIFORM,
+                DATAFLOW_FLOAT_TYPE_ID,
+            ],
+        )?;
+        for (index, _) in kernel.bindings.iter().enumerate() {
+            self.push_instruction(
+                OP_VARIABLE,
+                &[
+                    DATAFLOW_PTR_UNIFORM_BUFFER_TYPE_ID,
+                    dataflow_binding_var_id(index)?,
+                    STORAGE_CLASS_UNIFORM,
+                ],
+            )?;
+        }
+        self.push_instruction(
+            OP_VARIABLE,
+            &[
+                DATAFLOW_PTR_INPUT_VEC3_UINT_TYPE_ID,
+                DATAFLOW_GLOBAL_INVOCATION_ID_VAR_ID,
+                STORAGE_CLASS_INPUT,
+            ],
+        )
+    }
+
     fn push_parallel_float_function(&mut self) -> Result<(), PcuSpirvError> {
         self.push_instruction(
             OP_FUNCTION,
@@ -463,6 +657,126 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
         self.push_instruction(OP_FUNCTION_END, &[])
     }
 
+    fn push_f32_dataflow_function(
+        &mut self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<(), PcuSpirvError> {
+        self.push_instruction(
+            OP_FUNCTION,
+            &[
+                VOID_TYPE_ID,
+                ENTRY_POINT_ID,
+                FUNCTION_CONTROL_NONE,
+                VOID_FUNCTION_TYPE_ID,
+            ],
+        )?;
+        self.push_instruction(OP_LABEL, &[ENTRY_LABEL_ID])?;
+        self.push_instruction(
+            OP_ACCESS_CHAIN,
+            &[
+                DATAFLOW_PTR_INPUT_UINT_TYPE_ID,
+                DATAFLOW_INDEX_PTR_ID,
+                DATAFLOW_GLOBAL_INVOCATION_ID_VAR_ID,
+                DATAFLOW_UINT_ZERO_ID,
+            ],
+        )?;
+        self.push_instruction(
+            OP_LOAD,
+            &[
+                DATAFLOW_UINT_TYPE_ID,
+                DATAFLOW_INDEX_ID,
+                DATAFLOW_INDEX_PTR_ID,
+            ],
+        )?;
+        for (op_index, op) in kernel.ops.iter().copied().enumerate() {
+            match op {
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result,
+                    binding,
+                    index,
+                }) => self.push_f32_dataflow_load(kernel, op_index, result, binding, index)?,
+                PcuDispatchOp::Data(PcuDispatchDataOp::Constant { .. }) => {}
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    result,
+                    op,
+                    lhs,
+                    rhs,
+                }) => self.push_instruction(
+                    dataflow_alu_opcode(op)?,
+                    &[
+                        DATAFLOW_FLOAT_TYPE_ID,
+                        dataflow_value_id(kernel, result)?,
+                        dataflow_value_id(kernel, lhs)?,
+                        dataflow_value_id(kernel, rhs)?,
+                    ],
+                )?,
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding,
+                    index,
+                    value,
+                }) => self.push_f32_dataflow_store(kernel, op_index, binding, index, value)?,
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return) => {
+                    self.push_instruction(OP_RETURN, &[])?;
+                }
+                _ => return Err(PcuSpirvError::UnsupportedInstruction(op.support_flag())),
+            }
+        }
+        self.push_instruction(OP_FUNCTION_END, &[])
+    }
+
+    fn push_f32_dataflow_load(
+        &mut self,
+        kernel: &PcuDispatchKernelIr<'_>,
+        op_index: usize,
+        result: PcuDispatchValueId,
+        binding: PcuBindingRef,
+        index: PcuDispatchIndex,
+    ) -> Result<(), PcuSpirvError> {
+        let ptr_id = dataflow_op_ptr_id(kernel, op_index)?;
+        let variable_id = dataflow_binding_var_id(dataflow_binding_ordinal(kernel, binding)?)?;
+        self.push_f32_dataflow_access(ptr_id, variable_id, dataflow_index_id(index)?)?;
+        self.push_instruction(
+            OP_LOAD,
+            &[
+                DATAFLOW_FLOAT_TYPE_ID,
+                dataflow_value_id(kernel, result)?,
+                ptr_id,
+            ],
+        )
+    }
+
+    fn push_f32_dataflow_store(
+        &mut self,
+        kernel: &PcuDispatchKernelIr<'_>,
+        op_index: usize,
+        binding: PcuBindingRef,
+        index: PcuDispatchIndex,
+        value: PcuDispatchValueId,
+    ) -> Result<(), PcuSpirvError> {
+        let ptr_id = dataflow_op_ptr_id(kernel, op_index)?;
+        let variable_id = dataflow_binding_var_id(dataflow_binding_ordinal(kernel, binding)?)?;
+        self.push_f32_dataflow_access(ptr_id, variable_id, dataflow_index_id(index)?)?;
+        self.push_instruction(OP_STORE, &[ptr_id, dataflow_value_id(kernel, value)?])
+    }
+
+    fn push_f32_dataflow_access(
+        &mut self,
+        result_id: u32,
+        variable_id: u32,
+        index_id: u32,
+    ) -> Result<(), PcuSpirvError> {
+        self.push_instruction(
+            OP_ACCESS_CHAIN,
+            &[
+                DATAFLOW_PTR_UNIFORM_FLOAT_TYPE_ID,
+                result_id,
+                variable_id,
+                DATAFLOW_UINT_ZERO_ID,
+                index_id,
+            ],
+        )
+    }
+
     fn push_storage_float_access(
         &mut self,
         result_id: u32,
@@ -519,6 +833,127 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
         self.word_count += 1;
         Ok(())
     }
+}
+
+fn dataflow_alu_opcode(op: PcuDispatchAluOp) -> Result<u16, PcuSpirvError> {
+    match op {
+        PcuDispatchAluOp::Add => Ok(OP_F_ADD),
+        PcuDispatchAluOp::Sub => Ok(OP_F_SUB),
+        PcuDispatchAluOp::Mul => Ok(OP_F_MUL),
+        PcuDispatchAluOp::Div => Ok(OP_F_DIV),
+        _ => Err(PcuSpirvError::UnsupportedInstruction(op.support_flag())),
+    }
+}
+
+fn dataflow_bound(kernel: &PcuDispatchKernelIr<'_>) -> Result<u32, PcuSpirvError> {
+    let binding_count =
+        u32::try_from(kernel.bindings.len()).map_err(|_| PcuSpirvError::IdSpaceExhausted)?;
+    let op_count = u32::try_from(kernel.ops.len()).map_err(|_| PcuSpirvError::IdSpaceExhausted)?;
+    let max_value = u32::from(max_dataflow_value_id(kernel));
+    let value_base = DATAFLOW_BINDING_VAR_BASE_ID
+        .checked_add(binding_count)
+        .ok_or(PcuSpirvError::IdSpaceExhausted)?;
+    let ptr_base = value_base
+        .checked_add(max_value)
+        .ok_or(PcuSpirvError::IdSpaceExhausted)?;
+    ptr_base
+        .checked_add(op_count)
+        .ok_or(PcuSpirvError::IdSpaceExhausted)
+}
+
+fn dataflow_binding_var_id(index: usize) -> Result<u32, PcuSpirvError> {
+    let index = u32::try_from(index).map_err(|_| PcuSpirvError::IdSpaceExhausted)?;
+    DATAFLOW_BINDING_VAR_BASE_ID
+        .checked_add(index)
+        .ok_or(PcuSpirvError::IdSpaceExhausted)
+}
+
+fn dataflow_value_base(kernel: &PcuDispatchKernelIr<'_>) -> Result<u32, PcuSpirvError> {
+    let binding_count =
+        u32::try_from(kernel.bindings.len()).map_err(|_| PcuSpirvError::IdSpaceExhausted)?;
+    DATAFLOW_BINDING_VAR_BASE_ID
+        .checked_add(binding_count)
+        .ok_or(PcuSpirvError::IdSpaceExhausted)
+}
+
+fn dataflow_value_id(
+    kernel: &PcuDispatchKernelIr<'_>,
+    value: PcuDispatchValueId,
+) -> Result<u32, PcuSpirvError> {
+    if value.0 == 0 {
+        return Err(PcuSpirvError::InvalidKernelSignature);
+    }
+    dataflow_value_base(kernel)?
+        .checked_add(u32::from(value.0 - 1))
+        .ok_or(PcuSpirvError::IdSpaceExhausted)
+}
+
+fn dataflow_op_ptr_base(kernel: &PcuDispatchKernelIr<'_>) -> Result<u32, PcuSpirvError> {
+    dataflow_value_base(kernel)?
+        .checked_add(u32::from(max_dataflow_value_id(kernel)))
+        .ok_or(PcuSpirvError::IdSpaceExhausted)
+}
+
+fn dataflow_op_ptr_id(
+    kernel: &PcuDispatchKernelIr<'_>,
+    op_index: usize,
+) -> Result<u32, PcuSpirvError> {
+    let op_index = u32::try_from(op_index).map_err(|_| PcuSpirvError::IdSpaceExhausted)?;
+    dataflow_op_ptr_base(kernel)?
+        .checked_add(op_index)
+        .ok_or(PcuSpirvError::IdSpaceExhausted)
+}
+
+fn dataflow_binding_ordinal(
+    kernel: &PcuDispatchKernelIr<'_>,
+    binding: PcuBindingRef,
+) -> Result<usize, PcuSpirvError> {
+    kernel
+        .bindings
+        .iter()
+        .position(|candidate| {
+            candidate.set == binding.set
+                && candidate.binding == binding.binding
+                && matches!(
+                    candidate.access,
+                    PcuBindingAccess::ReadOnly
+                        | PcuBindingAccess::WriteOnly
+                        | PcuBindingAccess::ReadWrite
+                )
+        })
+        .ok_or(PcuSpirvError::InvalidBinding)
+}
+
+fn dataflow_index_id(index: PcuDispatchIndex) -> Result<u32, PcuSpirvError> {
+    match index {
+        PcuDispatchIndex::InvocationId => Ok(DATAFLOW_INDEX_ID),
+        PcuDispatchIndex::Value(_) => Err(PcuSpirvError::UnsupportedInstruction(
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            })
+            .support_flag(),
+        )),
+    }
+}
+
+fn max_dataflow_value_id(kernel: &PcuDispatchKernelIr<'_>) -> u16 {
+    let mut max_value = 0;
+    for op in kernel.ops.iter().copied() {
+        match op {
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { result, .. })
+            | PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, .. })
+            | PcuDispatchOp::Data(PcuDispatchDataOp::Alu { result, .. }) => {
+                max_value = max_value.max(result.0);
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { value, .. }) => {
+                max_value = max_value.max(value.0);
+            }
+            _ => {}
+        }
+    }
+    max_value
 }
 
 pub(crate) fn literal_string_word_count(value: &str) -> usize {

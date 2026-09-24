@@ -1,0 +1,16 @@
+[package]
+name = "fusion-pcu-tensor"
+description = "Experimental typed tensor dialect and deterministic CPU reference evaluator for Fusion PCU"
+documentation = ""
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "tensor.rs"
+
+[lints]
+workspace = true

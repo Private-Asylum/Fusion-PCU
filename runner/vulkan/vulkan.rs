@@ -14,7 +14,7 @@ use std::string::String;
 
 use ash::vk;
 
-use crate::runner::{
+use crate::{
     PcuComputeRunner,
     PcuLoweredSpirvDispatch,
     PcuResourceAddressingModel,
@@ -23,7 +23,7 @@ use crate::runner::{
     PcuRunnerExecutionReport,
     PcuRunnerHandle,
 };
-use crate::{
+use fusion_pcu::{
     PcuDispatchSubmission,
     PcuInvocationBinding,
     PcuInvocationBuffer,

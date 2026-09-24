@@ -1,0 +1,24 @@
+[package]
+name = "fusion-example-hosted-compute-rocm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "fusion-rocm-smoke"
+path = "main.rs"
+
+[[bin]]
+name = "fusion-rocm-pcu"
+path = "pcu.rs"
+
+[[bin]]
+name = "fusion-rocm-discover"
+path = "discover.rs"
+
+[dependencies]
+fusion-pcu.workspace = true
+fusion-pcu-rocm.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

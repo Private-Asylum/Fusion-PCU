@@ -1,0 +1,23 @@
+[package]
+name = "fusion-pcu-macros"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[dependencies]
+proc-macro2.workspace = true
+quote.workspace = true
+syn = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+pcu_alias = { package = "fusion-pcu", path = "..", default-features = false }
+trybuild = "1.0"
+
+[lints]
+workspace = true

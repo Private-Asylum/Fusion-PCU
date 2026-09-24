@@ -16,6 +16,7 @@ use crate::contract::{
     PcuCommandKernelIr,
     PcuDispatchKernelIr,
     PcuError,
+    PcuExecutorId,
     PcuInvocationBindings,
     PcuInvocationTarget,
     PcuInvocationParameters,
@@ -29,6 +30,7 @@ use crate::contract::{
     PcuStreamKernelIr,
     PcuTransactionKernelIr,
 };
+use crate::validation::validate_command_kernel;
 
 /// Logical invocation context surfaced to one dispatch-style kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -286,6 +288,395 @@ pub trait PcuDirectDispatchBackend: PcuBaseContract {
     ) -> Result<Self::SignalHandle, PcuError>;
 }
 
+/// Stream-family execution surface for a consumer-owned scheduler or courier.
+pub trait PcuStreamBackend: PcuBaseContract {
+    type StreamHandle: PcuPersistentHandle;
+
+    /// Installs one persistent Stream program.
+    fn install_stream(
+        &self,
+        installation: PcuStreamInstallation<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::StreamHandle, PcuError>;
+}
+
+/// Direct Stream-only backend contract.
+///
+/// This permits a PIO-like backend to implement the Stream family without placeholder handles
+/// or methods for unrelated PCU families. The broader legacy backend trait remains available
+/// while family-specific contracts are introduced incrementally.
+pub trait PcuDirectStreamBackend: PcuBaseContract {
+    type StreamHandle: PcuPersistentHandle;
+
+    /// Installs a Stream program after common structural and direct-support checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest support, binding, parameter, or backend installation error.
+    fn install_stream(
+        &self,
+        installation: PcuStreamInstallation<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::StreamHandle, PcuError> {
+        validate_direct_kernel_support(self, PcuKernel::Stream(*installation.kernel))?;
+        validate_parameters(installation.kernel.signature(), parameters)?;
+        validate_invocation_bindings(installation.kernel.signature(), bindings)?;
+        self.install_stream_direct(installation, bindings, parameters)
+    }
+
+    /// Installs a previously checked Stream program on this backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest backend installation error.
+    fn install_stream_direct(
+        &self,
+        installation: PcuStreamInstallation<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::StreamHandle, PcuError>;
+}
+
+impl<T> PcuStreamBackend for T
+where
+    T: PcuDirectStreamBackend,
+{
+    type StreamHandle = T::StreamHandle;
+
+    fn install_stream(
+        &self,
+        installation: PcuStreamInstallation<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::StreamHandle, PcuError> {
+        PcuDirectStreamBackend::install_stream(self, installation, bindings, parameters)
+    }
+}
+
+/// Stream backend that grants an exclusive, backend-bound executor lease.
+///
+/// The associated lease is an opaque backend-owned token by contract. Implementations should make
+/// it non-`Copy`, bind it to the originating backend and executor generation, and keep the claim
+/// alive for as long as installed work can use the executor. Rust cannot enforce those properties
+/// for an associated type. `install_stream_on_lease` performs common admission against the
+/// executor named by the lease; the backend method must still reject forged, foreign, or stale
+/// leases before touching the executor.
+pub trait PcuExclusiveStreamBackend: PcuBaseContract {
+    type Lease;
+    type StreamHandle: PcuPersistentHandle;
+
+    /// Claims one executor for exclusive Stream installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest invalid, unsupported, or busy error.
+    fn claim_stream_executor(&self, executor: PcuExecutorId) -> Result<Self::Lease, PcuError>;
+
+    /// Returns the executor identity carried by a lease.
+    fn lease_executor(&self, lease: &Self::Lease) -> PcuExecutorId;
+
+    /// Installs a Stream program using the selected executor lease after common admission checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest support, parameter, binding, lease, or installation error.
+    fn install_stream_on_lease(
+        &self,
+        lease: &mut Self::Lease,
+        installation: PcuStreamInstallation<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::StreamHandle, PcuError> {
+        let executor = self.lease_executor(lease);
+        if !self.executor_supports_kernel_direct(executor, PcuKernel::Stream(*installation.kernel))
+        {
+            return Err(PcuError::unsupported());
+        }
+        validate_parameters(installation.kernel.signature(), parameters)?;
+        validate_invocation_bindings(installation.kernel.signature(), bindings)?;
+        self.install_stream_on_lease_direct(lease, installation, bindings, parameters)
+    }
+
+    /// Installs one already-admitted Stream program and validates that the lease is live and
+    /// belongs to this backend before using the selected executor.
+    fn install_stream_on_lease_direct(
+        &self,
+        lease: &mut Self::Lease,
+        installation: PcuStreamInstallation<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::StreamHandle, PcuError>;
+}
+
+/// Command-family execution surface.
+///
+/// Backends that execute only sequential Command programs can implement this trait without
+/// providing placeholder handles or methods for Dispatch, Transaction, Stream, or Signal.
+pub trait PcuCommandBackend: PcuBaseContract {
+    type CommandHandle: PcuFiniteHandle;
+
+    /// Submits one finite sequential command program.
+    ///
+    /// # Errors
+    ///
+    /// Returns any honest admission, scheduling, or execution-substrate failure.
+    fn submit_command(
+        &self,
+        submission: PcuCommandSubmission<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::CommandHandle, PcuError>;
+}
+
+/// Direct Command-family backend implementation contract.
+///
+/// The default method applies the common direct-support and parameter checks before delegating to
+/// the backend implementation. It has no associated types or operations for unrelated families.
+pub trait PcuDirectCommandBackend: PcuBaseContract {
+    type CommandHandle: PcuFiniteHandle;
+
+    /// Submits one Command program after common admission checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest support, parameter, or backend execution error.
+    fn submit_command(
+        &self,
+        submission: PcuCommandSubmission<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::CommandHandle, PcuError> {
+        validate_direct_kernel_support(self, PcuKernel::Command(*submission.kernel))?;
+        validate_command_kernel(submission.kernel).map_err(|_| PcuError::invalid())?;
+        validate_parameters(submission.kernel.signature(), parameters)?;
+        self.submit_command_direct(submission, parameters)
+    }
+
+    /// Submits one already-validated direct Command program.
+    ///
+    /// # Errors
+    ///
+    /// Returns any honest backend admission or execution failure.
+    fn submit_command_direct(
+        &self,
+        submission: PcuCommandSubmission<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::CommandHandle, PcuError>;
+}
+
+impl<T> PcuCommandBackend for T
+where
+    T: PcuDirectCommandBackend,
+{
+    type CommandHandle = T::CommandHandle;
+
+    fn submit_command(
+        &self,
+        submission: PcuCommandSubmission<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::CommandHandle, PcuError> {
+        PcuDirectCommandBackend::submit_command(self, submission, parameters)
+    }
+}
+
+/// Signal-family execution surface.
+///
+/// Backends that install only triggered Signal programs can implement this trait without
+/// providing placeholder handles or methods for Dispatch, Command, Transaction, or Stream.
+pub trait PcuSignalBackend: PcuBaseContract {
+    type SignalHandle: PcuPersistentHandle;
+
+    /// Installs one persistent Signal program.
+    ///
+    /// # Errors
+    ///
+    /// Returns any honest admission, scheduling, or installation failure.
+    fn install_signal(
+        &self,
+        installation: PcuSignalInstallation<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::SignalHandle, PcuError>;
+}
+
+/// Direct Signal-family backend implementation contract.
+///
+/// The default method applies the common direct-support and parameter checks before delegating to
+/// the backend implementation. It defines no operations for unrelated families.
+pub trait PcuDirectSignalBackend: PcuBaseContract {
+    type SignalHandle: PcuPersistentHandle;
+
+    /// Installs one Signal program after common admission checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest support, parameter, or backend installation error.
+    fn install_signal(
+        &self,
+        installation: PcuSignalInstallation<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::SignalHandle, PcuError> {
+        validate_direct_kernel_support(self, PcuKernel::Signal(*installation.kernel))?;
+        validate_parameters(installation.kernel.signature(), parameters)?;
+        self.install_signal_direct(installation, parameters)
+    }
+
+    /// Installs one already-validated direct Signal program.
+    ///
+    /// # Errors
+    ///
+    /// Returns any honest backend admission or installation failure.
+    fn install_signal_direct(
+        &self,
+        installation: PcuSignalInstallation<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::SignalHandle, PcuError>;
+}
+
+impl<T> PcuSignalBackend for T
+where
+    T: PcuDirectSignalBackend,
+{
+    type SignalHandle = T::SignalHandle;
+
+    fn install_signal(
+        &self,
+        installation: PcuSignalInstallation<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::SignalHandle, PcuError> {
+        PcuDirectSignalBackend::install_signal(self, installation, parameters)
+    }
+}
+
+/// Dispatch-family execution surface.
+///
+/// The historical `PcuDirectDispatchBackend` remains the aggregate five-family adapter. This
+/// family-specific surface lets a backend implement indexed Dispatch alone.
+pub trait PcuDispatchBackend: PcuBaseContract {
+    type DispatchHandle: PcuFiniteHandle;
+
+    /// Submits one finite logical-dispatch program.
+    ///
+    /// # Errors
+    ///
+    /// Returns any honest admission, scheduling, or execution-substrate failure.
+    fn submit_dispatch(
+        &self,
+        submission: PcuDispatchSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::DispatchHandle, PcuError>;
+}
+
+/// Direct Dispatch-family backend implementation contract.
+pub trait PcuDirectDispatchFamilyBackend: PcuBaseContract {
+    type DispatchHandle: PcuFiniteHandle;
+
+    /// Submits one Dispatch program after common admission checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest support, shape, binding, parameter, or backend execution error.
+    fn submit_dispatch(
+        &self,
+        submission: PcuDispatchSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::DispatchHandle, PcuError> {
+        validate_direct_kernel_support(self, PcuKernel::Dispatch(*submission.kernel))?;
+        validate_dispatch_submission(submission)?;
+        validate_parameters(submission.kernel.signature(), parameters)?;
+        validate_invocation_bindings(submission.kernel.signature(), bindings)?;
+        self.submit_dispatch_direct(submission, bindings, parameters)
+    }
+
+    /// Submits one already-validated direct Dispatch program.
+    fn submit_dispatch_direct(
+        &self,
+        submission: PcuDispatchSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::DispatchHandle, PcuError>;
+}
+
+impl<T> PcuDispatchBackend for T
+where
+    T: PcuDirectDispatchFamilyBackend,
+{
+    type DispatchHandle = T::DispatchHandle;
+
+    fn submit_dispatch(
+        &self,
+        submission: PcuDispatchSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::DispatchHandle, PcuError> {
+        PcuDirectDispatchFamilyBackend::submit_dispatch(self, submission, bindings, parameters)
+    }
+}
+
+/// Transaction-family execution surface.
+pub trait PcuTransactionBackend: PcuBaseContract {
+    type TransactionHandle: PcuFiniteHandle;
+
+    /// Submits one finite opaque transaction program.
+    ///
+    /// # Errors
+    ///
+    /// Returns any honest admission, scheduling, or execution-substrate failure.
+    fn submit_transaction(
+        &self,
+        submission: PcuTransactionSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::TransactionHandle, PcuError>;
+}
+
+/// Direct Transaction-family backend implementation contract.
+pub trait PcuDirectTransactionBackend: PcuBaseContract {
+    type TransactionHandle: PcuFiniteHandle;
+
+    /// Submits one Transaction program after common admission checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an honest support, binding, parameter, or backend execution error.
+    fn submit_transaction(
+        &self,
+        submission: PcuTransactionSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::TransactionHandle, PcuError> {
+        validate_direct_kernel_support(self, PcuKernel::Transaction(*submission.kernel))?;
+        validate_parameters(submission.kernel.signature(), parameters)?;
+        validate_invocation_bindings(submission.kernel.signature(), bindings)?;
+        self.submit_transaction_direct(submission, bindings, parameters)
+    }
+
+    /// Submits one already-validated direct Transaction program.
+    fn submit_transaction_direct(
+        &self,
+        submission: PcuTransactionSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::TransactionHandle, PcuError>;
+}
+
+impl<T> PcuTransactionBackend for T
+where
+    T: PcuDirectTransactionBackend,
+{
+    type TransactionHandle = T::TransactionHandle;
+
+    fn submit_transaction(
+        &self,
+        submission: PcuTransactionSubmission<'_>,
+        bindings: PcuInvocationBindings<'_>,
+        parameters: PcuInvocationParameters<'_>,
+    ) -> Result<Self::TransactionHandle, PcuError> {
+        PcuDirectTransactionBackend::submit_transaction(self, submission, bindings, parameters)
+    }
+}
+
 impl<T> PcuDispatchContract for T
 where
     T: PcuDirectDispatchBackend,
@@ -315,6 +706,7 @@ where
         parameters: PcuInvocationParameters<'_>,
     ) -> Result<Self::CommandHandle, PcuError> {
         validate_direct_kernel_support(self, PcuKernel::Command(*submission.kernel))?;
+        validate_command_kernel(submission.kernel).map_err(|_| PcuError::invalid())?;
         validate_parameters(submission.kernel.signature(), parameters)?;
         self.submit_command_direct(submission, parameters)
     }
@@ -354,8 +746,8 @@ where
     }
 }
 
-fn validate_direct_kernel_support(
-    backend: &impl PcuBaseContract,
+fn validate_direct_kernel_support<B: PcuBaseContract + ?Sized>(
+    backend: &B,
     kernel: PcuKernel<'_>,
 ) -> Result<(), PcuError> {
     let kernel_supported = backend.any_executor_supports_kernel_direct(kernel);
@@ -390,7 +782,12 @@ fn validate_direct_kernel_support(
     Err(PcuError::unsupported())
 }
 
-pub(crate) fn validate_parameters(
+/// Checks that invocation parameters match the declared slots and types.
+///
+/// # Errors
+///
+/// Returns `Invalid` for missing, extra, duplicate, or mistyped parameters.
+pub fn validate_parameters(
     signature: PcuKernelSignature<'_>,
     parameters: PcuInvocationParameters<'_>,
 ) -> Result<(), PcuError> {
@@ -401,7 +798,15 @@ pub(crate) fn validate_parameters(
     }
 }
 
-pub(crate) fn validate_invocation_bindings(
+/// Checks that each supplied binding target exists and appears only once.
+///
+/// This is a partial structural check: backends must also verify required targets, access,
+/// layout, size, and residency before execution.
+///
+/// # Errors
+///
+/// Returns `Invalid` for duplicate or unknown targets.
+pub fn validate_invocation_bindings(
     signature: PcuKernelSignature<'_>,
     bindings: PcuInvocationBindings<'_>,
 ) -> Result<(), PcuError> {
@@ -428,9 +833,12 @@ pub(crate) fn validate_invocation_bindings(
     Ok(())
 }
 
-pub(crate) fn validate_dispatch_submission(
-    submission: PcuDispatchSubmission<'_>,
-) -> Result<(), PcuError> {
+/// Checks that a dispatch submission's thread count matches its logical shape.
+///
+/// # Errors
+///
+/// Returns `Invalid` for an unsupported topology, zero/overflowed extent, or mismatched count.
+pub fn validate_dispatch_submission(submission: PcuDispatchSubmission<'_>) -> Result<(), PcuError> {
     let PcuInvocationTopology::Indexed { logical_shape } =
         submission.kernel.signature().invocation.topology
     else {
@@ -467,14 +875,25 @@ mod tests {
 
     use super::{
         PcuCommandSubmission,
+        PcuCommandBackend,
+        PcuDirectCommandBackend,
+        PcuDirectDispatchFamilyBackend,
         PcuDirectDispatchBackend,
+        PcuDirectSignalBackend,
+        PcuDirectStreamBackend,
+        PcuDirectTransactionBackend,
+        PcuDispatchBackend,
         PcuDispatchContract,
         PcuDispatchSubmission,
         PcuFiniteHandle,
         PcuFiniteState,
         PcuPersistentHandle,
         PcuPersistentState,
+        PcuSignalBackend,
+        PcuSignalInstallation,
+        PcuExclusiveStreamBackend,
         PcuStreamInstallation,
+        PcuTransactionBackend,
     };
     use crate::{
         PcuBaseContract,
@@ -613,6 +1032,221 @@ mod tests {
         }
     }
 
+    struct StreamOnlyBackend(TestBackend);
+
+    impl PcuBaseContract for StreamOnlyBackend {
+        fn support(&self) -> PcuSupport {
+            self.0.support()
+        }
+
+        fn executors(&self) -> &'static [PcuExecutorDescriptor] {
+            self.0.executors()
+        }
+    }
+
+    impl PcuDirectStreamBackend for StreamOnlyBackend {
+        type StreamHandle = TestPersistentHandle;
+
+        fn install_stream_direct(
+            &self,
+            _installation: PcuStreamInstallation<'_>,
+            _bindings: PcuInvocationBindings<'_>,
+            _parameters: PcuInvocationParameters<'_>,
+        ) -> Result<Self::StreamHandle, PcuError> {
+            Ok(TestPersistentHandle)
+        }
+    }
+
+    struct CommandOnlyBackend(TestBackend);
+
+    impl PcuBaseContract for CommandOnlyBackend {
+        fn support(&self) -> PcuSupport {
+            self.0.support()
+        }
+
+        fn executors(&self) -> &'static [PcuExecutorDescriptor] {
+            self.0.executors()
+        }
+    }
+
+    impl PcuDirectCommandBackend for CommandOnlyBackend {
+        type CommandHandle = TestFiniteHandle;
+
+        fn submit_command_direct(
+            &self,
+            _submission: PcuCommandSubmission<'_>,
+            _parameters: PcuInvocationParameters<'_>,
+        ) -> Result<Self::CommandHandle, PcuError> {
+            Ok(TestFiniteHandle)
+        }
+    }
+
+    struct SignalOnlyBackend(TestBackend);
+
+    impl PcuBaseContract for SignalOnlyBackend {
+        fn support(&self) -> PcuSupport {
+            self.0.support()
+        }
+
+        fn executors(&self) -> &'static [PcuExecutorDescriptor] {
+            self.0.executors()
+        }
+    }
+
+    impl PcuDirectSignalBackend for SignalOnlyBackend {
+        type SignalHandle = TestPersistentHandle;
+
+        fn install_signal_direct(
+            &self,
+            _installation: PcuSignalInstallation<'_>,
+            _parameters: PcuInvocationParameters<'_>,
+        ) -> Result<Self::SignalHandle, PcuError> {
+            Ok(TestPersistentHandle)
+        }
+    }
+
+    struct TestStreamLease {
+        owner: u8,
+        generation: u32,
+        executor: crate::PcuExecutorId,
+    }
+
+    #[derive(Debug)]
+    struct SelectedStreamHandle(crate::PcuExecutorId);
+
+    impl PcuPersistentHandle for SelectedStreamHandle {
+        fn state(&self) -> Result<PcuPersistentState, PcuError> {
+            Ok(PcuPersistentState::Dormant)
+        }
+
+        fn start(&mut self) -> Result<(), PcuError> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), PcuError> {
+            Ok(())
+        }
+
+        fn uninstall(self) -> Result<(), PcuError> {
+            Ok(())
+        }
+    }
+
+    struct ExclusiveStreamTestBackend {
+        owner: u8,
+        generation: u32,
+    }
+
+    const SELECTABLE_EXECUTORS: [PcuExecutorDescriptor; 2] = [
+        PcuExecutorDescriptor {
+            id: PcuExecutorId(1),
+            ..DIRECT_EXECUTOR[0]
+        },
+        PcuExecutorDescriptor {
+            id: PcuExecutorId(2),
+            ..DIRECT_EXECUTOR[0]
+        },
+    ];
+
+    impl PcuBaseContract for ExclusiveStreamTestBackend {
+        fn support(&self) -> PcuSupport {
+            direct_backend().support()
+        }
+
+        fn executors(&self) -> &'static [PcuExecutorDescriptor] {
+            &SELECTABLE_EXECUTORS
+        }
+    }
+
+    impl PcuExclusiveStreamBackend for ExclusiveStreamTestBackend {
+        type Lease = TestStreamLease;
+        type StreamHandle = SelectedStreamHandle;
+
+        fn claim_stream_executor(
+            &self,
+            executor: crate::PcuExecutorId,
+        ) -> Result<Self::Lease, PcuError> {
+            if self.executor(executor).is_none() {
+                return Err(PcuError::invalid());
+            }
+            Ok(TestStreamLease {
+                owner: self.owner,
+                generation: self.generation,
+                executor,
+            })
+        }
+
+        fn lease_executor(&self, lease: &Self::Lease) -> crate::PcuExecutorId {
+            lease.executor
+        }
+
+        fn install_stream_on_lease_direct(
+            &self,
+            lease: &mut Self::Lease,
+            _installation: PcuStreamInstallation<'_>,
+            _bindings: PcuInvocationBindings<'_>,
+            _parameters: PcuInvocationParameters<'_>,
+        ) -> Result<Self::StreamHandle, PcuError> {
+            if lease.owner != self.owner
+                || lease.generation != self.generation
+                || self.executor(lease.executor).is_none()
+            {
+                return Err(PcuError::state_conflict());
+            }
+            Ok(SelectedStreamHandle(lease.executor))
+        }
+    }
+
+    struct DispatchOnlyBackend(TestBackend);
+
+    impl PcuBaseContract for DispatchOnlyBackend {
+        fn support(&self) -> PcuSupport {
+            self.0.support()
+        }
+
+        fn executors(&self) -> &'static [PcuExecutorDescriptor] {
+            self.0.executors()
+        }
+    }
+
+    impl PcuDirectDispatchFamilyBackend for DispatchOnlyBackend {
+        type DispatchHandle = TestFiniteHandle;
+
+        fn submit_dispatch_direct(
+            &self,
+            _submission: PcuDispatchSubmission<'_>,
+            _bindings: PcuInvocationBindings<'_>,
+            _parameters: PcuInvocationParameters<'_>,
+        ) -> Result<Self::DispatchHandle, PcuError> {
+            Ok(TestFiniteHandle)
+        }
+    }
+
+    struct TransactionOnlyBackend(TestBackend);
+
+    impl PcuBaseContract for TransactionOnlyBackend {
+        fn support(&self) -> PcuSupport {
+            self.0.support()
+        }
+
+        fn executors(&self) -> &'static [PcuExecutorDescriptor] {
+            self.0.executors()
+        }
+    }
+
+    impl PcuDirectTransactionBackend for TransactionOnlyBackend {
+        type TransactionHandle = TestFiniteHandle;
+
+        fn submit_transaction_direct(
+            &self,
+            _submission: super::PcuTransactionSubmission<'_>,
+            _bindings: PcuInvocationBindings<'_>,
+            _parameters: PcuInvocationParameters<'_>,
+        ) -> Result<Self::TransactionHandle, PcuError> {
+            Ok(TestFiniteHandle)
+        }
+    }
+
     const DIRECT_EXECUTOR: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
         id: PcuExecutorId(1),
         name: "cpu",
@@ -632,7 +1266,7 @@ mod tests {
                 .union(PcuStreamCapabilities::BIT_INVERT),
             command_instructions: crate::PcuCommandOpCaps::WRITE,
             transaction_features: crate::PcuTransactionFeatureCaps::empty(),
-            signal_instructions: crate::PcuSignalOpCaps::empty(),
+            signal_instructions: crate::PcuSignalOpCaps::ACK,
         },
     }];
 
@@ -672,6 +1306,18 @@ mod tests {
             instructions: PcuFeatureSupport::new(
                 crate::PcuCommandOpCaps::WRITE,
                 crate::PcuCommandOpCaps::WRITE,
+            ),
+        };
+        support.transaction_support = crate::PcuTransactionSupport {
+            features: PcuFeatureSupport::new(
+                crate::PcuTransactionFeatureCaps::empty(),
+                crate::PcuTransactionFeatureCaps::empty(),
+            ),
+        };
+        support.signal_support = crate::PcuSignalSupport {
+            instructions: PcuFeatureSupport::new(
+                crate::PcuSignalOpCaps::ACK,
+                crate::PcuSignalOpCaps::empty(),
             ),
         };
         TestBackend {
@@ -833,6 +1479,207 @@ mod tests {
                 .expect_err("unknown binding target must be rejected")
                 .kind(),
             crate::PcuErrorKind::Invalid
+        );
+    }
+
+    #[test]
+    fn stream_only_backend_needs_no_unrelated_family_methods() {
+        let backend = StreamOnlyBackend(direct_backend());
+        let builder = PcuStreamKernelBuilder::<1>::words(12, "stream")
+            .bit_invert()
+            .expect("builder should accept one stream pattern");
+        let kernel = builder.ir();
+
+        let handle = PcuDirectStreamBackend::install_stream(
+            &backend,
+            PcuStreamInstallation { kernel: &kernel },
+            PcuInvocationBindings::empty(),
+            PcuInvocationParameters::empty(),
+        )
+        .expect("stream-only backend should install a supported stream");
+        assert_eq!(
+            handle.state().expect("state is available"),
+            PcuPersistentState::Dormant
+        );
+    }
+
+    #[test]
+    fn exclusive_stream_lease_selects_executor_and_rejects_foreign_or_stale_leases() {
+        let backend = ExclusiveStreamTestBackend {
+            owner: 1,
+            generation: 9,
+        };
+        let builder = PcuStreamKernelBuilder::<1>::words(17, "leased")
+            .bit_invert()
+            .expect("builder should accept one pattern");
+        let kernel = builder.ir();
+        let mut selected = backend
+            .claim_stream_executor(PcuExecutorId(2))
+            .expect("executor 2 should be claimable");
+        let handle = backend
+            .install_stream_on_lease(
+                &mut selected,
+                PcuStreamInstallation { kernel: &kernel },
+                PcuInvocationBindings::empty(),
+                PcuInvocationParameters::empty(),
+            )
+            .expect("selected executor should install stream");
+        assert_eq!(handle.0, PcuExecutorId(2));
+
+        let foreign_backend = ExclusiveStreamTestBackend {
+            owner: 2,
+            generation: 9,
+        };
+        let mut foreign = foreign_backend
+            .claim_stream_executor(PcuExecutorId(2))
+            .expect("executor should be claimable on second provider");
+        assert_eq!(
+            backend
+                .install_stream_on_lease(
+                    &mut foreign,
+                    PcuStreamInstallation { kernel: &kernel },
+                    PcuInvocationBindings::empty(),
+                    PcuInvocationParameters::empty(),
+                )
+                .expect_err("foreign lease must be rejected")
+                .kind(),
+            crate::PcuErrorKind::StateConflict
+        );
+
+        let mut stale = backend
+            .claim_stream_executor(PcuExecutorId(1))
+            .expect("executor should be claimable");
+        stale.generation = 8;
+        assert_eq!(
+            backend
+                .install_stream_on_lease(
+                    &mut stale,
+                    PcuStreamInstallation { kernel: &kernel },
+                    PcuInvocationBindings::empty(),
+                    PcuInvocationParameters::empty(),
+                )
+                .expect_err("stale lease must be rejected")
+                .kind(),
+            crate::PcuErrorKind::StateConflict
+        );
+    }
+
+    #[test]
+    fn command_only_backend_needs_no_unrelated_family_methods() {
+        let backend = CommandOnlyBackend(direct_backend());
+        let builder = PcuCommandKernelBuilder::<1>::new(13, "write")
+            .with_step(
+                Some("write"),
+                PcuCommandOp::Write {
+                    target: crate::PcuTarget::Named("reg"),
+                    value: crate::PcuOperand::Immediate(PcuParameterValue::U32(7)),
+                },
+            )
+            .expect("builder should accept one command step");
+        let kernel = builder.ir();
+
+        let handle = PcuCommandBackend::submit_command(
+            &backend,
+            PcuCommandSubmission { kernel: &kernel },
+            PcuInvocationParameters::empty(),
+        )
+        .expect("command-only backend should accept a supported command");
+        assert_eq!(
+            handle.state().expect("state is available"),
+            PcuFiniteState::Complete
+        );
+    }
+
+    #[test]
+    fn command_admission_rejects_undefined_typed_result() {
+        let backend = CommandOnlyBackend(direct_backend());
+        let builder = PcuCommandKernelBuilder::<1>::new(19, "bad-result")
+            .with_step(
+                Some("write"),
+                PcuCommandOp::Write {
+                    target: crate::PcuTarget::Named("reg"),
+                    value: crate::PcuOperand::Result(crate::model::PcuCommandResultId(3)),
+                },
+            )
+            .expect("builder should accept one command step");
+        let kernel = builder.ir();
+        let error = PcuCommandBackend::submit_command(
+            &backend,
+            PcuCommandSubmission { kernel: &kernel },
+            PcuInvocationParameters::empty(),
+        )
+        .err()
+        .expect("undefined result must be rejected before backend execution");
+        assert_eq!(error.kind(), crate::PcuErrorKind::Invalid);
+    }
+
+    #[test]
+    fn signal_only_backend_needs_no_unrelated_family_methods() {
+        let backend = SignalOnlyBackend(direct_backend());
+        let builder = crate::model::PcuSignalKernelBuilder::<1>::new(
+            14,
+            "ack",
+            crate::PcuSignalTriggerKind::Software,
+        )
+        .with_op(crate::PcuSignalOp::Ack)
+        .expect("builder should accept one signal op");
+        let kernel = builder.ir();
+
+        let handle = PcuSignalBackend::install_signal(
+            &backend,
+            PcuSignalInstallation { kernel: &kernel },
+            PcuInvocationParameters::empty(),
+        )
+        .expect("signal-only backend should accept a supported signal");
+        assert_eq!(
+            handle.state().expect("state is available"),
+            PcuPersistentState::Dormant
+        );
+    }
+
+    #[test]
+    fn dispatch_only_backend_needs_no_unrelated_family_methods() {
+        let backend = DispatchOnlyBackend(direct_backend());
+        let builder = PcuDispatchKernelBuilder::<1>::new(15, "dispatch", [1, 1, 1])
+            .with_type_caps(
+                crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
+            )
+            .with_arithmetic_op(PcuDispatchAluOp::Add)
+            .expect("builder should accept one dispatch operation");
+        let kernel = builder.ir();
+
+        let handle = PcuDispatchBackend::submit_dispatch(
+            &backend,
+            PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::threads(NonZeroU32::new(1).expect("nonzero")),
+            },
+            PcuInvocationBindings::empty(),
+            PcuInvocationParameters::empty(),
+        )
+        .expect("dispatch-only backend should accept a supported dispatch");
+        assert_eq!(
+            handle.state().expect("state is available"),
+            PcuFiniteState::Complete
+        );
+    }
+
+    #[test]
+    fn transaction_only_backend_needs_no_unrelated_family_methods() {
+        let backend = TransactionOnlyBackend(direct_backend());
+        let builder = crate::model::PcuTransactionKernelBuilder::new(16, "transaction");
+        let kernel = builder.ir();
+
+        let handle = PcuTransactionBackend::submit_transaction(
+            &backend,
+            super::PcuTransactionSubmission { kernel: &kernel },
+            PcuInvocationBindings::empty(),
+            PcuInvocationParameters::empty(),
+        )
+        .expect("transaction-only backend should accept a supported transaction");
+        assert_eq!(
+            handle.state().expect("state is available"),
+            PcuFiniteState::Complete
         );
     }
 
