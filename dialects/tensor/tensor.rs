@@ -2,7 +2,7 @@
 //!
 //! This crate is intentionally outside `fusion-pcu`: tensor semantics belong to a dialect, not
 //! to the generic coprocessor IR. The current graph supports f32 inputs/constants, add, matrix
-//! multiplication, ReLU, and mean-squared error. It does not implement broadcasting, batching,
+//! multiplication, `ReLU`, and mean-squared error. It does not implement broadcasting, batching,
 //! convolution, views, mixed precision, optimizers, serialization, or device execution.
 
 use std::fmt;
@@ -24,6 +24,12 @@ pub struct Tensor {
 }
 
 impl Tensor {
+    /// Creates a tensor after checking that its data length matches its shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::ShapeOverflow`] if the element count overflows, or
+    /// [`TensorError::DataLength`] if `data` has the wrong number of elements.
     pub fn new(shape: impl Into<Vec<usize>>, data: Vec<f32>) -> Result<Self, TensorError> {
         let shape = shape.into();
         let len = element_count(&shape)?;
@@ -36,15 +42,18 @@ impl Tensor {
         Ok(Self { shape, data })
     }
 
+    #[must_use]
     pub fn scalar(value: f32) -> Self {
         Self {
             shape: vec![],
             data: vec![value],
         }
     }
+    #[must_use]
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
+    #[must_use]
     pub fn data(&self) -> &[f32] {
         &self.data
     }
@@ -127,6 +136,11 @@ impl Graph {
         id
     }
 
+    /// Adds an input value with the supplied shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::ShapeOverflow`] if the shape's element count overflows.
     pub fn input(&mut self, shape: impl Into<Vec<usize>>) -> Result<ValueId, TensorError> {
         let shape = shape.into();
         element_count(&shape)?;
@@ -137,6 +151,12 @@ impl Graph {
         self.push(Op::Constant(value.clone()), value.shape)
     }
 
+    /// Adds two values with identical shapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::UnknownValue`] for an invalid value ID or
+    /// [`TensorError::ShapeMismatch`] when the shapes differ.
     pub fn add(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
         let sa = self.shape(a)?.to_vec();
         let sb = self.shape(b)?.to_vec();
@@ -149,6 +169,13 @@ impl Graph {
         Ok(self.push(Op::Add(a, b), self.nodes[a.index].shape.clone()))
     }
 
+    /// Adds a rank-two matrix multiplication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::UnknownValue`] for an invalid value ID,
+    /// [`TensorError::MatMulShape`] for incompatible shapes, or
+    /// [`TensorError::ShapeOverflow`] if the output element count overflows.
     pub fn matmul(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
         let sa = self.shape(a)?.to_vec();
         let sb = self.shape(b)?.to_vec();
@@ -163,11 +190,22 @@ impl Graph {
         Ok(self.push(Op::MatMul(a, b), shape))
     }
 
+    /// Adds an elementwise `ReLU` operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::UnknownValue`] for an invalid value ID.
     pub fn relu(&mut self, x: ValueId) -> Result<ValueId, TensorError> {
         let shape = self.shape(x)?.to_vec();
         Ok(self.push(Op::Relu(x), shape))
     }
 
+    /// Adds a scalar mean-squared-error operation over equally shaped values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::UnknownValue`] for an invalid value ID,
+    /// [`TensorError::ShapeMismatch`] for differing or empty shapes.
     pub fn mean_squared_error(
         &mut self,
         prediction: ValueId,
@@ -184,6 +222,11 @@ impl Graph {
         Ok(self.push(Op::MeanSquaredError(prediction, target), vec![]))
     }
 
+    /// Returns the shape of a graph value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::UnknownValue`] if `id` does not belong to this graph.
     pub fn shape(&self, id: ValueId) -> Result<&[usize], TensorError> {
         self.nodes
             .get(id.index)
@@ -192,6 +235,11 @@ impl Graph {
             .ok_or(TensorError::UnknownValue(id))
     }
 
+    /// Evaluates the graph using the supplied input tensors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, duplicate, extra, or wrongly shaped inputs.
     pub fn evaluate(&self, inputs: &[(ValueId, Tensor)]) -> Result<Execution, TensorError> {
         let mut supplied: Vec<Option<&Tensor>> = vec![None; self.nodes.len()];
         for (id, tensor) in inputs {
@@ -232,7 +280,7 @@ impl Graph {
                     values[x.index].data.iter().map(|v| v.max(0.0)).collect(),
                 )?,
                 Op::MeanSquaredError(a, b) => {
-                    let n = values[a.index].data.len() as f32;
+                    let n = mean_denominator(values[a.index].data.len());
                     Tensor::scalar(
                         values[a.index]
                             .data
@@ -261,20 +309,28 @@ fn binary(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32) -> Tensor {
     }
 }
 
-fn matmul(a: &Tensor, b: &Tensor) -> Tensor {
-    let (m, k, n) = (a.shape[0], a.shape[1], b.shape[1]);
-    let mut out = vec![0.0; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            for p in 0..k {
-                out[i * n + j] += a.data[i * k + p] * b.data[p * n + j];
+fn matmul(left: &Tensor, right: &Tensor) -> Tensor {
+    let (rows, inner, columns) = (left.shape[0], left.shape[1], right.shape[1]);
+    let mut output = vec![0.0; rows * columns];
+    for row in 0..rows {
+        for column in 0..columns {
+            for inner_index in 0..inner {
+                output[row * columns + column] += left.data[row * inner + inner_index]
+                    * right.data[inner_index * columns + column];
             }
         }
     }
     Tensor {
-        shape: vec![m, n],
-        data: out,
+        shape: vec![rows, columns],
+        data: output,
     }
+}
+
+// Tensor storage must already fit in memory; f32 precision is sufficient for a
+// practically allocatable element count used as a mean divisor.
+#[allow(clippy::cast_precision_loss)]
+const fn mean_denominator(element_count: usize) -> f32 {
+    element_count as f32
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +340,11 @@ pub struct Execution {
     values: Vec<Tensor>,
 }
 impl Execution {
+    /// Returns the evaluated tensor for a graph value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::UnknownValue`] if `id` does not belong to this execution.
     pub fn value(&self, id: ValueId) -> Result<&Tensor, TensorError> {
         self.values
             .get(id.index)
@@ -292,6 +353,11 @@ impl Execution {
     }
 
     /// Reverse-mode derivative of the selected scalar output with respect to every graph value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the graph differs from the evaluated graph, the output ID is
+    /// invalid, or the selected output is not scalar.
     pub fn gradients(
         &self,
         graph: &Graph,
@@ -334,23 +400,29 @@ impl Execution {
                     accumulate(&mut grads, x, g);
                 }
                 Op::MeanSquaredError(a, b) => {
-                    let n = self.values[a.index].data.len() as f32;
-                    let p = &self.values[a.index];
-                    let t = &self.values[b.index];
+                    let divisor = mean_denominator(self.values[a.index].data.len());
+                    let prediction = &self.values[a.index];
+                    let target = &self.values[b.index];
                     let gp = Tensor::new(
-                        p.shape.clone(),
-                        p.data
+                        prediction.shape.clone(),
+                        prediction
+                            .data
                             .iter()
-                            .zip(&t.data)
-                            .map(|(x, y)| 2.0 * (x - y) / n * grad.data[0])
+                            .zip(&target.data)
+                            .map(|(predicted, expected)| {
+                                2.0 * (predicted - expected) / divisor * grad.data[0]
+                            })
                             .collect(),
                     )?;
                     let gt = Tensor::new(
-                        t.shape.clone(),
-                        p.data
+                        target.shape.clone(),
+                        prediction
+                            .data
                             .iter()
-                            .zip(&t.data)
-                            .map(|(x, y)| 2.0 * (y - x) / n * grad.data[0])
+                            .zip(&target.data)
+                            .map(|(predicted, expected)| {
+                                2.0 * (expected - predicted) / divisor * grad.data[0]
+                            })
                             .collect(),
                     )?;
                     accumulate(&mut grads, a, gp);
@@ -359,20 +431,30 @@ impl Execution {
                 Op::MatMul(a, b) => {
                     let left = &self.values[a.index];
                     let right = &self.values[b.index];
-                    let (m, k, n) = (left.shape[0], left.shape[1], right.shape[1]);
-                    let mut gl = vec![0.0; m * k];
-                    let mut gr = vec![0.0; k * n];
-                    for i in 0..m {
-                        for j in 0..n {
-                            let d = grad.data[i * n + j];
-                            for p in 0..k {
-                                gl[i * k + p] += d * right.data[p * n + j];
-                                gr[p * n + j] += left.data[i * k + p] * d;
+                    let (rows, inner, columns) = (left.shape[0], left.shape[1], right.shape[1]);
+                    let mut left_gradient = vec![0.0; rows * inner];
+                    let mut right_gradient = vec![0.0; inner * columns];
+                    for row in 0..rows {
+                        for column in 0..columns {
+                            let output_gradient = grad.data[row * columns + column];
+                            for inner_index in 0..inner {
+                                left_gradient[row * inner + inner_index] +=
+                                    output_gradient * right.data[inner_index * columns + column];
+                                right_gradient[inner_index * columns + column] +=
+                                    left.data[row * inner + inner_index] * output_gradient;
                             }
                         }
                     }
-                    accumulate(&mut grads, a, Tensor::new(left.shape.clone(), gl)?);
-                    accumulate(&mut grads, b, Tensor::new(right.shape.clone(), gr)?);
+                    accumulate(
+                        &mut grads,
+                        a,
+                        Tensor::new(left.shape.clone(), left_gradient)?,
+                    );
+                    accumulate(
+                        &mut grads,
+                        b,
+                        Tensor::new(right.shape.clone(), right_gradient)?,
+                    );
                 }
             }
         }
@@ -423,7 +505,7 @@ mod tests {
             .data
             .clone();
         let eps = 1e-3;
-        for index in 0..wv.data.len() {
+        for (index, analytic_gradient) in analytic.iter().enumerate() {
             let mut plus = wv.clone();
             plus.data[index] += eps;
             let mut minus = wv.clone();
@@ -436,9 +518,8 @@ mod tests {
             };
             let numeric = (eval_loss(plus) - eval_loss(minus)) / (2.0 * eps);
             assert!(
-                (analytic[index] - numeric).abs() < 1e-3,
-                "{index}: {} != {numeric}",
-                analytic[index]
+                (analytic_gradient - numeric).abs() < 1e-3,
+                "{index}: {analytic_gradient} != {numeric}"
             );
         }
         assert_eq!(execution.value(loss).unwrap().shape(), &[]);

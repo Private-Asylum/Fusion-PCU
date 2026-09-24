@@ -157,7 +157,7 @@ pub struct PcuInvocationBindings<'a> {
     pub bindings: &'a [PcuInvocationBinding<'a>],
 }
 
-impl<'a> PcuInvocationBindings<'a> {
+impl PcuInvocationBindings<'_> {
     /// Returns one empty invocation binding table.
     #[must_use]
     pub const fn empty() -> Self {

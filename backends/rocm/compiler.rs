@@ -74,7 +74,7 @@ pub fn compile_hip_source(source: &str, architecture: &str) -> Result<Vec<u8>, H
             std::env::temp_dir().join(format!("fusion-pcu-hip-{}-{id}", std::process::id()));
         match fs::create_dir(&candidate) {
             Ok(()) => break BuildDirectory(candidate),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(HipCompileError::Io(error)),
         }
     };

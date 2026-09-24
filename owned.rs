@@ -43,6 +43,7 @@ impl PcuDeviceIdentity {
     ///
     /// The provider must still validate freshness and physical identity when opening the device;
     /// this value only preserves the reference's namespace and generation.
+    #[must_use]
     pub const fn from_device_ref(reference: PcuObjectRef) -> Option<Self> {
         if matches!(reference.kind, PcuObjectKind::Device) {
             Some(Self {
@@ -158,6 +159,10 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
     fn device_identity(&self) -> PcuDeviceIdentity;
 
     /// Submits a validated owned Dispatch operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when the selected device cannot submit the operation.
     fn submit_dispatch_owned_direct(
         &self,
         submission: PcuDispatchSubmission<'_>,
@@ -166,6 +171,10 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
     ) -> Result<Self::Completion, Self::Error>;
 
     /// Performs common shape, parameter, support, device, and binding admission before submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a common validation error or the backend's submission error.
     fn submit_dispatch_owned(
         &self,
         submission: PcuDispatchSubmission<'_>,
@@ -203,6 +212,10 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
 /// This v1 sizing rule assumes a tightly packed, contiguous buffer with one scalar element per
 /// logical thread. Vector, matrix, image, sampler, and acceleration-structure layouts are rejected
 /// until a backend-specific layout contract can describe their actual storage size and stride.
+///
+/// # Errors
+///
+/// Returns the first missing, duplicate, mismatched, or undersized binding error.
 pub fn validate_owned_dispatch_bindings<R>(
     kernel: &PcuDispatchKernelIr<'_>,
     shape: PcuInvocationShape,
@@ -329,9 +342,17 @@ pub trait PcuOwnedCompletion {
 
     /// Returns current progress. A terminal state guarantees quiescence.
     /// An error leaves completion uncertain and does not permit releasing retained resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when progress cannot be determined safely.
     fn state(&self) -> Result<PcuCompletionState, Self::Error>;
 
     /// Waits for completion while preserving the handle on uncertain errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error while retaining completion ownership for retry.
     fn wait(&mut self) -> Result<PcuCompletionOutcome, Self::Error>;
 }
 

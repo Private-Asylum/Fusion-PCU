@@ -71,6 +71,8 @@ impl PcuRunnerRegistry {
     }
 
     #[must_use]
+    // `register_compiled_runners` may push into the heap-backed Vec.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn with_compiled_runners() -> Self {
         let mut registry = Self::new();
         register_compiled_runners(&mut registry);
@@ -158,10 +160,15 @@ impl PcuRunnerRegistry {
     }
 }
 
-fn register_compiled_runners(_registry: &mut PcuRunnerRegistry) {
-    #[cfg(feature = "runner-vulkan")]
-    _registry.register_unchecked(vulkan::PCU_VULKAN_RUNNER_DESCRIPTOR);
+// Registration mutates a heap-backed Vec, so this cannot be evaluated at compile time.
+#[cfg(feature = "runner-vulkan")]
+#[allow(clippy::missing_const_for_fn)]
+fn register_compiled_runners(registry: &mut PcuRunnerRegistry) {
+    registry.register_unchecked(vulkan::PCU_VULKAN_RUNNER_DESCRIPTOR);
 }
+
+#[cfg(not(feature = "runner-vulkan"))]
+const fn register_compiled_runners(_: &mut PcuRunnerRegistry) {}
 
 /// Opened PCU runtime selected from a runner registry.
 pub struct PcuRuntime {
@@ -486,10 +493,14 @@ mod tests {
         }
     }
 
+    // Keep these successful callbacks fallible because they exercise the runner's real callback
+    // signatures; their purpose is to model a backend that is already available.
+    #[allow(clippy::unnecessary_wraps)]
     fn dummy_probe() -> Result<(), PcuRunnerError> {
         Ok(())
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn dummy_open() -> Result<PcuRunnerHandle, PcuRunnerError> {
         Ok(PcuRunnerHandle::new(Box::new(DummyRunner)))
     }

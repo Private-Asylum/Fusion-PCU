@@ -393,7 +393,7 @@ pub struct PcuDispatchKernelBuilder<'a, const MAX_OPS: usize = DEFAULT_OP_CAPACI
 impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
     /// Creates one dispatch-kernel builder.
     #[must_use]
-    pub fn new(kernel_id: u32, entry_point: &'a str, logical_shape: [u32; 3]) -> Self {
+    pub const fn new(kernel_id: u32, entry_point: &'a str, logical_shape: [u32; 3]) -> Self {
         Self {
             kernel_id: PcuKernelId(kernel_id),
             entry: PcuDispatchEntryPoint {
@@ -584,7 +584,7 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
         PcuKernel::Dispatch(self.ir())
     }
 
-    fn push_op(&mut self, op: PcuDispatchOp<'a>) -> Result<(), PcuError> {
+    const fn push_op(&mut self, op: PcuDispatchOp<'a>) -> Result<(), PcuError> {
         if self.op_len == MAX_OPS {
             return Err(PcuError::resource_exhausted());
         }

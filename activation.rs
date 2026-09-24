@@ -22,10 +22,12 @@ pub struct PcuBackendToken {
 }
 
 impl PcuBackendToken {
+    #[must_use]
     pub const fn provider(self) -> PcuProviderId {
         self.provider
     }
 
+    #[must_use]
     pub const fn slot(self) -> usize {
         self.slot
     }
@@ -52,6 +54,7 @@ pub struct PcuRuntimeActivationRouter<const N: usize> {
 }
 
 impl<const N: usize> PcuRuntimeActivationRouter<N> {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             providers: [None; N],
@@ -59,15 +62,22 @@ impl<const N: usize> PcuRuntimeActivationRouter<N> {
         }
     }
 
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.len
     }
 
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Registers a provider and returns the token its typed consumer mapping should use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcuActivationRouteError::DuplicateProvider`] if the ID is already registered,
+    /// or [`PcuActivationRouteError::CapacityExhausted`] when the fixed table is full.
     pub fn register(
         &mut self,
         provider: PcuProviderId,
@@ -88,6 +98,11 @@ impl<const N: usize> PcuRuntimeActivationRouter<N> {
     ///
     /// This checks the object category and provider registration. The selected backend remains
     /// responsible for validating the generation and exact device ID before activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcuActivationRouteError::NotADevice`] for a non-device reference and
+    /// [`PcuActivationRouteError::UnknownProvider`] when its provider is not registered.
     pub fn route(&self, device: PcuObjectRef) -> Result<PcuBackendToken, PcuActivationRouteError> {
         if device.kind != PcuObjectKind::Device {
             return Err(PcuActivationRouteError::NotADevice(device.kind));

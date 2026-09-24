@@ -154,6 +154,11 @@ impl RocmOwnedDispatchBackend {
     ///
     /// The HIP architecture remains an explicit caller choice because the stable HIP APIs used by
     /// discovery do not yet provide a safely versioned way to query its code-generation target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device reference, block size, or runtime identity is invalid, or
+    /// when HIP cannot reopen the selected device.
     pub fn open(
         discovery: &RocmDiscovery,
         device: PcuObjectRef,
@@ -186,16 +191,25 @@ impl RocmOwnedDispatchBackend {
     }
 
     /// Allocate a buffer in the exact HIP runtime session accepted by this adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HIP allocation error when the device cannot allocate the requested size.
     pub fn allocate(&self, bytes: usize) -> Result<DeviceBuffer, HipError> {
         self.runtime.allocate(bytes)
     }
 
     /// Create a memory provider for this same opened HIP device and its caller-assigned pool.
+    #[must_use]
     pub fn memory_provider(&self, pool: fusion_pcu::PcuMemoryPoolId) -> RocmMemoryProvider {
         self.runtime.memory_provider(pool)
     }
 
     /// Create binding metadata from this adapter's device identity and the allocation's true size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the allocation belongs to another runtime or device.
     pub fn binding(
         &self,
         target: PcuBindingRef,
@@ -219,10 +233,10 @@ impl RocmOwnedDispatchBackend {
     fn submit(
         &self,
         submission: PcuDispatchSubmission<'_>,
-        bindings: Vec<PcuOwnedBinding<DeviceBuffer>>,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
         let kernel = submission.kernel;
-        validate_owned_dispatch_bindings(kernel, submission.shape, self.device, &bindings)
+        validate_owned_dispatch_bindings(kernel, submission.shape, self.device, bindings)
             .map_err(RocmOwnedDispatchError::Binding)?;
         let source = lower_dispatch_to_hip_source(kernel)?;
         let logical_threads = submission.shape.thread_count().get();
@@ -236,7 +250,7 @@ impl RocmOwnedDispatchBackend {
             .and_then(|threads| threads.checked_mul(size_of::<f32>()))
             .ok_or(RocmOwnedDispatchError::GeometryOverflow)?;
 
-        for binding in &bindings {
+        for binding in bindings {
             let actual = binding.resource.len();
             if binding.byte_len != actual as u64 {
                 return Err(RocmOwnedDispatchError::BufferSizeMismatch {
@@ -267,7 +281,7 @@ impl RocmOwnedDispatchBackend {
                 .bindings
                 .iter()
                 .map(|binding| PcuBindingRef::new(binding.set, binding.binding)),
-            &bindings,
+            bindings,
         )
         .map_err(RocmOwnedDispatchError::Binding)?;
         let arguments = indices
@@ -327,7 +341,7 @@ impl PcuOwnedDispatchBackend for RocmOwnedDispatchBackend {
                 RocmLowerError::UnsupportedKernelInterface,
             ));
         }
-        self.submit(submission, bindings)
+        self.submit(submission, &bindings)
     }
 }
 
@@ -388,7 +402,7 @@ fn binding_order<R>(
         .collect()
 }
 
-fn owned_dispatch_support() -> PcuSupport {
+const fn owned_dispatch_support() -> PcuSupport {
     let mut support = PcuSupport::unsupported();
     support.caps = fusion_pcu::PcuCaps::ENUMERATE_EXECUTORS
         .union(fusion_pcu::PcuCaps::DISPATCH)

@@ -125,7 +125,7 @@ pub(crate) struct PcuSpirvWriter<'a, S: PcuSpirvSink> {
 }
 
 impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
-    pub(crate) fn new(sink: &'a mut S) -> Self {
+    pub(crate) const fn new(sink: &'a mut S) -> Self {
         Self {
             sink,
             word_count: 0,
@@ -437,6 +437,10 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
                 PARALLEL_FLOAT_TYPE_ID,
             ],
         )?;
+        self.push_parallel_float_variables()
+    }
+
+    fn push_parallel_float_variables(&mut self) -> Result<(), PcuSpirvError> {
         self.push_instruction(
             OP_VARIABLE,
             &[
@@ -835,7 +839,7 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
     }
 }
 
-fn dataflow_alu_opcode(op: PcuDispatchAluOp) -> Result<u16, PcuSpirvError> {
+const fn dataflow_alu_opcode(op: PcuDispatchAluOp) -> Result<u16, PcuSpirvError> {
     match op {
         PcuDispatchAluOp::Add => Ok(OP_F_ADD),
         PcuDispatchAluOp::Sub => Ok(OP_F_SUB),
@@ -924,7 +928,7 @@ fn dataflow_binding_ordinal(
         .ok_or(PcuSpirvError::InvalidBinding)
 }
 
-fn dataflow_index_id(index: PcuDispatchIndex) -> Result<u32, PcuSpirvError> {
+const fn dataflow_index_id(index: PcuDispatchIndex) -> Result<u32, PcuSpirvError> {
     match index {
         PcuDispatchIndex::InvocationId => Ok(DATAFLOW_INDEX_ID),
         PcuDispatchIndex::Value(_) => Err(PcuSpirvError::UnsupportedInstruction(
@@ -942,9 +946,11 @@ fn max_dataflow_value_id(kernel: &PcuDispatchKernelIr<'_>) -> u16 {
     let mut max_value = 0;
     for op in kernel.ops.iter().copied() {
         match op {
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { result, .. })
-            | PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, .. })
-            | PcuDispatchOp::Data(PcuDispatchDataOp::Alu { result, .. }) => {
+            PcuDispatchOp::Data(
+                PcuDispatchDataOp::BindingLoad { result, .. }
+                | PcuDispatchDataOp::Constant { result, .. }
+                | PcuDispatchDataOp::Alu { result, .. },
+            ) => {
                 max_value = max_value.max(result.0);
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { value, .. }) => {
@@ -956,6 +962,6 @@ fn max_dataflow_value_id(kernel: &PcuDispatchKernelIr<'_>) -> u16 {
     max_value
 }
 
-pub(crate) fn literal_string_word_count(value: &str) -> usize {
+pub(crate) const fn literal_string_word_count(value: &str) -> usize {
     (value.len() + 1).div_ceil(4)
 }

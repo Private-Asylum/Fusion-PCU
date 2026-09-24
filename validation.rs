@@ -62,6 +62,11 @@ pub enum PcuCommandValidationError {
 /// `ReadResult` step, and typed reads must state a scalar type whose bit width matches the
 /// declared access width. Targets with declared binding or port types are checked against that
 /// type; named and intrinsic targets remain intentionally opaque to this backend-neutral layer.
+///
+/// # Errors
+///
+/// Returns the first invalid typed read, duplicate result, or use-before-definition error.
+#[allow(clippy::too_many_lines)] // Ordered read/effect checks are one verifier pass.
 pub fn validate_command_kernel(
     kernel: &PcuCommandKernelIr<'_>,
 ) -> Result<(), PcuCommandValidationError> {
@@ -390,6 +395,10 @@ pub enum PcuPioU32StreamProfileError {
 /// accepted operation patterns are bit reverse, bit invert, increment, decrement, logical shifts,
 /// bit extraction, low-bit mask, and U32 byte swap. Parameterized arithmetic and resource-backed
 /// programs are outside this profile.
+///
+/// # Errors
+///
+/// Returns the first port, binding, parameter, or operation mismatch.
 pub fn validate_pio_u32_stream_profile(
     kernel: &PcuStreamKernelIr<'_>,
 ) -> Result<(), PcuPioU32StreamProfileError> {
@@ -430,7 +439,7 @@ pub fn validate_pio_u32_stream_profile(
             (1..=32).contains(&bits)
         }
         PcuStreamPattern::ExtractBits { offset, width } => {
-            width >= 1 && offset < 32 && offset as u16 + width as u16 <= 32
+            width >= 1 && offset < 32 && u16::from(offset) + u16::from(width) <= 32
         }
         PcuStreamPattern::MaskLower { bits } => (1..=32).contains(&bits),
         PcuStreamPattern::AddParameter { .. } | PcuStreamPattern::XorParameter { .. } => false,
@@ -450,6 +459,10 @@ pub fn validate_pio_u32_stream_profile(
 
 /// Validates both the static program shape and the empty runtime binding tables required by the
 /// common RP2350 PIO U32 profile.
+///
+/// # Errors
+///
+/// Returns a profile error for unsupported program shape or nonempty runtime bindings.
 pub fn validate_pio_u32_stream_invocation(
     kernel: &PcuStreamKernelIr<'_>,
     bindings: PcuInvocationBindings<'_>,
@@ -531,6 +544,7 @@ pub const PCU_PIO_U32_STREAM_VECTORS: &[PcuPioU32StreamVector] = &[
 ];
 
 /// Executes one admitted U32 profile pattern as a CPU reference operation.
+#[must_use]
 pub fn execute_pio_u32_stream_reference(pattern: PcuStreamPattern, input: u32) -> Option<u32> {
     Some(match pattern {
         PcuStreamPattern::BitReverse => input.reverse_bits(),
@@ -552,7 +566,7 @@ pub fn execute_pio_u32_stream_reference(pattern: PcuStreamPattern, input: u32) -
             }
         }
         PcuStreamPattern::ExtractBits { offset, width }
-            if width >= 1 && offset < 32 && offset as u16 + width as u16 <= 32 =>
+            if width >= 1 && offset < 32 && u16::from(offset) + u16::from(width) <= 32 =>
         {
             let mask = if width == 32 {
                 u32::MAX

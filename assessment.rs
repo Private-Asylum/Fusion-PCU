@@ -130,12 +130,24 @@ pub trait PcuPreparedDispatch {
     fn device(&self) -> PcuDeviceIdentity;
     fn executor(&self) -> PcuExecutorId;
 
+    /// Submits this prepared operation and transfers ownership to its completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns the prepared operation when submission is safely retryable, or an owned
+    /// completion when work may already be in flight.
     fn submit(
         self,
     ) -> Result<Self::Completion, PcuPreparedDispatchSubmitError<Self, Self::Completion, Self::Error>>
     where
         Self: Sized;
 
+    /// Cancels this prepared operation without submitting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the prepared object with the backend error when cancellation cannot prove that
+    /// releasing its preparation resources is safe.
     fn cancel(self) -> Result<(), PcuPreparedDispatchCancelError<Self, Self::Error>>
     where
         Self: Sized;
@@ -186,12 +198,22 @@ pub trait PcuDispatchPreparationBackend: PcuBaseContract {
     /// snapshot or finish consuming everything it needs before this method returns. Since
     /// availability may change between assessment and preparation, the backend must recheck any
     /// mutable native constraints here before reserving resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend-specific error when preparation cannot create a safe prepared
+    /// operation.
     fn prepare_dispatch_direct(
         &mut self,
         request: PcuDispatchPreparationRequest<'_>,
     ) -> Result<Self::Prepared, Self::Error>;
 
     /// Assesses the explicit target and common requirements without preparing backend state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the device identity and first assessment issue when the requested dispatch cannot
+    /// be prepared under the selected executor's current capabilities.
     fn assess_dispatch(
         &self,
         request: PcuDispatchPreparationRequest<'_>,
@@ -228,6 +250,11 @@ pub trait PcuDispatchPreparationBackend: PcuBaseContract {
     }
 
     /// Assesses the target, then creates a backend-owned prepared operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an assessment failure before backend preparation, or the backend's preparation
+    /// error if preparation itself fails.
     fn prepare_dispatch(
         &mut self,
         request: PcuDispatchPreparationRequest<'_>,
@@ -239,7 +266,7 @@ pub trait PcuDispatchPreparationBackend: PcuBaseContract {
     }
 }
 
-fn assess_floor(
+const fn assess_floor(
     descriptor: PcuExecutorDescriptor,
     request: PcuDispatchPreparationRequest<'_>,
 ) -> Result<(), PcuDispatchAssessmentIssue> {
@@ -298,7 +325,7 @@ fn assess_limits(
     )
 }
 
-fn check_limit(
+const fn check_limit(
     kind: PcuDispatchLimitKind,
     requested: u32,
     maximum: Option<u32>,

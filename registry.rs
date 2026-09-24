@@ -57,7 +57,9 @@ impl PcuRegistryError {
                 let available = self.0.message.len().saturating_sub(start);
                 let n = value.len().min(available);
                 self.0.message[start..start + n].copy_from_slice(&value.as_bytes()[..n]);
-                self.0.message_len += n as u8;
+                self.0.message_len = self.0.message_len.saturating_add(
+                    u8::try_from(n).expect("the message buffer is at most 96 bytes"),
+                );
                 if n != value.len() {
                     self.0.truncated = true;
                 }
@@ -75,6 +77,7 @@ impl PcuRegistryError {
         result
     }
 
+    #[must_use]
     pub fn message(&self) -> &str {
         // The buffer is populated from UTF-8 `Display` strings and truncation is at a byte
         // boundary. If a multi-byte codepoint is split, expose the valid prefix.
@@ -140,21 +143,29 @@ pub struct PcuRuntimeDiscoveryRegistry<'a, const N: usize> {
 }
 
 impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             entries: [None; N],
             len: 0,
         }
     }
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.len
     }
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Registers one provider under its stable ID. The backend's descriptor IDs must use the
     /// same ID, making all returned object references directly routable and unambiguous.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error when discovery fails, the provider does not expose exactly one
+    /// descriptor, its ID is already registered, or the fixed registry is full.
     pub fn register<D>(&mut self, provider: &'a D) -> Result<PcuProviderId, PcuRegistryError>
     where
         D: PcuRuntimeDiscovery + 'static,
@@ -162,7 +173,7 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
     {
         let mut descriptor = [empty_provider()];
         let n = providers::<D>(
-            provider as *const D as *const (),
+            core::ptr::from_ref(provider).cast::<()>(),
             PcuProviderId(u32::MAX),
             &mut descriptor,
         )
@@ -199,7 +210,7 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         }
         let entry = Entry {
             id,
-            context: provider as *const D as *const (),
+            context: core::ptr::from_ref(provider).cast::<()>(),
             _borrow: core::marker::PhantomData,
             vtable: Vtable {
                 providers: providers::<D>,
@@ -219,6 +230,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         Ok(id)
     }
 
+    /// Enumerates registered providers into caller-owned bounded storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider's discovery error.
     pub fn providers<'s>(
         &'s self,
         output: &mut [PcuProviderDescriptor<'s>],
@@ -234,6 +250,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         }
         Ok(total)
     }
+    /// Enumerates targets for one registered provider and generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown or discovery fails.
     pub fn targets<'s>(
         &'s self,
         provider: PcuProviderId,
@@ -243,6 +264,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         let e = self.find(provider)?;
         (e.vtable.targets)(e.context, provider, generation, out)
     }
+    /// Enumerates devices for one target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown or discovery fails.
     pub fn devices<'s>(
         &'s self,
         target: PcuObjectRef,
@@ -251,6 +277,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         let e = self.find(target.provider)?;
         (e.vtable.devices)(e.context, target, out)
     }
+    /// Enumerates contexts for one device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown or discovery fails.
     pub fn contexts<'s>(
         &'s self,
         device: PcuObjectRef,
@@ -259,6 +290,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         let e = self.find(device.provider)?;
         (e.vtable.contexts)(e.context, device, out)
     }
+    /// Enumerates memory domains for one context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown or discovery fails.
     pub fn memory_domains<'s>(
         &'s self,
         context: PcuObjectRef,
@@ -267,6 +303,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         let e = self.find(context.provider)?;
         (e.vtable.domains)(e.context, context, out)
     }
+    /// Queries capabilities for one target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown or the query fails.
     pub fn target_capabilities(
         &self,
         target: PcuObjectRef,
@@ -274,6 +315,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         let e = self.find(target.provider)?;
         (e.vtable.target_caps)(e.context, target)
     }
+    /// Queries capabilities for one device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown or the query fails.
     pub fn device_capabilities(
         &self,
         device: PcuObjectRef,
@@ -281,6 +327,11 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
         let e = self.find(device.provider)?;
         (e.vtable.device_caps)(e.context, device)
     }
+    /// Enumerates executor descriptors for one discovered object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown or discovery fails.
     pub fn executors(
         &self,
         object: PcuObjectRef,
@@ -316,11 +367,12 @@ fn call_error(
 ) -> PcuRegistryError {
     PcuRegistryError::new(Some(p), op, e)
 }
-unsafe fn cast<'a, D: 'a>(x: *const ()) -> &'a D {
-    unsafe { &*(x as *const D) }
+const unsafe fn cast<'a, D: 'a>(x: *const ()) -> &'a D {
+    // SAFETY: Caller guarantees that `x` points to a live `D` for `'a`.
+    unsafe { &*x.cast::<D>() }
 }
 
-fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
+const fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
     use crate::{
         PcuProviderReadiness,
         PcuProviderStatus,
@@ -336,10 +388,10 @@ fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
     }
 }
 
-fn providers<'a, D: PcuRuntimeDiscovery + 'static>(
+fn providers<D: PcuRuntimeDiscovery + 'static>(
     x: *const (),
     id: PcuProviderId,
-    o: &mut [PcuProviderDescriptor<'a>],
+    o: &mut [PcuProviderDescriptor<'_>],
 ) -> Result<usize, PcuRegistryError>
 where
     D::Error: fmt::Display,
@@ -348,11 +400,11 @@ where
         .providers(o)
         .map_err(|e| call_error(e, id, PcuDiscoveryOperation::Providers))
 }
-fn targets<'a, D: PcuRuntimeDiscovery + 'static>(
+fn targets<D: PcuRuntimeDiscovery + 'static>(
     x: *const (),
     p: PcuProviderId,
     g: u64,
-    o: &mut [PcuTargetDescriptor<'a>],
+    o: &mut [PcuTargetDescriptor<'_>],
 ) -> Result<usize, PcuRegistryError>
 where
     D::Error: fmt::Display,
@@ -361,10 +413,10 @@ where
         .targets(p, g, o)
         .map_err(|e| call_error(e, p, PcuDiscoveryOperation::Targets))
 }
-fn devices<'a, D: PcuRuntimeDiscovery + 'static>(
+fn devices<D: PcuRuntimeDiscovery + 'static>(
     x: *const (),
     r: PcuObjectRef,
-    o: &mut [PcuDeviceDescriptor<'a>],
+    o: &mut [PcuDeviceDescriptor<'_>],
 ) -> Result<usize, PcuRegistryError>
 where
     D::Error: fmt::Display,
@@ -373,10 +425,10 @@ where
         .devices(r, o)
         .map_err(|e| call_error(e, r.provider, PcuDiscoveryOperation::Devices))
 }
-fn contexts<'a, D: PcuRuntimeDiscovery + 'static>(
+fn contexts<D: PcuRuntimeDiscovery + 'static>(
     x: *const (),
     r: PcuObjectRef,
-    o: &mut [PcuContextDescriptor<'a>],
+    o: &mut [PcuContextDescriptor<'_>],
 ) -> Result<usize, PcuRegistryError>
 where
     D::Error: fmt::Display,
@@ -385,10 +437,10 @@ where
         .contexts(r, o)
         .map_err(|e| call_error(e, r.provider, PcuDiscoveryOperation::Contexts))
 }
-fn domains<'a, D: PcuRuntimeDiscovery + 'static>(
+fn domains<D: PcuRuntimeDiscovery + 'static>(
     x: *const (),
     r: PcuObjectRef,
-    o: &mut [PcuMemoryDomainDescriptor<'a>],
+    o: &mut [PcuMemoryDomainDescriptor<'_>],
 ) -> Result<usize, PcuRegistryError>
 where
     D::Error: fmt::Display,

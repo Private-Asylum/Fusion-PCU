@@ -617,20 +617,26 @@ impl<'a> PcuBinding<'a> {
     #[must_use]
     pub const fn is_well_formed(self) -> bool {
         match (self.storage, self.binding_type) {
-            (PcuBindingStorageClass::Image, PcuBindingType::Image(_)) => true,
+            (PcuBindingStorageClass::Image, PcuBindingType::Image(_))
+            | (
+                PcuBindingStorageClass::AccelerationStructure,
+                PcuBindingType::AccelerationStructure(_),
+            ) => true,
             (PcuBindingStorageClass::Sampler, PcuBindingType::Sampler(_)) => {
                 matches!(self.access, PcuBindingAccess::ReadOnly)
             }
             (
-                PcuBindingStorageClass::AccelerationStructure,
-                PcuBindingType::AccelerationStructure(_),
-            ) => true,
-            (PcuBindingStorageClass::Image, _)
-            | (PcuBindingStorageClass::Sampler, _)
-            | (PcuBindingStorageClass::AccelerationStructure, _)
-            | (_, PcuBindingType::Image(_))
-            | (_, PcuBindingType::Sampler(_))
-            | (_, PcuBindingType::AccelerationStructure(_)) => false,
+                PcuBindingStorageClass::Image
+                | PcuBindingStorageClass::Sampler
+                | PcuBindingStorageClass::AccelerationStructure,
+                _,
+            )
+            | (
+                _,
+                PcuBindingType::Image(_)
+                | PcuBindingType::Sampler(_)
+                | PcuBindingType::AccelerationStructure(_),
+            ) => false,
             (_, PcuBindingType::Value(_)) => true,
         }
     }
@@ -694,7 +700,7 @@ impl PcuParameterValue {
         if value < -8 || value > 7 {
             None
         } else {
-            Some(Self::I4((value as u8) & 0x0f))
+            Some(Self::I4(u8::from_ne_bytes(value.to_ne_bytes()) & 0x0f))
         }
     }
 
@@ -728,7 +734,7 @@ impl PcuParameterValue {
     }
 
     #[must_use]
-    pub fn from_f32(value: f32) -> Self {
+    pub const fn from_f32(value: f32) -> Self {
         Self::F32(value.to_bits())
     }
 
@@ -738,7 +744,7 @@ impl PcuParameterValue {
     }
 
     #[must_use]
-    pub fn from_f64(value: f64) -> Self {
+    pub const fn from_f64(value: f64) -> Self {
         Self::F64(value.to_bits())
     }
 
@@ -787,9 +793,9 @@ impl PcuParameterValue {
             Self::I4(bits) => {
                 let bits = bits & 0x0f;
                 Some(if (bits & 0x08) != 0 {
-                    (bits | 0xf0) as i8
+                    i8::from_ne_bytes([bits | 0xf0])
                 } else {
-                    bits as i8
+                    i8::from_ne_bytes([bits])
                 })
             }
             _ => None,
@@ -869,7 +875,7 @@ impl PcuParameterValue {
     }
 
     #[must_use]
-    pub fn as_f32(self) -> Option<f32> {
+    pub const fn as_f32(self) -> Option<f32> {
         match self {
             Self::F32(bits) => Some(f32::from_bits(bits)),
             _ => None,
@@ -885,7 +891,7 @@ impl PcuParameterValue {
     }
 
     #[must_use]
-    pub fn as_f64(self) -> Option<f64> {
+    pub const fn as_f64(self) -> Option<f64> {
         match self {
             Self::F64(bits) => Some(f64::from_bits(bits)),
             _ => None,

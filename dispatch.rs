@@ -293,6 +293,10 @@ pub trait PcuStreamBackend: PcuBaseContract {
     type StreamHandle: PcuPersistentHandle;
 
     /// Installs one persistent Stream program.
+    ///
+    /// # Errors
+    ///
+    /// Returns an admission or backend installation error.
     fn install_stream(
         &self,
         installation: PcuStreamInstallation<'_>,
@@ -401,6 +405,10 @@ pub trait PcuExclusiveStreamBackend: PcuBaseContract {
 
     /// Installs one already-admitted Stream program and validates that the lease is live and
     /// belongs to this backend before using the selected executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lease or backend installation is invalid.
     fn install_stream_on_lease_direct(
         &self,
         lease: &mut Self::Lease,
@@ -590,6 +598,10 @@ pub trait PcuDirectDispatchFamilyBackend: PcuBaseContract {
     }
 
     /// Submits one already-validated direct Dispatch program.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend submission error without claiming completion.
     fn submit_dispatch_direct(
         &self,
         submission: PcuDispatchSubmission<'_>,
@@ -653,6 +665,10 @@ pub trait PcuDirectTransactionBackend: PcuBaseContract {
     }
 
     /// Submits one already-validated direct Transaction program.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend submission error without claiming completion.
     fn submit_transaction_direct(
         &self,
         submission: PcuTransactionSubmission<'_>,
@@ -752,27 +768,27 @@ fn validate_direct_kernel_support<B: PcuBaseContract + ?Sized>(
 ) -> Result<(), PcuError> {
     let kernel_supported = backend.any_executor_supports_kernel_direct(kernel);
 
-    if let PcuKernel::Dispatch(dispatch) = kernel {
-        if !kernel_supported {
-            let any_structural = backend.executors().iter().copied().any(|descriptor| {
+    if let PcuKernel::Dispatch(dispatch) = kernel
+        && !kernel_supported
+    {
+        let any_structural = backend.executors().iter().copied().any(|descriptor| {
+            descriptor
+                .support
+                .supports_dispatch_direct_structure(dispatch)
+        });
+        if any_structural {
+            let any_typed = backend.executors().iter().copied().any(|descriptor| {
                 descriptor
                     .support
                     .supports_dispatch_direct_structure(dispatch)
-            });
-            if any_structural {
-                let any_typed = backend.executors().iter().copied().any(|descriptor| {
-                    descriptor
+                    && descriptor
                         .support
-                        .supports_dispatch_direct_structure(dispatch)
-                        && descriptor
-                            .support
-                            .supports_value_types_direct(dispatch.required_type_support())
-                });
-                if any_typed {
-                    return Err(PcuError::unsupported_feature_support());
-                }
-                return Err(PcuError::unsupported_type_support());
+                        .supports_value_types_direct(dispatch.required_type_support())
+            });
+            if any_typed {
+                return Err(PcuError::unsupported_feature_support());
             }
+            return Err(PcuError::unsupported_type_support());
         }
     }
 
@@ -1608,8 +1624,7 @@ mod tests {
             PcuCommandSubmission { kernel: &kernel },
             PcuInvocationParameters::empty(),
         )
-        .err()
-        .expect("undefined result must be rejected before backend execution");
+        .expect_err("undefined result must be rejected before backend execution");
         assert_eq!(error.kind(), crate::PcuErrorKind::Invalid);
     }
 

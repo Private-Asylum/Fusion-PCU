@@ -107,14 +107,15 @@ impl PcuStreamPattern {
             | Self::Decrement
             | Self::AddParameter { .. }
             | Self::XorParameter { .. } => true,
-            Self::ShiftLeft { bits } | Self::ShiftRight { bits } => bits >= 1 && bits <= bit_width,
+            Self::ShiftLeft { bits } | Self::ShiftRight { bits } | Self::MaskLower { bits } => {
+                bits >= 1 && bits <= bit_width
+            }
             Self::ExtractBits { offset, width } => {
                 width >= 1
                     && width <= bit_width
                     && offset < bit_width
                     && (offset as u16 + width as u16) <= bit_width as u16
             }
-            Self::MaskLower { bits } => bits >= 1 && bits <= bit_width,
             Self::ByteSwap32 => matches!(value_type, PcuStreamValueType::U32),
         }
     }
@@ -561,7 +562,7 @@ impl<'a, const MAX_PATTERNS: usize> PcuStreamKernelBuilder<'a, MAX_PATTERNS> {
         Ok(())
     }
 
-    fn ports(&self) -> &'static [PcuPort<'static>; 2] {
+    const fn ports(&self) -> &'static [PcuPort<'static>; 2] {
         match self.value_type {
             PcuStreamValueType::U8 => &BYTE_STREAM_PORTS,
             PcuStreamValueType::U16 => &HALF_WORD_STREAM_PORTS,

@@ -52,7 +52,7 @@ pub struct F32MapBuilder<'a, const MAX_OPS: usize = 32> {
 impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
     /// Start a kernel with a finite logical invocation shape and its resource bindings.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         kernel_id: u32,
         entry_point: &'a str,
         logical_shape: [u32; 3],
@@ -69,6 +69,10 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
     }
 
     /// Load a scalar `f32` binding at the current invocation ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding is missing, incompatible, or operation storage is full.
     pub fn load_f32(mut self, binding: PcuBindingRef) -> Result<(Self, F32Value), PcuError> {
         self.check_binding(binding, false)?;
         let value = self.fresh_value()?;
@@ -81,6 +85,10 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
     }
 
     /// Construct a scalar `f32` constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation buffer is full or the value ID space is exhausted.
     pub fn constant(mut self, value: f32) -> Result<(Self, F32Value), PcuError> {
         let result = self.fresh_value()?;
         self.push(PcuDispatchDataOp::Constant {
@@ -91,6 +99,11 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
     }
 
     /// Add two values produced by this builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either value belongs to another kernel or operation/value capacity
+    /// is exhausted.
     pub fn add(mut self, lhs: F32Value, rhs: F32Value) -> Result<(Self, F32Value), PcuError> {
         self.check_value(lhs)?;
         self.check_value(rhs)?;
@@ -105,6 +118,11 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
     }
 
     /// Multiply two values produced by this builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either value belongs to another kernel or operation/value capacity
+    /// is exhausted.
     pub fn mul(mut self, lhs: F32Value, rhs: F32Value) -> Result<(Self, F32Value), PcuError> {
         self.check_value(lhs)?;
         self.check_value(rhs)?;
@@ -119,6 +137,10 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
     }
 
     /// Store one value to a writable scalar `f32` binding at the current invocation ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value or binding is incompatible, or operation storage is full.
     pub fn store_f32(mut self, binding: PcuBindingRef, value: F32Value) -> Result<Self, PcuError> {
         self.check_value(value)?;
         self.check_binding(binding, true)?;
@@ -173,8 +195,11 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
         Ok(())
     }
 
-    fn check_value(&self, value: F32Value) -> Result<(), PcuError> {
-        if value.kernel_id != self.kernel_id || value.id >= self.next_value {
+    const fn check_value(&self, value: F32Value) -> Result<(), PcuError> {
+        if value.kernel_id != self.kernel_id {
+            return Err(PcuError::invalid());
+        }
+        if value.id >= self.next_value {
             return Err(PcuError::invalid());
         }
         Ok(())
@@ -232,8 +257,8 @@ mod tests {
         ));
         assert!(
             matches!(ir.ops[1], PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
-            result: PcuDispatchValueId(2), value: PcuParameterValue::F32(bits),
-        }) if bits == 0.5f32.to_bits())
+            result: PcuDispatchValueId(2), value: PcuParameterValue::F32(raw_bits),
+        }) if raw_bits == 0.5f32.to_bits())
         );
         assert!(matches!(
             ir.ops[2],

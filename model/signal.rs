@@ -135,7 +135,7 @@ pub struct PcuSignalKernelBuilder<'a, const MAX_OPS: usize = DEFAULT_OP_CAPACITY
 impl<'a, const MAX_OPS: usize> PcuSignalKernelBuilder<'a, MAX_OPS> {
     /// Creates one signal-kernel builder.
     #[must_use]
-    pub fn new(kernel_id: u32, entry_point: &'a str, trigger: PcuSignalTriggerKind) -> Self {
+    pub const fn new(kernel_id: u32, entry_point: &'a str, trigger: PcuSignalTriggerKind) -> Self {
         Self {
             kernel_id: PcuKernelId(kernel_id),
             entry_point,
@@ -217,7 +217,7 @@ impl<'a, const MAX_OPS: usize> PcuSignalKernelBuilder<'a, MAX_OPS> {
         PcuKernel::Signal(self.ir())
     }
 
-    fn push_op(&mut self, op: PcuSignalOp<'a>) -> Result<(), PcuError> {
+    const fn push_op(&mut self, op: PcuSignalOp<'a>) -> Result<(), PcuError> {
         if self.op_len == MAX_OPS {
             return Err(PcuError::resource_exhausted());
         }

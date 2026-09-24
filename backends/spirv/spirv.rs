@@ -1,6 +1,6 @@
 //! SPIR-V lowering backend for PCU IR.
 //!
-//! This module is a compiler target, not a device runner. Vulkan, OpenCL, or any other runtime
+//! This module is a compiler target, not a device runner. Vulkan, `OpenCL`, or any other runtime
 //! may consume the generated words elsewhere; this backend only lowers PCU dispatch IR into
 //! backend-neutral SPIR-V module bytes.
 

@@ -121,17 +121,23 @@ impl From<HipError> for RocblasError {
 /// rocBLAS handle tied to the HIP runtime and device used to create it.
 pub struct Rocblas {
     runtime: HipRuntime,
-    _library: Arc<Library>,
+    library: Arc<Library>,
     handle: RocblasHandle,
     poisoned: Cell<bool>,
 }
 
 impl Rocblas {
     /// Load `librocblas.so` (or `ROCBLAS_LIBRARY`) and create a handle for `runtime`'s device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when rocBLAS cannot be loaded, a required symbol is missing, or HIP/rocBLAS
+    /// fails to create the handle.
     pub fn new(runtime: &HipRuntime) -> Result<Self, RocblasError> {
-        let candidates: Vec<OsString> = std::env::var_os("ROCBLAS_LIBRARY")
-            .map(|p| vec![p])
-            .unwrap_or_else(|| vec!["librocblas.so".into(), "librocblas.so.5".into()]);
+        let candidates: Vec<OsString> = std::env::var_os("ROCBLAS_LIBRARY").map_or_else(
+            || vec!["librocblas.so".into(), "librocblas.so.5".into()],
+            |path| vec![path],
+        );
         let mut last_error = None;
         for candidate in candidates {
             // SAFETY: rocBLAS exports the documented C ABI. Arc keeps it loaded for handle life.
@@ -150,7 +156,7 @@ impl Rocblas {
                     symbol: "rocblas_create_handle",
                     detail: e.to_string(),
                 })?;
-            let status = unsafe { create(&mut handle) };
+            let status = unsafe { create(&raw mut handle) };
             if status != ROCBLAS_SUCCESS {
                 return Err(RocblasError::Status {
                     operation: "rocblas_create_handle",
@@ -159,7 +165,7 @@ impl Rocblas {
             }
             return Ok(Self {
                 runtime: runtime.clone(),
-                _library: library,
+                library,
                 handle,
                 poisoned: Cell::new(false),
             });
@@ -171,7 +177,17 @@ impl Rocblas {
 
     /// Compute column-major `C = alpha * op(A) * op(B) + beta * C` and wait for device completion.
     /// Leading dimensions and allocation extents are validated before entering the C ABI.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid dimensions, buffers from another device, concurrent buffer
+    /// use, or a HIP/rocBLAS failure.
+    // The argument names follow the standardized BLAS SGEMM signature.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::too_many_arguments
+    )]
     pub fn sgemm(
         &self,
         transpose_a: bool,
@@ -225,7 +241,7 @@ impl Rocblas {
         self.runtime.hip_set_device(self.runtime.0.device)?;
         // SAFETY: signature follows rocblas_sgemm in rocblas.h; buffers are validated allocations
         // from this runtime/device and the scalar pointers remain live through the call.
-        let sgemm = unsafe { self._library.get::<Sgemm>(b"rocblas_sgemm\0") }.map_err(|e| {
+        let sgemm = unsafe { self.library.get::<Sgemm>(b"rocblas_sgemm\0") }.map_err(|e| {
             RocblasError::MissingSymbol {
                 symbol: "rocblas_sgemm",
                 detail: e.to_string(),
@@ -247,12 +263,12 @@ impl Rocblas {
                 m,
                 n,
                 k,
-                &alpha,
+                std::ptr::from_ref(&alpha),
                 a.allocation.pointer.cast(),
                 lda,
                 b.allocation.pointer.cast(),
                 ldb,
-                &beta,
+                std::ptr::from_ref(&beta),
                 c.allocation.pointer.cast(),
                 ldc,
             )
@@ -286,16 +302,16 @@ impl Rocblas {
 impl Drop for Rocblas {
     fn drop(&mut self) {
         if self.poisoned.get() {
-            std::mem::forget(self._library.clone());
+            std::mem::forget(self.library.clone());
             return;
         }
         if self.runtime.hip_set_device(self.runtime.0.device).is_err() {
-            std::mem::forget(self._library.clone());
+            std::mem::forget(self.library.clone());
             return;
         }
         // SAFETY: handle came from rocblas_create_handle and library is retained until this drop.
         if let Ok(destroy) = unsafe {
-            self._library
+            self.library
                 .get::<DestroyHandle>(b"rocblas_destroy_handle\0")
         } {
             let _ = unsafe { destroy(self.handle) };

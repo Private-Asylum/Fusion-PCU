@@ -1,4 +1,4 @@
-//! Hardware proof for PCU Dispatch -> HIP source -> HSACO -> ROCm execution.
+//! Hardware proof for PCU Dispatch -> HIP source -> HSACO -> `ROCm` execution.
 
 use std::process::ExitCode;
 use std::num::NonZeroU32;
@@ -62,6 +62,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)] // This hardware smoke test keeps resource lifetimes visible end to end.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     const COUNT: usize = 65;
     let architecture = std::env::var("FUSION_ROCM_ARCH").unwrap_or_else(|_| "gfx1030".into());
@@ -104,7 +105,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("ROCm memory pool: {used}/{capacity} bytes system-used");
     }
 
-    let input: Vec<f32> = (0..COUNT).map(|index| index as f32).collect();
+    let input: Vec<f32> = (0..COUNT)
+        .map(|index| f32::from(u16::try_from(index).expect("smoke-test index fits in u16")))
+        .collect();
     let mut input_bytes = Vec::with_capacity(COUNT * 4);
     for value in &input {
         input_bytes.extend_from_slice(&value.to_ne_bytes());
@@ -160,9 +163,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             PcuValueType::f32(),
         ),
     ];
-    let (builder, input_value) =
-        F32MapBuilder::<8>::new(1, "add_one", [COUNT as u32, 1, 1], &bindings)
-            .load_f32(PcuBindingRef::new(0, 0))?;
+    let (builder, input_value) = F32MapBuilder::<8>::new(1, "add_one", [65, 1, 1], &bindings)
+        .load_f32(PcuBindingRef::new(0, 0))?;
     let (builder, one) = builder.constant(1.0)?;
     let (builder, result) = builder.add(input_value, one)?;
     let builder = builder.store_f32(PcuBindingRef::new(0, 1), result)?;
@@ -191,7 +193,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for (index, chunk) in output_bytes.chunks_exact(4).enumerate() {
         let actual = f32::from_ne_bytes(chunk.try_into()?);
         let expected = input[index] + 1.0;
-        if actual != expected {
+        if (actual - expected).abs() > f32::EPSILON {
             return Err(format!("output[{index}] = {actual}, expected {expected}").into());
         }
     }
@@ -242,7 +244,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .submit_dispatch_owned(
             PcuDispatchSubmission {
                 kernel: &kernel,
-                shape: PcuInvocationShape::threads(NonZeroU32::new(COUNT as u32).unwrap()),
+                shape: PcuInvocationShape::threads(NonZeroU32::new(65).unwrap()),
             },
             async_bindings,
             PcuInvocationParameters::empty(),
@@ -300,24 +302,23 @@ fn rank_devices(
     devices: &[Candidate],
     preferred: Option<i32>,
 ) -> Result<Vec<&Candidate>, Box<dyn std::error::Error>> {
-    match preferred {
-        Some(index) => devices
+    if let Some(index) = preferred {
+        devices
             .iter()
             .find(|device| i32::try_from(device.reference.id).ok() == Some(index))
             .map(|device| vec![device])
-            .ok_or_else(|| format!("requested ROCm device index {index} is unavailable").into()),
-        None => {
-            if devices.is_empty() {
-                return Err("no ROCm devices are available".into());
-            }
-            let mut ranked: Vec<_> = devices.iter().collect();
-            ranked.sort_by(|a, b| {
-                b.total_memory
-                    .cmp(&a.total_memory)
-                    .then_with(|| a.reference.id.cmp(&b.reference.id))
-            });
-            Ok(ranked)
+            .ok_or_else(|| format!("requested ROCm device index {index} is unavailable").into())
+    } else {
+        if devices.is_empty() {
+            return Err("no ROCm devices are available".into());
         }
+        let mut ranked: Vec<_> = devices.iter().collect();
+        ranked.sort_by(|a, b| {
+            b.total_memory
+                .cmp(&a.total_memory)
+                .then_with(|| a.reference.id.cmp(&b.reference.id))
+        });
+        Ok(ranked)
     }
 }
 
@@ -368,7 +369,7 @@ const EMPTY_REF: PcuObjectRef = PcuObjectRef {
     id: 0,
 };
 
-fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
+const fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
     PcuProviderDescriptor {
         id: PcuProviderId(0),
         generation: 0,
@@ -380,7 +381,7 @@ fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
     }
 }
 
-fn empty_target<'a>() -> PcuTargetDescriptor<'a> {
+const fn empty_target<'a>() -> PcuTargetDescriptor<'a> {
     PcuTargetDescriptor {
         reference: EMPTY_REF,
         name: "",
@@ -391,7 +392,7 @@ fn empty_target<'a>() -> PcuTargetDescriptor<'a> {
     }
 }
 
-fn empty_device<'a>() -> PcuDeviceDescriptor<'a> {
+const fn empty_device<'a>() -> PcuDeviceDescriptor<'a> {
     PcuDeviceDescriptor {
         reference: EMPTY_REF,
         target: EMPTY_REF,
@@ -404,7 +405,7 @@ fn empty_device<'a>() -> PcuDeviceDescriptor<'a> {
     }
 }
 
-fn empty_context<'a>() -> PcuContextDescriptor<'a> {
+const fn empty_context<'a>() -> PcuContextDescriptor<'a> {
     PcuContextDescriptor {
         reference: EMPTY_REF,
         device: EMPTY_REF,
@@ -413,7 +414,7 @@ fn empty_context<'a>() -> PcuContextDescriptor<'a> {
     }
 }
 
-fn empty_domain<'a>() -> PcuMemoryDomainDescriptor<'a> {
+const fn empty_domain<'a>() -> PcuMemoryDomainDescriptor<'a> {
     PcuMemoryDomainDescriptor {
         reference: EMPTY_REF,
         context: EMPTY_REF,

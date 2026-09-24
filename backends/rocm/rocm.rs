@@ -124,17 +124,23 @@ pub struct HipRuntimeProbe {
 }
 
 struct RuntimeInner {
-    _library: Arc<Library>,
+    library: Arc<Library>,
     device: HipDevice,
     name: String,
 }
 
 impl HipRuntime {
     /// Load HIP and report visible devices without selecting one. Zero devices is a valid result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a runtime library cannot be loaded, a required symbol is missing,
+    /// or HIP reports a failure.
     pub fn probe() -> Result<HipRuntimeProbe, HipError> {
-        let candidates = std::env::var_os("HIP_RUNTIME_LIBRARY")
-            .map(|path| vec![path])
-            .unwrap_or_else(|| vec!["libamdhip64.so".into(), "libamdhip64.so.6".into()]);
+        let candidates = std::env::var_os("HIP_RUNTIME_LIBRARY").map_or_else(
+            || vec!["libamdhip64.so".into(), "libamdhip64.so.6".into()],
+            |path| vec![path],
+        );
         let mut last_error = None;
         for candidate in candidates {
             let path = candidate.to_string_lossy().into_owned();
@@ -152,12 +158,12 @@ impl HipRuntime {
                     detail: error.to_string(),
                 })?;
             let mut count = 0;
-            let status = unsafe { get_count(&mut count) };
+            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
             if status != HIP_SUCCESS {
                 return Err(raw_hip_error(&library, "hipGetDeviceCount", status));
             }
             return Ok(HipRuntimeProbe {
-                device_count: count.max(0) as u32,
+                device_count: count.max(0).unsigned_abs(),
                 runtime_library: path,
             });
         }
@@ -167,10 +173,16 @@ impl HipRuntime {
     }
 
     /// Enumerate visible devices without selecting one, querying only stable HIP identity facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a runtime library cannot be loaded, a required symbol is missing,
+    /// or HIP fails to enumerate a device.
     pub fn enumerate_devices() -> Result<Vec<HipDeviceInfo>, HipError> {
-        let candidates = std::env::var_os("HIP_RUNTIME_LIBRARY")
-            .map(|path| vec![path])
-            .unwrap_or_else(|| vec!["libamdhip64.so".into(), "libamdhip64.so.6".into()]);
+        let candidates = std::env::var_os("HIP_RUNTIME_LIBRARY").map_or_else(
+            || vec!["libamdhip64.so".into(), "libamdhip64.so.6".into()],
+            |path| vec![path],
+        );
         let mut last_error = None;
         for candidate in candidates {
             // SAFETY: symbols are used while this library remains in scope.
@@ -205,25 +217,25 @@ impl HipRuntime {
                     detail: error.to_string(),
                 })?;
             let mut count = 0;
-            let status = unsafe { get_count(&mut count) };
+            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
             if status != HIP_SUCCESS {
                 return Err(raw_hip_error(&library, "hipGetDeviceCount", status));
             }
-            let mut devices = Vec::with_capacity(count.max(0) as usize);
+            let mut devices = Vec::new();
             for index in 0..count.max(0) {
                 let mut device = 0;
-                let status = unsafe { get_device(&mut device, index) };
+                let status = unsafe { get_device(ptr::from_mut(&mut device), index) };
                 if status != HIP_SUCCESS {
                     return Err(raw_hip_error(&library, "hipDeviceGet", status));
                 }
                 let mut name = [0_i8; 256];
-                let status = unsafe { get_name(name.as_mut_ptr(), name.len() as c_int, device) };
+                let status = unsafe { get_name(name.as_mut_ptr(), 256, device) };
                 if status != HIP_SUCCESS {
                     return Err(raw_hip_error(&library, "hipDeviceGetName", status));
                 }
                 let name = bounded_device_name(&name);
                 let mut total = 0_usize;
-                let status = unsafe { total_mem(&mut total, device) };
+                let status = unsafe { total_mem(&raw mut total, device) };
                 if status != HIP_SUCCESS {
                     return Err(raw_hip_error(&library, "hipDeviceTotalMem", status));
                 }
@@ -245,10 +257,15 @@ impl HipRuntime {
     }
 
     /// Load `libamdhip64.so` (or `HIP_RUNTIME_LIBRARY`) and select `device_index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot load, enumerate, or select the requested device.
     pub fn new(device_index: u32) -> Result<Self, HipError> {
-        let candidates = std::env::var_os("HIP_RUNTIME_LIBRARY")
-            .map(|path| vec![path])
-            .unwrap_or_else(|| vec!["libamdhip64.so".into(), "libamdhip64.so.6".into()]);
+        let candidates = std::env::var_os("HIP_RUNTIME_LIBRARY").map_or_else(
+            || vec!["libamdhip64.so".into(), "libamdhip64.so.6".into()],
+            |path| vec![path],
+        );
         let mut last_error = None;
         for candidate in candidates {
             // SAFETY: HIP runtime exports C ABI symbols; retaining the library in RuntimeInner
@@ -268,16 +285,16 @@ impl HipRuntime {
                     detail: error.to_string(),
                 })?;
             let mut count: c_int = 0;
-            let status = unsafe { get_count(&mut count) };
+            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
             let runtime = Self(Arc::new(RuntimeInner {
-                _library: Arc::new(library),
+                library: Arc::new(library),
                 device: 0,
                 name: String::new(),
             }));
             if status != HIP_SUCCESS {
                 return Err(runtime.error("hipGetDeviceCount", status));
             }
-            let count = count.max(0) as u32;
+            let count = count.max(0).unsigned_abs();
             if device_index >= count {
                 return Err(HipError::DeviceIndexOutOfRange {
                     requested: device_index,
@@ -294,7 +311,7 @@ impl HipRuntime {
             runtime.hip_set_device(device)?;
             let name = runtime.device_name(device)?;
             return Ok(Self(Arc::new(RuntimeInner {
-                _library: runtime.0._library.clone(),
+                library: runtime.0.library.clone(),
                 device,
                 name,
             })));
@@ -305,19 +322,27 @@ impl HipRuntime {
     }
 
     /// Return visible HIP device count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot query the visible device count.
     pub fn device_count(&self) -> Result<u32, HipError> {
         let mut count = 0;
         self.call("hipGetDeviceCount", |f: GetDeviceCount| unsafe {
-            f(&mut count)
+            f(&raw mut count)
         })?;
-        Ok(count.max(0) as u32)
+        Ok(count.max(0).unsigned_abs())
     }
 
     /// Return the selected device's index, name, and physical memory capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot query device memory information.
     pub fn device_info(&self) -> Result<HipDeviceInfo, HipError> {
         let mut total = 0_usize;
         self.call("hipDeviceTotalMem", |f: DeviceTotalMem| unsafe {
-            f(&mut total, self.0.device)
+            f(&raw mut total, self.0.device)
         })?;
         Ok(HipDeviceInfo {
             index: self.0.device,
@@ -325,7 +350,7 @@ impl HipRuntime {
             vendor: "AMD".into(),
             architecture: None,
             generation: None,
-            pci_bus_id: query_pci_bus_id(&self.0._library, self.0.device),
+            pci_bus_id: query_pci_bus_id(&self.0.library, self.0.device),
             total_memory: total as u64,
         })
     }
@@ -334,11 +359,15 @@ impl HipRuntime {
     ///
     /// This is system-wide free capacity at a point in time, not an allocation reservation or
     /// process-attributable usage. Admission can race with other GPU clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot query device memory information.
     pub fn memory_info(&self) -> Result<HipMemoryInfo, HipError> {
         let mut free = 0_usize;
         let mut total = 0_usize;
         self.call("hipMemGetInfo", |f: MemGetInfo| unsafe {
-            f(&mut free, &mut total)
+            f(&raw mut free, &raw mut total)
         })?;
         Ok(HipMemoryInfo {
             free_bytes: free as u64,
@@ -352,6 +381,10 @@ impl HipRuntime {
     /// free/total query describes device-wide availability; it does not attribute memory use to
     /// this process, so process usage is reported as unknown. The result is telemetry only and
     /// does not reserve memory or prevent another client from allocating concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying HIP memory query fails.
     pub fn memory_pool_snapshot(
         &self,
         pool: PcuMemoryPoolId,
@@ -361,14 +394,21 @@ impl HipRuntime {
     }
 
     /// Bind a caller-assigned abstract pool identity to this selected HIP device.
+    #[must_use]
     pub fn memory_provider(&self, pool: PcuMemoryPoolId) -> RocmMemoryProvider {
         RocmMemoryProvider::new(self.clone(), pool)
     }
 
     /// Allocate device memory. The allocation is released when the returned buffer is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HIP allocation error if the device cannot allocate the requested size.
     pub fn allocate(&self, bytes: usize) -> Result<DeviceBuffer, HipError> {
         let mut pointer = ptr::null_mut();
-        self.call("hipMalloc", |f: Malloc| unsafe { f(&mut pointer, bytes) })?;
+        self.call("hipMalloc", |f: Malloc| unsafe {
+            f(&raw mut pointer, bytes)
+        })?;
         Ok(DeviceBuffer {
             allocation: Rc::new(DeviceAllocation {
                 runtime: self.clone(),
@@ -382,10 +422,14 @@ impl HipRuntime {
     }
 
     /// Load a HIP code object (HSACO) into this device context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot load the module.
     pub fn load_module(&self, image: &[u8]) -> Result<HipModule, HipError> {
         let mut raw = ptr::null_mut();
         self.call("hipModuleLoadData", |f: ModuleLoadData| unsafe {
-            f(&mut raw, image.as_ptr().cast())
+            f(&raw mut raw, image.as_ptr().cast())
         })?;
         Ok(HipModule {
             inner: Rc::new(ModuleInner {
@@ -399,10 +443,14 @@ impl HipRuntime {
     ///
     /// The initial crate surface does not enqueue work onto this stream; it is exposed so later
     /// submission support can build on a real HIP stream without changing the resource type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot create the stream.
     pub fn create_stream(&self) -> Result<HipStreamHandle, HipError> {
         let mut stream = ptr::null_mut();
         self.call("hipStreamCreate", |f: StreamCreate| unsafe {
-            f(&mut stream)
+            f(&raw mut stream)
         })?;
         Ok(HipStreamHandle {
             inner: Rc::new(StreamInner {
@@ -415,10 +463,14 @@ impl HipRuntime {
     /// Create a timing-disabled event.
     ///
     /// Events can be recorded on streams and synchronized, but are not yet linked to submissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot create the event.
     pub fn create_event(&self) -> Result<HipEventHandle, HipError> {
         let mut event = ptr::null_mut();
         self.call("hipEventCreateWithFlags", |f: EventCreate| unsafe {
-            f(&mut event, 2)
+            f(&raw mut event, 2)
         })?;
         Ok(HipEventHandle {
             inner: Rc::new(EventInner {
@@ -431,7 +483,11 @@ impl HipRuntime {
     fn device_name(&self, device: HipDevice) -> Result<String, HipError> {
         let mut name = [0_i8; 256];
         self.call("hipDeviceGetName", |f: GetDeviceName| unsafe {
-            f(name.as_mut_ptr(), name.len() as c_int, device)
+            f(
+                name.as_mut_ptr(),
+                c_int::try_from(name.len()).expect("fixed name buffer fits c_int"),
+                device,
+            )
         })?;
         Ok(bounded_device_name(&name))
     }
@@ -439,7 +495,7 @@ impl HipRuntime {
     fn hip_get_device(&self, index: c_int) -> Result<HipDevice, HipError> {
         let mut device = 0;
         self.call("hipDeviceGet", |f: GetDevice| unsafe {
-            f(&mut device, index)
+            f(ptr::from_mut(&mut device), index)
         })?;
         Ok(device)
     }
@@ -456,19 +512,20 @@ impl HipRuntime {
         if symbol != "hipSetDevice" {
             // HIP's current device is thread-local, so select this runtime's device before each
             // operation. This keeps cloned handles valid when used from another host thread.
-            let setter = unsafe { self.0._library.get::<SetDevice>(b"hipSetDevice\0") }.map_err(
-                |error| HipError::MissingSymbol {
-                    symbol: "hipSetDevice",
-                    detail: error.to_string(),
-                },
-            )?;
+            let setter =
+                unsafe { self.0.library.get::<SetDevice>(b"hipSetDevice\0") }.map_err(|error| {
+                    HipError::MissingSymbol {
+                        symbol: "hipSetDevice",
+                        detail: error.to_string(),
+                    }
+                })?;
             let status = unsafe { setter(self.0.device) };
             if status != HIP_SUCCESS {
                 return Err(self.error("hipSetDevice", status));
             }
         }
         // SAFETY: `symbol` is loaded from the retained HIP runtime and `T` matches the named C ABI.
-        let function = unsafe { self.0._library.get::<T>(symbol.as_bytes()) }.map_err(|error| {
+        let function = unsafe { self.0.library.get::<T>(symbol.as_bytes()) }.map_err(|error| {
             HipError::MissingSymbol {
                 symbol,
                 detail: error.to_string(),
@@ -484,15 +541,11 @@ impl HipRuntime {
 
     fn error(&self, operation: &'static str, code: HipResult) -> HipError {
         // Error-string lookup is optional; preserve numeric status even if the symbol is absent.
-        let detail = unsafe {
-            self.0
-                ._library
-                .get::<GetErrorString>(b"hipGetErrorString\0")
-        }
-        .ok()
-        .map(|f| unsafe { f(code) })
-        .filter(|p| !p.is_null())
-        .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
+        let detail = unsafe { self.0.library.get::<GetErrorString>(b"hipGetErrorString\0") }
+            .ok()
+            .map(|f| unsafe { f(code) })
+            .filter(|p| !p.is_null())
+            .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
         HipError::Runtime {
             operation,
             code,
@@ -501,7 +554,7 @@ impl HipRuntime {
     }
 
     fn ensure_same_runtime(&self, other: &Self) -> Result<(), HipError> {
-        if Arc::ptr_eq(&self.0._library, &other.0._library) && self.0.device == other.0.device {
+        if Arc::ptr_eq(&self.0.library, &other.0.library) && self.0.device == other.0.device {
             Ok(())
         } else {
             Err(HipError::DifferentRuntime)
@@ -534,7 +587,8 @@ pub struct HipDeviceInfo {
 fn query_pci_bus_id(library: &Library, ordinal: c_int) -> Option<String> {
     let function = unsafe { library.get::<GetDevicePciBusId>(b"hipDeviceGetPCIBusId\0") }.ok()?;
     let mut buffer = [0_i8; 64];
-    let status = unsafe { function(buffer.as_mut_ptr(), buffer.len() as c_int, ordinal) };
+    let capacity = c_int::try_from(buffer.len()).expect("fixed PCI bus buffer fits c_int");
+    let status = unsafe { function(buffer.as_mut_ptr(), capacity, ordinal) };
     if status != HIP_SUCCESS {
         return None;
     }
@@ -546,7 +600,7 @@ fn bounded_device_name(buffer: &[c_char]) -> String {
     let bytes: Vec<u8> = buffer
         .iter()
         .take_while(|&&byte| byte != 0)
-        .map(|&byte| byte as u8)
+        .map(|&byte| byte.to_ne_bytes()[0])
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -627,7 +681,7 @@ impl Drop for AllocationAccessGuard {
 
 /// A live access lease pins both the native allocation and its shared busy gate.
 struct DeviceAccessLease {
-    _allocation: Rc<DeviceAllocation>,
+    allocation: Rc<DeviceAllocation>,
     _guard: AllocationAccessGuard,
 }
 impl Drop for DeviceAllocation {
@@ -653,10 +707,20 @@ impl DeviceBuffer {
         self.allocation.bytes == 0
     }
     /// Copy bytes from host memory into this allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is invalid, another operation holds the allocation, or HIP
+    /// reports a copy or completion failure.
     pub fn copy_from(&mut self, source: &[u8]) -> Result<(), HipError> {
         self.copy_from_at(0, source)
     }
     /// Copy bytes from host memory into a checked byte range of this allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is invalid, another operation holds the allocation, or HIP
+    /// reports a copy or completion failure.
     pub fn copy_from_at(&mut self, offset: usize, source: &[u8]) -> Result<(), HipError> {
         self.check_range(offset, source.len())?;
         if source.is_empty() {
@@ -677,10 +741,20 @@ impl DeviceBuffer {
         lease.finish_synchronous(result)
     }
     /// Copy this allocation into host memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is invalid, another operation holds the allocation, or HIP
+    /// reports a copy or completion failure.
     pub fn copy_to(&self, destination: &mut [u8]) -> Result<(), HipError> {
         self.copy_to_at(0, destination)
     }
     /// Copy a checked byte range of this allocation into host memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is invalid, another operation holds the allocation, or HIP
+    /// reports a copy or completion failure.
     pub fn copy_to_at(&self, offset: usize, destination: &mut [u8]) -> Result<(), HipError> {
         self.check_range(offset, destination.len())?;
         if destination.is_empty() {
@@ -701,11 +775,13 @@ impl DeviceBuffer {
         lease.finish_synchronous(result)
     }
     /// Copy bytes from another device allocation.
-    pub fn copy_from_device(
-        &mut self,
-        source: &DeviceBuffer,
-        bytes: usize,
-    ) -> Result<(), HipError> {
+    /// Copy bytes from a different allocation belonging to the same HIP runtime and device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtimes differ, either buffer is too small or busy, or HIP
+    /// reports a copy or completion failure.
+    pub fn copy_from_device(&mut self, source: &Self, bytes: usize) -> Result<(), HipError> {
         self.allocation
             .runtime
             .ensure_same_runtime(&source.allocation.runtime)?;
@@ -761,7 +837,7 @@ impl DeviceBuffer {
             .acquire()
             .map_err(|()| HipError::Busy)?;
         Ok(DeviceAccessLease {
-            _allocation: Rc::clone(&self.allocation),
+            allocation: Rc::clone(&self.allocation),
             _guard: guard,
         })
     }
@@ -773,7 +849,7 @@ impl DeviceAccessLease {
             Ok(()) => Ok(()),
             Err(error) => {
                 if self
-                    ._allocation
+                    .allocation
                     .runtime
                     .call(
                         "hipDeviceSynchronize",
@@ -797,7 +873,7 @@ impl DeviceAccessLease {
             Ok(()) => Ok(()),
             Err(error) => {
                 if self
-                    ._allocation
+                    .allocation
                     .runtime
                     .call(
                         "hipDeviceSynchronize",
@@ -833,6 +909,11 @@ pub struct HipStreamHandle {
     inner: Rc<StreamInner>,
 }
 impl HipStreamHandle {
+    /// Wait until all operations queued on this stream have completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HIP synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), HipError> {
         self.inner
             .runtime
@@ -841,6 +922,10 @@ impl HipStreamHandle {
             })
     }
     /// Record an event after all work already queued on this stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event belongs to another runtime or HIP fails to record it.
     pub fn record(&self, event: &HipEventHandle) -> Result<(), HipError> {
         self.inner
             .runtime
@@ -870,6 +955,11 @@ pub struct HipEventHandle {
     inner: Rc<EventInner>,
 }
 impl HipEventHandle {
+    /// Wait until the event has completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HIP synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), HipError> {
         self.inner
             .runtime
@@ -897,12 +987,16 @@ pub struct HipModule {
 }
 impl HipModule {
     /// Resolve one named kernel function from this module.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot resolve the named function.
     pub fn function(&self, name: &CStr) -> Result<HipKernel, HipError> {
         let mut raw = ptr::null_mut();
         self.inner
             .runtime
             .call("hipModuleGetFunction", |f: ModuleGetFunction| unsafe {
-                f(&mut raw, self.inner.raw, name.as_ptr())
+                f(&raw mut raw, self.inner.raw, name.as_ptr())
             })?;
         Ok(HipKernel {
             module: self.inner.clone(),
@@ -948,6 +1042,10 @@ pub struct HipCompletion {
 impl HipCompletion {
     /// Wait for the launch to complete. On an error the token retains its resources and can be
     /// retried or dropped (drop retries and leaks resources if HIP still cannot confirm completion).
+    ///
+    /// # Errors
+    ///
+    /// Returns the HIP synchronization error while retaining the launch resources for a retry.
     pub fn wait(&mut self) -> Result<(), HipError> {
         if let Some(event) = &self.event {
             event.synchronize()?;
@@ -996,6 +1094,16 @@ impl HipKernel {
     /// completion token has synchronized. The kernel must not retain argument pointers after it
     /// returns. GPU execution errors remain possible and are reported when the completion token is
     /// synchronized.
+    /// Launch this kernel with the supplied argument storage and retain resources until completion.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the argument count, byte layouts, ordering, and pointer types match
+    /// the kernel's actual ABI. Device buffers must be valid for the kernel's accesses.
+    ///
+    /// # Errors
+    ///
+    /// Returns a HIP launch error or an error while preparing stream/event resources.
     pub unsafe fn launch<'a>(
         &'a self,
         stream: &'a HipStreamHandle,
@@ -1024,7 +1132,7 @@ impl HipKernel {
                         .runtime
                         .ensure_same_runtime(&buffer.allocation.runtime)?;
                     if !access_leases.iter().any(|lease: &DeviceAccessLease| {
-                        Rc::ptr_eq(&lease._allocation, &buffer.allocation)
+                        Rc::ptr_eq(&lease.allocation, &buffer.allocation)
                     }) {
                         access_leases.push(buffer.acquire_access()?);
                     }
@@ -1032,7 +1140,7 @@ impl HipKernel {
                     // HIP kernel parameters receive a device pointer value, not its host address.
                     unsafe {
                         std::slice::from_raw_parts(
-                            (&buffer.allocation.pointer as *const *mut c_void).cast(),
+                            (&raw const buffer.allocation.pointer).cast(),
                             size_of::<*mut c_void>(),
                         )
                     }
@@ -1184,12 +1292,14 @@ mod memory_snapshot_tests {
     fn runtime_probe_is_safe_without_selecting_a_device() {
         match HipRuntime::probe() {
             Ok(probe) => assert!(!probe.runtime_library.is_empty()),
-            Err(HipError::RuntimeUnavailable(_)) => {}
-            Err(HipError::Runtime {
-                operation: "hipGetDeviceCount",
-                code: 100,
-                ..
-            }) => {}
+            Err(
+                HipError::RuntimeUnavailable(_)
+                | HipError::Runtime {
+                    operation: "hipGetDeviceCount",
+                    code: 100,
+                    ..
+                },
+            ) => {}
             Err(error) => panic!("unexpected HIP probe error: {error}"),
         }
     }

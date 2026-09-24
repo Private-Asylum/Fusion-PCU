@@ -36,6 +36,7 @@ pub struct PcuMemoryRatio {
 }
 
 impl PcuMemoryRatio {
+    #[must_use]
     pub const fn new(numerator: u64, denominator: u64) -> Self {
         Self {
             numerator,
@@ -48,7 +49,8 @@ impl PcuMemoryRatio {
     }
 
     fn permits(self, used: u64, capacity: u64) -> bool {
-        (used as u128) * (self.denominator as u128) < (capacity as u128) * (self.numerator as u128)
+        u128::from(used) * u128::from(self.denominator)
+            < u128::from(capacity) * u128::from(self.numerator)
     }
 }
 
@@ -111,6 +113,7 @@ pub struct PcuMemoryReservation {
 }
 
 impl PcuMemoryReservation {
+    #[must_use]
     pub const fn pool(self) -> PcuMemoryPoolId {
         self.pool
     }
@@ -136,6 +139,7 @@ pub struct PcuMemoryReservationLedger<const N: usize> {
 }
 
 impl<const N: usize> PcuMemoryReservationLedger<N> {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             entries: [None; N],
@@ -143,6 +147,10 @@ impl<const N: usize> PcuMemoryReservationLedger<N> {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an admission error when the snapshot or limit is invalid, capacity is exhausted,
+    /// or the ledger cannot record another reservation.
     pub fn reserve(
         &mut self,
         snapshot: PcuMemoryPoolSnapshot,
@@ -156,6 +164,11 @@ impl<const N: usize> PcuMemoryReservationLedger<N> {
     ///
     /// A single reservation is recorded and therefore is counted once in the ledger, even when
     /// both system and process limits are enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an admission error when telemetry is insufficient, a limit would be crossed, or
+    /// reservation accounting cannot proceed.
     pub fn reserve_with_limits(
         &mut self,
         snapshot: PcuMemoryPoolSnapshot,
@@ -218,8 +231,11 @@ impl<const N: usize> PcuMemoryReservationLedger<N> {
                     .ok_or_else(|| {
                         reject(PcuMemoryAdmissionReason::ReservationAccountingOverflow)
                     })?;
-                let maximum = ((capacity as u128 * limit.max_fraction.numerator as u128)
-                    / limit.max_fraction.denominator as u128) as u64;
+                let maximum = u64::try_from(
+                    (u128::from(capacity) * u128::from(limit.max_fraction.numerator))
+                        / u128::from(limit.max_fraction.denominator),
+                )
+                .map_err(|_| reject(PcuMemoryAdmissionReason::ReservationAccountingOverflow))?;
                 if !limit.max_fraction.permits(projected, capacity) {
                     return Err(defer(PcuMemoryAdmissionReason::LimitExceeded {
                         mode: limit.mode,
@@ -251,6 +267,10 @@ impl<const N: usize> PcuMemoryReservationLedger<N> {
     }
 
     /// Releases a prior reservation and returns the number of bytes released.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidReservation` for a stale, foreign, or already released handle.
     pub fn release(
         &mut self,
         reservation: PcuMemoryReservation,
@@ -269,6 +289,7 @@ impl<const N: usize> PcuMemoryReservationLedger<N> {
         }
     }
 
+    #[must_use]
     pub fn reserved_bytes(&self, pool: PcuMemoryPoolId) -> Option<u64> {
         self.entries
             .iter()
@@ -320,6 +341,10 @@ pub struct PcuMemoryAllocationRequest {
 
 impl PcuMemoryAllocationRequest {
     /// Checks the provider-independent constraints before admission or allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ZeroSize` or `InvalidAlignment` when the request violates those constraints.
     pub const fn validate(self) -> Result<(), PcuMemoryRequestError> {
         if self.size_bytes == 0 {
             return Err(PcuMemoryRequestError::ZeroSize);
@@ -347,6 +372,7 @@ pub struct PcuMemoryRange {
 
 impl PcuMemoryRange {
     /// Returns the exclusive end offset, or `None` if the range overflows.
+    #[must_use]
     pub const fn checked_end(self) -> Option<u64> {
         self.offset_bytes.checked_add(self.size_bytes)
     }
@@ -450,12 +476,20 @@ pub trait PcuMemoryProvider {
         Self: 'a;
 
     /// Reads telemetry for the requested stable pool identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error if the pool is unavailable or telemetry cannot be read.
     fn snapshot(
         &self,
         pool: PcuMemoryPoolId,
     ) -> Result<PcuMemoryPoolSnapshot, PcuMemoryProviderError>;
 
     /// Allocates a provider-owned resource in the requested pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error if the request cannot be satisfied.
     fn allocate(
         &mut self,
         request: PcuMemoryAllocationRequest,
@@ -463,6 +497,10 @@ pub trait PcuMemoryProvider {
 
     /// Imports a provider-specific external allocation while retaining the descriptor's required
     /// ownership lease in the returned resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error if the import is unsupported or incompatible.
     fn import(
         &mut self,
         descriptor: Self::ImportDescriptor,
@@ -470,6 +508,10 @@ pub trait PcuMemoryProvider {
 
     /// Maps a checked range for the duration of the returned guard. Providers that cannot provide
     /// a safe scoped mapping return `MappingUnavailable`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error if mapping is unsupported, unsafe, or the range is invalid.
     fn map<'a>(
         &'a mut self,
         resource: &'a mut Self::Resource,
@@ -477,6 +519,10 @@ pub trait PcuMemoryProvider {
     ) -> Result<Self::Mapping<'a>, PcuMemoryProviderError>;
 
     /// Copies bytes into a resource without exposing its address space.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error if access is denied or the range cannot be transferred.
     fn transfer_to(
         &mut self,
         resource: &mut Self::Resource,
@@ -485,6 +531,10 @@ pub trait PcuMemoryProvider {
     ) -> Result<(), PcuMemoryProviderError>;
 
     /// Copies bytes out of a resource without exposing its address space.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error if access is denied or the range cannot be transferred.
     fn transfer_from(
         &mut self,
         resource: &Self::Resource,
@@ -512,7 +562,7 @@ impl PcuMemoryReservationSet {
         Self { entries: [None; 2] }
     }
 
-    fn push(&mut self, reservation: PcuMemoryReservation) {
+    const fn push(&mut self, reservation: PcuMemoryReservation) {
         if self.entries[0].is_none() {
             self.entries[0] = Some(reservation);
         } else {
@@ -521,16 +571,22 @@ impl PcuMemoryReservationSet {
     }
 
     /// Returns the number of active reservation handles in this set.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.iter().flatten().count()
     }
 
     /// Returns whether this set contains no reservations.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Releases all reservations, retaining any handle whose release failed for retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first invalid reservation error and keeps its handle for retry.
     pub fn release_all<const N: usize>(
         &mut self,
         ledger: &mut PcuMemoryReservationLedger<N>,
@@ -560,23 +616,39 @@ pub struct PcuAdmittedResource<R> {
 }
 
 impl<R> PcuAdmittedResource<R> {
-    pub fn resource(&self) -> &R {
+    /// Borrows the resource while it remains admitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resource has already been removed during release.
+    #[must_use]
+    pub const fn resource(&self) -> &R {
         self.resource
             .as_ref()
             .expect("resource is present until release")
     }
 
-    pub fn resource_mut(&mut self) -> &mut R {
+    /// Mutably borrows the resource while it remains admitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resource has already been removed during release.
+    pub const fn resource_mut(&mut self) -> &mut R {
         self.resource
             .as_mut()
             .expect("resource is present until release")
     }
 
+    #[must_use]
     pub const fn reservations(&self) -> &PcuMemoryReservationSet {
         &self.reservations
     }
 
     /// Transfers the resource and reservation set to the caller.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resource has already been removed during release.
     pub fn into_parts(mut self) -> (R, PcuMemoryReservationSet) {
         let resource = self
             .resource
@@ -590,6 +662,10 @@ impl<R> PcuAdmittedResource<R> {
     /// If a ledger release fails, remaining reservation handles are returned so the caller can
     /// retry against the correct ledger. This only releases abstract accounting; the backend
     /// resource's own drop implementation defines physical deallocation behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failed ledger release and remaining reservation handles for recovery.
     pub fn release<const N: usize>(
         mut self,
         ledger: &mut PcuMemoryReservationLedger<N>,
@@ -641,6 +717,10 @@ pub enum PcuMemoryAllocateWithPolicyError {
 /// carries one reservation covering all enabled ratios. On allocation failure, that reservation
 /// is rolled back before returning. The helper enforces only provider-reported metadata and
 /// abstract admission; it makes no physical residency, contiguity, or completion guarantee.
+///
+/// # Errors
+///
+/// Returns validation, telemetry, admission, allocation, or rollback errors with their cause.
 pub fn allocate_with_policy<P: PcuMemoryProvider, const N: usize>(
     provider: &mut P,
     ledger: &mut PcuMemoryReservationLedger<N>,
@@ -730,7 +810,9 @@ fn resource_matches_request<R: PcuMemoryResource>(
     resource.pool() == request.pool
         && resource.size_bytes() >= request.size_bytes
         && resource.alignment_bytes() >= request.alignment_bytes
-        && resource.alignment_bytes() % request.alignment_bytes == 0
+        && resource
+            .alignment_bytes()
+            .is_multiple_of(request.alignment_bytes)
         && access_supports(resource.access(), request.access)
         && (!request.require_device_local || resource.is_device_local() == Some(true))
 }
@@ -1052,12 +1134,10 @@ mod tests {
             max_fraction: PcuMemoryRatio::new(95, 100),
         };
 
-        let workers = (0..2)
-            .map(|_| {
-                let ledger = Arc::clone(&ledger);
-                std::thread::spawn(move || ledger.lock().unwrap().reserve(pool, 5, limit))
-            })
-            .collect::<std::vec::Vec<_>>();
+        let workers = [0, 1].map(|_| {
+            let ledger = Arc::clone(&ledger);
+            std::thread::spawn(move || ledger.lock().unwrap().reserve(pool, 5, limit))
+        });
 
         let results = workers
             .into_iter()
@@ -1081,6 +1161,7 @@ mod tests {
         assert_eq!(ledger.reserved_bytes(pool.id), Some(5));
         assert_eq!(ledger.release(reservations[0]), Ok(5));
         assert_eq!(ledger.reserved_bytes(pool.id), Some(0));
+        drop(ledger);
     }
 
     #[test]

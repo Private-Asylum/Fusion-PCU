@@ -20,5 +20,10 @@ path = "discover.rs"
 fusion-pcu.workspace = true
 fusion-pcu-rocm.workspace = true
 
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+
 [lints.rust]
 unsafe_code = "forbid"

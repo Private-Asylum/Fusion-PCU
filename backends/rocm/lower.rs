@@ -3,7 +3,10 @@
 //! The current subset is deliberately one-dimensional: f32 storage bindings, invocation-ID
 //! indexed loads/stores, f32 constants, add/subtract/multiply/divide, and a terminal return.
 
-use std::fmt;
+use std::fmt::{
+    self,
+    Write as _,
+};
 
 use fusion_pcu::{
     PcuBindingAccess,
@@ -43,6 +46,7 @@ pub enum RocmLowerError {
     UnsupportedIndex,
     MissingStoreOrReturn,
     OperationAfterReturn,
+    FormattingFailure,
 }
 
 impl fmt::Display for RocmLowerError {
@@ -89,6 +93,9 @@ impl fmt::Display for RocmLowerError {
                 formatter.write_str("HIP kernel must contain at least one store and a return")
             }
             Self::OperationAfterReturn => formatter.write_str("operation appears after return"),
+            Self::FormattingFailure => {
+                formatter.write_str("generated HIP source formatting failed")
+            }
         }
     }
 }
@@ -99,6 +106,11 @@ impl std::error::Error for RocmLowerError {}
 ///
 /// The generated kernel is named `fusion_kernel`. Its launch geometry is expected to cover the
 /// kernel's one-dimensional `logical_shape[0]`; the caller owns compilation and launch.
+///
+/// # Errors
+///
+/// Returns a lowering error when the kernel shape, interface, types, values, or operations fall
+/// outside the supported HIP subset.
 pub fn lower_dispatch_to_hip_source(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<String, RocmLowerError> {
@@ -123,15 +135,19 @@ pub fn lower_dispatch_to_hip_source(
         } else {
             "const float*"
         };
-        source.push_str(&format!(
+        write!(
+            &mut source,
             "{qualifier} binding_{}_{}",
             binding.set, binding.binding
-        ));
+        )
+        .map_err(|_| RocmLowerError::FormattingFailure)?;
     }
-    source.push_str(&format!(
+    write!(
+        &mut source,
         ") {{\n    const unsigned int fusion_gid = blockIdx.x * blockDim.x + threadIdx.x;\n    if (fusion_gid >= {}u) return;\n",
         kernel.entry.logical_shape[0]
-    ));
+    )
+    .map_err(|_| RocmLowerError::FormattingFailure)?;
 
     for op in kernel.ops.iter().copied() {
         match op {
@@ -139,17 +155,21 @@ pub fn lower_dispatch_to_hip_source(
                 result,
                 binding,
                 index: PcuDispatchIndex::InvocationId,
-            }) => source.push_str(&format!(
-                "    float v{} = binding_{}_{}[fusion_gid];\n",
+            }) => writeln!(
+                &mut source,
+                "    float v{} = binding_{}_{}[fusion_gid];",
                 result.0, binding.set, binding.binding
-            )),
+            )
+            .map_err(|_| RocmLowerError::FormattingFailure)?,
             PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
                 result,
                 value: PcuParameterValue::F32(bits),
-            }) => source.push_str(&format!(
-                "    float v{} = __builtin_bit_cast(float, 0x{bits:08x}u);\n",
+            }) => writeln!(
+                &mut source,
+                "    float v{} = __builtin_bit_cast(float, 0x{bits:08x}u);",
                 result.0
-            )),
+            )
+            .map_err(|_| RocmLowerError::FormattingFailure)?,
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
                 result,
                 op,
@@ -163,19 +183,23 @@ pub fn lower_dispatch_to_hip_source(
                     PcuDispatchAluOp::Div => "/",
                     _ => unreachable!("validated ALU op"),
                 };
-                source.push_str(&format!(
-                    "    float v{} = v{} {operator} v{};\n",
+                writeln!(
+                    &mut source,
+                    "    float v{} = v{} {operator} v{};",
                     result.0, lhs.0, rhs.0
-                ));
+                )
+                .map_err(|_| RocmLowerError::FormattingFailure)?;
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
                 binding,
                 index: PcuDispatchIndex::InvocationId,
                 value,
-            }) => source.push_str(&format!(
-                "    binding_{}_{}[fusion_gid] = v{};\n",
+            }) => writeln!(
+                &mut source,
+                "    binding_{}_{}[fusion_gid] = v{};",
                 binding.set, binding.binding, value.0
-            )),
+            )
+            .map_err(|_| RocmLowerError::FormattingFailure)?,
             PcuDispatchOp::Control(PcuDispatchControlOp::Return) => {
                 source.push_str("    return;\n");
             }
@@ -186,6 +210,7 @@ pub fn lower_dispatch_to_hip_source(
     Ok(source)
 }
 
+#[allow(clippy::too_many_lines)] // One pass keeps the supported IR subset's validation rules together.
 fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), RocmLowerError> {
     if kernel.entry.logical_shape[0] == 0
         || kernel.entry.logical_shape[1] != 1

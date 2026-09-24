@@ -1,4 +1,4 @@
-//! Synchronous, bounded PCU Dispatch execution on one ROCm device.
+//! Synchronous, bounded PCU Dispatch execution on one `ROCm` device.
 
 use std::{
     error::Error,

@@ -1,4 +1,4 @@
-//! Inspect ROCm through PCU's consumer-facing discovery registry.
+//! Inspect `ROCm` through PCU's consumer-facing discovery registry.
 
 use fusion_pcu::{
     PcuDeviceClass,
@@ -92,7 +92,7 @@ const EMPTY_REF: PcuObjectRef = PcuObjectRef {
     id: 0,
 };
 
-fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
+const fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
     PcuProviderDescriptor {
         id: PcuProviderId(0),
         generation: 0,
@@ -104,7 +104,7 @@ fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
     }
 }
 
-fn empty_target<'a>() -> PcuTargetDescriptor<'a> {
+const fn empty_target<'a>() -> PcuTargetDescriptor<'a> {
     PcuTargetDescriptor {
         reference: EMPTY_REF,
         name: "",
@@ -115,7 +115,7 @@ fn empty_target<'a>() -> PcuTargetDescriptor<'a> {
     }
 }
 
-fn empty_device<'a>() -> PcuDeviceDescriptor<'a> {
+const fn empty_device<'a>() -> PcuDeviceDescriptor<'a> {
     PcuDeviceDescriptor {
         reference: EMPTY_REF,
         target: EMPTY_REF,

@@ -117,6 +117,11 @@ pub enum PcuDialectValidationError {
 }
 
 /// Validate identity/version, operation admission, effects, and local typed value flow.
+///
+/// # Errors
+///
+/// Returns the first contract violation, including unsupported operations or malformed local
+/// value flow.
 pub fn validate_dialect_fragment(
     fragment: &PcuDialectFragment<'_>,
     support: &PcuDialectSupport<'_>,
@@ -172,16 +177,15 @@ pub fn validate_dialect_fragment(
                 return Err(PcuDialectValidationError::OperandTypeMismatch(input.id));
             }
         }
-        if let Some(result) = op.result {
-            if fragment.operations[..index]
+        if let Some(result) = op.result
+            && (fragment.operations[..index]
                 .iter()
                 .any(|prior| prior.result.is_some_and(|r| r.id == result.id))
                 || op.inputs[..op.input_count as usize]
                     .iter()
-                    .any(|input| input.id == result.id)
-            {
-                return Err(PcuDialectValidationError::DuplicateResult(result.id));
-            }
+                    .any(|input| input.id == result.id))
+        {
+            return Err(PcuDialectValidationError::DuplicateResult(result.id));
         }
     }
     Ok(())
@@ -202,6 +206,11 @@ pub enum PcuDialectComposeError {
 /// Inputs in the second fragment are remapped by the same offset, so its internal dataflow is
 /// preserved and no accidental capture of first-fragment IDs occurs. Cross-fragment value
 /// references are not part of this deliberately small composition API.
+///
+/// # Errors
+///
+/// Returns an error when fragment identity or version differs, output storage is too small,
+/// value IDs overflow, or the second fragment has invalid local dataflow.
 pub fn compose_dialect_fragments<'a>(
     first: &PcuDialectFragment<'a>,
     second: &PcuDialectFragment<'a>,
@@ -226,7 +235,7 @@ pub fn compose_dialect_fragments<'a>(
         .iter()
         .filter_map(|op| op.result.map(|r| r.id.0))
         .max()
-        .map_or(0u32, |id| id as u32 + 1);
+        .map_or(0u32, |id| u32::from(id) + 1);
     for (index, op) in second.operations.iter().enumerate() {
         if op.input_count as usize > op.inputs.len() {
             return Err(PcuDialectComposeError::InvalidFragmentFlow);
@@ -242,20 +251,20 @@ pub fn compose_dialect_fragments<'a>(
                 return Err(PcuDialectComposeError::InvalidFragmentFlow);
             }
         }
-        if let Some(result) = op.result {
-            if second.operations[..index].iter().any(|prior| {
+        if let Some(result) = op.result
+            && second.operations[..index].iter().any(|prior| {
                 prior
                     .result
                     .is_some_and(|prior_result| prior_result.id == result.id)
-            }) {
-                return Err(PcuDialectComposeError::InvalidFragmentFlow);
-            }
+            })
+        {
+            return Err(PcuDialectComposeError::InvalidFragmentFlow);
         }
         if op
             .result
             .into_iter()
             .chain(op.inputs[..op.input_count as usize].iter().copied())
-            .any(|v| v.id.0 as u32 + offset > u16::MAX as u32)
+            .any(|v| u32::from(v.id.0) + offset > u32::from(u16::MAX))
         {
             return Err(PcuDialectComposeError::ValueIdOverflow);
         }
@@ -263,13 +272,18 @@ pub fn compose_dialect_fragments<'a>(
     output[..first.operations.len()].copy_from_slice(first.operations);
     for (index, op) in second.operations.iter().enumerate() {
         let mut remapped = *op;
-        for input in &mut remapped.inputs[..remapped.input_count as usize] {
-            input.id = PcuDialectValueId((input.id.0 as u32 + offset) as u16);
+        for input in &mut remapped.inputs[..usize::from(remapped.input_count)] {
+            let remapped_id = u32::from(input.id.0) + offset;
+            input.id = PcuDialectValueId(
+                u16::try_from(remapped_id).map_err(|_| PcuDialectComposeError::ValueIdOverflow)?,
+            );
         }
-        remapped.result = remapped.result.map(|mut result| {
-            result.id = PcuDialectValueId((result.id.0 as u32 + offset) as u16);
-            result
-        });
+        if let Some(result) = &mut remapped.result {
+            let remapped_id = u32::from(result.id.0) + offset;
+            result.id = PcuDialectValueId(
+                u16::try_from(remapped_id).map_err(|_| PcuDialectComposeError::ValueIdOverflow)?,
+            );
+        }
         output[first.operations.len() + index] = remapped;
     }
     Ok(count)
@@ -284,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // End-to-end fragment composition and rejection vector.
     fn vm_consumer_admits_typed_versioned_instructions_and_composes_without_capture() {
         let dialect = PcuDialectId("org.example.stack-vm");
         let add = PcuDialectOperation {

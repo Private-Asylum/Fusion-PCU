@@ -122,7 +122,7 @@ pub struct PcuTransactionKernelBuilder<'a> {
 impl<'a> PcuTransactionKernelBuilder<'a> {
     /// Creates one transaction-kernel builder.
     #[must_use]
-    pub fn new(kernel_id: u32, entry_point: &'a str) -> Self {
+    pub const fn new(kernel_id: u32, entry_point: &'a str) -> Self {
         Self {
             kernel_id: PcuKernelId(kernel_id),
             entry_point,
@@ -195,7 +195,7 @@ impl<'a> PcuTransactionKernelBuilder<'a> {
 
     /// Builds the transaction-kernel IR payload.
     #[must_use]
-    pub fn ir(&self) -> PcuTransactionKernelIr<'_> {
+    pub const fn ir(&self) -> PcuTransactionKernelIr<'_> {
         PcuTransactionKernelIr {
             id: self.kernel_id,
             entry_point: self.entry_point,
@@ -212,7 +212,7 @@ impl<'a> PcuTransactionKernelBuilder<'a> {
 
     /// Builds the generic kernel wrapper.
     #[must_use]
-    pub fn kernel(&self) -> PcuKernel<'_> {
+    pub const fn kernel(&self) -> PcuKernel<'_> {
         PcuKernel::Transaction(self.ir())
     }
 }

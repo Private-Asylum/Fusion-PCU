@@ -33,11 +33,11 @@ pub struct RocmMemoryProvider {
 }
 
 impl RocmMemoryProvider {
-    pub(crate) fn new(runtime: HipRuntime, pool: PcuMemoryPoolId) -> Self {
+    pub(crate) const fn new(runtime: HipRuntime, pool: PcuMemoryPoolId) -> Self {
         Self { runtime, pool }
     }
 
-    fn error(
+    const fn error(
         &self,
         operation: PcuMemoryProviderOperation,
         failure: PcuMemoryProviderFailure,
@@ -112,17 +112,18 @@ impl PcuMemoryResource for RocmMemoryResource {
 }
 
 impl RocmMemoryResource {
-    /// Borrow the underlying HIP allocation for direct ROCm PCU dispatch binding.
+    /// Borrow the underlying HIP allocation for direct `ROCm` `PCU` dispatch binding.
     ///
     /// The returned buffer uses the same shared busy gate as provider-mediated transfers, so
     /// overlapping synchronous access is rejected by the backend. The caller remains responsible
     /// for honoring this resource's declared [`PcuMemoryAccess`] when building a dispatch.
-    pub fn device_buffer(&self) -> &DeviceBuffer {
+    #[must_use]
+    pub const fn device_buffer(&self) -> &DeviceBuffer {
         &self.buffer
     }
 }
 
-/// Marker import descriptor. ROCm import remains unavailable until a safe HIP/OS handle lease
+/// Marker import descriptor. `ROCm` import remains unavailable until a safe HIP/OS handle lease
 /// protocol is implemented.
 #[derive(Debug, Clone, Copy)]
 pub struct RocmImportDescriptor {
@@ -238,8 +239,8 @@ impl PcuMemoryProvider for RocmMemoryProvider {
         let buffer = self
             .runtime
             .allocate(size)
-            .map_err(|error| hip_failure(self, op, error))?;
-        if (buffer.allocation.pointer as usize) % alignment != 0 {
+            .map_err(|error| hip_failure(self, op, &error))?;
+        if !(buffer.allocation.pointer as usize).is_multiple_of(alignment) {
             return Err(self.error(
                 op,
                 PcuMemoryProviderFailure::BackendFailure,
@@ -326,7 +327,7 @@ impl PcuMemoryProvider for RocmMemoryProvider {
         resource
             .buffer
             .copy_from_at(offset, bytes)
-            .map_err(|error| hip_failure(self, op, error))
+            .map_err(|error| hip_failure(self, op, &error))
     }
 
     fn transfer_from(
@@ -370,7 +371,7 @@ impl PcuMemoryProvider for RocmMemoryProvider {
         resource
             .buffer
             .copy_to_at(offset, bytes)
-            .map_err(|error| hip_failure(self, op, error))
+            .map_err(|error| hip_failure(self, op, &error))
     }
 }
 
@@ -378,10 +379,10 @@ fn range_fits(capacity: u64, range: PcuMemoryRange) -> bool {
     range.checked_end().is_some_and(|end| end <= capacity)
 }
 
-fn hip_failure(
+const fn hip_failure(
     provider: &RocmMemoryProvider,
     operation: PcuMemoryProviderOperation,
-    error: HipError,
+    error: &HipError,
 ) -> PcuMemoryProviderError {
     let (failure, disposition) = match error {
         HipError::Busy => (PcuMemoryProviderFailure::Busy, PcuMemoryDisposition::Defer),

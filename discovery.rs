@@ -49,6 +49,11 @@ pub trait PcuDeviceActivation {
     type Error;
 
     /// Opens the device named by one explicit discovery reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend-specific error when the reference is stale, belongs to another
+    /// provider, identifies a non-device object, or cannot be opened.
     fn open_device(&self, device: PcuObjectRef) -> Result<Self::Session, Self::Error>;
 }
 
@@ -173,12 +178,20 @@ pub trait PcuRuntimeDiscovery {
     type Error;
 
     /// Enumerates available providers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if enumeration fails.
     fn providers<'a>(
         &'a self,
         output: &mut [PcuProviderDescriptor<'a>],
     ) -> Result<usize, Self::Error>;
 
     /// Enumerates backend targets for one provider generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if enumeration fails.
     fn targets<'a>(
         &'a self,
         provider: PcuProviderId,
@@ -187,6 +200,10 @@ pub trait PcuRuntimeDiscovery {
     ) -> Result<usize, Self::Error>;
 
     /// Enumerates devices for one target.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if enumeration fails.
     fn devices<'a>(
         &'a self,
         target: PcuObjectRef,
@@ -194,6 +211,10 @@ pub trait PcuRuntimeDiscovery {
     ) -> Result<usize, Self::Error>;
 
     /// Enumerates contexts for one device.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if enumeration fails.
     fn contexts<'a>(
         &'a self,
         device: PcuObjectRef,
@@ -201,6 +222,10 @@ pub trait PcuRuntimeDiscovery {
     ) -> Result<usize, Self::Error>;
 
     /// Enumerates memory domains for one context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if enumeration fails.
     fn memory_domains<'a>(
         &'a self,
         context: PcuObjectRef,
@@ -208,18 +233,30 @@ pub trait PcuRuntimeDiscovery {
     ) -> Result<usize, Self::Error>;
 
     /// Queries target-level capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if the query fails.
     fn target_capabilities(
         &self,
         target: PcuObjectRef,
     ) -> Result<PcuCapabilitySnapshot, Self::Error>;
 
     /// Queries device-specific capabilities and limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if the query fails.
     fn device_capabilities(
         &self,
         device: PcuObjectRef,
     ) -> Result<PcuCapabilitySnapshot, Self::Error>;
 
     /// Copies executor descriptors into caller storage and returns the required total count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error if enumeration fails.
     fn executors(
         &self,
         object: PcuObjectRef,

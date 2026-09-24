@@ -389,11 +389,9 @@ fn validate_f32_generic(arguments: &PathArguments) -> Result<(), Error> {
 fn validate_body(function: &ItemFn) -> Result<(Ident, &ExprAssign), Error> {
     let statements = &function.block.stmts;
     if statements.len() != 2 {
-        let span = if let Some(statement) = statements.get(2) {
-            statement.span()
-        } else {
-            function.block.span()
-        };
+        let span = statements
+            .get(2)
+            .map_or_else(|| function.block.span(), syn::spanned::Spanned::span);
         return Err(Error::new(
             span,
             "PCU dispatch body supports exactly `let thread = context.thread;` followed by one `output[thread] = <expr>;` assignment",

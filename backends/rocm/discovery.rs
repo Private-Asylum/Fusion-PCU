@@ -1,4 +1,4 @@
-//! Runtime-backed discovery for the ROCm provider.
+//! Runtime-backed discovery for the `ROCm` provider.
 
 use std::{
     process::Command,
@@ -58,7 +58,7 @@ const PROVIDER: PcuProviderId = PcuProviderId(0x524f_434d);
 const TARGET_ID: u32 = 0;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// A stable ROCm runtime snapshot. Device names are owned by this value and borrowed by discovery.
+/// A stable `ROCm` runtime snapshot. Device names are owned by this value and borrowed by discovery.
 pub struct RocmDiscovery {
     generation: u64,
     devices: Vec<HipDeviceInfo>,
@@ -118,7 +118,7 @@ impl RocmDiscovery {
         }
     }
 
-    fn reference(&self, kind: PcuObjectKind, id: u32) -> PcuObjectRef {
+    const fn reference(&self, kind: PcuObjectKind, id: u32) -> PcuObjectRef {
         PcuObjectRef {
             provider: PROVIDER,
             generation: self.generation,
@@ -149,6 +149,11 @@ impl RocmDiscovery {
     }
 
     /// Return the immutable facts recorded for a selected device reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HipError::InvalidDiscoveryReference`] if the reference does not identify a
+    /// device in this discovery snapshot.
     pub fn device_info(&self, device: PcuObjectRef) -> Result<&HipDeviceInfo, HipError> {
         self.validate(device, PcuObjectKind::Device)?;
         self.devices
@@ -162,6 +167,11 @@ impl RocmDiscovery {
     /// HIP ordinals can change between discovery and activation. To avoid silently opening a
     /// different GPU after such a change, activation requires the PCI bus ID to be available in
     /// both the discovery snapshot and the live HIP query, and requires them to match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference is invalid, HIP cannot open the device, its stable
+    /// identity is unavailable, or the live identity differs from the discovery snapshot.
     pub fn open_device(&self, device: PcuObjectRef) -> Result<HipRuntime, HipError> {
         let snapshot = self.device_info(device)?;
         let expected = snapshot
@@ -203,7 +213,7 @@ impl PcuDeviceActivation for RocmDiscovery {
     type Error = HipError;
 
     fn open_device(&self, device: PcuObjectRef) -> Result<Self::Session, Self::Error> {
-        RocmDiscovery::open_device(self, device)
+        Self::open_device(self, device)
     }
 }
 
@@ -353,7 +363,7 @@ impl PcuRuntimeDiscovery for RocmDiscovery {
 }
 
 impl RocmDiscovery {
-    fn support(&self) -> PcuSupport {
+    const fn support(&self) -> PcuSupport {
         let mut support = PcuSupport::unsupported();
         support.caps = PcuCaps::ENUMERATE_EXECUTORS;
         if !self.devices.is_empty() && self.unavailable_reason.is_none() {
@@ -399,6 +409,11 @@ impl RocmDiscovery {
     /// This runs the execution lowerer and compiles its output for the caller-selected architecture.
     /// The current HIP discovery API does not expose a stable architecture string, so this cannot
     /// verify that the supplied architecture matches the selected physical GPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference is invalid, lowering rejects the kernel, or HIP
+    /// compilation fails.
     pub fn assess_dispatch(
         &self,
         device: PcuObjectRef,

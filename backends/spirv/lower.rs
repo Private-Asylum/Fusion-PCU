@@ -86,7 +86,7 @@ pub fn validate_dispatch_for_spirv(
     Ok(())
 }
 
-fn validate_spirv_version(options: PcuSpirvLoweringOptions) -> Result<(), PcuSpirvError> {
+const fn validate_spirv_version(options: PcuSpirvLoweringOptions) -> Result<(), PcuSpirvError> {
     let version = options.version.0;
     // SPIR-V's header encodes major/minor/revision in the low 24 bits. This backend
     // advertises the core 1.0 through 1.3 versions only. Newer SPIR-V requires
@@ -151,7 +151,7 @@ fn validate_kernel_signature(
     Ok(())
 }
 
-fn validate_dispatch_features(features: PcuDispatchFeatureCaps) -> Result<(), PcuSpirvError> {
+const fn validate_dispatch_features(features: PcuDispatchFeatureCaps) -> Result<(), PcuSpirvError> {
     if features.contains(PcuDispatchFeatureCaps::COOPERATIVE_SCRATCHPAD) {
         return Err(PcuSpirvError::UnsupportedInstruction(
             PcuDispatchOpCaps::SYNC_BARRIER,
@@ -167,7 +167,12 @@ fn validate_op_for_spirv(
 ) -> Result<(), PcuSpirvError> {
     match op {
         PcuDispatchOp::Control(PcuDispatchControlOp::Return) => Ok(()),
-        PcuDispatchOp::Control(_) => unsupported(op),
+        PcuDispatchOp::Control(_)
+        | PcuDispatchOp::Value(_)
+        | PcuDispatchOp::Arithmetic(_)
+        | PcuDispatchOp::Port(_)
+        | PcuDispatchOp::Sync(_)
+        | PcuDispatchOp::Intrinsic { .. } => unsupported(op),
         PcuDispatchOp::Resource(resource) => validate_resource_op(resource, options),
         PcuDispatchOp::Data(data) => {
             Err(PcuSpirvError::UnsupportedInstruction(data.support_flag()))
@@ -182,11 +187,6 @@ fn validate_op_for_spirv(
             Err(PcuSpirvError::UnsupportedInstruction(flag))
         }
         PcuDispatchOp::RayTrace(ray) => validate_ray_op(ray, kernel, options),
-        PcuDispatchOp::Value(_)
-        | PcuDispatchOp::Arithmetic(_)
-        | PcuDispatchOp::Port(_)
-        | PcuDispatchOp::Sync(_)
-        | PcuDispatchOp::Intrinsic { .. } => unsupported(op),
     }
 }
 
@@ -276,7 +276,7 @@ fn validate_value_type(
     }
 }
 
-fn validate_scalar_type(scalar: PcuScalarType) -> Result<(), PcuSpirvError> {
+const fn validate_scalar_type(scalar: PcuScalarType) -> Result<(), PcuSpirvError> {
     match scalar {
         PcuScalarType::Bool | PcuScalarType::I32 | PcuScalarType::U32 | PcuScalarType::F32 => {
             Ok(())
@@ -297,7 +297,7 @@ fn validate_scalar_type(scalar: PcuScalarType) -> Result<(), PcuSpirvError> {
     }
 }
 
-fn require_capability(
+const fn require_capability(
     options: PcuSpirvLoweringOptions,
     capability: PcuSpirvCapability,
 ) -> Result<(), PcuSpirvError> {
@@ -308,7 +308,7 @@ fn require_capability(
     }
 }
 
-fn unsupported(op: PcuDispatchOp<'_>) -> Result<(), PcuSpirvError> {
+const fn unsupported(op: PcuDispatchOp<'_>) -> Result<(), PcuSpirvError> {
     Err(PcuSpirvError::UnsupportedInstruction(op.support_flag()))
 }
 
@@ -346,7 +346,7 @@ fn is_storage_f32_binding_type(binding: fusion_pcu::PcuBinding<'_>, set: u32, sl
         && binding.binding_type == PcuBindingType::Value(PcuValueType::f32())
 }
 
-fn has_parallel_float_ops(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+const fn has_parallel_float_ops(kernel: &PcuDispatchKernelIr<'_>) -> bool {
     matches!(
         kernel.ops,
         [
@@ -465,10 +465,13 @@ fn validate_dataflow_binding(
 
     let access_allowed = matches!(
         (candidate.access, required),
-        (PcuBindingAccess::ReadOnly, PcuBindingAccess::ReadOnly)
-            | (PcuBindingAccess::WriteOnly, PcuBindingAccess::WriteOnly)
-            | (PcuBindingAccess::ReadWrite, PcuBindingAccess::ReadOnly)
-            | (PcuBindingAccess::ReadWrite, PcuBindingAccess::WriteOnly)
+        (
+            PcuBindingAccess::ReadOnly | PcuBindingAccess::ReadWrite,
+            PcuBindingAccess::ReadOnly,
+        ) | (
+            PcuBindingAccess::WriteOnly | PcuBindingAccess::ReadWrite,
+            PcuBindingAccess::WriteOnly,
+        )
     );
     if access_allowed && is_storage_f32_dataflow_binding(candidate) {
         Ok(())
@@ -486,7 +489,7 @@ fn validate_invocation_index(index: PcuDispatchIndex) -> Result<(), PcuSpirvErro
     }
 }
 
-fn validate_value_result(value: PcuDispatchValueId) -> Result<(), PcuSpirvError> {
+const fn validate_value_result(value: PcuDispatchValueId) -> Result<(), PcuSpirvError> {
     if value.0 == 0 {
         Err(PcuSpirvError::InvalidKernelSignature)
     } else {
@@ -532,11 +535,13 @@ fn validate_defined_before(
     }
 }
 
-fn dataflow_result(op: PcuDispatchOp<'_>) -> Option<PcuDispatchValueId> {
+const fn dataflow_result(op: PcuDispatchOp<'_>) -> Option<PcuDispatchValueId> {
     match op {
-        PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { result, .. })
-        | PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, .. })
-        | PcuDispatchOp::Data(PcuDispatchDataOp::Alu { result, .. }) => Some(result),
+        PcuDispatchOp::Data(
+            PcuDispatchDataOp::BindingLoad { result, .. }
+            | PcuDispatchDataOp::Constant { result, .. }
+            | PcuDispatchDataOp::Alu { result, .. },
+        ) => Some(result),
         _ => None,
     }
 }
@@ -981,7 +986,8 @@ mod tests {
         while offset < words.len() {
             let instruction = words[offset];
             let word_count = (instruction >> 16) as usize;
-            let opcode = instruction as u16;
+            let opcode = u16::try_from(instruction & u32::from(u16::MAX))
+                .expect("mask limits the opcode to 16 bits");
             assert!(word_count > 0, "malformed SPIR-V instruction");
             if opcode == super::super::OP_EXECUTION_MODE
                 && words[offset + 2] == super::super::EXECUTION_MODE_LOCAL_SIZE

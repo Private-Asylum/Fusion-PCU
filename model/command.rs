@@ -143,10 +143,9 @@ impl PcuCommandOp<'_> {
             Self::Read { .. } | Self::ReadResult { .. } => PcuCommandEffectKind::Read,
             Self::Write { .. } | Self::Copy { .. } => PcuCommandEffectKind::Write,
             Self::Modify { .. } => PcuCommandEffectKind::Transform,
-            Self::Invoke { .. } => PcuCommandEffectKind::Control,
+            Self::Invoke { .. } | Self::Return { .. } => PcuCommandEffectKind::Control,
             Self::Await { .. } | Self::Barrier => PcuCommandEffectKind::Synchronize,
             Self::Stall { .. } | Self::Sleep { .. } => PcuCommandEffectKind::Host,
-            Self::Return { .. } => PcuCommandEffectKind::Control,
         }
     }
 
@@ -243,7 +242,7 @@ pub struct PcuCommandKernelBuilder<'a, const MAX_STEPS: usize = DEFAULT_STEP_CAP
 impl<'a, const MAX_STEPS: usize> PcuCommandKernelBuilder<'a, MAX_STEPS> {
     /// Creates one command-kernel builder.
     #[must_use]
-    pub fn new(kernel_id: u32, entry_point: &'a str) -> Self {
+    pub const fn new(kernel_id: u32, entry_point: &'a str) -> Self {
         Self {
             kernel_id: PcuKernelId(kernel_id),
             entry_point,
@@ -330,7 +329,7 @@ impl<'a, const MAX_STEPS: usize> PcuCommandKernelBuilder<'a, MAX_STEPS> {
         PcuKernel::Command(self.ir())
     }
 
-    fn push_step(&mut self, step: PcuCommandStep<'a>) -> Result<(), PcuError> {
+    const fn push_step(&mut self, step: PcuCommandStep<'a>) -> Result<(), PcuError> {
         if self.step_len == MAX_STEPS {
             return Err(PcuError::resource_exhausted());
         }
