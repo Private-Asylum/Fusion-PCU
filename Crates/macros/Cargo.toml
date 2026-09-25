@@ -1,5 +1,6 @@
 [package]
 name = "fusion-pcu-macros"
+description = "Bounded Rust kernel frontend for Fusion PCU dispatch"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -16,9 +17,10 @@ quote.workspace = true
 syn = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-pcu_alias = { package = "fusion-pcu", path = "../fusion-pcu", default-features = false }
-fusion-pcu-rocm = { path = "../backends/rocm" }
-fusion-pcu-spirv = { path = "../backends/spirv" }
+pcu_alias = { package = "fusion-pcu", version = "0.1.0", path = "../fusion-pcu", default-features = false }
+fusion-pcu-rocm = { version = "0.1.0", path = "../backends/rocm" }
+fusion-pcu-cpu = { version = "0.1.0", path = "../backends/cpu" }
+fusion-pcu-spirv = { version = "0.1.0", path = "../backends/spirv" }
 trybuild = "1.0"
 
 [lints]

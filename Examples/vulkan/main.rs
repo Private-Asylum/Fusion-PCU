@@ -33,8 +33,8 @@ use winit::window::{
 
 const WINDOW_WIDTH: f64 = 960.0;
 const WINDOW_HEIGHT: f64 = 540.0;
-const ELEMENT_COUNT: usize = 256;
-const INVOCATIONS: u32 = 256;
+const ELEMENT_COUNT: usize = 2048;
+const INVOCATIONS: u32 = 250;
 
 fn main() {
     if let Err(error) = run() {
@@ -78,7 +78,7 @@ impl ExampleApp {
 
         let report = result?;
         println!(
-            "fusion-vulkan-example: dispatched {} PCU invocations through {} on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
+            "fusion-vulkan-example: dispatched {} PCU invocations over {ELEMENT_COUNT} elements through {} on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
             report.dispatch.execution.invocations,
             report.dispatch.runner_id,
             report
@@ -149,7 +149,7 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
     fill_inputs(&mut source, &mut bias)?;
 
     let bindings = parallel_float_kernel_bindings();
-    let builder = parallel_float_kernel(&bindings).map_err(ExampleError::Pcu)?;
+    let builder = parallel_float_kernel::<ELEMENT_COUNT>(&bindings).map_err(ExampleError::Pcu)?;
     let kernel = builder.ir();
     let runtime = PcuRuntime::auto().map_err(ExampleError::Runner)?;
     let invocations = NonZeroU32::new(INVOCATIONS).ok_or(ExampleError::BufferTooLarge)?;
@@ -177,10 +177,14 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
     })
 }
 
-#[pcu_dispatch(kernel_id = 1, invocations = 256)]
-fn parallel_float_kernel(input_a: &[f32], input_b: &[f32], output: &mut [f32]) {
-    let invocation = context.global_invocation_id;
-    output[invocation] = input_a[invocation] * 2.0 + input_b[invocation] + 1.0;
+#[pcu_dispatch(kernel_id = 1, invocations = 250)]
+fn parallel_float_kernel<const N: usize>(input_a: &[f32], input_b: &[f32], output: &mut [f32]) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        output[id] = ((input_a[id] + input_b[id]) * 2.0) / 2.0 - 1.0;
+        id += stride;
+    }
 }
 
 const fn parallel_float_invocation_bindings<'a>(
@@ -224,9 +228,9 @@ fn verify_parallel_float_output(
     for index in 0..ELEMENT_COUNT {
         let source = f32::from_bits(source[index]);
         let bias = f32::from_bits(bias[index]);
-        let expected = source.mul_add(2.0, bias) + 1.0;
+        let expected = source + bias - 1.0;
         let actual = f32::from_bits(output[index]);
-        if (actual - expected).abs() > f32::EPSILON {
+        if actual.to_bits() != expected.to_bits() {
             return Err(ExampleError::ComputeMismatch {
                 index,
                 expected,

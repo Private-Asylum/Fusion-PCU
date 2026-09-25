@@ -1,6 +1,9 @@
 //! PCU dispatch to SPIR-V lowering entry points.
 
+use alloc::vec::Vec;
+
 use fusion_pcu::{
+    PcuF32MapValidationError,
     PcuBindingRef,
     PcuBindingAccess,
     PcuBindingStorageClass,
@@ -20,6 +23,7 @@ use fusion_pcu::{
     PcuParameterValue,
     PcuScalarType,
     PcuValueType,
+    validate_f32_map_kernel,
 };
 
 use super::{
@@ -172,7 +176,8 @@ fn validate_op_for_spirv(
         | PcuDispatchOp::Arithmetic(_)
         | PcuDispatchOp::Port(_)
         | PcuDispatchOp::Sync(_)
-        | PcuDispatchOp::Intrinsic { .. } => unsupported(op),
+        | PcuDispatchOp::Intrinsic { .. }
+        | PcuDispatchOp::GridStrideLoop { .. } => unsupported(op),
         PcuDispatchOp::Resource(resource) => validate_resource_op(resource, options),
         PcuDispatchOp::Data(data) => {
             Err(PcuSpirvError::UnsupportedInstruction(data.support_flag()))
@@ -363,13 +368,22 @@ const fn has_parallel_float_ops(kernel: &PcuDispatchKernelIr<'_>) -> bool {
 }
 
 fn has_f32_dataflow_ops(kernel: &PcuDispatchKernelIr<'_>) -> bool {
-    kernel
-        .ops
-        .iter()
-        .any(|op| matches!(op, PcuDispatchOp::Data(_)))
+    kernel.ops.iter().any(|op| {
+        matches!(
+            op,
+            PcuDispatchOp::Data(_) | PcuDispatchOp::GridStrideLoop { .. }
+        )
+    })
 }
 
 fn validate_f32_dataflow_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), PcuSpirvError> {
+    if kernel
+        .ops
+        .iter()
+        .any(|op| matches!(op, PcuDispatchOp::GridStrideLoop { .. }))
+    {
+        return validate_grid_stride_kernel(kernel);
+    }
     if !kernel
         .bindings
         .iter()
@@ -434,6 +448,119 @@ fn validate_f32_dataflow_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), 
     }
 
     if saw_return && saw_store {
+        validate_f32_map_kernel(kernel).map_err(|error| match error {
+            PcuF32MapValidationError::InvalidBinding(_)
+            | PcuF32MapValidationError::DuplicateBinding(_) => PcuSpirvError::InvalidBinding,
+            PcuF32MapValidationError::InvalidIndex(_) => PcuSpirvError::UnsupportedInstruction(
+                PcuDispatchOpCaps::BINDING_LOAD | PcuDispatchOpCaps::BINDING_STORE,
+            ),
+            PcuF32MapValidationError::UnsupportedOperation(position) => {
+                PcuSpirvError::UnsupportedInstruction(kernel.ops[position].support_flag())
+            }
+            PcuF32MapValidationError::UnsupportedInterface
+            | PcuF32MapValidationError::InvalidValue(_)
+            | PcuF32MapValidationError::DuplicateValue(_)
+            | PcuF32MapValidationError::MissingStore
+            | PcuF32MapValidationError::MissingReturn => PcuSpirvError::InvalidKernelSignature,
+        })
+    } else {
+        Err(PcuSpirvError::InvalidKernelSignature)
+    }
+}
+
+fn validate_grid_stride_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), PcuSpirvError> {
+    let mut loops = kernel.ops.iter().filter_map(|op| match op {
+        PcuDispatchOp::GridStrideLoop { extent, body } => Some((*extent, *body)),
+        _ => None,
+    });
+    let Some((extent, body)) = loops.next() else {
+        return Err(PcuSpirvError::InvalidKernelSignature);
+    };
+    if extent == 0 || loops.next().is_some() || kernel.entry.logical_shape[0] == 0 {
+        return Err(PcuSpirvError::InvalidKernelSignature);
+    }
+    if !matches!(
+        kernel.ops,
+        [
+            PcuDispatchOp::GridStrideLoop { .. },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return)
+        ]
+    ) {
+        return Err(PcuSpirvError::InvalidKernelSignature);
+    }
+    if !kernel
+        .bindings
+        .iter()
+        .copied()
+        .all(is_storage_f32_dataflow_binding)
+    {
+        return Err(PcuSpirvError::InvalidBinding);
+    }
+    let mut definitions = Vec::new();
+    let mut has_store = false;
+    for op in body.iter().copied() {
+        match op {
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result,
+                binding,
+                index: PcuDispatchIndex::GridStrideId,
+            }) => {
+                validate_value_result(result)?;
+                validate_dataflow_binding(kernel, binding, PcuBindingAccess::ReadOnly)?;
+                if definitions.contains(&result) {
+                    return Err(PcuSpirvError::InvalidKernelSignature);
+                }
+                definitions.push(result);
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding,
+                index: PcuDispatchIndex::GridStrideId,
+                value,
+            }) => {
+                validate_dataflow_binding(kernel, binding, PcuBindingAccess::WriteOnly)?;
+                if !definitions.contains(&value) {
+                    return Err(PcuSpirvError::InvalidKernelSignature);
+                }
+                has_store = true;
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result,
+                value: PcuParameterValue::F32(_),
+            }) => {
+                validate_value_result(result)?;
+                if definitions.contains(&result) {
+                    return Err(PcuSpirvError::InvalidKernelSignature);
+                }
+                definitions.push(result);
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                result,
+                op,
+                lhs,
+                rhs,
+            }) => {
+                validate_value_result(result)?;
+                if !matches!(
+                    op,
+                    PcuDispatchAluOp::Add
+                        | PcuDispatchAluOp::Sub
+                        | PcuDispatchAluOp::Mul
+                        | PcuDispatchAluOp::Div
+                ) {
+                    return Err(PcuSpirvError::UnsupportedInstruction(op.support_flag()));
+                }
+                if definitions.contains(&result)
+                    || !definitions.contains(&lhs)
+                    || !definitions.contains(&rhs)
+                {
+                    return Err(PcuSpirvError::InvalidKernelSignature);
+                }
+                definitions.push(result);
+            }
+            _ => return Err(PcuSpirvError::UnsupportedInstruction(op.support_flag())),
+        }
+    }
+    if has_store {
         Ok(())
     } else {
         Err(PcuSpirvError::InvalidKernelSignature)
@@ -483,9 +610,11 @@ fn validate_dataflow_binding(
 fn validate_invocation_index(index: PcuDispatchIndex) -> Result<(), PcuSpirvError> {
     match index {
         PcuDispatchIndex::InvocationId => Ok(()),
-        PcuDispatchIndex::Value(_) => Err(PcuSpirvError::UnsupportedInstruction(
-            PcuDispatchOpCaps::BINDING_LOAD | PcuDispatchOpCaps::BINDING_STORE,
-        )),
+        PcuDispatchIndex::GridStrideId | PcuDispatchIndex::Value(_) => {
+            Err(PcuSpirvError::UnsupportedInstruction(
+                PcuDispatchOpCaps::BINDING_LOAD | PcuDispatchOpCaps::BINDING_STORE,
+            ))
+        }
     }
 }
 
@@ -571,6 +700,7 @@ mod tests {
         PcuDispatchCoordinateOp,
         PcuDispatchDataOp,
         PcuDispatchIndex,
+        PcuDispatchOp,
         PcuDispatchOpCaps,
         PcuDispatchResourceOp,
         PcuDispatchRayTraceOp,
@@ -627,6 +757,46 @@ mod tests {
             assert_eq!(result, Err(PcuSpirvError::UnsupportedVersion(version)));
             assert!(sink.is_empty());
         }
+    }
+
+    #[test]
+    fn common_f32_profile_rejects_duplicate_binding_addresses() {
+        let bindings = [
+            PcuBinding::scalar::<f32>(
+                Some("first"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadWrite,
+            ),
+            PcuBinding::scalar::<f32>(
+                Some("duplicate"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadWrite,
+            ),
+        ];
+        let builder = PcuDispatchKernelBuilder::<3>::new(7, "main", [4, 1, 1])
+            .with_bindings(&bindings)
+            .with_data_op(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(1),
+                value: PcuParameterValue::F32(1.0_f32.to_bits()),
+            })
+            .expect("constant")
+            .with_data_op(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(1),
+            })
+            .expect("store")
+            .with_control_op(fusion_pcu::PcuDispatchControlOp::Return)
+            .expect("return");
+        let kernel = builder.ir();
+        assert_eq!(
+            validate_dispatch_for_spirv(&kernel, PcuSpirvLoweringOptions::minimal_shader()),
+            Err(PcuSpirvError::InvalidBinding)
+        );
     }
 
     #[test]
@@ -793,7 +963,7 @@ mod tests {
         .expect("operandful parallel float map should lower");
 
         assert_eq!(sink.as_slice()[0], SPIRV_MAGIC);
-        assert_eq!(info.bound, 37);
+        assert_eq!(info.bound, 38);
         assert_eq!(info.word_count, sink.len());
         assert_eq!(execution_local_size(sink.as_slice()), [1, 1, 1]);
         assert!(
@@ -801,6 +971,88 @@ mod tests {
                 .iter()
                 .any(|word| (*word & 0xffff) == u32::from(super::super::OP_F_ADD))
         );
+    }
+
+    #[test]
+    fn grid_stride_map_emits_structured_spirv_loop() {
+        let bindings = [
+            PcuBinding::value(
+                Some("input"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::f32(),
+            ),
+            PcuBinding::value(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                PcuValueType::f32(),
+            ),
+        ];
+        let body = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::GridStrideId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(2),
+                value: PcuParameterValue::F32(1.0_f32.to_bits()),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Add,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::GridStrideId,
+                value: PcuDispatchValueId(3),
+            }),
+        ];
+        let ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 2048,
+                body: &body,
+            },
+            PcuDispatchOp::Control(fusion_pcu::PcuDispatchControlOp::Return),
+        ];
+        let builder = PcuDispatchKernelBuilder::<2>::new(10, "grid_stride", [250, 1, 1])
+            .with_bindings(&bindings)
+            .with_ops(&ops)
+            .expect("builder should accept grid-stride map");
+        let kernel = builder.ir();
+        let mut sink = PcuSpirvFixedSink::<512>::new();
+
+        let info = lower_dispatch_to_spirv(
+            &kernel,
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut sink,
+        )
+        .expect("grid-stride map should lower");
+
+        assert_eq!(info.word_count, sink.len());
+        for opcode in [
+            super::super::OP_PHI,
+            super::super::OP_LOOP_MERGE,
+            super::super::OP_BRANCH,
+            super::super::OP_BRANCH_CONDITIONAL,
+            super::super::OP_I_ADD,
+            super::super::OP_U_LESS_THAN,
+            super::super::OP_U_LESS_THAN_EQUAL,
+        ] {
+            assert!(
+                sink.as_slice()
+                    .iter()
+                    .any(|word| (*word & 0xffff) == u32::from(opcode)),
+                "missing SPIR-V opcode {opcode}"
+            );
+        }
     }
 
     #[test]

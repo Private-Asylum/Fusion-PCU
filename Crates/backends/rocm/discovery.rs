@@ -51,6 +51,8 @@ use crate::{
     HipRuntime,
     RocmDispatchError,
     compile_hip_source,
+    compile_hip_source_for_device,
+    rtc::hiprtc_available,
     lower_dispatch_to_hip_source,
 };
 
@@ -65,6 +67,14 @@ pub struct RocmDiscovery {
     unavailable_reason: Option<String>,
     compiler_available: bool,
     compiler_reason: Option<String>,
+    hiprtc_available: bool,
+    hiprtc_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchCompiler {
+    Hipcc,
+    HipRtc,
 }
 
 impl RocmDiscovery {
@@ -79,6 +89,9 @@ impl RocmDiscovery {
         let compiler_reason = (!compiler_available).then(|| {
             "HIP compiler is unavailable; source-lowered dispatch cannot be compiled".to_string()
         });
+        let hiprtc_result = hiprtc_available();
+        let hiprtc_available = hiprtc_result.is_ok();
+        let hiprtc_reason = hiprtc_result.err().map(|error| error.to_string());
         match HipRuntime::enumerate_devices() {
             Ok(devices) => Self {
                 generation,
@@ -86,6 +99,8 @@ impl RocmDiscovery {
                 unavailable_reason: None,
                 compiler_available,
                 compiler_reason,
+                hiprtc_available,
+                hiprtc_reason,
             },
             Err(error) => Self {
                 generation,
@@ -93,6 +108,8 @@ impl RocmDiscovery {
                 unavailable_reason: Some(error.to_string()),
                 compiler_available,
                 compiler_reason,
+                hiprtc_available,
+                hiprtc_reason,
             },
         }
     }
@@ -107,9 +124,12 @@ impl RocmDiscovery {
                 status: Status::Degraded,
                 reason: Some("HIP runtime is available but reports no visible devices"),
             },
-            None if !self.compiler_available => PcuProviderReadiness {
+            None if !self.compiler_available && !self.hiprtc_available => PcuProviderReadiness {
                 status: Status::Degraded,
-                reason: self.compiler_reason.as_deref(),
+                reason: self
+                    .compiler_reason
+                    .as_deref()
+                    .or(self.hiprtc_reason.as_deref()),
             },
             None => PcuProviderReadiness {
                 status: Status::Ready,
@@ -160,6 +180,20 @@ impl RocmDiscovery {
             .iter()
             .find(|info| u32::try_from(info.index).ok() == Some(device.id))
             .ok_or(HipError::InvalidDiscoveryReference)
+    }
+
+    pub(crate) fn dispatch_compiler(
+        &self,
+        device: PcuObjectRef,
+    ) -> Result<DispatchCompiler, HipError> {
+        let info = self.device_info(device)?;
+        if info.architecture.is_some() && self.compiler_available {
+            return Ok(DispatchCompiler::Hipcc);
+        }
+        if self.hiprtc_available {
+            return Ok(DispatchCompiler::HipRtc);
+        }
+        Err(HipError::MissingArchitecture)
     }
 
     /// Open an explicitly selected device, confirming its physical identity after reopening HIP.
@@ -321,7 +355,11 @@ impl PcuRuntimeDiscovery for RocmDiscovery {
         target: PcuObjectRef,
     ) -> Result<PcuCapabilitySnapshot, Self::Error> {
         self.validate(target, PcuObjectKind::Target)?;
-        let mut support = self.support();
+        let has_codegen_target = self
+            .devices
+            .iter()
+            .any(|device| self.compiler_for_info(device));
+        let mut support = self.support(has_codegen_target);
         // Executors are enumerated under individual devices, not the aggregate target.
         support.executor_count = 0;
         Ok(PcuCapabilitySnapshot { support })
@@ -332,8 +370,9 @@ impl PcuRuntimeDiscovery for RocmDiscovery {
         device: PcuObjectRef,
     ) -> Result<PcuCapabilitySnapshot, Self::Error> {
         self.validate(device, PcuObjectKind::Device)?;
+        let has_codegen_target = self.dispatch_compiler(device).is_ok();
         Ok(PcuCapabilitySnapshot {
-            support: self.support(),
+            support: self.support(has_codegen_target),
         })
     }
 
@@ -351,8 +390,10 @@ impl PcuRuntimeDiscovery for RocmDiscovery {
         if object.kind != PcuObjectKind::Device && object.kind != PcuObjectKind::Context {
             return Ok(0);
         }
-        if self.devices.is_empty() || self.unavailable_reason.is_some() || !self.compiler_available
-        {
+        let has_codegen_target = self.devices.iter().any(|device| {
+            u32::try_from(device.index).ok() == Some(object.id) && self.compiler_for_info(device)
+        });
+        if self.devices.is_empty() || self.unavailable_reason.is_some() || !has_codegen_target {
             return Ok(0);
         }
         if let Some(slot) = output.first_mut() {
@@ -363,14 +404,17 @@ impl PcuRuntimeDiscovery for RocmDiscovery {
 }
 
 impl RocmDiscovery {
-    const fn support(&self) -> PcuSupport {
+    const fn compiler_for_info(&self, info: &HipDeviceInfo) -> bool {
+        (info.architecture.is_some() && self.compiler_available) || self.hiprtc_available
+    }
+
+    const fn support(&self, has_codegen_target: bool) -> PcuSupport {
         let mut support = PcuSupport::unsupported();
         support.caps = PcuCaps::ENUMERATE_EXECUTORS;
         if !self.devices.is_empty() && self.unavailable_reason.is_none() {
             support.caps = support.caps.union(PcuCaps::DEVICE_LOCAL_MEMORY);
         }
-        if self.devices.is_empty() || self.unavailable_reason.is_some() || !self.compiler_available
-        {
+        if self.devices.is_empty() || self.unavailable_reason.is_some() || !has_codegen_target {
             return support;
         }
         support.caps = support
@@ -405,10 +449,7 @@ impl RocmDiscovery {
         support
     }
 
-    /// Assess a concrete dispatch program for a discovered device.
-    /// This runs the execution lowerer and compiles its output for the caller-selected architecture.
-    /// The current HIP discovery API does not expose a stable architecture string, so this cannot
-    /// verify that the supplied architecture matches the selected physical GPU.
+    /// Assess a dispatch program using the compiler path advertised for its device.
     ///
     /// # Errors
     ///
@@ -418,14 +459,36 @@ impl RocmDiscovery {
         &self,
         device: PcuObjectRef,
         kernel: &PcuDispatchKernelIr<'_>,
-        architecture: &str,
     ) -> Result<(), RocmDispatchError> {
-        self.validate(device, PcuObjectKind::Device)
-            .map_err(RocmDispatchError::Hip)?;
+        let compiler = self.dispatch_compiler(device).map_err(|error| {
+            if matches!(error, HipError::MissingArchitecture) {
+                RocmDispatchError::CompilerUnavailable
+            } else {
+                RocmDispatchError::Hip(error)
+            }
+        })?;
         let source = lower_dispatch_to_hip_source(kernel).map_err(RocmDispatchError::Lower)?;
-        compile_hip_source(&source, architecture)
-            .map(|_| ())
-            .map_err(RocmDispatchError::Compile)
+        match compiler {
+            DispatchCompiler::Hipcc => {
+                let architecture = self
+                    .device_info(device)
+                    .map_err(RocmDispatchError::Hip)?
+                    .architecture
+                    .as_deref()
+                    .ok_or(RocmDispatchError::Hip(HipError::MissingArchitecture))?;
+                compile_hip_source(&source, architecture)
+                    .map(|_| ())
+                    .map_err(RocmDispatchError::Compile)
+            }
+            DispatchCompiler::HipRtc => {
+                let runtime = self.open_device(device).map_err(RocmDispatchError::Hip)?;
+                let rtc_source = crate::lower_dispatch_to_hip_rtc_source(kernel)
+                    .map_err(RocmDispatchError::Lower)?;
+                compile_hip_source_for_device(&runtime, &rtc_source)
+                    .map(|_| ())
+                    .map_err(RocmDispatchError::HipRtc)
+            }
+        }
     }
 }
 
@@ -467,7 +530,7 @@ mod tests {
                 index: 2,
                 name: "Test AMD GPU".into(),
                 vendor: "AMD".into(),
-                architecture: None,
+                architecture: Some("gfx1030".into()),
                 generation: None,
                 pci_bus_id: Some("0000:03:00.0".into()),
                 total_memory: 8 * 1024 * 1024,
@@ -475,6 +538,8 @@ mod tests {
             unavailable_reason: None,
             compiler_available: true,
             compiler_reason: None,
+            hiprtc_available: false,
+            hiprtc_reason: Some("HIPRTC unavailable".into()),
         }
     }
 
@@ -647,6 +712,8 @@ mod tests {
         let mut discovery = sample();
         discovery.compiler_available = false;
         discovery.compiler_reason = Some("hipcc unavailable".into());
+        discovery.hiprtc_available = false;
+        discovery.hiprtc_reason = Some("HIPRTC unavailable".into());
         let mut provider = [PcuProviderDescriptor {
             id: PROVIDER,
             generation: 0,
@@ -658,11 +725,58 @@ mod tests {
         }];
         discovery.providers(&mut provider).unwrap();
         assert_eq!(provider[0].readiness.status, Status::Degraded);
-        let snapshot = discovery.support();
+        let snapshot = discovery.support(false);
         assert!(!snapshot.caps.contains(PcuCaps::DISPATCH));
         assert!(snapshot.caps.contains(PcuCaps::ENUMERATE_EXECUTORS));
         let device = discovery.reference(PcuObjectKind::Device, 2);
         assert_eq!(discovery.executors(device, &mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn missing_codegen_target_preserves_device_memory_but_suppresses_dispatch() {
+        let mut discovery = sample();
+        discovery.devices[0].architecture = None;
+        let device = discovery.reference(PcuObjectKind::Device, 2);
+        let support = discovery.device_capabilities(device).unwrap().support;
+        assert!(support.caps.contains(PcuCaps::DEVICE_LOCAL_MEMORY));
+        assert!(!support.caps.contains(PcuCaps::DISPATCH));
+        assert_eq!(discovery.executors(device, &mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn runtime_compiler_claims_dispatch_without_architecture_or_hipcc() {
+        let mut discovery = sample();
+        discovery.devices[0].architecture = None;
+        discovery.compiler_available = false;
+        discovery.compiler_reason = Some("hipcc unavailable".into());
+        discovery.hiprtc_available = true;
+        discovery.hiprtc_reason = None;
+        let device = discovery.reference(PcuObjectKind::Device, 2);
+        assert_eq!(
+            discovery.dispatch_compiler(device).unwrap(),
+            DispatchCompiler::HipRtc
+        );
+        assert!(
+            discovery
+                .device_capabilities(device)
+                .unwrap()
+                .support
+                .caps
+                .contains(PcuCaps::DISPATCH)
+        );
+        assert_eq!(discovery.executors(device, &mut []).unwrap(), 1);
+    }
+
+    #[test]
+    fn known_architecture_prefers_hipcc_even_when_runtime_compiler_exists() {
+        let mut discovery = sample();
+        discovery.hiprtc_available = true;
+        assert_eq!(
+            discovery
+                .dispatch_compiler(discovery.reference(PcuObjectKind::Device, 2))
+                .unwrap(),
+            DispatchCompiler::Hipcc
+        );
     }
 
     #[test]
@@ -684,7 +798,7 @@ mod tests {
         let mut stale = discovery.reference(PcuObjectKind::Device, 2);
         stale.generation -= 1;
         assert!(matches!(
-            discovery.assess_dispatch(stale, &kernel, "gfx1030"),
+            discovery.assess_dispatch(stale, &kernel),
             Err(RocmDispatchError::Hip(HipError::InvalidDiscoveryReference))
         ));
     }

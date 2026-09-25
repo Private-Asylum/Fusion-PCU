@@ -1,7 +1,5 @@
 error: second PCU dispatch statement must be `output[invocation] = <expr>;`
   --> tests/ui/unsupported_statement.rs:10:5
    |
-10 | /     if invocation > 0 {
-11 | |         output[invocation] = input[invocation];
-12 | |     }
-   | |_____^
+10 |     if invocation > 0 {
+   |     ^^

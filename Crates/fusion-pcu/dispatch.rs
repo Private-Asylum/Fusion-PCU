@@ -15,6 +15,7 @@ use crate::contract::{
     PcuBindingRef,
     PcuCommandKernelIr,
     PcuDispatchKernelIr,
+    PcuDispatchOp,
     PcuError,
     PcuExecutorId,
     PcuInvocationBindings,
@@ -905,6 +906,25 @@ pub fn validate_invocation_bindings(
 ///
 /// Returns `Invalid` for an unsupported topology, zero/overflowed extent, or mismatched count.
 pub fn validate_dispatch_submission(submission: PcuDispatchSubmission<'_>) -> Result<(), PcuError> {
+    for (index, binding) in submission.kernel.bindings.iter().enumerate() {
+        if submission.kernel.bindings[..index]
+            .iter()
+            .any(|prior| prior.reference() == binding.reference())
+        {
+            // A binding address names exactly one declared resource. Accepting duplicates makes
+            // lookup-based admission depend on declaration order, so the requested access/type
+            // contract could disagree with the resource a backend actually selects.
+            return Err(PcuError::invalid());
+        }
+    }
+    if submission
+        .kernel
+        .ops
+        .iter()
+        .any(|op| matches!(op, PcuDispatchOp::GridStrideLoop { extent: 0, .. }))
+    {
+        return Err(PcuError::invalid());
+    }
     let PcuInvocationTopology::Indexed { logical_shape } =
         submission.kernel.signature().invocation.topology
     else {
@@ -1487,6 +1507,40 @@ mod tests {
         assert_eq!(
             result.expect_err("shape mismatch must be rejected").kind(),
             crate::PcuErrorKind::Invalid
+        );
+    }
+
+    #[test]
+    fn dispatch_submission_rejects_aliased_binding_addresses() {
+        let bindings = [
+            crate::PcuBinding::value(
+                Some("input"),
+                0,
+                0,
+                crate::PcuBindingStorageClass::Storage,
+                crate::PcuBindingAccess::ReadOnly,
+                PcuValueType::u32(),
+            ),
+            crate::PcuBinding::value(
+                Some("output"),
+                0,
+                0,
+                crate::PcuBindingStorageClass::Storage,
+                crate::PcuBindingAccess::WriteOnly,
+                PcuValueType::u32(),
+            ),
+        ];
+        let builder =
+            PcuDispatchKernelBuilder::<0>::new(8, "main", [1, 1, 1]).with_bindings(&bindings);
+        let kernel = builder.ir();
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(1).expect("nonzero")),
+        };
+
+        assert_eq!(
+            super::validate_dispatch_submission(submission),
+            Err(PcuError::invalid())
         );
     }
 

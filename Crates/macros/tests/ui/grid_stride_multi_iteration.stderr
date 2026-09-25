@@ -1,0 +1,5 @@
+error: grid-stride loop extent must exactly match `invocations`; mismatched extents need loop-capable PCU IR
+ --> tests/ui/grid_stride_multi_iteration.rs:7:11
+  |
+7 |     while id < 16 {
+  |           ^^^^^^^

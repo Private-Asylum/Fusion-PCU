@@ -19,12 +19,66 @@ name = "fusion-rocm-discover"
 path = "discover.rs"
 
 [[bin]]
-name = "fusion-rocm-dispatch-bench"
-path = "dispatch_bench.rs"
+name = "fusion-rocm-tensor"
+path = "tensor.rs"
+
+[[bin]]
+name = "fusion-rocm-rtc"
+path = "rtc.rs"
+
+[[bin]]
+name = "fusion-rocm-train-step"
+path = "train_step.rs"
+
+[[bench]]
+name = "dispatch"
+path = "benches/dispatch.rs"
+harness = false
+
+[[bench]]
+name = "tensor"
+path = "benches/tensor.rs"
+harness = false
+
+[[bench]]
+name = "tensor_add"
+path = "benches/tensor_add.rs"
+harness = false
+
+[[bench]]
+name = "tensor_relu"
+path = "benches/tensor_relu.rs"
+harness = false
+
+[[bench]]
+name = "tensor_mse"
+path = "benches/tensor_mse.rs"
+harness = false
+
+[[bench]]
+name = "tensor_resident"
+path = "benches/tensor_resident.rs"
+harness = false
+
+[[bench]]
+name = "tensor_train_step"
+path = "benches/tensor_train_step.rs"
+harness = false
+
+[[bench]]
+name = "tensor_mlp_train"
+path = "benches/tensor_mlp_train.rs"
+harness = false
 
 [dependencies]
 fusion-pcu.workspace = true
-fusion-pcu-rocm.workspace = true
+fusion-pcu-rocm = { workspace = true, features = ["tensor"] }
+fusion-pcu-macros.workspace = true
+fusion-pcu-tensor.workspace = true
+
+[dev-dependencies]
+bytemuck = "1.25"
+criterion = "0.7"
 
 [lints.clippy]
 all = "warn"

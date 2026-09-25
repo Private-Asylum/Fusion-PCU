@@ -1,7 +1,6 @@
 [package]
 name = "fusion-pcu-tensor"
 description = "Experimental typed tensor dialect and deterministic CPU reference evaluator for Fusion PCU"
-documentation = ""
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

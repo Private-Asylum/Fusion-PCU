@@ -18,6 +18,7 @@ extern crate std;
 
 pub mod activation;
 pub mod assessment;
+pub mod borrowed;
 pub mod builder;
 #[path = "contract/contract.rs"]
 pub mod contract;
@@ -26,6 +27,7 @@ pub mod dialect;
 pub mod dialect_builder;
 pub mod discovery;
 pub mod dispatch;
+pub mod f32_map_validation;
 pub mod ir;
 pub mod memory;
 #[path = "model/model.rs"]
@@ -38,8 +40,10 @@ pub mod validation;
 pub use contract::*;
 pub use activation::*;
 pub use assessment::*;
+pub use borrowed::*;
 pub use builder::*;
 pub use dispatch::*;
+pub use f32_map_validation::*;
 pub use dialect::*;
 pub use dialect_builder::*;
 pub use discovery::*;

@@ -1,7 +1,6 @@
 [package]
 name = "fusion-pcu"
-description = ""
-documentation = ""
+description = "Backend-neutral intermediate representation and execution contracts for coprocessors"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

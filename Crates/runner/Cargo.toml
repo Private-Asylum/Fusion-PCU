@@ -1,7 +1,6 @@
 [package]
 name = "fusion-pcu-runner"
 description = "Hosted runner and runtime selection for Fusion PCU"
-documentation = ""
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -32,7 +32,9 @@ pub struct RocmDispatchBinding<'a> {
 pub enum RocmDispatchError {
     Lower(RocmLowerError),
     Compile(HipCompileError),
+    HipRtc(crate::HipRtcError),
     Hip(HipError),
+    CompilerUnavailable,
     MissingBinding(PcuBindingRef),
     DuplicateBinding(PcuBindingRef),
     UnexpectedBinding(PcuBindingRef),
@@ -50,7 +52,11 @@ impl fmt::Display for RocmDispatchError {
         match self {
             Self::Lower(error) => write!(f, "PCU Dispatch cannot lower to ROCm: {error}"),
             Self::Compile(error) => write!(f, "ROCm code object compilation failed: {error}"),
+            Self::HipRtc(error) => write!(f, "ROCm runtime compilation failed: {error}"),
             Self::Hip(error) => write!(f, "ROCm execution failed: {error}"),
+            Self::CompilerUnavailable => {
+                f.write_str("no usable ROCm source compiler is available for this device")
+            }
             Self::MissingBinding(id) => write!(f, "missing device binding {id:?}"),
             Self::DuplicateBinding(id) => write!(f, "duplicate device binding {id:?}"),
             Self::UnexpectedBinding(id) => write!(f, "unexpected device binding {id:?}"),

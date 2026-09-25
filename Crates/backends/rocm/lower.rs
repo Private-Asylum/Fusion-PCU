@@ -23,8 +23,10 @@ use fusion_pcu::{
     PcuDispatchOpCaps,
     PcuDispatchValueId,
     PcuParameterValue,
+    PcuF32MapValidationError,
     PcuValueType,
     PcuValueTypeCaps,
+    validate_f32_map_kernel,
 };
 
 /// Structured reason why a dispatch kernel is outside the HIP source-lowering subset.
@@ -37,6 +39,7 @@ pub enum RocmLowerError {
     InvalidBindingAccess(PcuBindingRef),
     DuplicateValue(PcuDispatchValueId),
     UndefinedValue(PcuDispatchValueId),
+    InvalidValue(PcuDispatchValueId),
     UnsupportedConstant,
     UnsupportedAlu(PcuDispatchAluOp),
     UnsupportedOperation {
@@ -77,6 +80,13 @@ impl fmt::Display for RocmLowerError {
             Self::UndefinedValue(value) => {
                 write!(formatter, "value {} is used before definition", value.0)
             }
+            Self::InvalidValue(value) => {
+                write!(
+                    formatter,
+                    "value {} is reserved and cannot appear in the IR",
+                    value.0
+                )
+            }
             Self::UnsupportedConstant => {
                 formatter.write_str("HIP lowering supports f32 constants only")
             }
@@ -114,10 +124,33 @@ impl std::error::Error for RocmLowerError {}
 pub fn lower_dispatch_to_hip_source(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<String, RocmLowerError> {
+    lower_dispatch_to_hip_source_with_preamble(kernel, true)
+}
+
+/// Lower the same kernel for HIPRTC, whose online compiler supplies HIP builtins directly.
+///
+/// # Errors
+///
+/// Returns a lowering error when the kernel is outside the supported HIP subset.
+pub fn lower_dispatch_to_hip_rtc_source(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Result<String, RocmLowerError> {
+    lower_dispatch_to_hip_source_with_preamble(kernel, false)
+}
+
+#[allow(clippy::too_many_lines)] // Keep direct and loop emission visibly parallel for this small subset.
+fn lower_dispatch_to_hip_source_with_preamble(
+    kernel: &PcuDispatchKernelIr<'_>,
+    include_runtime_header: bool,
+) -> Result<String, RocmLowerError> {
     validate_kernel(kernel)?;
 
-    let mut source =
-        String::from("#include <hip/hip_runtime.h>\n\nextern \"C\" __global__ void fusion_kernel(");
+    let mut source = if include_runtime_header {
+        String::from("#include <hip/hip_runtime.h>\n\n")
+    } else {
+        String::new()
+    };
+    source.push_str("extern \"C\" __global__ void fusion_kernel(");
     for (index, binding) in kernel.bindings.iter().enumerate() {
         if index != 0 {
             source.push_str(", ");
@@ -176,19 +209,28 @@ pub fn lower_dispatch_to_hip_source(
                 lhs,
                 rhs,
             }) => {
-                let operator = match op {
-                    PcuDispatchAluOp::Add => "+",
-                    PcuDispatchAluOp::Sub => "-",
-                    PcuDispatchAluOp::Mul => "*",
-                    PcuDispatchAluOp::Div => "/",
-                    _ => unreachable!("validated ALU op"),
-                };
-                writeln!(
-                    &mut source,
-                    "    float v{} = v{} {operator} v{};",
-                    result.0, lhs.0, rhs.0
-                )
-                .map_err(|_| RocmLowerError::FormattingFailure)?;
+                if op == PcuDispatchAluOp::Max {
+                    writeln!(
+                        &mut source,
+                        "    float v{} = fmaxf(v{}, v{});",
+                        result.0, lhs.0, rhs.0
+                    )
+                    .map_err(|_| RocmLowerError::FormattingFailure)?;
+                } else {
+                    let operator = match op {
+                        PcuDispatchAluOp::Add => "+",
+                        PcuDispatchAluOp::Sub => "-",
+                        PcuDispatchAluOp::Mul => "*",
+                        PcuDispatchAluOp::Div => "/",
+                        _ => unreachable!("validated ALU op"),
+                    };
+                    writeln!(
+                        &mut source,
+                        "    float v{} = v{} {operator} v{};",
+                        result.0, lhs.0, rhs.0
+                    )
+                    .map_err(|_| RocmLowerError::FormattingFailure)?;
+                }
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
                 binding,
@@ -203,11 +245,91 @@ pub fn lower_dispatch_to_hip_source(
             PcuDispatchOp::Control(PcuDispatchControlOp::Return) => {
                 source.push_str("    return;\n");
             }
+            PcuDispatchOp::GridStrideLoop { extent, body } => {
+                writeln!(
+                    &mut source,
+                    "    for (unsigned long long fusion_idx = fusion_gid; fusion_idx < {extent}ull; fusion_idx += {}ull) {{",
+                    kernel.entry.logical_shape[0]
+                )
+                .map_err(|_| RocmLowerError::FormattingFailure)?;
+                for body_op in body.iter().copied() {
+                    emit_hip_data_op(&mut source, body_op, "fusion_idx")?;
+                }
+                source.push_str("    }\n");
+            }
             _ => unreachable!("validated operation"),
         }
     }
     source.push_str("}\n");
     Ok(source)
+}
+
+fn emit_hip_data_op(
+    source: &mut String,
+    op: PcuDispatchOp<'_>,
+    index_name: &str,
+) -> Result<(), RocmLowerError> {
+    match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result,
+            binding,
+            index: PcuDispatchIndex::GridStrideId,
+        }) => writeln!(
+            source,
+            "        float v{} = binding_{}_{}[{index_name}];",
+            result.0, binding.set, binding.binding
+        )
+        .map_err(|_| RocmLowerError::FormattingFailure),
+        PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+            binding,
+            index: PcuDispatchIndex::GridStrideId,
+            value,
+        }) => writeln!(
+            source,
+            "        binding_{}_{}[{index_name}] = v{};",
+            binding.set, binding.binding, value.0
+        )
+        .map_err(|_| RocmLowerError::FormattingFailure),
+        PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+            result,
+            value: PcuParameterValue::F32(bits),
+        }) => writeln!(
+            source,
+            "        float v{} = __builtin_bit_cast(float, 0x{bits:08x}u);",
+            result.0
+        )
+        .map_err(|_| RocmLowerError::FormattingFailure),
+        PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+            result,
+            op,
+            lhs,
+            rhs,
+        }) => {
+            if op == PcuDispatchAluOp::Max {
+                writeln!(
+                    source,
+                    "        float v{} = fmaxf(v{}, v{});",
+                    result.0, lhs.0, rhs.0
+                )
+                .map_err(|_| RocmLowerError::FormattingFailure)
+            } else {
+                let operator = match op {
+                    PcuDispatchAluOp::Add => "+",
+                    PcuDispatchAluOp::Sub => "-",
+                    PcuDispatchAluOp::Mul => "*",
+                    PcuDispatchAluOp::Div => "/",
+                    _ => unreachable!("validated ALU op"),
+                };
+                writeln!(
+                    source,
+                    "        float v{} = v{} {operator} v{};",
+                    result.0, lhs.0, rhs.0
+                )
+                .map_err(|_| RocmLowerError::FormattingFailure)
+            }
+        }
+        _ => unreachable!("validated grid-stride body operation"),
+    }
 }
 
 #[allow(clippy::too_many_lines)] // One pass keeps the supported IR subset's validation rules together.
@@ -252,6 +374,7 @@ fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), RocmLowerErro
 
     let mut definitions = Vec::new();
     let mut has_store = false;
+    let mut has_grid_stride_loop = false;
     let mut saw_return = false;
     for (index, op) in kernel.ops.iter().copied().enumerate() {
         if saw_return {
@@ -285,6 +408,7 @@ fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), RocmLowerErro
                         | PcuDispatchAluOp::Sub
                         | PcuDispatchAluOp::Mul
                         | PcuDispatchAluOp::Div
+                        | PcuDispatchAluOp::Max
                 ) {
                     return Err(RocmLowerError::UnsupportedAlu(op));
                 }
@@ -302,6 +426,17 @@ fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), RocmLowerErro
                 require_defined(&definitions, value)?;
                 has_store = true;
             }
+            PcuDispatchOp::GridStrideLoop { extent, body } => {
+                if has_grid_stride_loop || extent == 0 {
+                    return Err(RocmLowerError::UnsupportedOperation {
+                        index,
+                        support: op.support_flag(),
+                    });
+                }
+                validate_grid_stride_body(kernel, body)?;
+                has_grid_stride_loop = true;
+                has_store = true;
+            }
             PcuDispatchOp::Control(PcuDispatchControlOp::Return) => saw_return = true,
             _ => {
                 return Err(RocmLowerError::UnsupportedOperation {
@@ -311,10 +446,115 @@ fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), RocmLowerErro
             }
         }
     }
-    if has_store && saw_return {
+    if has_store && saw_return && !has_grid_stride_loop {
+        validate_f32_map_kernel(kernel).map_err(|error| map_common_validation_error(error, kernel))
+    } else if has_store && saw_return {
+        if matches!(
+            kernel.ops,
+            [
+                PcuDispatchOp::GridStrideLoop { .. },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return)
+            ]
+        ) {
+            Ok(())
+        } else {
+            Err(RocmLowerError::UnsupportedKernelInterface)
+        }
+    } else {
+        Err(RocmLowerError::MissingStoreOrReturn)
+    }
+}
+
+fn validate_grid_stride_body(
+    kernel: &PcuDispatchKernelIr<'_>,
+    body: &[PcuDispatchOp<'_>],
+) -> Result<(), RocmLowerError> {
+    let mut definitions = Vec::new();
+    let mut has_store = false;
+    for (index, op) in body.iter().copied().enumerate() {
+        match op {
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result,
+                binding,
+                index: PcuDispatchIndex::GridStrideId,
+            }) => {
+                require_binding(kernel, binding, false)?;
+                define(&mut definitions, result)?;
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding,
+                index: PcuDispatchIndex::GridStrideId,
+                value,
+            }) => {
+                require_binding(kernel, binding, true)?;
+                require_defined(&definitions, value)?;
+                has_store = true;
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
+                if !matches!(value, PcuParameterValue::F32(_)) {
+                    return Err(RocmLowerError::UnsupportedConstant);
+                }
+                define(&mut definitions, result)?;
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                result,
+                op,
+                lhs,
+                rhs,
+            }) => {
+                if !matches!(
+                    op,
+                    PcuDispatchAluOp::Add
+                        | PcuDispatchAluOp::Sub
+                        | PcuDispatchAluOp::Mul
+                        | PcuDispatchAluOp::Div
+                        | PcuDispatchAluOp::Max
+                ) {
+                    return Err(RocmLowerError::UnsupportedAlu(op));
+                }
+                require_defined(&definitions, lhs)?;
+                require_defined(&definitions, rhs)?;
+                define(&mut definitions, result)?;
+            }
+            _ => {
+                return Err(RocmLowerError::UnsupportedOperation {
+                    index,
+                    support: op.support_flag(),
+                });
+            }
+        }
+    }
+    if has_store {
         Ok(())
     } else {
         Err(RocmLowerError::MissingStoreOrReturn)
+    }
+}
+
+fn map_common_validation_error(
+    error: PcuF32MapValidationError,
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> RocmLowerError {
+    match error {
+        PcuF32MapValidationError::UnsupportedInterface => {
+            RocmLowerError::UnsupportedKernelInterface
+        }
+        PcuF32MapValidationError::InvalidBinding(binding)
+        | PcuF32MapValidationError::DuplicateBinding(binding) => {
+            RocmLowerError::InvalidBinding(binding)
+        }
+        PcuF32MapValidationError::UnsupportedOperation(index) => {
+            RocmLowerError::UnsupportedOperation {
+                index,
+                support: kernel.ops[index].support_flag(),
+            }
+        }
+        PcuF32MapValidationError::InvalidIndex(_) => RocmLowerError::UnsupportedIndex,
+        PcuF32MapValidationError::InvalidValue(value) => RocmLowerError::InvalidValue(value),
+        PcuF32MapValidationError::DuplicateValue(value) => RocmLowerError::DuplicateValue(value),
+        PcuF32MapValidationError::MissingStore | PcuF32MapValidationError::MissingReturn => {
+            RocmLowerError::MissingStoreOrReturn
+        }
     }
 }
 
@@ -382,6 +622,7 @@ fn require_binding(
 mod tests {
     use super::{
         RocmLowerError,
+        lower_dispatch_to_hip_rtc_source,
         lower_dispatch_to_hip_source,
     };
     use fusion_pcu::{
@@ -474,6 +715,11 @@ mod tests {
         ];
 
         let source = lower_dispatch_to_hip_source(&kernel(&ops, &bindings)).unwrap();
+        let rtc_source = lower_dispatch_to_hip_rtc_source(&kernel(&ops, &bindings)).unwrap();
+        assert_eq!(
+            source.strip_prefix("#include <hip/hip_runtime.h>\n\n"),
+            Some(rtc_source.as_str())
+        );
         assert!(source.contains("const float* binding_0_0"));
         assert!(source.contains("float* binding_0_1"));
         assert!(source.contains("float v7 = __builtin_bit_cast(float, 0x3f800000u);"));
@@ -483,6 +729,67 @@ mod tests {
             let image = crate::compile_hip_source(&source, "gfx1030").unwrap();
             assert!(!image.is_empty());
         }
+    }
+
+    #[test]
+    fn lowers_grid_stride_map_to_real_hip_loop() {
+        let bindings = [
+            PcuBinding::value(
+                Some("input"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::f32(),
+            ),
+            PcuBinding::value(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                PcuValueType::f32(),
+            ),
+        ];
+        let body = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::GridStrideId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(2),
+                value: PcuParameterValue::F32(1.0_f32.to_bits()),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Add,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::GridStrideId,
+                value: PcuDispatchValueId(3),
+            }),
+        ];
+        let ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 2048,
+                body: &body,
+            },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let mut loop_kernel = kernel(&ops, &bindings);
+        loop_kernel.entry.logical_shape = [250, 1, 1];
+
+        let source = lower_dispatch_to_hip_source(&loop_kernel).expect("grid-stride lower");
+        assert!(source.contains("fusion_gid >= 250u"));
+        assert!(
+            source.contains("fusion_idx = fusion_gid; fusion_idx < 2048ull; fusion_idx += 250ull")
+        );
+        assert!(source.contains("binding_0_0[fusion_idx]"));
+        assert!(source.contains("binding_0_1[fusion_idx] = v3;"));
     }
 
     #[test]
@@ -507,6 +814,35 @@ mod tests {
         assert_eq!(
             lower_dispatch_to_hip_source(&kernel(&ops, &bindings)),
             Err(RocmLowerError::UndefinedValue(PcuDispatchValueId(99)))
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_zero_value_id_from_common_map_validation() {
+        let bindings = [PcuBinding::value(
+            Some("output"),
+            0,
+            0,
+            PcuBindingStorageClass::Storage,
+            PcuBindingAccess::WriteOnly,
+            PcuValueType::f32(),
+        )];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(0),
+                value: PcuParameterValue::F32(1.0_f32.to_bits()),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(0),
+            }),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+
+        assert_eq!(
+            lower_dispatch_to_hip_source(&kernel(&ops, &bindings)),
+            Err(RocmLowerError::InvalidValue(PcuDispatchValueId(0)))
         );
     }
 
@@ -551,13 +887,13 @@ mod tests {
         )];
         let ops = [
             PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
-                result: PcuDispatchValueId(0),
+                result: PcuDispatchValueId(1),
                 value: PcuParameterValue::F32(0),
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
                 binding: PcuBindingRef::new(0, 0),
                 index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(0),
+                value: PcuDispatchValueId(1),
             }),
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
@@ -595,16 +931,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_alu_with_structured_error() {
+    fn rejects_unsupported_min_with_structured_error() {
         let ops = [PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
             result: PcuDispatchValueId(3),
-            op: PcuDispatchAluOp::Max,
+            op: PcuDispatchAluOp::Min,
             lhs: PcuDispatchValueId(1),
             rhs: PcuDispatchValueId(2),
         })];
         assert_eq!(
             lower_dispatch_to_hip_source(&kernel(&ops, &[])),
-            Err(RocmLowerError::UnsupportedAlu(PcuDispatchAluOp::Max))
+            Err(RocmLowerError::UnsupportedAlu(PcuDispatchAluOp::Min))
         );
     }
 }

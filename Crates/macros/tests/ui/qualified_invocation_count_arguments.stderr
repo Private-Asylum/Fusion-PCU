@@ -1,0 +1,5 @@
+error: this grid-stride form cannot be proven to execute exactly once per logical lane; use `invocations = N` with the canonical loop, or add loop-capable PCU IR support
+ --> tests/ui/qualified_invocation_count_arguments.rs:6:49
+  |
+6 |     let stride = pcu::context::invocation_count(1);
+  |                                                 ^

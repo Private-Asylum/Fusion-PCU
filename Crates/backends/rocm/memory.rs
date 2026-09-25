@@ -117,13 +117,46 @@ impl PcuMemoryResource for RocmMemoryResource {
 }
 
 impl RocmMemoryResource {
-    /// Borrow the underlying HIP allocation for direct `ROCm` `PCU` dispatch binding.
+    /// Whether two provider resources share the same underlying HIP allocation.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.buffer.allocation, &other.buffer.allocation)
+    }
+
+    #[cfg(feature = "tensor")]
+    pub(crate) fn copy_from_resource(
+        &mut self,
+        source: &Self,
+        bytes: usize,
+    ) -> Result<(), HipError> {
+        self.buffer.copy_from_device(&source.buffer, bytes)
+    }
+
+    /// Whether this allocation belongs to the same HIP runtime and selected device.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn belongs_to_runtime(&self, runtime: &HipRuntime) -> bool {
+        runtime
+            .ensure_same_runtime(&self.buffer.allocation.runtime)
+            .is_ok()
+    }
+
+    /// Clone the shared allocation lease while preserving provider-visible metadata.
     ///
-    /// The returned buffer uses the same shared busy gate as provider-mediated transfers, so
-    /// overlapping synchronous access is rejected by the backend. The caller remains responsible
-    /// for honoring this resource's declared [`PcuMemoryAccess`] when building a dispatch.
+    /// `DeviceBuffer::clone` increments the allocation lease; the allocation is released only
+    /// after the caller-owned input and every in-flight execution lease have been dropped.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn clone_for_tensor_input(&self) -> Self {
+        Self {
+            pool: self.pool,
+            buffer: self.buffer.clone(),
+            alignment: self.alignment,
+            access: self.access,
+        }
+    }
+
+    /// Borrow the underlying HIP allocation for the `ROCm` adapter's internal dispatch binding.
     #[must_use]
-    pub const fn device_buffer(&self) -> &DeviceBuffer {
+    pub(crate) const fn device_buffer(&self) -> &DeviceBuffer {
         &self.buffer
     }
 }
@@ -185,13 +218,9 @@ impl PcuMemoryProvider for RocmMemoryProvider {
                 PcuMemoryDisposition::Reject,
             ));
         }
-        self.runtime.memory_pool_snapshot(pool).map_err(|_| {
-            self.error(
-                PcuMemoryProviderOperation::Snapshot,
-                PcuMemoryProviderFailure::BackendFailure,
-                PcuMemoryDisposition::Reject,
-            )
-        })
+        self.runtime
+            .memory_pool_snapshot(pool)
+            .map_err(|error| hip_failure(self, PcuMemoryProviderOperation::Snapshot, &error))
     }
 
     fn allocate(
@@ -389,8 +418,27 @@ const fn hip_failure(
     operation: PcuMemoryProviderOperation,
     error: &HipError,
 ) -> PcuMemoryProviderError {
-    let (failure, disposition) = match error {
+    let (failure, disposition) = hip_failure_classification(error);
+    provider.error(operation, failure, disposition)
+}
+
+const fn hip_failure_classification(
+    error: &HipError,
+) -> (PcuMemoryProviderFailure, PcuMemoryDisposition) {
+    match error {
         HipError::Busy => (PcuMemoryProviderFailure::Busy, PcuMemoryDisposition::Defer),
+        // HIP runtime API statuses: out of memory = 2, no device = 100, context destroyed = 709.
+        // Only the latter two establish that this provider's selected device/session is gone.
+        HipError::Runtime { code: 2, .. } => (
+            PcuMemoryProviderFailure::OutOfMemory,
+            PcuMemoryDisposition::Defer,
+        ),
+        HipError::Runtime {
+            code: 100 | 709, ..
+        } => (
+            PcuMemoryProviderFailure::DeviceLost,
+            PcuMemoryDisposition::Reject,
+        ),
         HipError::BufferTooSmall { .. } => (
             PcuMemoryProviderFailure::RangeOutOfBounds,
             PcuMemoryDisposition::Reject,
@@ -399,13 +447,44 @@ const fn hip_failure(
             PcuMemoryProviderFailure::BackendFailure,
             PcuMemoryDisposition::Reject,
         ),
-    };
-    provider.error(operation, failure, disposition)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hip_memory_failures_keep_retry_and_device_loss_distinct() {
+        let runtime_error = |code| HipError::Runtime {
+            operation: "test",
+            code,
+            detail: None,
+        };
+        assert_eq!(
+            hip_failure_classification(&runtime_error(2)),
+            (
+                PcuMemoryProviderFailure::OutOfMemory,
+                PcuMemoryDisposition::Defer
+            )
+        );
+        for code in [100, 709] {
+            assert_eq!(
+                hip_failure_classification(&runtime_error(code)),
+                (
+                    PcuMemoryProviderFailure::DeviceLost,
+                    PcuMemoryDisposition::Reject
+                )
+            );
+        }
+        assert_eq!(
+            hip_failure_classification(&runtime_error(719)),
+            (
+                PcuMemoryProviderFailure::BackendFailure,
+                PcuMemoryDisposition::Reject
+            )
+        );
+    }
 
     #[test]
     fn range_validation_rejects_overflow_and_past_end_without_gpu() {

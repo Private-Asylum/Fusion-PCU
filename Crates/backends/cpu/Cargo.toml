@@ -1,0 +1,18 @@
+[package]
+name = "fusion-pcu-cpu"
+description = "Opt-in CPU execution backend for Fusion PCU"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "cpu.rs"
+
+[dependencies]
+fusion-pcu.workspace = true
+
+[lints]
+workspace = true

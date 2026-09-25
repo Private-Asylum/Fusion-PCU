@@ -1,0 +1,5 @@
+error: PCU dispatch invocation binding must initialize from `context.global_invocation_id` or the zero-argument call `pcu::context::global_invocation_id()`
+ --> tests/ui/qualified_context_arguments.rs:5:49
+  |
+5 |     let id = pcu::context::global_invocation_id(1);
+  |                                                 ^

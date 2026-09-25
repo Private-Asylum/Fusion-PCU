@@ -19,6 +19,8 @@ use crate::{
     PcuObjectRef,
     PcuProviderId,
     PcuBaseContract,
+    PcuMemoryPoolId,
+    PcuMemoryProvider,
 };
 use crate::dispatch::{
     PcuDispatchSubmission,
@@ -155,6 +157,16 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
     type Completion: PcuOwnedCompletion;
     type Error;
 
+    /// Reusable executable prepared for one kernel, shape, and parameter set.
+    type Prepared<'kernel, 'parameters>: PcuPreparedOwnedDispatch<
+            Resource = Self::Resource,
+            Bindings = Self::Bindings,
+            Completion = Self::Completion,
+            Error = Self::Error,
+        >
+    where
+        Self: 'kernel;
+
     /// Returns the identity of the device/session selected by this backend instance.
     fn device_identity(&self) -> PcuDeviceIdentity;
 
@@ -169,6 +181,20 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
         bindings: Self::Bindings,
         parameters: PcuInvocationParameters<'_>,
     ) -> Result<Self::Completion, Self::Error>;
+
+    /// Performs backend preparation such as lowering, compilation, and executable creation.
+    ///
+    /// Parameters may be borrowed for the lifetime of the prepared executable. Implementations
+    /// must snapshot any borrowed data they need if they wish to return a longer-lived value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend error when lowering or executable preparation fails.
+    fn prepare_dispatch_owned_direct<'kernel, 'parameters>(
+        &self,
+        submission: PcuDispatchSubmission<'kernel>,
+        parameters: PcuInvocationParameters<'parameters>,
+    ) -> Result<Self::Prepared<'kernel, 'parameters>, Self::Error>;
 
     /// Performs common shape, parameter, support, device, and binding admission before submission.
     ///
@@ -205,6 +231,130 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
         self.submit_dispatch_owned_direct(submission, bindings, parameters)
             .map_err(PcuOwnedDispatchError::Backend)
     }
+
+    /// Validates and prepares one Dispatch executable for repeated owned-binding submissions.
+    ///
+    /// Common support, shape, parameter, and port admission runs once here. Every later call to
+    /// [`PcuPreparedOwnedDispatch::submit_owned`] repeats device, binding, and extent validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a common admission error or a backend preparation error.
+    fn prepare_dispatch_owned<'kernel, 'parameters>(
+        &self,
+        submission: PcuDispatchSubmission<'kernel>,
+        parameters: PcuInvocationParameters<'parameters>,
+    ) -> Result<Self::Prepared<'kernel, 'parameters>, PcuOwnedDispatchError<Self::Error>> {
+        if !self
+            .support()
+            .supports_kernel_direct(PcuKernel::Dispatch(*submission.kernel))
+        {
+            return Err(PcuOwnedDispatchError::Admission(PcuError::unsupported()));
+        }
+        validate_dispatch_submission(submission).map_err(PcuOwnedDispatchError::Admission)?;
+        validate_parameters(submission.kernel.signature(), parameters)
+            .map_err(PcuOwnedDispatchError::Admission)?;
+        if !submission.kernel.ports.is_empty() {
+            return Err(PcuOwnedDispatchError::Binding(
+                PcuOwnedDispatchBindingError::UnsupportedPorts,
+            ));
+        }
+        self.prepare_dispatch_owned_direct(submission, parameters)
+            .map_err(PcuOwnedDispatchError::Backend)
+    }
+}
+
+/// Backend-specific reusable executable for repeated owned Dispatch submissions.
+///
+/// Preparation captures or snapshots the kernel and parameter data needed for later launches.
+/// Each submission consumes its own binding container so the backend can move all resource
+/// leases into the returned completion. It must keep those leases until the completion law in
+/// [`PcuOwnedCompletion`] establishes quiescence.
+pub trait PcuPreparedOwnedDispatch {
+    type Resource;
+    type Bindings: AsRef<[PcuOwnedBinding<Self::Resource>]>;
+    type Completion: PcuOwnedCompletion;
+    type Error;
+
+    fn kernel(&self) -> &PcuDispatchKernelIr<'_>;
+    fn shape(&self) -> PcuInvocationShape;
+    fn device_identity(&self) -> PcuDeviceIdentity;
+
+    /// Submits after common binding admission. Implementations must retain resources through
+    /// terminal quiescence, including on uncertain post-enqueue errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a backend submission error.
+    fn submit_owned_direct(
+        &self,
+        bindings: Self::Bindings,
+    ) -> Result<Self::Completion, Self::Error>;
+
+    /// Validates complete binding coverage, device identity, metadata, and minimum extent before
+    /// handing the owned bindings to the backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns a common binding admission error or a backend submission error.
+    fn submit_owned(
+        &self,
+        bindings: Self::Bindings,
+    ) -> Result<Self::Completion, PcuOwnedDispatchError<Self::Error>> {
+        validate_owned_dispatch_bindings(
+            self.kernel(),
+            self.shape(),
+            self.device_identity(),
+            bindings.as_ref(),
+        )
+        .map_err(PcuOwnedDispatchError::Binding)?;
+        self.submit_owned_direct(bindings)
+            .map_err(PcuOwnedDispatchError::Backend)
+    }
+}
+
+/// Connects an owned Dispatch session to the same backend's memory provider and binding model.
+///
+/// A session returns a provider scoped to the requested stable pool. Callers allocate or import
+/// resources through that provider, then pass references to those resources to [`Self::bind`]
+/// before submitting the resulting owned bindings through [`PcuOwnedDispatchBackend`]. Binding
+/// may retain, clone, or otherwise acquire a backend lease; the returned binding must keep every
+/// resource needed by dispatch alive through completion. It must also report the selected device,
+/// actual byte length, access, and type accurately so common owned-dispatch admission can validate
+/// it. The provider resource remains caller-owned, so implementations must not consume or silently
+/// invalidate it during binding.
+///
+/// This is an extension contract: a backend may implement [`PcuOwnedDispatchBackend`] without
+/// exposing its memory service through this trait.
+pub trait PcuOwnedDispatchMemorySession: PcuOwnedDispatchBackend {
+    /// Provider tied to this dispatch backend's device/session domain.
+    type MemoryProvider: PcuMemoryProvider;
+
+    /// Creates a provider view for a stable pool identity.
+    ///
+    /// The returned provider must address the same device generation as `self`. The caller passes
+    /// a pool identity obtained through discovery; provider operations must reject requests for
+    /// pools other than the one supplied here.
+    fn memory_provider(&self, pool: PcuMemoryPoolId) -> Self::MemoryProvider;
+
+    /// Creates an owned dispatch binding from a resource allocated or imported by this session's
+    /// memory provider.
+    ///
+    /// Implementations must preserve the resource's lifetime and enforce the requested access and
+    /// binding type. The returned binding's device identity and byte length are checked again by
+    /// [`PcuOwnedDispatchBackend::submit_dispatch_owned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend error if the resource cannot be bound for the requested target or
+    /// metadata.
+    fn bind(
+        &self,
+        target: PcuBindingRef,
+        access: PcuBindingAccess,
+        binding_type: PcuBindingType,
+        resource: &<Self::MemoryProvider as PcuMemoryProvider>::Resource,
+    ) -> Result<PcuOwnedBinding<Self::Resource>, Self::Error>;
 }
 
 /// Validates complete owned binding coverage and metadata for scalar value buffers.
@@ -250,9 +400,8 @@ pub fn validate_owned_dispatch_bindings<R>(
                 binding.target,
             ));
         };
-        let Some(required) =
-            bytes_per_element.checked_mul(u64::from(shape.invocation_count().get()))
-        else {
+        let required_elements = kernel.minimum_binding_elements(shape.invocation_count().get());
+        let Some(required) = bytes_per_element.checked_mul(u64::from(required_elements)) else {
             return Err(PcuOwnedDispatchBindingError::UnsupportedLayout(
                 binding.target,
             ));
@@ -367,6 +516,7 @@ mod tests {
         PcuOwnedCompletion,
         PcuOwnedDispatchBackend,
         PcuOwnedDispatchBindingError,
+        PcuPreparedOwnedDispatch,
         validate_owned_dispatch_bindings,
     };
     use crate::{
@@ -453,6 +603,42 @@ mod tests {
         device: PcuDeviceIdentity,
     }
 
+    struct FakePrepared<'kernel> {
+        kernel: &'kernel crate::PcuDispatchKernelIr<'kernel>,
+        shape: PcuInvocationShape,
+        device: PcuDeviceIdentity,
+    }
+
+    impl PcuPreparedOwnedDispatch for FakePrepared<'_> {
+        type Resource = Resource;
+        type Bindings = [PcuOwnedBinding<Resource>; 1];
+        type Completion = FakeCompletion;
+        type Error = &'static str;
+
+        fn kernel(&self) -> &crate::PcuDispatchKernelIr<'_> {
+            self.kernel
+        }
+
+        fn shape(&self) -> PcuInvocationShape {
+            self.shape
+        }
+
+        fn device_identity(&self) -> PcuDeviceIdentity {
+            self.device
+        }
+
+        fn submit_owned_direct(
+            &self,
+            [binding]: Self::Bindings,
+        ) -> Result<Self::Completion, Self::Error> {
+            Ok(FakeCompletion {
+                resource: Some(binding),
+                attempts: 0,
+                terminal: None,
+            })
+        }
+    }
+
     impl PcuBaseContract for FakeBackend {
         fn support(&self) -> PcuSupport {
             support()
@@ -468,6 +654,7 @@ mod tests {
         type Bindings = [PcuOwnedBinding<Resource>; 1];
         type Completion = FakeCompletion;
         type Error = &'static str;
+        type Prepared<'kernel, 'parameters> = FakePrepared<'kernel>;
 
         fn device_identity(&self) -> PcuDeviceIdentity {
             self.device
@@ -483,6 +670,18 @@ mod tests {
                 resource: Some(binding),
                 attempts: 0,
                 terminal: None,
+            })
+        }
+
+        fn prepare_dispatch_owned_direct<'kernel, 'parameters>(
+            &self,
+            submission: PcuDispatchSubmission<'kernel>,
+            _parameters: PcuInvocationParameters<'parameters>,
+        ) -> Result<Self::Prepared<'kernel, 'parameters>, Self::Error> {
+            Ok(FakePrepared {
+                kernel: submission.kernel,
+                shape: submission.shape,
+                device: self.device,
             })
         }
     }
@@ -653,5 +852,51 @@ mod tests {
         assert_eq!(completion.wait(), Ok(PcuCompletionOutcome::Succeeded));
         assert!(dropped.get());
         assert_eq!(completion.state().unwrap(), PcuCompletionState::Succeeded);
+    }
+
+    #[test]
+    fn prepared_owned_dispatch_revalidates_each_binding_set() {
+        let declarations = [declared_binding()];
+        let kernel = make_kernel(&declarations);
+        let selected = device(1);
+        let backend = FakeBackend { device: selected };
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(core::num::NonZeroU32::new(4).unwrap()),
+        };
+        let prepared = backend
+            .prepare_dispatch_owned(submission, PcuInvocationParameters::empty())
+            .unwrap();
+        let target = PcuBindingRef::new(0, 0);
+        let rejected_drop = Rc::new(Cell::new(false));
+        let result = prepared.submit_owned([owned_binding(
+            device(2),
+            16,
+            PcuBindingAccess::ReadOnly,
+            Rc::clone(&rejected_drop),
+        )]);
+        let Err(error) = result else {
+            panic!("prepared submit should reject a binding from another device");
+        };
+        assert!(matches!(
+            error,
+            crate::PcuOwnedDispatchError::Binding(
+                PcuOwnedDispatchBindingError::WrongDevice(binding)
+            ) if binding == target
+        ));
+        assert!(rejected_drop.get());
+
+        let accepted_drop = Rc::new(Cell::new(false));
+        let completion = prepared
+            .submit_owned([owned_binding(
+                selected,
+                16,
+                PcuBindingAccess::ReadOnly,
+                Rc::clone(&accepted_drop),
+            )])
+            .unwrap();
+        assert!(!accepted_drop.get());
+        drop(completion);
+        assert!(accepted_drop.get());
     }
 }

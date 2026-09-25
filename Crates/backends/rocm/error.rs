@@ -19,6 +19,7 @@ pub enum HipError {
     },
     InvalidDiscoveryReference,
     MissingStableDeviceIdentity,
+    MissingArchitecture,
     DeviceIdentityChanged {
         expected: String,
         actual: String,
@@ -61,6 +62,9 @@ impl fmt::Display for HipError {
             ),
             Self::MissingStableDeviceIdentity => formatter.write_str(
                 "cannot safely activate the ROCm device because HIP did not provide a PCI bus ID",
+            ),
+            Self::MissingArchitecture => formatter.write_str(
+                "cannot compile for the selected ROCm device because its exact GPU architecture could not be detected",
             ),
             Self::DeviceIdentityChanged { expected, actual } => write!(
                 formatter,

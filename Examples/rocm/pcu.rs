@@ -1,11 +1,9 @@
-//! Hardware proof for PCU Dispatch -> HIP source -> HSACO -> `ROCm` execution.
+//! Explicit `ROCm` selection followed by backend-neutral PCU memory and Dispatch contracts.
 
 use std::process::ExitCode;
 use std::num::NonZeroU32;
-use std::time::Instant;
 
 use fusion_pcu::{
-    F32MapBuilder,
     PcuContextDescriptor,
     PcuContextKind,
     PcuDeviceClass,
@@ -20,7 +18,6 @@ use fusion_pcu::{
     PcuMemoryProvider,
     PcuMemoryRatio,
     PcuMemoryReservationLedger,
-    PcuMemoryUsage,
     PcuObjectKind,
     PcuObjectRef,
     PcuProviderDescriptor,
@@ -29,27 +26,35 @@ use fusion_pcu::{
     PcuProviderStatus,
     PcuRuntimeDiscoveryRegistry,
     PcuTargetDescriptor,
-    PcuBinding,
     PcuBindingAccess,
     PcuBindingRef,
-    PcuBindingStorageClass,
     PcuBindingType,
     PcuCompletionOutcome,
     PcuDispatchSubmission,
     PcuInvocationShape,
+    PcuInvocationParameters,
     PcuOwnedCompletion,
+    PcuOwnedDispatchBackend,
+    PcuOwnedDispatchMemorySession,
+    PcuPreparedOwnedDispatch,
     PcuValueType,
     allocate_with_policy,
 };
 use fusion_pcu_rocm::{
-    HipRuntime,
-    Rocblas,
     RocmDiscovery,
-    RocmDispatchBinding,
     RocmOwnedDispatchBackend,
-    HipError,
-    execute_pcu_dispatch,
 };
+use fusion_pcu_macros::pcu_dispatch;
+
+#[pcu_dispatch(invocations = 250)]
+fn grid_stride_add<const N: usize>(input: &[f32], output: &mut [f32]) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        output[id] = ((input[id] + 2.5) * 2.0) / 2.0 - 1.0;
+        id += stride;
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -61,10 +66,10 @@ fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)] // This hardware smoke test keeps resource lifetimes visible end to end.
+#[allow(clippy::too_many_lines)] // Keep discovery, resource, and completion lifetimes visible end to end.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    const COUNT: usize = 65;
-    let architecture = std::env::var("FUSION_ROCM_ARCH").unwrap_or_else(|_| "gfx1030".into());
+    const COUNT: usize = 2048;
+    const INVOCATIONS: u32 = 250;
     let rocm = RocmDiscovery::new();
     let available = discovered_devices(&rocm)?;
     let preferred = std::env::var("FUSION_ROCM_DEVICE")
@@ -72,47 +77,53 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|index| index.parse::<i32>())
         .transpose()?;
     let candidates = rank_devices(&available, preferred)?;
-    let mut open_failures = Vec::new();
+    let bindings = grid_stride_add_bindings();
+    let builder = grid_stride_add::<COUNT>(&bindings)?;
+    let kernel = builder.ir();
+    let submission = PcuDispatchSubmission {
+        kernel: &kernel,
+        shape: PcuInvocationShape::invocations(NonZeroU32::new(INVOCATIONS).expect("nonzero")),
+    };
+    let mut selection_failures = Vec::new();
     let mut opened = None;
     for candidate in candidates {
-        let attempt = rocm
-            .open_device(candidate.reference)
-            .map_err(|error| error.to_string());
-        match attempt {
-            Ok(runtime) => {
-                opened = Some((runtime, candidate.clone()));
-                break;
+        match RocmOwnedDispatchBackend::open(&rocm, candidate.reference, 64) {
+            Ok(session) => {
+                match session.prepare_dispatch_owned(submission, PcuInvocationParameters::empty()) {
+                    Ok(prepared) => {
+                        opened = Some((session, candidate.clone(), prepared));
+                        break;
+                    }
+                    Err(error) => selection_failures.push(format!(
+                        "device {} dispatch preparation: {error:?}",
+                        candidate.reference.id
+                    )),
+                }
             }
-            Err(error) => open_failures.push(format!("device {}: {error}", candidate.reference.id)),
+            Err(error) => {
+                selection_failures.push(format!("device {} open: {error}", candidate.reference.id));
+            }
         }
     }
-    let (runtime, selected) = opened.ok_or_else(|| {
+    let (session, selected, prepared) = opened.ok_or_else(|| {
         format!(
-            "no ROCm device could be opened: {}",
-            open_failures.join("; ")
+            "no ROCm device could prepare the dispatch: {}",
+            selection_failures.join("; ")
         )
     })?;
-    let device = runtime.device_info()?;
     println!(
-        "ROCm device: {} (index {}, {} bytes physical memory)",
-        device.name, selected.reference.id, selected.total_memory
+        "PCU selected ROCm device {} ({} bytes physical memory)",
+        selected.reference.id, selected.total_memory
     );
-    let pool = runtime.memory_pool_snapshot(PcuMemoryPoolId(selected.reference.id))?;
-    if let (Some(capacity), PcuMemoryUsage::Known(used)) =
-        (pool.capacity_bytes, pool.system_used_bytes)
-    {
-        println!("ROCm memory pool: {used}/{capacity} bytes system-used");
-    }
-
     let input: Vec<f32> = (0..COUNT)
-        .map(|index| f32::from(u16::try_from(index).expect("smoke-test index fits in u16")))
+        .map(|index| f32::from(u16::try_from(index).expect("example index fits in u16")) + 1.25)
         .collect();
     let mut input_bytes = Vec::with_capacity(COUNT * 4);
     for value in &input {
         input_bytes.extend_from_slice(&value.to_ne_bytes());
     }
-    let pool_id = PcuMemoryPoolId(selected.reference.id);
-    let mut memory_provider = runtime.memory_provider(pool_id);
+    let pool_id = selected.pool;
+    let mut memory_provider = PcuOwnedDispatchMemorySession::memory_provider(&session, pool_id);
     let mut memory_ledger = PcuMemoryReservationLedger::<2>::new();
     let memory_policy = PcuMemoryAdmissionPolicy {
         system_used: Some(PcuMemoryRatio::new(95, 100)),
@@ -144,46 +155,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transfer_to(gpu_input.resource_mut(), 0, &input_bytes)
         .map_err(|error| format!("PCU input transfer: {error:?}"))?;
 
-    let bindings = [
-        PcuBinding::value(
-            Some("input"),
-            0,
-            0,
-            PcuBindingStorageClass::Storage,
-            PcuBindingAccess::ReadOnly,
-            PcuValueType::f32(),
-        ),
-        PcuBinding::value(
-            Some("output"),
-            0,
-            1,
-            PcuBindingStorageClass::Storage,
-            PcuBindingAccess::WriteOnly,
-            PcuValueType::f32(),
-        ),
-    ];
-    let (builder, input_value) = F32MapBuilder::<8>::new(1, "add_one", [65, 1, 1], &bindings)
-        .load_f32(PcuBindingRef::new(0, 0))?;
-    let (builder, one) = builder.constant(1.0)?;
-    let (builder, result) = builder.add(input_value, one)?;
-    let builder = builder.store_f32(PcuBindingRef::new(0, 1), result)?;
-    let kernel = builder.ir();
-    execute_pcu_dispatch(
-        &runtime,
-        &kernel,
-        &architecture,
-        64,
-        &[
-            RocmDispatchBinding {
-                id: PcuBindingRef::new(0, 0),
-                buffer: gpu_input.resource().device_buffer(),
-            },
-            RocmDispatchBinding {
-                id: PcuBindingRef::new(0, 1),
-                buffer: gpu_output.resource().device_buffer(),
-            },
-        ],
-    )?;
+    for _ in 0..2 {
+        let owned_bindings = vec![
+            session.bind(
+                PcuBindingRef::new(0, 0),
+                PcuBindingAccess::ReadOnly,
+                PcuBindingType::Value(PcuValueType::f32()),
+                gpu_input.resource(),
+            )?,
+            session.bind(
+                PcuBindingRef::new(0, 1),
+                PcuBindingAccess::ReadWrite,
+                PcuBindingType::Value(PcuValueType::f32()),
+                gpu_output.resource(),
+            )?,
+        ];
+        let mut completion = prepared
+            .submit_owned(owned_bindings)
+            .map_err(|error| format!("PCU prepared dispatch submission: {error:?}"))?;
+        if completion.wait()? != PcuCompletionOutcome::Succeeded {
+            return Err("PCU dispatch did not succeed".into());
+        }
+    }
 
     let mut output_bytes = vec![0_u8; input_bytes.len()];
     memory_provider
@@ -191,133 +184,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("PCU output transfer: {error:?}"))?;
     for (index, chunk) in output_bytes.chunks_exact(4).enumerate() {
         let actual = f32::from_ne_bytes(chunk.try_into()?);
-        let expected = input[index] + 1.0;
-        if (actual - expected).abs() > f32::EPSILON {
+        let expected = input[index] + 1.5;
+        if actual.to_bits() != expected.to_bits() {
             return Err(format!("output[{index}] = {actual}, expected {expected}").into());
         }
     }
-    println!("PCU -> ROCm dispatch passed for {COUNT} values");
+    println!(
+        "PCU prepared grid-stride dispatch on explicitly selected ROCm backend passed twice: {INVOCATIONS} invocations covered {COUNT} values"
+    );
     gpu_input
         .release(&mut memory_ledger)
         .map_err(|error| format!("PCU input accounting release: {error:?}"))?;
     gpu_output
         .release(&mut memory_ledger)
         .map_err(|error| format!("PCU output accounting release: {error:?}"))?;
-    let async_backend =
-        RocmOwnedDispatchBackend::open(&rocm, selected.reference, &architecture, 64)?;
-    let mut async_memory_provider = async_backend.memory_provider(pool_id);
-    let mut async_memory_ledger = PcuMemoryReservationLedger::<2>::new();
-    let mut async_input = allocate_with_policy(
-        &mut async_memory_provider,
-        &mut async_memory_ledger,
-        memory_request,
-        memory_policy,
-    )
-    .map_err(|error| format!("PCU async input memory admission: {error:?}"))?;
-    let async_output = allocate_with_policy(
-        &mut async_memory_provider,
-        &mut async_memory_ledger,
-        memory_request,
-        memory_policy,
-    )
-    .map_err(|error| format!("PCU async output memory admission: {error:?}"))?;
-    async_memory_provider
-        .transfer_to(async_input.resource_mut(), 0, &input_bytes)
-        .map_err(|error| format!("PCU async input transfer: {error:?}"))?;
-    let async_readback = async_output.resource().device_buffer().clone();
-    let async_bindings = vec![
-        async_backend.binding(
-            PcuBindingRef::new(0, 1),
-            PcuBindingAccess::WriteOnly,
-            PcuBindingType::Value(PcuValueType::f32()),
-            async_output.resource().device_buffer().clone(),
-        )?,
-        async_backend.binding(
-            PcuBindingRef::new(0, 0),
-            PcuBindingAccess::ReadOnly,
-            PcuBindingType::Value(PcuValueType::f32()),
-            async_input.resource().device_buffer().clone(),
-        )?,
-    ];
-    let submission = PcuDispatchSubmission {
-        kernel: &kernel,
-        shape: PcuInvocationShape::invocations(NonZeroU32::new(65).unwrap()),
-    };
-    let prepare_started = Instant::now();
-    let prepared = async_backend.prepare_dispatch(submission)?;
-    let prepare_elapsed = prepare_started.elapsed();
-    let mut completion = prepared
-        .submit(&async_bindings)
-        .map_err(|error| format!("PCU prepared async submission: {error:?}"))?;
-    let mut async_output_bytes = vec![0_u8; input_bytes.len()];
-    if !matches!(
-        async_readback.copy_to(&mut async_output_bytes),
-        Err(HipError::Busy)
-    ) {
-        return Err("owned async output was accessible before completion wait".into());
-    }
-    if completion.wait()? != PcuCompletionOutcome::Succeeded {
-        return Err("owned async dispatch did not succeed".into());
-    }
-    let mut warm_samples = Vec::with_capacity(32);
-    for _ in 0..32 {
-        let warm_started = Instant::now();
-        let bindings = vec![
-            async_backend.binding(
-                PcuBindingRef::new(0, 1),
-                PcuBindingAccess::WriteOnly,
-                PcuBindingType::Value(PcuValueType::f32()),
-                async_output.resource().device_buffer().clone(),
-            )?,
-            async_backend.binding(
-                PcuBindingRef::new(0, 0),
-                PcuBindingAccess::ReadOnly,
-                PcuBindingType::Value(PcuValueType::f32()),
-                async_input.resource().device_buffer().clone(),
-            )?,
-        ];
-        let mut repeated = prepared.submit(&bindings)?;
-        if repeated.wait()? != PcuCompletionOutcome::Succeeded {
-            return Err("repeated prepared dispatch did not succeed".into());
-        }
-        warm_samples.push(warm_started.elapsed());
-    }
-    warm_samples.sort_unstable();
-    println!(
-        "PCU prepared ROCm cold prepare: {:.3} ms; warm bind+submit+wait p50/p95: {:.3}/{:.3} us (32 runs)",
-        prepare_elapsed.as_secs_f64() * 1_000.0,
-        warm_samples[15].as_secs_f64() * 1_000_000.0,
-        warm_samples[30].as_secs_f64() * 1_000_000.0,
-    );
-    async_memory_provider
-        .transfer_from(async_output.resource(), 0, &mut async_output_bytes)
-        .map_err(|error| format!("PCU async output transfer: {error:?}"))?;
-    if async_output_bytes != output_bytes {
-        return Err("owned async dispatch output differs from synchronous reference".into());
-    }
-    drop(async_readback);
-    drop(completion);
-    async_input
-        .release(&mut async_memory_ledger)
-        .map_err(|error| format!("PCU async input accounting release: {error:?}"))?;
-    async_output
-        .release(&mut async_memory_ledger)
-        .map_err(|error| format!("PCU async output accounting release: {error:?}"))?;
-    if async_memory_ledger.reserved_bytes(pool_id) != Some(0) {
-        return Err("owned async admission did not release its memory reservation".into());
-    }
-    let replacement = allocate_with_policy(
-        &mut async_memory_provider,
-        &mut async_memory_ledger,
-        memory_request,
-        memory_policy,
-    )
-    .map_err(|error| format!("PCU async memory reuse admission: {error:?}"))?;
-    replacement
-        .release(&mut async_memory_ledger)
-        .map_err(|error| format!("PCU async memory reuse release: {error:?}"))?;
-    println!("PCU -> ROCm owned async dispatch passed for {COUNT} values");
-    verify_rocblas(&runtime)?;
     Ok(())
 }
 
@@ -325,6 +205,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct Candidate {
     reference: PcuObjectRef,
     total_memory: u64,
+    pool: PcuMemoryPoolId,
 }
 
 fn rank_devices(
@@ -382,6 +263,7 @@ fn discovered_devices(rocm: &RocmDiscovery) -> Result<Vec<Candidate>, Box<dyn st
         candidates.push(Candidate {
             reference: device.reference,
             total_memory: domains[0].capacity_bytes.unwrap_or(0),
+            pool: PcuMemoryPoolId(domains[0].reference.id),
         });
     }
     Ok(candidates)
@@ -453,39 +335,6 @@ const fn empty_domain<'a>() -> PcuMemoryDomainDescriptor<'a> {
     }
 }
 
-fn verify_rocblas(runtime: &HipRuntime) -> Result<(), Box<dyn std::error::Error>> {
-    fn bytes(values: &[f32]) -> Vec<u8> {
-        values
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect()
-    }
-
-    // Column-major A = [[1, 2], [3, 4]], B = [[5, 6], [7, 8]].
-    let a_data = bytes(&[1.0, 3.0, 2.0, 4.0]);
-    let b_data = bytes(&[5.0, 7.0, 6.0, 8.0]);
-    let mut a = runtime.allocate(a_data.len())?;
-    let mut b = runtime.allocate(b_data.len())?;
-    let c = runtime.allocate(4 * size_of::<f32>())?;
-    a.copy_from(&a_data)?;
-    b.copy_from(&b_data)?;
-    Rocblas::new(runtime)?.sgemm(false, false, 2, 2, 2, 1.0, &a, 2, &b, 2, 0.0, &c, 2)?;
-    let mut result = vec![0_u8; 4 * size_of::<f32>()];
-    c.copy_to(&mut result)?;
-    let actual: Vec<f32> = result
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte chunk")))
-        .collect();
-    let expected = [19.0, 43.0, 22.0, 50.0];
-    if actual != expected {
-        return Err(
-            format!("Rust rocBLAS SGEMM returned {actual:?}, expected {expected:?}").into(),
-        );
-    }
-    println!("Rust rocBLAS SGEMM and output verification passed");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +348,7 @@ mod tests {
                 id: index,
             },
             total_memory,
+            pool: PcuMemoryPoolId(index),
         }
     }
 

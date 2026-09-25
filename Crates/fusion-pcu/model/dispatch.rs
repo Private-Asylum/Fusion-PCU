@@ -84,11 +84,20 @@ pub enum PcuDispatchOp<'a> {
     Control(PcuDispatchControlOp),
     Resource(PcuDispatchResourceOp),
     Data(PcuDispatchDataOp),
+    /// Execute a data-only map body at logical indices `base + n * stride` below `extent`.
+    /// The stride is the actual submitted invocation count; `base` is each invocation id.
+    /// The body may use `GridStrideId` for indexed accesses and its SSA values are region-local.
+    GridStrideLoop {
+        extent: u32,
+        body: &'a [Self],
+    },
     Coordinate(PcuDispatchCoordinateOp),
     RayTrace(PcuDispatchRayTraceOp),
     Port(PcuDispatchPortOp),
     Sync(PcuDispatchSyncOp),
-    Intrinsic { name: &'a str },
+    Intrinsic {
+        name: &'a str,
+    },
 }
 
 impl PcuDispatchOp<'_> {
@@ -100,6 +109,7 @@ impl PcuDispatchOp<'_> {
             Self::Control(op) => op.support_flag(),
             Self::Resource(op) => op.support_flag(),
             Self::Data(op) => op.support_flag(),
+            Self::GridStrideLoop { .. } => PcuDispatchOpCaps::CONTROL_LOOP,
             Self::Coordinate(op) => op.support_flag(),
             Self::RayTrace(op) => op.support_flag(),
             Self::Port(op) => op.support_flag(),
@@ -117,6 +127,8 @@ pub struct PcuDispatchValueId(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuDispatchIndex {
     InvocationId,
+    /// Current logical element index inside a `GridStrideLoop` body.
+    GridStrideId,
     Value(PcuDispatchValueId),
 }
 
@@ -226,6 +238,19 @@ pub struct PcuDispatchKernelIr<'a> {
 }
 
 impl PcuDispatchKernelIr<'_> {
+    /// Returns the minimum element count required for buffer bindings by this launch.
+    /// A grid-stride map uses its semantic extent; direct maps use submitted launch width.
+    #[must_use]
+    pub fn minimum_binding_elements(&self, submitted_invocations: u32) -> u32 {
+        self.ops
+            .iter()
+            .find_map(|op| match op {
+                PcuDispatchOp::GridStrideLoop { extent, .. } => Some(*extent),
+                _ => None,
+            })
+            .unwrap_or(submitted_invocations)
+    }
+
     /// Returns the dispatch-policy flags required to route this dispatch kernel honestly.
     #[must_use]
     pub const fn required_dispatch_policy(&self) -> PcuDispatchPolicyCaps {
@@ -241,6 +266,11 @@ impl PcuDispatchKernelIr<'_> {
         let mut flags = PcuDispatchOpCaps::empty();
         for op in self.ops.iter().copied() {
             flags = flags.union(op.support_flag());
+            if let PcuDispatchOp::GridStrideLoop { body, .. } = op {
+                for body_op in body.iter().copied() {
+                    flags = flags.union(body_op.support_flag());
+                }
+            }
         }
         flags
     }

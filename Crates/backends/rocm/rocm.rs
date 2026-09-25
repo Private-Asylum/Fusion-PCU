@@ -16,6 +16,8 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+#[cfg(target_os = "linux")]
+use std::fs;
 
 use libloading::Library;
 use fusion_pcu::{
@@ -32,6 +34,9 @@ mod error;
 mod lower;
 mod memory;
 mod owned_dispatch;
+mod rtc;
+#[cfg(feature = "tensor")]
+mod tensor;
 
 pub use blas::{
     Rocblas,
@@ -50,6 +55,7 @@ pub use discovery::RocmDiscovery;
 pub use error::*;
 pub use lower::{
     RocmLowerError,
+    lower_dispatch_to_hip_rtc_source,
     lower_dispatch_to_hip_source,
 };
 pub use memory::{
@@ -63,6 +69,20 @@ pub use owned_dispatch::{
     RocmOwnedDispatchBackend,
     RocmOwnedDispatchError,
     RocmPreparedDispatch,
+};
+pub use rtc::{
+    HipRtcError,
+    compile_hip_source_for_device,
+};
+#[cfg(feature = "tensor")]
+pub use tensor::{
+    RocmPreparedTensorGraph,
+    RocmTensorAssessor,
+    RocmTensorError,
+    RocmTensorExecutionError,
+    RocmTensorInput,
+    RocmTensorOutputBank,
+    RocmTensorScratch,
 };
 
 type HipResult = c_int;
@@ -240,13 +260,14 @@ impl HipRuntime {
                 if status != HIP_SUCCESS {
                     return Err(raw_hip_error(&library, "hipDeviceTotalMem", status));
                 }
+                let pci_bus_id = query_pci_bus_id(&library, index);
                 devices.push(HipDeviceInfo {
                     index,
                     name,
                     vendor: "AMD".into(),
-                    architecture: None,
+                    architecture: pci_bus_id.as_deref().and_then(query_architecture),
                     generation: None,
-                    pci_bus_id: query_pci_bus_id(&library, index),
+                    pci_bus_id,
                     total_memory: total as u64,
                 });
             }
@@ -345,13 +366,14 @@ impl HipRuntime {
         self.call("hipDeviceTotalMem", |f: DeviceTotalMem| unsafe {
             f(&raw mut total, self.0.device)
         })?;
+        let pci_bus_id = query_pci_bus_id(&self.0.library, self.0.device);
         Ok(HipDeviceInfo {
             index: self.0.device,
             name: self.0.name.clone(),
             vendor: "AMD".into(),
-            architecture: None,
+            architecture: pci_bus_id.as_deref().and_then(query_architecture),
             generation: None,
-            pci_bus_id: query_pci_bus_id(&self.0.library, self.0.device),
+            pci_bus_id,
             total_memory: total as u64,
         })
     }
@@ -525,8 +547,21 @@ impl HipRuntime {
                 return Err(self.error("hipSetDevice", status));
             }
         }
+        // libloading allocates a CString when the supplied symbol lacks a trailing NUL. All
+        // ordinary HIP symbols fit in this stack buffer; retain an overflow path for future ABI
+        // names rather than making symbol length an undocumented runtime limit.
+        let mut inline_symbol = [0_u8; 64];
+        let mut overflow_symbol = Vec::new();
+        let symbol_bytes = if symbol.len() < inline_symbol.len() {
+            inline_symbol[..symbol.len()].copy_from_slice(symbol.as_bytes());
+            &inline_symbol[..=symbol.len()]
+        } else {
+            overflow_symbol.extend_from_slice(symbol.as_bytes());
+            overflow_symbol.push(0);
+            &overflow_symbol
+        };
         // SAFETY: `symbol` is loaded from the retained HIP runtime and `T` matches the named C ABI.
-        let function = unsafe { self.0.library.get::<T>(symbol.as_bytes()) }.map_err(|error| {
+        let function = unsafe { self.0.library.get::<T>(symbol_bytes) }.map_err(|error| {
             HipError::MissingSymbol {
                 symbol,
                 detail: error.to_string(),
@@ -569,10 +604,8 @@ pub struct HipDeviceInfo {
     pub index: i32,
     pub name: String,
     pub vendor: String,
-    /// HIP architecture IDs currently require the ABI-versioned `hipDeviceProp_t` layout, so are
-    /// left unknown. HIP's older `hipDeviceAttributeGcnArchName` attribute is marked unused.
-    /// A future stable solution should use an explicitly versioned HIP property API or a supported
-    /// ROCr/HSA topology query rather than reading the property struct by assumed offsets.
+    /// Base `gfx` target matched from HIP's PCI identity to KFD topology on Linux when exposed.
+    /// KFD's numeric target does not report optional target feature suffixes.
     pub architecture: Option<String>,
     /// GPU generation is not inferred from the marketing name.
     pub generation: Option<String>,
@@ -595,6 +628,73 @@ fn query_pci_bus_id(library: &Library, ordinal: c_int) -> Option<String> {
     }
     let value = bounded_device_name(&buffer);
     (!value.is_empty()).then_some(value)
+}
+
+/// Resolve the base AMD target reported by Linux KFD for the HIP device's PCI function.
+/// HIP keeps `gcnArchName` in an ABI-versioned properties struct, while KFD exposes the same
+/// target as `gfx_target_version`. Matching the DRM render node to HIP's PCI ID avoids relying on
+/// the changing HIP struct layout or guessing an ISA from a marketing name.
+#[cfg(target_os = "linux")]
+fn query_architecture(pci_bus_id: &str) -> Option<String> {
+    let expected = canonical_pci_bus_id(pci_bus_id);
+    let nodes = fs::read_dir("/sys/class/kfd/kfd/topology/nodes").ok()?;
+    for node in nodes.flatten() {
+        let Ok(properties) = fs::read_to_string(node.path().join("properties")) else {
+            continue;
+        };
+        let mut render_minor = None;
+        let mut target_version = None;
+        for line in properties.lines() {
+            let Some((key, value)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            match key {
+                "drm_render_minor" => render_minor = value.trim().parse::<u32>().ok(),
+                "gfx_target_version" => target_version = value.trim().parse::<u32>().ok(),
+                _ => {}
+            }
+        }
+        let (Some(render_minor), Some(target_version)) = (render_minor, target_version) else {
+            continue;
+        };
+        if target_version == 0 {
+            continue;
+        }
+        let render_device = format!("/sys/class/drm/renderD{render_minor}/device");
+        let Ok(device_path) = fs::canonicalize(render_device) else {
+            continue;
+        };
+        let Some(actual) = device_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if canonical_pci_bus_id(actual) == expected {
+            return format_gfx_target(target_version);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn query_architecture(_pci_bus_id: &str) -> Option<String> {
+    // No portable, safely versioned HIP property query is wired into this backend yet.
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_pci_bus_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn format_gfx_target(target_version: u32) -> Option<String> {
+    let major = target_version / 10_000;
+    let minor = (target_version / 100) % 100;
+    let stepping = target_version % 100;
+    if major == 0 || major > 99 || minor > 9 || stepping > 15 {
+        return None;
+    }
+    let stepping = char::from_digit(stepping, 16)?;
+    Some(format!("gfx{major}{minor}{stepping}"))
 }
 
 fn bounded_device_name(buffer: &[c_char]) -> String {
@@ -1027,10 +1127,64 @@ struct AlignedKernelWord {
     _word: usize,
 }
 
+const INLINE_KERNEL_PARAMETERS: usize = 8;
+
+struct LaunchAccessLeases {
+    inline: [Option<DeviceAccessLease>; INLINE_KERNEL_PARAMETERS],
+    overflow: Vec<DeviceAccessLease>,
+    inline_len: usize,
+}
+
+impl LaunchAccessLeases {
+    fn new() -> Self {
+        Self {
+            inline: std::array::from_fn(|_| None),
+            overflow: Vec::new(),
+            inline_len: 0,
+        }
+    }
+
+    fn contains(&self, allocation: &Rc<DeviceAllocation>) -> bool {
+        self.inline[..self.inline_len]
+            .iter()
+            .flatten()
+            .chain(self.overflow.iter())
+            .any(|lease| Rc::ptr_eq(&lease.allocation, allocation))
+    }
+
+    fn push(&mut self, lease: DeviceAccessLease) {
+        if self.inline_len < self.inline.len() {
+            self.inline[self.inline_len] = Some(lease);
+            self.inline_len += 1;
+        } else {
+            self.overflow.push(lease);
+        }
+    }
+}
+
+fn can_inline_kernel_parameters(arguments: &[HipKernelArgument<'_>]) -> bool {
+    arguments.len() <= INLINE_KERNEL_PARAMETERS
+        && arguments.iter().all(|argument| match argument {
+            HipKernelArgument::Bytes(bytes) => bytes.len() <= size_of::<AlignedKernelWord>(),
+            HipKernelArgument::Buffer(_) => {
+                size_of::<*mut c_void>() <= size_of::<AlignedKernelWord>()
+            }
+        })
+}
+
+fn copy_inline_kernel_parameter(destination: &mut AlignedKernelWord, bytes: &[u8]) -> *mut c_void {
+    assert!(bytes.len() <= size_of::<AlignedKernelWord>());
+    let pointer = ptr::from_mut(destination).cast::<c_void>();
+    // SAFETY: the bound above keeps the write within one aligned word; both pointers are valid
+    // for `bytes.len()` bytes, and the source slice cannot alias the local destination word.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast(), bytes.len()) };
+    pointer
+}
+
 struct LaunchResources {
     _module: Rc<ModuleInner>,
-    _buffers: Vec<Rc<DeviceAllocation>>,
-    _access_leases: Vec<DeviceAccessLease>,
+    // Each unique lease owns the allocation as well as its busy gate until completion.
+    _access_leases: LaunchAccessLeases,
     _stream: HipStreamHandle,
 }
 
@@ -1105,6 +1259,7 @@ impl HipKernel {
     /// # Errors
     ///
     /// Returns a HIP launch error or an error while preparing stream/event resources.
+    #[allow(clippy::too_many_lines)] // Keep argument storage, launch, and uncertain-completion retention visible together.
     pub unsafe fn launch<'a>(
         &'a self,
         stream: &'a HipStreamHandle,
@@ -1122,22 +1277,26 @@ impl HipKernel {
             }
         }
 
-        let mut storage = Vec::<Vec<AlignedKernelWord>>::with_capacity(arguments.len());
-        let mut buffers = Vec::new();
-        let mut access_leases = Vec::new();
-        for argument in arguments {
+        let inline = can_inline_kernel_parameters(arguments);
+        let mut inline_storage: [AlignedKernelWord; INLINE_KERNEL_PARAMETERS] =
+            std::array::from_fn(|_| AlignedKernelWord { _word: 0 });
+        let mut inline_params = [ptr::null_mut(); INLINE_KERNEL_PARAMETERS];
+        let mut storage = if inline {
+            Vec::<Vec<AlignedKernelWord>>::new()
+        } else {
+            Vec::<Vec<AlignedKernelWord>>::with_capacity(arguments.len())
+        };
+        let mut access_leases = LaunchAccessLeases::new();
+        for (index, argument) in arguments.iter().enumerate() {
             let bytes = match argument {
                 HipKernelArgument::Bytes(bytes) => *bytes,
                 HipKernelArgument::Buffer(buffer) => {
                     self.module
                         .runtime
                         .ensure_same_runtime(&buffer.allocation.runtime)?;
-                    if !access_leases.iter().any(|lease: &DeviceAccessLease| {
-                        Rc::ptr_eq(&lease.allocation, &buffer.allocation)
-                    }) {
+                    if !access_leases.contains(&buffer.allocation) {
                         access_leases.push(buffer.acquire_access()?);
                     }
-                    buffers.push(buffer.allocation.clone());
                     // HIP kernel parameters receive a device pointer value, not its host address.
                     unsafe {
                         std::slice::from_raw_parts(
@@ -1147,30 +1306,44 @@ impl HipKernel {
                     }
                 }
             };
-            let words = bytes.len().div_ceil(size_of::<AlignedKernelWord>()).max(1);
-            let mut aligned = (0..words)
-                .map(|_| AlignedKernelWord { _word: 0 })
-                .collect::<Vec<_>>();
-            // SAFETY: `aligned` has enough writable bytes and each argument region starts at a
-            // 16-byte-aligned address, covering the HIP kernel parameter ABI alignment used by
-            // scalar and vector parameter types. `source` is a valid byte slice.
-            unsafe {
-                ptr::copy_nonoverlapping(bytes.as_ptr(), aligned.as_mut_ptr().cast(), bytes.len());
+            if inline {
+                // Each word stays at a stable stack address until HIP consumes the pointer table.
+                inline_params[index] =
+                    copy_inline_kernel_parameter(&mut inline_storage[index], bytes);
+            } else {
+                let words = bytes.len().div_ceil(size_of::<AlignedKernelWord>()).max(1);
+                let mut aligned = (0..words)
+                    .map(|_| AlignedKernelWord { _word: 0 })
+                    .collect::<Vec<_>>();
+                // SAFETY: `aligned` has enough writable bytes and each argument region starts at
+                // a 16-byte-aligned address. `bytes` is a live argument value or device pointer.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        aligned.as_mut_ptr().cast(),
+                        bytes.len(),
+                    );
+                }
+                storage.push(aligned);
             }
-            storage.push(aligned);
         }
-        let mut kernel_params: Vec<*mut c_void> = storage
-            .iter_mut()
-            .map(|arg| arg.as_mut_ptr().cast())
-            .collect();
-        let params = if kernel_params.is_empty() {
+        let mut kernel_params: Vec<*mut c_void> = if inline {
+            Vec::new()
+        } else {
+            storage
+                .iter_mut()
+                .map(|arg| arg.as_mut_ptr().cast())
+                .collect()
+        };
+        let params = if arguments.is_empty() {
             ptr::null_mut()
+        } else if inline {
+            inline_params.as_mut_ptr()
         } else {
             kernel_params.as_mut_ptr()
         };
         let resources = LaunchResources {
             _module: self.module.clone(),
-            _buffers: buffers,
             _access_leases: access_leases,
             _stream: stream.clone(),
         };
@@ -1222,6 +1395,39 @@ impl HipKernel {
 #[cfg(test)]
 mod memory_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn kfd_target_version_is_formatted_as_an_exact_gfx_target() {
+        assert_eq!(format_gfx_target(100_300).as_deref(), Some("gfx1030"));
+        assert_eq!(format_gfx_target(110_000).as_deref(), Some("gfx1100"));
+        assert_eq!(format_gfx_target(90_010).as_deref(), Some("gfx90a"));
+        assert_eq!(format_gfx_target(0), None);
+        assert_eq!(format_gfx_target(101_010), None);
+    }
+
+    #[test]
+    fn inline_kernel_parameter_is_aligned_and_copies_exact_bytes() {
+        let mut word = AlignedKernelWord { _word: 0 };
+        let bytes = [0x12_u8, 0x34, 0x56, 0x78, 0x9a];
+        let pointer = copy_inline_kernel_parameter(&mut word, &bytes);
+        assert_eq!((pointer as usize) % 16, 0);
+        // SAFETY: the pointer refers to the live aligned word and five initialized bytes.
+        let copied = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), bytes.len()) };
+        assert_eq!(copied, bytes);
+        assert!(!copy_inline_kernel_parameter(&mut word, &[]).is_null());
+    }
+
+    #[test]
+    fn inline_kernel_arguments_fall_back_for_large_arity_or_values() {
+        let empty = HipKernelArgument::Bytes(&[]);
+        let full_word = HipKernelArgument::Bytes(&[0_u8; 16]);
+        let oversized = HipKernelArgument::Bytes(&[0_u8; 17]);
+        assert!(can_inline_kernel_parameters(&[empty, full_word]));
+        assert!(!can_inline_kernel_parameters(&[oversized]));
+        let nine: [HipKernelArgument<'_>; 9] =
+            std::array::from_fn(|_| HipKernelArgument::Bytes(&[]));
+        assert!(!can_inline_kernel_parameters(&nine));
+    }
 
     #[test]
     fn cloned_allocation_gate_rejects_busy_access_and_releases_with_lease() {

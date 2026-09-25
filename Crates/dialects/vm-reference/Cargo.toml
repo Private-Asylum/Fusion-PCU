@@ -1,7 +1,6 @@
 [package]
 name = "fusion-pcu-vm-reference"
 description = "no_std reference consumer for typed PCU dialect fragments"
-documentation = ""
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

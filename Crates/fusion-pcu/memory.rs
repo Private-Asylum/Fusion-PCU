@@ -553,6 +553,10 @@ pub trait PcuMemoryProvider {
 
     /// Copies bytes into a resource without exposing its address space.
     ///
+    /// Access to the borrowed host slice must be finished before this call returns, including on
+    /// error. A provider that submits asynchronous DMA must stage the bytes into owned storage or
+    /// use a separate owned-transfer API; it cannot retain this borrow after return.
+    ///
     /// # Errors
     ///
     /// Returns a provider error if access is denied or the range cannot be transferred.
@@ -564,6 +568,10 @@ pub trait PcuMemoryProvider {
     ) -> Result<(), PcuMemoryProviderError>;
 
     /// Copies bytes out of a resource without exposing its address space.
+    ///
+    /// Access to the borrowed host slice must be finished before this call returns, including on
+    /// error. A provider that submits asynchronous DMA must establish completion before return or
+    /// use a separate owned-transfer API; it cannot retain this borrow after return.
     ///
     /// # Errors
     ///

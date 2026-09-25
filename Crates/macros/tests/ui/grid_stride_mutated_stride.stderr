@@ -1,0 +1,5 @@
+error: this grid-stride form cannot be proven to execute exactly once per logical lane; use `invocations = N` with the canonical loop, or add loop-capable PCU IR support
+ --> tests/ui/grid_stride_mutated_stride.rs:9:22
+  |
+9 |         id += stride * 2;
+  |                      ^

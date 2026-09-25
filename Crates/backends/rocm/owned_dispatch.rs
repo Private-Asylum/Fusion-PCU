@@ -10,6 +10,8 @@ use std::{
     mem::size_of,
 };
 
+const INLINE_ARGUMENTS: usize = 8;
+
 use fusion_pcu::{
     PcuBaseContract,
     PcuBindingAccess,
@@ -33,11 +35,15 @@ use fusion_pcu::{
     PcuOwnedBinding,
     PcuOwnedCompletion,
     PcuOwnedDispatchBackend,
+    PcuPreparedOwnedDispatch,
+    PcuOwnedDispatchMemorySession,
     PcuObjectKind,
     PcuObjectRef,
     PcuOwnedDispatchBindingError,
     PcuPrimitiveCaps,
     PcuPrimitiveSupport,
+    PcuMemoryAccess,
+    PcuMemoryResource,
     PcuSupport,
     PcuValueTypeCaps,
     validate_owned_dispatch_bindings,
@@ -52,6 +58,7 @@ use crate::{
     RocmDiscovery,
     RocmLowerError,
     RocmMemoryProvider,
+    RocmMemoryResource,
     compile_hip_source,
     lower_dispatch_to_hip_source,
 };
@@ -62,6 +69,8 @@ pub enum RocmOwnedDispatchError {
     Hip(HipError),
     Lower(RocmLowerError),
     Compile(crate::HipCompileError),
+    HipRtc(crate::HipRtcError),
+    CompilerUnavailable,
     InvalidDeviceReference,
     InvalidBlockSize,
     RuntimeDeviceMismatch {
@@ -79,6 +88,7 @@ pub enum RocmOwnedDispatchError {
         available: usize,
     },
     DifferentRuntime(PcuBindingRef),
+    MemoryAccessMismatch(PcuBindingRef),
     GeometryOverflow,
     Binding(PcuOwnedDispatchBindingError),
 }
@@ -89,6 +99,8 @@ impl fmt::Display for RocmOwnedDispatchError {
             Self::Hip(error) => error.fmt(f),
             Self::Lower(error) => write!(f, "PCU Dispatch cannot lower to ROCm: {error}"),
             Self::Compile(error) => write!(f, "ROCm code object compilation failed: {error}"),
+            Self::HipRtc(error) => write!(f, "ROCm runtime compilation failed: {error}"),
+            Self::CompilerUnavailable => f.write_str("no usable ROCm source compiler is available"),
             Self::InvalidDeviceReference => f.write_str("invalid ROCm device reference"),
             Self::InvalidBlockSize => f.write_str("HIP block size must be nonzero"),
             Self::RuntimeDeviceMismatch { expected, actual } => write!(
@@ -114,6 +126,10 @@ impl fmt::Display for RocmOwnedDispatchError {
             Self::DifferentRuntime(binding) => write!(
                 f,
                 "binding {binding:?} belongs to another HIP runtime or device"
+            ),
+            Self::MemoryAccessMismatch(binding) => write!(
+                f,
+                "memory resource for binding {binding:?} does not permit the requested access"
             ),
             Self::GeometryOverflow => f.write_str("HIP launch geometry overflow"),
             Self::Binding(error) => write!(f, "invalid owned PCU binding: {error:?}"),
@@ -145,15 +161,44 @@ impl From<crate::HipCompileError> for RocmOwnedDispatchError {
 pub struct RocmOwnedDispatchBackend {
     runtime: HipRuntime,
     device: PcuDeviceIdentity,
-    architecture: String,
+    architecture: Option<String>,
+    compiler: Option<crate::discovery::DispatchCompiler>,
     block_size: u32,
 }
 
 impl RocmOwnedDispatchBackend {
+    #[cfg(feature = "tensor")]
+    pub(crate) const fn tensor_runtime(&self) -> &HipRuntime {
+        &self.runtime
+    }
+
+    #[cfg(feature = "tensor")]
+    pub(crate) fn compile_tensor_source(
+        &self,
+        source: &str,
+    ) -> Result<Vec<u8>, RocmOwnedDispatchError> {
+        match self.compiler {
+            Some(crate::discovery::DispatchCompiler::Hipcc) => {
+                let architecture = self
+                    .architecture
+                    .as_deref()
+                    .ok_or(HipError::MissingArchitecture)?;
+                let hipcc_source = format!("#include <hip/hip_runtime.h>\n{source}");
+                compile_hip_source(&hipcc_source, architecture).map_err(Into::into)
+            }
+            Some(crate::discovery::DispatchCompiler::HipRtc) => {
+                crate::compile_hip_source_for_device(&self.runtime, source)
+                    .map_err(RocmOwnedDispatchError::HipRtc)
+            }
+            None => Err(RocmOwnedDispatchError::CompilerUnavailable),
+        }
+    }
+
     /// Validate and open one discovered device for owned asynchronous Dispatch.
     ///
-    /// The HIP architecture remains an explicit caller choice because the stable HIP APIs used by
-    /// discovery do not yet provide a safely versioned way to query its code-generation target.
+    /// The code-generation target is detected from the selected device's PCI identity and KFD
+    /// topology when available. Library-backed tensor work can use this session without it;
+    /// Dispatch preparation uses HIPRTC when an architecture or `hipcc` is unavailable.
     ///
     /// # Errors
     ///
@@ -162,7 +207,6 @@ impl RocmOwnedDispatchBackend {
     pub fn open(
         discovery: &RocmDiscovery,
         device: PcuObjectRef,
-        architecture: impl Into<String>,
         block_size: u32,
     ) -> Result<Self, RocmOwnedDispatchError> {
         if block_size == 0 {
@@ -173,8 +217,10 @@ impl RocmOwnedDispatchBackend {
         }
         let identity = PcuDeviceIdentity::from_device_ref(device)
             .ok_or(RocmOwnedDispatchError::InvalidDeviceReference)?;
+        let compiler = discovery.dispatch_compiler(device).ok();
         let runtime = discovery.open_device(device)?;
-        let actual = u32::try_from(runtime.device_info()?.index)
+        let runtime_info = runtime.device_info()?;
+        let actual = u32::try_from(runtime_info.index)
             .map_err(|_| RocmOwnedDispatchError::InvalidDeviceReference)?;
         if actual != identity.device_id() {
             return Err(RocmOwnedDispatchError::RuntimeDeviceMismatch {
@@ -182,10 +228,12 @@ impl RocmOwnedDispatchBackend {
                 actual,
             });
         }
+        let architecture = runtime_info.architecture;
         Ok(Self {
             runtime,
             device: identity,
-            architecture: architecture.into(),
+            architecture,
+            compiler,
             block_size,
         })
     }
@@ -230,15 +278,6 @@ impl RocmOwnedDispatchBackend {
         ))
     }
 
-    fn submit(
-        &self,
-        submission: PcuDispatchSubmission<'_>,
-        bindings: &[PcuOwnedBinding<DeviceBuffer>],
-    ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
-        let prepared = self.prepare_dispatch(submission)?;
-        prepared.submit(bindings)
-    }
-
     /// Lower, compile, load, and resolve one Dispatch kernel for repeated submissions.
     ///
     /// The returned reusable executable captures this session's generation-bound device
@@ -254,21 +293,62 @@ impl RocmOwnedDispatchBackend {
         &self,
         submission: PcuDispatchSubmission<'kernel>,
     ) -> Result<RocmPreparedDispatch<'kernel>, RocmOwnedDispatchError> {
-        let kernel = submission.kernel;
-        let source = lower_dispatch_to_hip_source(kernel)?;
-        let logical_invocations = submission.shape.invocation_count().get();
+        self.prepare_dispatch_ir(*submission.kernel, submission.shape)
+    }
+
+    /// Prepare an owned kernel descriptor whose instruction and binding slices are `'static`.
+    ///
+    /// This form is useful for backend-local caches: the returned executable owns the descriptor
+    /// and can outlive the temporary descriptor value without leaking it. The referenced IR
+    /// slices must remain valid for the executable lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if lowering, shape validation, or HIP executable preparation fails.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_dispatch_owned_kernel(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'static>,
+        shape: fusion_pcu::PcuInvocationShape,
+    ) -> Result<RocmPreparedDispatch<'static>, RocmOwnedDispatchError> {
+        self.prepare_dispatch_ir(kernel, shape)
+    }
+
+    fn prepare_dispatch_ir<'kernel>(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'kernel>,
+        shape: fusion_pcu::PcuInvocationShape,
+    ) -> Result<RocmPreparedDispatch<'kernel>, RocmOwnedDispatchError> {
+        let source = lower_dispatch_to_hip_source(&kernel)?;
+        let logical_invocations = shape.invocation_count().get();
         if kernel.entry.logical_shape != [logical_invocations, 1, 1] {
             return Err(RocmOwnedDispatchError::Lower(
                 RocmLowerError::InvalidKernelShape,
             ));
         }
-        let required = usize::try_from(logical_invocations)
+        let required = usize::try_from(kernel.minimum_binding_elements(logical_invocations))
             .ok()
-            .and_then(|invocations| invocations.checked_mul(size_of::<f32>()))
+            .and_then(|elements| elements.checked_mul(size_of::<f32>()))
             .ok_or(RocmOwnedDispatchError::GeometryOverflow)?;
 
         let grid_x = launch_grid(logical_invocations, self.block_size)?;
-        let image = compile_hip_source(&source, &self.architecture)?;
+        let compiler = self
+            .compiler
+            .ok_or(RocmOwnedDispatchError::CompilerUnavailable)?;
+        let image = match compiler {
+            crate::discovery::DispatchCompiler::Hipcc => {
+                let architecture = self
+                    .architecture
+                    .as_deref()
+                    .ok_or(HipError::MissingArchitecture)?;
+                compile_hip_source(&source, architecture)?
+            }
+            crate::discovery::DispatchCompiler::HipRtc => {
+                let rtc_source = crate::lower_dispatch_to_hip_rtc_source(&kernel)?;
+                crate::compile_hip_source_for_device(&self.runtime, &rtc_source)
+                    .map_err(RocmOwnedDispatchError::HipRtc)?
+            }
+        };
         let module = self.runtime.load_module(&image)?;
         let function = module.function(c"fusion_kernel")?;
         let stream = self.runtime.create_stream()?;
@@ -281,7 +361,7 @@ impl RocmOwnedDispatchBackend {
             runtime: self.runtime.clone(),
             device: self.device,
             kernel,
-            shape: submission.shape,
+            shape,
             required,
             grid_x,
             block_size: self.block_size,
@@ -292,14 +372,15 @@ impl RocmOwnedDispatchBackend {
     }
 }
 
-/// Reusable compiled `ROCm` executable for one borrowed PCU Dispatch kernel.
+/// Reusable compiled `ROCm` executable for one PCU Dispatch descriptor.
 ///
 /// This is distinct from the core `PcuPreparedDispatch` assessment value: it owns the compiled
-/// HIP function and reusable stream needed to submit the same kernel repeatedly.
+/// HIP function, a copy of the descriptor, and a reusable stream needed to submit the same kernel
+/// repeatedly. The descriptor's referenced IR slices must outlive this executable.
 pub struct RocmPreparedDispatch<'kernel> {
     runtime: HipRuntime,
     device: PcuDeviceIdentity,
-    kernel: &'kernel fusion_pcu::PcuDispatchKernelIr<'kernel>,
+    kernel: fusion_pcu::PcuDispatchKernelIr<'kernel>,
     shape: fusion_pcu::PcuInvocationShape,
     required: usize,
     grid_x: u32,
@@ -325,7 +406,7 @@ impl RocmPreparedDispatch<'_> {
         &self,
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
-        validate_owned_dispatch_bindings(self.kernel, self.shape, self.device, bindings)
+        validate_owned_dispatch_bindings(&self.kernel, self.shape, self.device, bindings)
             .map_err(RocmOwnedDispatchError::Binding)?;
         for binding in bindings {
             let actual = binding.resource.len();
@@ -347,12 +428,32 @@ impl RocmPreparedDispatch<'_> {
                 });
             }
         }
-        let indices = binding_order(self.binding_targets.iter().copied(), bindings)
-            .map_err(RocmOwnedDispatchError::Binding)?;
-        let arguments = indices
-            .into_iter()
-            .map(|index| HipKernelArgument::Buffer(&bindings[index].resource))
-            .collect::<Vec<_>>();
+        // Kernel arguments are borrowed only during `launch`; HIP copies their pointer values
+        // into owned aligned storage before returning. Keep common small interfaces on the stack
+        // without constraining larger kernels to an arbitrary binding-count limit.
+        let mut inline_arguments: [HipKernelArgument<'_>; INLINE_ARGUMENTS] =
+            std::array::from_fn(|_| HipKernelArgument::Bytes(&[]));
+        let mut overflow_arguments = Vec::new();
+        let arguments: &[HipKernelArgument<'_>] = if self.binding_targets.len() <= INLINE_ARGUMENTS
+        {
+            for (slot, target) in inline_arguments
+                .iter_mut()
+                .zip(self.binding_targets.iter().copied())
+            {
+                let binding =
+                    find_binding(target, bindings).map_err(RocmOwnedDispatchError::Binding)?;
+                *slot = HipKernelArgument::Buffer(&binding.resource);
+            }
+            &inline_arguments[..self.binding_targets.len()]
+        } else {
+            overflow_arguments.reserve(self.binding_targets.len());
+            for target in self.binding_targets.iter().copied() {
+                let binding =
+                    find_binding(target, bindings).map_err(RocmOwnedDispatchError::Binding)?;
+                overflow_arguments.push(HipKernelArgument::Buffer(&binding.resource));
+            }
+            &overflow_arguments
+        };
 
         // SAFETY: lowering validates the generated kernel ABI as exactly one f32 pointer per
         // declared binding in declaration order. Core admission validates full binding coverage,
@@ -365,7 +466,7 @@ impl RocmPreparedDispatch<'_> {
                 [self.grid_x, 1, 1],
                 [self.block_size, 1, 1],
                 0,
-                &arguments,
+                arguments,
             )?
         };
         Ok(RocmOwnedCompletion {
@@ -390,6 +491,10 @@ impl PcuOwnedDispatchBackend for RocmOwnedDispatchBackend {
     type Bindings = Vec<PcuOwnedBinding<DeviceBuffer>>;
     type Completion = RocmOwnedCompletion;
     type Error = RocmOwnedDispatchError;
+    type Prepared<'kernel, 'parameters>
+        = RocmPreparedDispatch<'kernel>
+    where
+        Self: 'kernel;
 
     fn device_identity(&self) -> PcuDeviceIdentity {
         self.device
@@ -401,12 +506,93 @@ impl PcuOwnedDispatchBackend for RocmOwnedDispatchBackend {
         bindings: Self::Bindings,
         parameters: PcuInvocationParameters<'_>,
     ) -> Result<Self::Completion, Self::Error> {
+        let prepared = self.prepare_dispatch_owned_direct(submission, parameters)?;
+        prepared.submit_owned_direct(bindings)
+    }
+
+    fn prepare_dispatch_owned_direct<'kernel, 'parameters>(
+        &self,
+        submission: PcuDispatchSubmission<'kernel>,
+        parameters: PcuInvocationParameters<'parameters>,
+    ) -> Result<Self::Prepared<'kernel, 'parameters>, Self::Error> {
         if !parameters.is_empty() {
             return Err(RocmOwnedDispatchError::Lower(
                 RocmLowerError::UnsupportedKernelInterface,
             ));
         }
-        self.submit(submission, &bindings)
+        self.prepare_dispatch(submission)
+    }
+}
+
+impl PcuPreparedOwnedDispatch for RocmPreparedDispatch<'_> {
+    type Resource = DeviceBuffer;
+    type Bindings = Vec<PcuOwnedBinding<DeviceBuffer>>;
+    type Completion = RocmOwnedCompletion;
+    type Error = RocmOwnedDispatchError;
+
+    fn kernel(&self) -> &fusion_pcu::PcuDispatchKernelIr<'_> {
+        &self.kernel
+    }
+
+    fn shape(&self) -> fusion_pcu::PcuInvocationShape {
+        self.shape
+    }
+
+    fn device_identity(&self) -> PcuDeviceIdentity {
+        self.device
+    }
+
+    fn submit_owned_direct(
+        &self,
+        bindings: Self::Bindings,
+    ) -> Result<Self::Completion, Self::Error> {
+        self.submit(&bindings)
+    }
+}
+
+impl PcuOwnedDispatchMemorySession for RocmOwnedDispatchBackend {
+    type MemoryProvider = RocmMemoryProvider;
+
+    fn memory_provider(&self, pool: fusion_pcu::PcuMemoryPoolId) -> Self::MemoryProvider {
+        Self::memory_provider(self, pool)
+    }
+
+    fn bind(
+        &self,
+        target: PcuBindingRef,
+        access: PcuBindingAccess,
+        binding_type: PcuBindingType,
+        resource: &RocmMemoryResource,
+    ) -> Result<PcuOwnedBinding<Self::Resource>, Self::Error> {
+        if !memory_access_supports_binding(resource.access(), access) {
+            return Err(RocmOwnedDispatchError::MemoryAccessMismatch(target));
+        }
+        let buffer = resource.device_buffer();
+        self.runtime
+            .ensure_same_runtime(&buffer.allocation.runtime)
+            .map_err(|_| RocmOwnedDispatchError::DifferentRuntime(target))?;
+        Ok(PcuOwnedBinding::new(
+            target,
+            self.device,
+            resource.size_bytes(),
+            access,
+            binding_type,
+            buffer.clone(),
+        ))
+    }
+}
+
+fn memory_access_supports_binding(available: PcuMemoryAccess, requested: PcuBindingAccess) -> bool {
+    match requested {
+        PcuBindingAccess::ReadOnly => matches!(
+            available,
+            PcuMemoryAccess::ReadOnly | PcuMemoryAccess::ReadWrite
+        ),
+        PcuBindingAccess::WriteOnly => matches!(
+            available,
+            PcuMemoryAccess::WriteOnly | PcuMemoryAccess::ReadWrite
+        ),
+        PcuBindingAccess::ReadWrite => available == PcuMemoryAccess::ReadWrite,
     }
 }
 
@@ -453,18 +639,14 @@ fn launch_grid(invocations: u32, block_size: u32) -> Result<u32, RocmOwnedDispat
     u32::try_from(grid).map_err(|_| RocmOwnedDispatchError::GeometryOverflow)
 }
 
-fn binding_order<R>(
-    declared: impl Iterator<Item = PcuBindingRef>,
+fn find_binding<R>(
+    target: PcuBindingRef,
     provided: &[PcuOwnedBinding<R>],
-) -> Result<Vec<usize>, PcuOwnedDispatchBindingError> {
-    declared
-        .map(|target| {
-            provided
-                .iter()
-                .position(|binding| binding.target == target)
-                .ok_or(PcuOwnedDispatchBindingError::Missing(target))
-        })
-        .collect()
+) -> Result<&PcuOwnedBinding<R>, PcuOwnedDispatchBindingError> {
+    provided
+        .iter()
+        .find(|binding| binding.target == target)
+        .ok_or(PcuOwnedDispatchBindingError::Missing(target))
 }
 
 const fn owned_dispatch_support() -> PcuSupport {
@@ -490,6 +672,7 @@ const fn owned_dispatch_support() -> PcuSupport {
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
+            .union(PcuDispatchOpCaps::CONTROL_LOOP)
             .union(PcuDispatchOpCaps::BINDING_LOAD)
             .union(PcuDispatchOpCaps::BINDING_STORE),
         PcuDispatchOpCaps::empty(),
@@ -509,6 +692,7 @@ const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_
     .union(PcuDispatchOpCaps::ALU_MUL)
     .union(PcuDispatchOpCaps::ALU_DIV)
     .union(PcuDispatchOpCaps::CONTROL_RETURN)
+    .union(PcuDispatchOpCaps::CONTROL_LOOP)
     .union(PcuDispatchOpCaps::BINDING_LOAD)
     .union(PcuDispatchOpCaps::BINDING_STORE);
 
@@ -536,13 +720,15 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
 mod tests {
     use super::{
         RocmOwnedDispatchError,
-        binding_order,
+        find_binding,
+        memory_access_supports_binding,
         launch_grid,
     };
     use fusion_pcu::{
         PcuBindingAccess,
         PcuBindingRef,
         PcuBindingType,
+        PcuMemoryAccess,
         PcuDeviceIdentity,
         PcuObjectKind,
         PcuObjectRef,
@@ -589,7 +775,36 @@ mod tests {
             )
         });
 
-        let order = binding_order([second, first].into_iter(), &provided).unwrap();
-        assert_eq!(order, [1, 0]);
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(find_binding(second, &provided).unwrap()),
+            std::ptr::from_ref(&provided[1])
+        ));
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(find_binding(first, &provided).unwrap()),
+            std::ptr::from_ref(&provided[0])
+        ));
+    }
+
+    #[test]
+    fn memory_access_must_cover_dispatch_binding_access() {
+        use PcuBindingAccess::{
+            ReadOnly,
+            ReadWrite,
+            WriteOnly,
+        };
+        use PcuMemoryAccess::{
+            ReadOnly as MemoryReadOnly,
+            ReadWrite as MemoryReadWrite,
+            WriteOnly as MemoryWriteOnly,
+        };
+
+        assert!(memory_access_supports_binding(MemoryReadOnly, ReadOnly));
+        assert!(!memory_access_supports_binding(MemoryReadOnly, WriteOnly));
+        assert!(!memory_access_supports_binding(MemoryReadOnly, ReadWrite));
+        assert!(memory_access_supports_binding(MemoryWriteOnly, WriteOnly));
+        assert!(!memory_access_supports_binding(MemoryWriteOnly, ReadOnly));
+        assert!(memory_access_supports_binding(MemoryReadWrite, ReadOnly));
+        assert!(memory_access_supports_binding(MemoryReadWrite, WriteOnly));
+        assert!(memory_access_supports_binding(MemoryReadWrite, ReadWrite));
     }
 }

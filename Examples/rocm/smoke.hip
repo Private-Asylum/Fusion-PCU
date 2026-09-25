@@ -1,5 +1,7 @@
 #include <cmath>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
@@ -24,9 +26,19 @@ __global__ void add_kernel(const float* a, const float* b, float* out, int n) {
     if (i < n) out[i] = a[i] + b[i];
 }
 
-int main() {
-    int device = 0;
-    HIP_CHECK(hipGetDevice(&device));
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::fprintf(stderr, "expected selected HIP device index\n");
+        return 1;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(argv[1], &end, 10);
+    if (*end != '\0' || parsed < 0 || parsed > INT_MAX) {
+        std::fprintf(stderr, "invalid HIP device index: %s\n", argv[1]);
+        return 1;
+    }
+    const int device = static_cast<int>(parsed);
+    HIP_CHECK(hipSetDevice(device));
     hipDeviceProp_t properties{};
     HIP_CHECK(hipGetDeviceProperties(&properties, device));
     std::printf("ROCm device %d: %s (%s)\n", device, properties.name, properties.gcnArchName);

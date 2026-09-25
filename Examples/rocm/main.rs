@@ -7,6 +7,11 @@ use std::process::{
     ExitCode,
 };
 
+use fusion_pcu_rocm::RocmDiscovery;
+
+#[path = "selection.rs"]
+mod selection;
+
 const HIP_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/smoke.hip");
 
 fn main() -> ExitCode {
@@ -20,17 +25,40 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), RunError> {
-    let arch = env::var("FUSION_ROCM_ARCH").unwrap_or_else(|_| "gfx1030".to_owned());
     if !Path::new(HIP_SOURCE).is_file() {
         return Err(RunError::Failure(format!(
             "HIP source not found: {HIP_SOURCE}"
         )));
     }
 
-    run_compiled(&arch)
+    let discovery = RocmDiscovery::new();
+    let candidates = selection::ranked_devices(
+        &discovery,
+        selection::preferred_device().map_err(|error| RunError::Failure(error.to_string()))?,
+        true,
+    )
+    .map_err(|error| RunError::Failure(error.to_string()))?;
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        let Some(architecture) = candidate.architecture.as_deref() else {
+            failures.push(format!(
+                "device {} has no native hipcc architecture",
+                candidate.device.id
+            ));
+            continue;
+        };
+        match run_compiled(architecture, candidate.device.id) {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(format!("device {}: {error}", candidate.device.id)),
+        }
+    }
+    Err(RunError::Failure(format!(
+        "no capable ROCm device passed the HIP/rocBLAS probe: {}",
+        failures.join("; ")
+    )))
 }
 
-fn run_compiled(arch: &str) -> Result<(), RunError> {
+fn run_compiled(arch: &str, device: u32) -> Result<(), RunError> {
     let output = env::temp_dir().join(format!("fusion-rocm-smoke-{}", std::process::id()));
     let mut compiler =
         Command::new(env::var_os("HIPCC").unwrap_or_else(|| OsString::from("hipcc")));
@@ -54,9 +82,12 @@ fn run_compiled(arch: &str) -> Result<(), RunError> {
         )));
     }
 
-    let execution = Command::new(&output).output().map_err(|error| {
-        RunError::Failure(format!("could not launch compiled HIP probe: {error}"))
-    });
+    let execution = Command::new(&output)
+        .arg(device.to_string())
+        .output()
+        .map_err(|error| {
+            RunError::Failure(format!("could not launch compiled HIP probe: {error}"))
+        });
     let _ = std::fs::remove_file(&output);
     let execution = execution?;
     if !execution.status.success() {

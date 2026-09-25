@@ -25,6 +25,7 @@ use crate::{
 };
 use fusion_pcu::{
     PcuDispatchSubmission,
+    PcuDispatchOp,
     PcuInvocationBinding,
     PcuInvocationBuffer,
     PcuInvocationParameters,
@@ -445,9 +446,10 @@ fn fixed_descriptor_execution(
     }
 
     let invocations = submission.shape.invocation_count().get();
-    if !invocations.is_multiple_of(dispatch.local_size[0]) {
-        return Err(PcuVulkanError::InvalidDispatchShape);
-    }
+    let semantic_extent = submission.kernel.ops.iter().find_map(|op| match op {
+        PcuDispatchOp::GridStrideLoop { extent, .. } => Some(*extent),
+        _ => None,
+    });
 
     let source_len = binding_byte_len(bindings, 0)?;
     let bias_len = binding_byte_len(bindings, 1)?;
@@ -456,20 +458,36 @@ fn fixed_descriptor_execution(
         return Err(PcuVulkanError::InvalidInvocationBinding);
     }
 
-    let Some(word_count) = source_len.checked_div(mem::size_of::<u32>()) else {
-        return Err(PcuVulkanError::InvalidInvocationBinding);
-    };
-    if word_count != usize::try_from(invocations).map_err(|_| PcuVulkanError::BufferTooLarge)?
-        || word_count * mem::size_of::<u32>() != source_len
-    {
-        return Err(PcuVulkanError::InvalidDispatchShape);
-    }
+    let dispatch_groups_x = fixed_descriptor_geometry(
+        invocations,
+        dispatch.local_size[0],
+        semantic_extent,
+        source_len,
+    )?;
 
     Ok(FixedDescriptorExecution {
         invocations,
-        dispatch_groups: [invocations / dispatch.local_size[0], 1, 1],
+        dispatch_groups: [dispatch_groups_x, 1, 1],
         bound_byte_len: source_len,
     })
+}
+
+fn fixed_descriptor_geometry(
+    invocations: u32,
+    local_size_x: u32,
+    semantic_extent: Option<u32>,
+    bound_byte_len: usize,
+) -> Result<u32, PcuVulkanError> {
+    if local_size_x == 0 || !invocations.is_multiple_of(local_size_x) {
+        return Err(PcuVulkanError::InvalidDispatchShape);
+    }
+    let expected_elements = usize::try_from(semantic_extent.unwrap_or(invocations))
+        .map_err(|_| PcuVulkanError::BufferTooLarge)?;
+    let expected_bytes = typed_byte_len::<u32>(expected_elements)?;
+    if expected_bytes != bound_byte_len {
+        return Err(PcuVulkanError::InvalidDispatchShape);
+    }
+    Ok(invocations / local_size_x)
 }
 
 fn write_binding_buffer(
@@ -1482,6 +1500,8 @@ fn find_memory_type(
 #[cfg(test)]
 mod tests {
     use super::{
+        fixed_descriptor_geometry,
+        PcuVulkanError,
         PcuVulkanDescriptorHeapBudget,
         PcuVulkanDescriptorIndexingCaps,
     };
@@ -1512,5 +1532,35 @@ mod tests {
 
         assert!(caps.supports_storage_buffer_heap());
         assert!(!caps.supports_sampled_image_heap());
+    }
+
+    #[test]
+    fn grid_stride_geometry_uses_extent_for_buffer_and_launch_width_for_groups() {
+        let groups = fixed_descriptor_geometry(8, 4, Some(19), 19 * 4)
+            .expect("bounded grid-stride dispatch should be admitted");
+
+        assert_eq!(groups, 2);
+    }
+
+    #[test]
+    fn direct_map_geometry_keeps_buffer_length_equal_to_invocations() {
+        let groups = fixed_descriptor_geometry(8, 4, None, 8 * 4)
+            .expect("direct map should keep its exact launch-sized buffer");
+
+        assert_eq!(groups, 2);
+    }
+
+    #[test]
+    fn direct_map_still_rejects_mismatched_buffer_length() {
+        let result = fixed_descriptor_geometry(8, 4, None, 19 * 4);
+
+        assert!(matches!(result, Err(PcuVulkanError::InvalidDispatchShape)));
+    }
+
+    #[test]
+    fn grid_stride_rejects_buffer_length_that_does_not_match_extent() {
+        let result = fixed_descriptor_geometry(8, 4, Some(19), 8 * 4);
+
+        assert!(matches!(result, Err(PcuVulkanError::InvalidDispatchShape)));
     }
 }

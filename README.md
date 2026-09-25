@@ -27,8 +27,8 @@ The currently tested executable profiles are deliberately small:
 | --- | --- | --- |
 | Hosted CPU Stream | Stream transforms pass local tests | The hosted CPU adapter and its broader Stream behavior live in Fusion. |
 | Fusion RP2350 PIO Stream integration | Adapter compiles for `thumbv8m.main-none-eabihf` in the Fusion repository | Hardware parity on a board is not yet demonstrated; the Cortex-M adapter stays in Fusion. |
-| ROCm Dispatch | RX 6900 XT runs a 65-value f32 map and Rust rocBLAS SGEMM | Only a bounded f32 indexed-map subset lowers to HIP; architecture is supplied by the caller. |
-| SPIR-V/Vulkan Dispatch | Vulkan example runs a 256-value map on RX 6900 XT | SPIR-V 1.0–1.3 only; current emitter uses LocalSize `[1, 1, 1]` and the runner is a synchronous, fixed three-buffer, one-dimensional adapter. |
+| ROCm Dispatch | RX 6900 XT runs a 250-invocation/2048-value grid-stride f32 map; separate HIP and rocBLAS smoke checks pass | Only a bounded f32 indexed-map subset and its structured grid-stride loop lower to HIP; device architecture discovery and runtime compilation have limited hardware coverage. |
+| SPIR-V/Vulkan Dispatch | Vulkan example runs a 250-invocation/2048-value grid-stride map on RX 6900 XT | SPIR-V 1.0–1.3 only; current emitter uses LocalSize `[1, 1, 1]` and the runner is a synchronous, fixed three-buffer, one-dimensional adapter. |
 | Fusion AML Command/Signal integration | Firmware VM fixtures execute in the Fusion repository | No AML method is lowered and executed through PCU yet; the ACPI integration stays in Fusion. |
 
 `PcuRuntimeDiscovery` exposes backend, target, device, context, and memory-domain facts with
@@ -44,15 +44,16 @@ atomic system/process ratio reservation, provider allocation, and rollback on fa
 host example uses a 95/100 system-used policy; accounting remains the caller's responsibility
 until all aliases and in-flight uses have ended.
 
-The experimental owned Dispatch contract admits only tightly packed scalar buffers with one
-element per logical invocation; it rejects other layouts and ports. Its completion law retains
-resources through uncertain waits and releases them only after quiescence. ROCm now implements
+The experimental owned Dispatch contract admits only tightly packed scalar buffers, sized for
+the full indexed extent of a supported grid-stride loop; it rejects other layouts and ports. Its
+completion law retains resources through uncertain waits and releases them only after quiescence. ROCm now implements
 that contract for the bounded f32 map subset. Cloned ROCm device buffers share an access gate,
 so safe copies and rocBLAS reject overlapping use while a launched kernel owns an allocation.
-The host example proves asynchronous submission, pre-wait access rejection, completion, and
-readback on the RX 6900 XT. ROCm now also exposes a reusable prepared executable for this f32
+The host example prepares once, submits twice through the PCU owned-dispatch contract, and proves
+completion and readback on the RX 6900 XT.
+ROCm also exposes a reusable prepared executable for this f32
 profile: lowering, HIP compilation, module/function resolution, and stream creation happen at
-prepare time, while each launch owns its bindings and completion. The hosted proof submits it
+prepare time, while each launch owns its bindings and completion. The separate benchmark submits it
 repeatedly and reports cold preparation separately from warm bind/submit/wait samples. Per-launch
 binding checks, argument allocation, access gates, and events remain; no zero-overhead claim is
 made. The original synchronous helper remains available. Command has a
@@ -64,14 +65,34 @@ little-endian encoding; it does not grant a backend a zero-copy device ABI or ar
 with automatic nonzero value IDs. Both ROCm and SPIR-V lowerers accept its output in tests. It is
 not a Rust-to-PCU compiler, and value handles are scoped by caller-assigned kernel ID rather than
 by a generative Rust lifetime. The optional dispatch macro has compile-fail tests for unsupported
-statements and expressions and a renamed-crate compile-pass test. The macro accepts literal counts
+statements and expressions and a renamed-crate compile-pass test. The macro is also exported as
+`#[pcu]` for the guiding-star spelling. It accepts literal counts
 and checked const-generic `usize` expressions such as `invocations = R * C`; specialization rejects
 zero, overflow, and counts beyond `u32`. The old logical-thread spelling is rejected. The core
 shape and context use invocation terminology directly. Macro resources use `&[f32]` for read-only
 access and `&mut [f32]` for read/write access. The macro still accepts only its narrow f32
-assignment body; grid-stride loops and generic element types remain planned frontend work.
+assignment body and one canonical grid-stride loop; generic element types and general control flow
+remain planned frontend work. Within that subset, source may use
+`pcu::context::global_invocation_id()` and `pcu::context::invocation_count()`; other function calls
+are rejected. The loop carries a semantic extent distinct from the launch width,
+so a smaller dispatch can cover a larger buffer with repeated per-lane iterations.
 These references are parsed into IR access descriptors; the generated builder does not yet
 borrow host buffers or enforce their lifetime and exclusivity through Rust's borrow checker.
+The shared f32 profile admits add, subtract, multiply, and divide, but full IEEE edge behavior is
+not yet normalized across CPU, HIP, and SPIR-V (in particular NaNs, signed zero, subnormals,
+overflow/underflow, and contraction/reassociation). Current cross-backend conformance vectors
+therefore use finite normal operands with exact results: `1.25 + 2.5 = 3.75`,
+`7.5 - 2.25 = 5.25`, `1.5 * -2 = -3`, and `7.5 / 2.5 = 3`. These should be compared by
+f32 bit pattern; they define the tested baseline, not a promise about excluded edge cases. The CPU
+reference also accepts Min and Max as a CPU-only extension; the shared GPU profile rejects them.
+For synchronous host execution, the bounded `PcuHostScalarBinding` path holds real `&[T]` and
+`&mut [T]` references through admission and execution. Its backend trait is unsafe to implement:
+device access must end even on an error before the call returns. Asynchronous execution continues
+to use the owned-resource completion contract.
+`fusion-pcu-cpu` is a separate opt-in backend crate. Its current allocation-free reference
+interpreter covers the bounded f32 indexed-map and U32 Stream transform profiles; it does not
+silently replace a selected device when that device rejects a kernel. Broader built-in dialect
+coverage remains planned.
 
 The additive `dialect` module describes namespaced, versioned external operations with typed
 operands/results and declared effects. A consumer supplies the authoritative operation signatures;
@@ -91,9 +112,17 @@ Neither reference consumer establishes a general VM ABI or binary plugin interfa
 Its typed `bool`, `u32`, and `f32` SSA handles support fan-out; callers give separate builders
 distinct scope IDs. It validates each append against the selected consumer support table, while
 program ports and immediates are supplied through the program wrapper. The optional
-`fusion-pcu-tensor` crate is a separate f32 CPU
-reference graph with shape checks and reverse-mode gradients. It does not yet lower through PCU or
-run on a device backend.
+`fusion-pcu-tensor` crate defines an f32 graph with shape checks, explicit operation assessment,
+execution planning, and CPU reference reverse-mode gradients. ROCm executes bounded MatMul through
+rocBLAS and same-shape Add, Sub, Mul, and ReLU through PCU Dispatch on a selected device, without
+implicit CPU fallback. It also supports transpose-aware MatMul, `ReLU` backward, scalar MSE, and reusable device
+inputs. The ROCm training example builds a linear-regression gradient with `backward_mse`, then
+composes an SGD update graph. It feeds each GPU-produced weight tensor directly into the next
+step and checks both against CPU reverse-mode gradients. The example reads each output back for
+verification; reusable intermediate storage, optimizer state, and a fully device-resident training
+loop remain open. Synthesized elementwise operations cache a bounded
+set of session-bound prepared Dispatch executables by operation and flattened element count,
+avoiding recompilation on repeated execution while retaining per-call binding and device checks.
 
 The Cortex-M, PIO hardware adapter, AML, HAL/PAL, and driver integrations remain in Fusion.
 

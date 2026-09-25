@@ -114,6 +114,7 @@ struct ExprEmitter<'a> {
     bindings: &'a [BindingSpec],
     invocation_ident: &'a Ident,
     crate_path: &'a Path,
+    grid_stride: bool,
     next_value: u16,
     ops: Vec<TokenStream2>,
 }
@@ -123,11 +124,13 @@ impl<'a> ExprEmitter<'a> {
         bindings: &'a [BindingSpec],
         invocation_ident: &'a Ident,
         crate_path: &'a Path,
+        grid_stride: bool,
     ) -> Self {
         Self {
             bindings,
             invocation_ident,
             crate_path,
+            grid_stride,
             next_value: 1,
             ops: Vec::new(),
         }
@@ -140,7 +143,7 @@ impl<'a> ExprEmitter<'a> {
             Expr::Lit(lit) => self.emit_lit(lit),
             Expr::Paren(paren) => self.emit_expr(&paren.expr),
             _ => Err(Error::new(
-                expr.span(),
+                unsupported_expression_span(expr),
                 "unsupported PCU expression; supported subset is binding[index], f32 literals, parentheses, and + - * /",
             )),
         }
@@ -187,11 +190,12 @@ impl<'a> ExprEmitter<'a> {
             .binding;
         let result = self.alloc_value(index.span())?;
         let pcu = self.crate_path;
+        let dispatch_index = self.index();
         self.ops.push(quote! {
             #pcu::PcuDispatchDataOp::BindingLoad {
                 result: #pcu::PcuDispatchValueId(#result),
                 binding: #pcu::PcuBindingRef::new(0, #slot),
-                index: #pcu::PcuDispatchIndex::InvocationId,
+                index: #dispatch_index,
             }
         });
         Ok(result)
@@ -214,6 +218,15 @@ impl<'a> ExprEmitter<'a> {
             }
         });
         Ok(result)
+    }
+
+    fn index(&self) -> TokenStream2 {
+        let pcu = self.crate_path;
+        if self.grid_stride {
+            quote! { #pcu::PcuDispatchIndex::GridStrideId }
+        } else {
+            quote! { #pcu::PcuDispatchIndex::InvocationId }
+        }
     }
 
     fn binding(&self, ident: &Ident, required: BindingAccess) -> Result<&BindingSpec, Error> {
@@ -254,6 +267,51 @@ pub fn pcu_dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Define a bounded PCU kernel with Rust-style invocation-count syntax.
+///
+/// `#[pcu(invocations = R * C)]` is the concise spelling of [`pcu_dispatch`]. The attribute
+/// accepts the same arguments and currently lowers the same deliberately bounded source subset.
+#[proc_macro_attribute]
+pub fn pcu(attr: TokenStream, item: TokenStream) -> TokenStream {
+    pcu_dispatch(attr, item)
+}
+
+fn build_body_operations(
+    data_ops: &[TokenStream2],
+    loop_extent: Option<&Expr>,
+    const_generics: &[Ident],
+    crate_path: &Path,
+) -> Result<(TokenStream2, usize), Error> {
+    if let Some(extent) = loop_extent {
+        let extent = lower_invocation_expr(extent, const_generics)?;
+        let body_len = data_ops.len();
+        let loop_body = data_ops
+            .iter()
+            .map(|op| quote! { #crate_path::PcuDispatchOp::Data(#op) })
+            .collect::<Vec<_>>();
+        let operations = quote! {
+            const __PCU_GRID_STRIDE_BODY: [#crate_path::PcuDispatchOp<'static>; #body_len] = [
+                #(#loop_body),*
+            ];
+            let builder = builder.with_op(#crate_path::PcuDispatchOp::GridStrideLoop {
+                extent: const {
+                    let extent: usize = #extent;
+                    assert!(extent != 0, "PCU grid-stride extent must be nonzero");
+                    assert!(extent <= u32::MAX as usize, "PCU grid-stride extent exceeds u32");
+                    extent as u32
+                },
+                body: &__PCU_GRID_STRIDE_BODY,
+            })?;
+        };
+        Ok((operations, 2))
+    } else {
+        Ok((
+            quote! { #(let builder = builder.with_data_op(#data_ops)?;)* },
+            data_ops.len() + 1,
+        ))
+    }
+}
+
 fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<TokenStream2, Error> {
     let vis = function.vis.clone();
     let function_ident = function.sig.ident.clone();
@@ -268,27 +326,50 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
         quote! { <'a, #params> }
     };
     let binding_specs = parse_bindings(&function.sig.inputs)?;
-    let (invocation_ident, assignment) = validate_body(function)?;
-    let output_binding = validate_assignment_target(assignment, &binding_specs, &invocation_ident)?;
-    let mut emitter = ExprEmitter::new(&binding_specs, &invocation_ident, &crate_path);
+    let body = validate_body(function)?;
+    let (invocation_ident, assignment, loop_extent) = match &body {
+        ValidatedBody::Indexed {
+            invocation,
+            assignment,
+        } => (invocation, *assignment, None),
+        ValidatedBody::GridStride {
+            invocation,
+            assignment,
+            extent,
+        } => (invocation, *assignment, Some(*extent)),
+    };
+    let output_binding = validate_assignment_target(assignment, &binding_specs, invocation_ident)?;
+    let mut emitter = ExprEmitter::new(
+        &binding_specs,
+        invocation_ident,
+        &crate_path,
+        loop_extent.is_some(),
+    );
     let result_value = emitter.emit_expr(&assignment.right)?;
     let output_slot = output_binding.binding;
     let mut data_ops = emitter.ops;
+    let store_index = if loop_extent.is_some() {
+        quote! { GridStrideId }
+    } else {
+        quote! { InvocationId }
+    };
     let pcu = &crate_path;
     data_ops.push(quote! {
         #pcu::PcuDispatchDataOp::BindingStore {
             binding: #pcu::PcuBindingRef::new(0, #output_slot),
-            index: #pcu::PcuDispatchIndex::InvocationId,
+            index: #pcu::PcuDispatchIndex::#store_index,
             value: #pcu::PcuDispatchValueId(#result_value),
         }
     });
+
+    let (operations, op_count) =
+        build_body_operations(&data_ops, loop_extent, &const_generics, &crate_path)?;
 
     let binding_items = binding_specs
         .iter()
         .map(|binding| binding_tokens(binding, pcu))
         .collect::<Vec<_>>();
     let binding_count = binding_items.len();
-    let op_count = data_ops.len() + 1;
     let kernel_id = args.kernel_id;
     Ok(quote! {
         #vis const fn #bindings_ident() -> [#pcu::PcuBinding<'static>; #binding_count] {
@@ -313,7 +394,7 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
                 [invocations, 1, 1],
             )
             .with_bindings(bindings);
-            #(let builder = builder.with_data_op(#data_ops)?;)*
+            #operations
             builder.with_control_op(#pcu::PcuDispatchControlOp::Return)
         }
     })
@@ -337,7 +418,7 @@ fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
         let GenericParam::Const(parameter) = parameter else {
             return Err(Error::new(
                 parameter.span(),
-                "PCU dispatch currently supports only `const NAME: usize` generics",
+                "PCU dispatch does not yet support type generics: binding metadata and emitted constants currently use f32, so a `T: PcuScalar` bound alone would not make the lowered operations type-safe; use `const NAME: usize` generics for invocation shapes",
             ));
         };
         let Type::Path(ty) = &parameter.ty else {
@@ -485,22 +566,39 @@ fn parse_binding_type(ty: &Type) -> Result<BindingAccess, Error> {
     })
 }
 
-fn validate_body(function: &ItemFn) -> Result<(Ident, &ExprAssign), Error> {
+enum ValidatedBody<'a> {
+    Indexed {
+        invocation: Ident,
+        assignment: &'a ExprAssign,
+    },
+    GridStride {
+        invocation: Ident,
+        assignment: &'a ExprAssign,
+        extent: &'a Expr,
+    },
+}
+
+fn validate_body(function: &ItemFn) -> Result<ValidatedBody<'_>, Error> {
     let statements = &function.block.stmts;
+    if statements.len() == 3
+        && matches!(statements.first(), Some(Stmt::Local(local)) if matches!(local.pat, Pat::Ident(ref pat) if pat.mutability.is_some()))
+    {
+        return validate_grid_stride_body(statements);
+    }
     if statements.len() != 2 {
         let span = statements
             .get(2)
             .map_or_else(|| function.block.span(), syn::spanned::Spanned::span);
         return Err(Error::new(
             span,
-            "PCU dispatch body supports exactly `let invocation = context.global_invocation_id;` followed by one `output[invocation] = <expr>;` assignment",
+            "PCU dispatch body supports exactly one invocation binding (`context.global_invocation_id` or `pcu::context::global_invocation_id()`) followed by exactly one indexed output assignment",
         ));
     }
 
     let Stmt::Local(local) = &statements[0] else {
         return Err(Error::new(
             statements[0].span(),
-            "first PCU dispatch statement must be `let invocation = context.global_invocation_id;`",
+            "first PCU dispatch statement must bind the invocation from `context.global_invocation_id` or `pcu::context::global_invocation_id()`",
         ));
     };
     if !local.attrs.is_empty() {
@@ -524,33 +622,195 @@ fn validate_body(function: &ItemFn) -> Result<(Ident, &ExprAssign), Error> {
     let Some(init) = &local.init else {
         return Err(Error::new(
             local.pat.span(),
-            "PCU dispatch invocation binding must initialize from `context.global_invocation_id`",
+            "PCU dispatch invocation binding must initialize from `context.global_invocation_id` or `pcu::context::global_invocation_id()`",
         ));
     };
     if init.diverge.is_some() || !is_context_invocation_expr(&init.expr) {
         return Err(Error::new(
-            init.expr.span(),
-            "PCU dispatch invocation binding must initialize from `context.global_invocation_id`",
+            invalid_context_expression_span(&init.expr),
+            "PCU dispatch invocation binding must initialize from `context.global_invocation_id` or the zero-argument call `pcu::context::global_invocation_id()`",
         ));
     }
 
     let Stmt::Expr(Expr::Assign(assignment), Some(_)) = &statements[1] else {
         return Err(Error::new(
-            statements[1].span(),
+            diagnostic_statement_span(&statements[1]),
             "second PCU dispatch statement must be `output[invocation] = <expr>;`",
         ));
     };
-    Ok((pat.ident.clone(), assignment))
+    Ok(ValidatedBody::Indexed {
+        invocation: pat.ident.clone(),
+        assignment,
+    })
+}
+
+/// Accepts the canonical grid-stride spelling and retains it as a structured loop region.
+fn validate_grid_stride_body(statements: &[Stmt]) -> Result<ValidatedBody<'_>, Error> {
+    let unsupported = |span| {
+        Error::new(
+            span,
+            "this grid-stride form cannot be proven to execute exactly once per logical lane; use `invocations = N` with the canonical loop, or add loop-capable PCU IR support",
+        )
+    };
+    let Stmt::Local(id_local) = &statements[0] else {
+        return Err(unsupported(statements[0].span()));
+    };
+    let Pat::Ident(id_pat) = &id_local.pat else {
+        return Err(unsupported(id_local.pat.span()));
+    };
+    if id_pat.mutability.is_none() || id_pat.by_ref.is_some() || id_pat.subpat.is_some() {
+        return Err(unsupported(id_pat.ident.span()));
+    }
+    let Some(id_init) = &id_local.init else {
+        return Err(unsupported(id_pat.ident.span()));
+    };
+    if id_init.diverge.is_some() || !is_context_invocation_expr(&id_init.expr) {
+        return Err(unsupported(invalid_context_expression_span(&id_init.expr)));
+    }
+
+    let Stmt::Local(stride_local) = &statements[1] else {
+        return Err(unsupported(statements[1].span()));
+    };
+    let Pat::Ident(stride_pat) = &stride_local.pat else {
+        return Err(unsupported(stride_local.pat.span()));
+    };
+    if stride_pat.mutability.is_some() || stride_pat.by_ref.is_some() || stride_pat.subpat.is_some()
+    {
+        return Err(unsupported(stride_pat.ident.span()));
+    }
+    let Some(stride_init) = &stride_local.init else {
+        return Err(unsupported(stride_pat.ident.span()));
+    };
+    if stride_init.diverge.is_some() || !is_context_invocation_count_expr(&stride_init.expr) {
+        return Err(unsupported(invalid_context_expression_span(
+            &stride_init.expr,
+        )));
+    }
+
+    let Stmt::Expr(Expr::While(loop_expr), None) = &statements[2] else {
+        return Err(unsupported(statements[2].span()));
+    };
+    let Expr::Binary(condition) = loop_expr.cond.as_ref() else {
+        return Err(unsupported(loop_expr.cond.span()));
+    };
+    if !matches!(condition.op, BinOp::Lt(_)) || !is_ident_expr(&condition.left, &id_pat.ident) {
+        return Err(unsupported(condition.span()));
+    }
+    let [
+        Stmt::Expr(Expr::Assign(assignment), Some(_)),
+        Stmt::Expr(Expr::Binary(increment), Some(_)),
+    ] = loop_expr.body.stmts.as_slice()
+    else {
+        let span = loop_expr
+            .body
+            .stmts
+            .first()
+            .map_or_else(|| loop_expr.while_token.span(), grid_stride_statement_span);
+        return Err(unsupported(span));
+    };
+    if !matches!(increment.op, BinOp::AddAssign(_)) {
+        return Err(unsupported(increment.op.span()));
+    }
+    if !is_ident_expr(&increment.left, &id_pat.ident) {
+        return Err(unsupported(increment.left.span()));
+    }
+    if !is_ident_expr(&increment.right, &stride_pat.ident) {
+        return Err(unsupported(unsupported_expression_span(&increment.right)));
+    }
+    Ok(ValidatedBody::GridStride {
+        invocation: id_pat.ident.clone(),
+        assignment,
+        extent: &condition.right,
+    })
+}
+
+fn grid_stride_statement_span(statement: &Stmt) -> proc_macro2::Span {
+    match statement {
+        Stmt::Expr(Expr::If(expression), _) => expression.if_token.span(),
+        _ => statement.span(),
+    }
+}
+
+fn diagnostic_statement_span(statement: &Stmt) -> proc_macro2::Span {
+    match statement {
+        Stmt::Expr(Expr::If(expression), _) => expression.if_token.span(),
+        _ => statement.span(),
+    }
+}
+
+fn unsupported_expression_span(expression: &Expr) -> proc_macro2::Span {
+    match expression {
+        Expr::Binary(binary) => binary.op.span(),
+        Expr::MethodCall(method_call) => method_call.method.span(),
+        _ => expression.span(),
+    }
+}
+
+fn invalid_context_expression_span(expression: &Expr) -> proc_macro2::Span {
+    match expression {
+        Expr::Call(call) => call
+            .args
+            .first()
+            .map_or_else(|| call.func.span(), syn::spanned::Spanned::span),
+        _ => expression.span(),
+    }
+}
+
+fn is_context_invocation_count_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(ExprField { base, member, .. }) => {
+            expr_ident(base).is_some_and(|ident| ident == "context")
+                && member.to_token_stream().to_string() == "invocation_count"
+        }
+        _ => is_context_builtin_call(expr, "invocation_count"),
+    }
+}
+
+fn is_ident_expr(expr: &Expr, ident: &Ident) -> bool {
+    expr_ident(expr).is_some_and(|candidate| candidate == ident)
 }
 
 fn is_context_invocation_expr(expr: &Expr) -> bool {
-    let Expr::Field(ExprField { base, member, .. }) = expr else {
+    match expr {
+        Expr::Field(ExprField { base, member, .. }) => {
+            expr_ident(base).is_some_and(|ident| ident == "context")
+                && member.to_token_stream().to_string() == "global_invocation_id"
+        }
+        _ => is_context_builtin_call(expr, "global_invocation_id"),
+    }
+}
+
+fn is_context_builtin_call(expr: &Expr, builtin: &str) -> bool {
+    let Expr::Call(call) = expr else {
         return false;
     };
-    let Some(base_ident) = expr_ident(base) else {
+    if !call.args.is_empty() {
+        return false;
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
         return false;
     };
-    base_ident == "context" && member.to_token_stream().to_string() == "global_invocation_id"
+    if path.qself.is_some() || path.path.segments.len() != 3 {
+        return false;
+    }
+    if path
+        .path
+        .segments
+        .iter()
+        .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+    {
+        return false;
+    }
+    let mut segments = path.path.segments.iter();
+    segments
+        .next()
+        .is_some_and(|segment| segment.ident == "pcu")
+        && segments
+            .next()
+            .is_some_and(|segment| segment.ident == "context")
+        && segments
+            .next()
+            .is_some_and(|segment| segment.ident == builtin)
 }
 
 fn validate_assignment_target<'a>(
@@ -669,6 +929,31 @@ mod tests {
     }
 
     #[test]
+    fn lowers_multi_iteration_grid_stride_map_to_a_loop_region() {
+        let tokens = expand(
+            "let mut id = context.global_invocation_id; let stride = context.invocation_count; while id < 64 { output[id] = input[id] * 2.0; id += stride; }",
+        )
+        .expect("canonical grid-stride loop lowers to a loop region");
+        let generated = tokens.to_string();
+        assert!(generated.contains("BindingLoad"));
+        assert!(generated.contains("BindingStore"));
+        assert!(generated.contains("GridStrideLoop"));
+        assert!(generated.contains("GridStrideId"));
+    }
+
+    #[test]
+    fn accepts_grid_stride_loop_with_a_smaller_dispatch_extent() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel<const N: usize>(input: &[f32], output: &mut [f32]) { let mut id = context.global_invocation_id; let stride = context.invocation_count; while id < N { output[id] = input[id]; id += stride; } }",
+        )
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 32").expect("attribute parses");
+        let tokens = expand_pcu_dispatch(args, &function)
+            .expect("a smaller launch is represented by loop IR");
+        assert!(tokens.to_string().contains("GridStrideLoop"));
+    }
+
+    #[test]
     fn accepts_invocation_spelling() {
         let function = syn::parse_str::<ItemFn>(
             "fn kernel(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0; }",
@@ -721,12 +1006,16 @@ mod tests {
     #[test]
     fn rejects_type_generic_sources_until_element_semantics_exist() {
         let function = syn::parse_str::<ItemFn>(
-            "fn kernel<T>(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation]; }",
+            "fn kernel<T: PcuScalar>(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation]; }",
         )
         .expect("test function parses");
         let args = syn::parse_str::<PcuDispatchArgs>("invocations = 8").expect("attribute parses");
         let error = expand_pcu_dispatch(args, &function).expect_err("type generic is unsupported");
-        assert!(error.to_string().contains("const NAME: usize"));
+        let message = error.to_string();
+        assert!(message.contains("does not yet support type generics"));
+        assert!(message.contains("binding metadata and emitted constants currently use f32"));
+        assert!(message.contains("T: PcuScalar"));
+        assert!(message.contains("const NAME: usize"));
     }
 
     #[test]

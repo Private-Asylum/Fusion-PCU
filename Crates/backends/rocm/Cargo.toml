@@ -1,7 +1,6 @@
 [package]
 name = "fusion-pcu-rocm"
 description = "HIP runtime substrate for Fusion PCU on AMD GPUs"
-documentation = ""
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,8 +11,13 @@ repository.workspace = true
 crate-type = ["rlib"]
 path = "rocm.rs"
 
+[features]
+default = []
+tensor = ["dep:fusion-pcu-tensor"]
+
 [dependencies]
 fusion-pcu.workspace = true
+fusion-pcu-tensor = { workspace = true, optional = true }
 libloading = "0.8"
 
 [lints]

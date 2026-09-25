@@ -4,6 +4,7 @@ members = [
     "Crates/fusion-pcu",
     "Crates/macros",
     "Crates/backends/rocm",
+    "Crates/backends/cpu",
     "Crates/backends/spirv",
     "Crates/runner",
     "Crates/dialects/tensor",
@@ -20,11 +21,12 @@ license = "Apache-2.0"
 repository = "https://github.com/Private-Asylum/Fusion-PCU"
 
 [workspace.dependencies]
-fusion-pcu = { path = "Crates/fusion-pcu", default-features = false }
-fusion-pcu-macros = { path = "Crates/macros" }
-fusion-pcu-rocm = { path = "Crates/backends/rocm", default-features = false }
-fusion-pcu-spirv = { path = "Crates/backends/spirv", default-features = false }
-fusion-pcu-runner = { path = "Crates/runner", default-features = false }
+fusion-pcu = { version = "0.1.0", path = "Crates/fusion-pcu", default-features = false }
+fusion-pcu-macros = { version = "0.1.0", path = "Crates/macros" }
+fusion-pcu-rocm = { version = "0.1.0", path = "Crates/backends/rocm", default-features = false }
+fusion-pcu-spirv = { version = "0.1.0", path = "Crates/backends/spirv", default-features = false }
+fusion-pcu-runner = { version = "0.1.0", path = "Crates/runner", default-features = false }
+fusion-pcu-tensor = { version = "0.1.0", path = "Crates/dialects/tensor" }
 
 ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
 proc-macro2 = "1.0.103"
