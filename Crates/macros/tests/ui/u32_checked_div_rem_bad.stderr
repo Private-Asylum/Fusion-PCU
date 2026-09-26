@@ -1,0 +1,5 @@
+error: checked DivRem outputs must be distinct
+  --> tests/ui/u32_checked_div_rem_bad.rs:10:5
+   |
+10 |     q[id] = remainder;
+   |     ^^^^^

@@ -756,6 +756,7 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
                     op,
                     lhs,
                     rhs,
+                    ..
                 }) => self.push_instruction(
                     dataflow_alu_opcode(op)?,
                     &[
@@ -853,6 +854,7 @@ impl<'a, S: PcuSpirvSink> PcuSpirvWriter<'a, S> {
                     op,
                     lhs,
                     rhs,
+                    ..
                 }) => self.push_instruction(
                     dataflow_alu_opcode(op)?,
                     &[
@@ -1208,14 +1210,16 @@ fn dataflow_index_id(
     match index {
         PcuDispatchIndex::InvocationId => Ok(DATAFLOW_INDEX_ID),
         PcuDispatchIndex::GridStrideId => Ok(dataflow_loop_ids(kernel)?.index),
-        PcuDispatchIndex::Value(_) => Err(PcuSpirvError::UnsupportedInstruction(
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index,
-            })
-            .support_flag(),
-        )),
+        PcuDispatchIndex::BindingElementZero | PcuDispatchIndex::Value(_) => {
+            Err(PcuSpirvError::UnsupportedInstruction(
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index,
+                })
+                .support_flag(),
+            ))
+        }
     }
 }
 

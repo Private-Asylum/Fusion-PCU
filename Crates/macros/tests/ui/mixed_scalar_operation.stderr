@@ -1,0 +1,5 @@
+error: PCU floating arithmetic requires matching f32 or f64 operands
+ --> tests/ui/mixed_scalar_operation.rs:6:26
+  |
+6 |     output[invocation] = input[invocation] + 1.0;
+  |                          ^^^^^^^^^^^^^^^^^^^^^^^

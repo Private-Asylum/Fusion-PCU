@@ -1,16 +1,44 @@
 //! Owned, asynchronous PCU Dispatch adapter for one explicitly selected HIP device.
 //!
-//! This first adapter deliberately supports the existing scalar f32 source lowerer only. It
-//! requires buffers allocated by this adapter's HIP runtime and retains exclusive buffer leases
-//! until the HIP event proves that the kernel has stopped accessing them.
+//! This adapter supports the bounded scalar Dispatch profiles accepted by the `ROCm` lowerer.
+//! It requires buffers allocated by this adapter's HIP runtime and retains exclusive buffer
+//! leases until the HIP event proves that the kernel has stopped accessing them.
 
 use std::{
     error::Error,
     fmt,
-    mem::size_of,
 };
 
 const INLINE_ARGUMENTS: usize = 8;
+const FAULT_WORD_SENTINEL: u64 = u64::MAX;
+
+fn kernel_uses_checked_div_rem(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    kernel.ops.iter().any(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. }) => true,
+        PcuDispatchOp::GridStrideLoop { body, .. } => body.iter().any(|body_op| {
+            matches!(
+                body_op,
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. })
+            )
+        }),
+        _ => false,
+    })
+}
+
+const fn decode_fault_word(word: u64) -> Result<Option<PcuExecutionFault>, HipError> {
+    if word == FAULT_WORD_SENTINEL {
+        return Ok(None);
+    }
+    let kind = match word & 0b11 {
+        1 => PcuExecutionFaultKind::DivideByZero,
+        2 => PcuExecutionFaultKind::SignedDivisionOverflow,
+        _ => return Err(HipError::InvalidExecutionFaultWord(word)),
+    };
+    Ok(Some(PcuExecutionFault {
+        kind,
+        invocation_id: word >> 2,
+    }))
+}
 
 use fusion_pcu::{
     PcuBaseContract,
@@ -19,9 +47,14 @@ use fusion_pcu::{
     PcuBindingType,
     PcuCompletionOutcome,
     PcuCompletionState,
+    PcuExecutionFault,
+    PcuExecutionFaultKind,
     PcuDeviceIdentity,
+    PcuDispatchDataOp,
     PcuDispatchFeatureCaps,
+    PcuDispatchKernelIr,
     PcuDispatchOpCaps,
+    PcuDispatchOp,
     PcuDispatchPolicyCaps,
     PcuDispatchSubmission,
     PcuDispatchSupport,
@@ -46,7 +79,8 @@ use fusion_pcu::{
     PcuMemoryResource,
     PcuSupport,
     PcuValueTypeCaps,
-    validate_owned_dispatch_bindings,
+    validate_owned_binding_requirements,
+    PcuOwnedBindingRequirement,
 };
 
 use crate::{
@@ -60,8 +94,10 @@ use crate::{
     RocmMemoryProvider,
     RocmMemoryResource,
     compile_hip_source,
+    lower_dispatch_to_hip_rtc_source,
     lower_dispatch_to_hip_source,
 };
+use crate::HipCompletionBatch;
 
 /// ROCm-owned dispatch setup or submission failure.
 #[derive(Debug)]
@@ -91,6 +127,7 @@ pub enum RocmOwnedDispatchError {
     MemoryAccessMismatch(PcuBindingRef),
     GeometryOverflow,
     Binding(PcuOwnedDispatchBindingError),
+    CheckedDivisionBatchUnsupported,
 }
 
 impl fmt::Display for RocmOwnedDispatchError {
@@ -133,6 +170,9 @@ impl fmt::Display for RocmOwnedDispatchError {
             ),
             Self::GeometryOverflow => f.write_str("HIP launch geometry overflow"),
             Self::Binding(error) => write!(f, "invalid owned PCU binding: {error:?}"),
+            Self::CheckedDivisionBatchUnsupported => f.write_str(
+                "checked integer division cannot be submitted through the ordered HIP batch path",
+            ),
         }
     }
 }
@@ -289,85 +329,147 @@ impl RocmOwnedDispatchBackend {
     /// # Errors
     ///
     /// Returns an error if the kernel profile cannot be lowered or HIP cannot compile/load it.
-    pub fn prepare_dispatch<'kernel>(
+    pub fn prepare_dispatch(
         &self,
-        submission: PcuDispatchSubmission<'kernel>,
-    ) -> Result<RocmPreparedDispatch<'kernel>, RocmOwnedDispatchError> {
+        submission: PcuDispatchSubmission<'_>,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
         self.prepare_dispatch_ir(*submission.kernel, submission.shape)
     }
 
-    /// Prepare an owned kernel descriptor whose instruction and binding slices are `'static`.
-    ///
-    /// This form is useful for backend-local caches: the returned executable owns the descriptor
-    /// and can outlive the temporary descriptor value without leaking it. The referenced IR
-    /// slices must remain valid for the executable lifetime.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if lowering, shape validation, or HIP executable preparation fails.
+    /// Prepares a tensor-owned kernel on the tensor assessor's selected ordered stream.
     #[cfg(feature = "tensor")]
-    pub(crate) fn prepare_dispatch_owned_kernel(
+    pub(crate) fn prepare_dispatch_owned_kernel_on_stream(
         &self,
-        kernel: fusion_pcu::PcuDispatchKernelIr<'static>,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
         shape: fusion_pcu::PcuInvocationShape,
-    ) -> Result<RocmPreparedDispatch<'static>, RocmOwnedDispatchError> {
-        self.prepare_dispatch_ir(kernel, shape)
+        stream: &crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
+        }
+        self.prepare_dispatch_ir_with_stream(kernel, shape, stream.clone())
     }
 
-    fn prepare_dispatch_ir<'kernel>(
+    /// Prepares a dynamically generated tensor kernel with HIPRTC as the first compiler choice.
+    ///
+    /// HIPRTC compiles against the selected runtime device and avoids launching a `hipcc` process
+    /// for short-lived generated tensor programs. When discovery selected `hipcc` as available,
+    /// a HIPRTC failure falls back to that compiler. This preference is deliberately local to the
+    /// tensor-generated executable and does not change general Dispatch compiler selection.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_dynamic_tensor_kernel_on_stream(
         &self,
-        kernel: fusion_pcu::PcuDispatchKernelIr<'kernel>,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
         shape: fusion_pcu::PcuInvocationShape,
-    ) -> Result<RocmPreparedDispatch<'kernel>, RocmOwnedDispatchError> {
+        stream: &crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
+        }
+        self.prepare_dispatch_ir_with_stream_preference(kernel, shape, stream.clone(), true)
+    }
+
+    fn prepare_dispatch_ir(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
+        shape: fusion_pcu::PcuInvocationShape,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        let stream = self.runtime.create_stream()?;
+        self.prepare_dispatch_ir_with_stream(kernel, shape, stream)
+    }
+
+    fn prepare_dispatch_ir_with_stream(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
+        shape: fusion_pcu::PcuInvocationShape,
+        stream: crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        self.prepare_dispatch_ir_with_stream_preference(kernel, shape, stream, false)
+    }
+
+    fn prepare_dispatch_ir_with_stream_preference(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
+        shape: fusion_pcu::PcuInvocationShape,
+        stream: crate::HipStreamHandle,
+        prefer_hiprtc: bool,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
         let source = lower_dispatch_to_hip_source(&kernel)?;
+        let checked_division = kernel_uses_checked_div_rem(&kernel);
         let logical_invocations = shape.invocation_count().get();
         if kernel.entry.logical_shape != [logical_invocations, 1, 1] {
             return Err(RocmOwnedDispatchError::Lower(
                 RocmLowerError::InvalidKernelShape,
             ));
         }
-        let required = usize::try_from(kernel.minimum_binding_elements(logical_invocations))
-            .ok()
-            .and_then(|elements| elements.checked_mul(size_of::<f32>()))
-            .ok_or(RocmOwnedDispatchError::GeometryOverflow)?;
-
         let grid_x = launch_grid(logical_invocations, self.block_size)?;
         let compiler = self
             .compiler
             .ok_or(RocmOwnedDispatchError::CompilerUnavailable)?;
-        let image = match compiler {
-            crate::discovery::DispatchCompiler::Hipcc => {
-                let architecture = self
-                    .architecture
-                    .as_deref()
-                    .ok_or(HipError::MissingArchitecture)?;
-                compile_hip_source(&source, architecture)?
+        let image = if prefer_hiprtc {
+            let rtc_image = lower_dispatch_to_hip_rtc_source(&kernel)
+                .map_err(RocmOwnedDispatchError::Lower)
+                .and_then(|rtc_source| {
+                    crate::compile_hip_source_for_device(&self.runtime, &rtc_source)
+                        .map_err(RocmOwnedDispatchError::HipRtc)
+                });
+            match rtc_image {
+                Ok(image) => image,
+                Err(_rtc_error) if compiler == crate::discovery::DispatchCompiler::Hipcc => {
+                    let architecture = self
+                        .architecture
+                        .as_deref()
+                        .ok_or(HipError::MissingArchitecture)?;
+                    compile_hip_source(&source, architecture)?
+                }
+                Err(error) => return Err(error),
             }
-            crate::discovery::DispatchCompiler::HipRtc => {
-                let rtc_source = crate::lower_dispatch_to_hip_rtc_source(&kernel)?;
-                crate::compile_hip_source_for_device(&self.runtime, &rtc_source)
-                    .map_err(RocmOwnedDispatchError::HipRtc)?
+        } else {
+            match compiler {
+                crate::discovery::DispatchCompiler::Hipcc => {
+                    let architecture = self
+                        .architecture
+                        .as_deref()
+                        .ok_or(HipError::MissingArchitecture)?;
+                    compile_hip_source(&source, architecture)?
+                }
+                crate::discovery::DispatchCompiler::HipRtc => {
+                    let rtc_source = crate::lower_dispatch_to_hip_rtc_source(&kernel)?;
+                    crate::compile_hip_source_for_device(&self.runtime, &rtc_source)
+                        .map_err(RocmOwnedDispatchError::HipRtc)?
+                }
             }
         };
         let module = self.runtime.load_module(&image)?;
         let function = module.function(c"fusion_kernel")?;
-        let stream = self.runtime.create_stream()?;
         let binding_targets = kernel
             .bindings
             .iter()
             .map(|binding| PcuBindingRef::new(binding.set, binding.binding))
             .collect();
+        let binding_requirements = kernel
+            .bindings
+            .iter()
+            .map(|binding| {
+                PcuOwnedBindingRequirement::from_verified_binding(
+                    &kernel,
+                    PcuBindingRef::new(binding.set, binding.binding),
+                    shape,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RocmOwnedDispatchError::Binding)?;
         Ok(RocmPreparedDispatch {
             runtime: self.runtime.clone(),
             device: self.device,
-            kernel,
+            binding_requirements,
             shape,
-            required,
             grid_x,
             block_size: self.block_size,
             function,
             stream,
             binding_targets,
+            checked_division,
         })
     }
 }
@@ -375,22 +477,22 @@ impl RocmOwnedDispatchBackend {
 /// Reusable compiled `ROCm` executable for one PCU Dispatch descriptor.
 ///
 /// This is distinct from the core `PcuPreparedDispatch` assessment value: it owns the compiled
-/// HIP function, a copy of the descriptor, and a reusable stream needed to submit the same kernel
-/// repeatedly. The descriptor's referenced IR slices must outlive this executable.
-pub struct RocmPreparedDispatch<'kernel> {
+/// HIP function, owned binding requirements, and a reusable stream needed to submit the same kernel
+/// repeatedly. The source IR may be dropped after preparation.
+pub struct RocmPreparedDispatch {
     runtime: HipRuntime,
     device: PcuDeviceIdentity,
-    kernel: fusion_pcu::PcuDispatchKernelIr<'kernel>,
+    binding_requirements: Vec<PcuOwnedBindingRequirement>,
     shape: fusion_pcu::PcuInvocationShape,
-    required: usize,
     grid_x: u32,
     block_size: u32,
     function: crate::HipKernel,
     stream: crate::HipStreamHandle,
     binding_targets: Vec<PcuBindingRef>,
+    checked_division: bool,
 }
 
-impl RocmPreparedDispatch<'_> {
+impl RocmPreparedDispatch {
     /// Submit this executable with a fresh set of owned bindings.
     ///
     /// Binding metadata, allocation size, and captured runtime/device identity are checked on
@@ -406,7 +508,7 @@ impl RocmPreparedDispatch<'_> {
         &self,
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
-        validate_owned_dispatch_bindings(&self.kernel, self.shape, self.device, bindings)
+        validate_owned_binding_requirements(&self.binding_requirements, self.device, bindings)
             .map_err(RocmOwnedDispatchError::Binding)?;
         for binding in bindings {
             let actual = binding.resource.len();
@@ -420,17 +522,101 @@ impl RocmPreparedDispatch<'_> {
             self.runtime
                 .ensure_same_runtime(&binding.resource.allocation.runtime)
                 .map_err(|_| RocmOwnedDispatchError::DifferentRuntime(binding.target))?;
-            if actual < self.required {
-                return Err(RocmOwnedDispatchError::BufferTooSmall {
-                    binding: binding.target,
-                    required: self.required,
-                    available: actual,
-                });
-            }
         }
         // Kernel arguments are borrowed only during `launch`; HIP copies their pointer values
         // into owned aligned storage before returning. Keep common small interfaces on the stack
         // without constraining larger kernels to an arbitrary binding-count limit.
+        let mut fault_word = if self.checked_division {
+            let mut buffer = self.runtime.allocate(core::mem::size_of::<u64>())?;
+            buffer.copy_from(&FAULT_WORD_SENTINEL.to_le_bytes())?;
+            Some(buffer)
+        } else {
+            None
+        };
+        let argument_count = self.binding_targets.len() + usize::from(fault_word.is_some());
+        let mut inline_arguments: [HipKernelArgument<'_>; INLINE_ARGUMENTS] =
+            std::array::from_fn(|_| HipKernelArgument::Bytes(&[]));
+        let mut overflow_arguments = Vec::new();
+        let arguments: &[HipKernelArgument<'_>] = if argument_count <= INLINE_ARGUMENTS {
+            for (slot, target) in inline_arguments
+                .iter_mut()
+                .zip(self.binding_targets.iter().copied())
+            {
+                let binding =
+                    find_binding(target, bindings).map_err(RocmOwnedDispatchError::Binding)?;
+                *slot = HipKernelArgument::Buffer(&binding.resource);
+            }
+            if let Some(buffer) = fault_word.as_ref() {
+                inline_arguments[self.binding_targets.len()] = HipKernelArgument::Buffer(buffer);
+            }
+            &inline_arguments[..argument_count]
+        } else {
+            overflow_arguments.reserve(argument_count);
+            for target in self.binding_targets.iter().copied() {
+                let binding =
+                    find_binding(target, bindings).map_err(RocmOwnedDispatchError::Binding)?;
+                overflow_arguments.push(HipKernelArgument::Buffer(&binding.resource));
+            }
+            if let Some(buffer) = fault_word.as_ref() {
+                overflow_arguments.push(HipKernelArgument::Buffer(buffer));
+            }
+            &overflow_arguments
+        };
+
+        // SAFETY: lowering validates one typed scalar pointer per declared binding in
+        // declaration order (f32 map or u32 identity-copy profile). Core admission validates full binding coverage,
+        // device metadata, access, and type. This adapter additionally verifies actual allocation
+        // length and HIP runtime identity, and HipKernel::launch acquires the shared exclusive
+        // allocation gates and retains module, stream, and allocations through event completion.
+        let hip = unsafe {
+            self.function.launch(
+                &self.stream,
+                [self.grid_x, 1, 1],
+                [self.block_size, 1, 1],
+                0,
+                arguments,
+            )?
+        };
+        Ok(RocmOwnedCompletion {
+            hip: Some(hip),
+            fault_word: fault_word.take(),
+            terminal: None,
+        })
+    }
+
+    /// Submit this executable directly into an ordered HIP completion batch.
+    ///
+    /// This path avoids creating a per-launch HIP event. The batch must use the stream captured
+    /// by this prepared dispatch and must be finished after the final queued operation. If this
+    /// method returns a HIP launch error, the batch is poisoned and must be dropped; its drop
+    /// path synchronizes the stream or quarantines its retained resources.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bindings, a mismatched runtime/device/stream, a poisoned
+    /// batch, or HIP launch failure.
+    pub fn submit_into_batch(
+        &self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+        batch: &mut HipCompletionBatch,
+    ) -> Result<(), RocmOwnedDispatchError> {
+        if self.checked_division {
+            return Err(RocmOwnedDispatchError::CheckedDivisionBatchUnsupported);
+        }
+        validate_owned_binding_requirements(&self.binding_requirements, self.device, bindings)
+            .map_err(RocmOwnedDispatchError::Binding)?;
+        for binding in bindings {
+            let actual = binding.resource.len();
+            if binding.byte_len != actual as u64 {
+                return Err(RocmOwnedDispatchError::BufferSizeMismatch {
+                    binding: binding.target,
+                    metadata: binding.byte_len,
+                    actual,
+                });
+            }
+            self.runtime
+                .ensure_same_runtime(&binding.resource.allocation.runtime)
+                .map_err(|_| RocmOwnedDispatchError::DifferentRuntime(binding.target))?;
+        }
         let mut inline_arguments: [HipKernelArgument<'_>; INLINE_ARGUMENTS] =
             std::array::from_fn(|_| HipKernelArgument::Bytes(&[]));
         let mut overflow_arguments = Vec::new();
@@ -455,24 +641,18 @@ impl RocmPreparedDispatch<'_> {
             &overflow_arguments
         };
 
-        // SAFETY: lowering validates the generated kernel ABI as exactly one f32 pointer per
-        // declared binding in declaration order. Core admission validates full binding coverage,
-        // device metadata, access, and type. This adapter additionally verifies actual allocation
-        // length and HIP runtime identity, and HipKernel::launch acquires the shared exclusive
-        // allocation gates and retains module, stream, and allocations through event completion.
-        let hip = unsafe {
-            self.function.launch(
-                &self.stream,
+        // SAFETY: the same validated binding ABI and allocation checks as `submit` apply. The
+        // launch primitive retains all leases in `batch` before enqueue and poisons it on error.
+        unsafe {
+            self.function.launch_into_batch(
+                batch,
                 [self.grid_x, 1, 1],
                 [self.block_size, 1, 1],
                 0,
                 arguments,
-            )?
-        };
-        Ok(RocmOwnedCompletion {
-            hip: Some(hip),
-            terminal: None,
-        })
+            )
+        }?;
+        Ok(())
     }
 }
 
@@ -492,7 +672,7 @@ impl PcuOwnedDispatchBackend for RocmOwnedDispatchBackend {
     type Completion = RocmOwnedCompletion;
     type Error = RocmOwnedDispatchError;
     type Prepared<'kernel, 'parameters>
-        = RocmPreparedDispatch<'kernel>
+        = RocmPreparedDispatch
     where
         Self: 'kernel;
 
@@ -524,14 +704,16 @@ impl PcuOwnedDispatchBackend for RocmOwnedDispatchBackend {
     }
 }
 
-impl PcuPreparedOwnedDispatch for RocmPreparedDispatch<'_> {
+impl PcuPreparedOwnedDispatch for RocmPreparedDispatch {
     type Resource = DeviceBuffer;
     type Bindings = Vec<PcuOwnedBinding<DeviceBuffer>>;
     type Completion = RocmOwnedCompletion;
     type Error = RocmOwnedDispatchError;
 
-    fn kernel(&self) -> &fusion_pcu::PcuDispatchKernelIr<'_> {
-        &self.kernel
+    type BindingSchema = [PcuOwnedBindingRequirement];
+
+    fn binding_schema(&self) -> &Self::BindingSchema {
+        &self.binding_requirements
     }
 
     fn shape(&self) -> fusion_pcu::PcuInvocationShape {
@@ -599,6 +781,7 @@ fn memory_access_supports_binding(available: PcuMemoryAccess, requested: PcuBind
 /// Core completion contract over the HIP event-backed completion token.
 pub struct RocmOwnedCompletion {
     hip: Option<HipCompletion>,
+    fault_word: Option<DeviceBuffer>,
     terminal: Option<PcuCompletionOutcome>,
 }
 
@@ -608,7 +791,9 @@ impl PcuOwnedCompletion for RocmOwnedCompletion {
     fn state(&self) -> Result<PcuCompletionState, Self::Error> {
         Ok(match self.terminal {
             Some(PcuCompletionOutcome::Succeeded) => PcuCompletionState::Succeeded,
-            Some(PcuCompletionOutcome::Failed) => PcuCompletionState::Failed,
+            Some(PcuCompletionOutcome::Failed | PcuCompletionOutcome::Fault(_)) => {
+                PcuCompletionState::Failed
+            }
             None => PcuCompletionState::Running,
         })
     }
@@ -622,9 +807,19 @@ impl PcuOwnedCompletion for RocmOwnedCompletion {
             .as_mut()
             .expect("nonterminal completion retains HIP token");
         hip.wait()?;
+        let outcome = if let Some(fault_word) = self.fault_word.as_ref() {
+            let mut bytes = [0_u8; core::mem::size_of::<u64>()];
+            fault_word.copy_to(&mut bytes)?;
+            let word = u64::from_le_bytes(bytes);
+            decode_fault_word(word)?
+                .map_or(PcuCompletionOutcome::Succeeded, PcuCompletionOutcome::Fault)
+        } else {
+            PcuCompletionOutcome::Succeeded
+        };
         self.hip.take();
-        self.terminal = Some(PcuCompletionOutcome::Succeeded);
-        Ok(PcuCompletionOutcome::Succeeded)
+        self.fault_word.take();
+        self.terminal = Some(outcome);
+        Ok(outcome)
     }
 }
 
@@ -660,7 +855,17 @@ const fn owned_dispatch_support() -> PcuSupport {
         primitives: PcuFeatureSupport::new(PcuPrimitiveCaps::DISPATCH, PcuPrimitiveCaps::empty()),
     };
     support.value_type_support = PcuFeatureSupport::new(
-        PcuValueTypeCaps::FLOAT32.union(PcuValueTypeCaps::SCALAR_VALUES),
+        PcuValueTypeCaps::FLOAT32
+            .union(PcuValueTypeCaps::FLOAT64)
+            .union(PcuValueTypeCaps::INT8)
+            .union(PcuValueTypeCaps::UINT8)
+            .union(PcuValueTypeCaps::UINT16)
+            .union(PcuValueTypeCaps::UINT32)
+            .union(PcuValueTypeCaps::INT32)
+            .union(PcuValueTypeCaps::INT16)
+            .union(PcuValueTypeCaps::UINT64)
+            .union(PcuValueTypeCaps::INT64)
+            .union(PcuValueTypeCaps::SCALAR_VALUES),
         PcuValueTypeCaps::empty(),
     );
     let mut dispatch = PcuDispatchSupport::unsupported();
@@ -671,11 +876,27 @@ const fn owned_dispatch_support() -> PcuSupport {
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
             .union(PcuDispatchOpCaps::CONTROL_LOOP)
             .union(PcuDispatchOpCaps::BINDING_LOAD)
+            .union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
             .union(PcuDispatchOpCaps::BINDING_STORE),
         PcuDispatchOpCaps::empty(),
+    );
+    dispatch.scalar_alu = PcuFeatureSupport::new(
+        fusion_pcu::PcuDispatchScalarAluSupport::empty()
+            .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U16, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I16, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I64, int_alu_caps()),
+        fusion_pcu::PcuDispatchScalarAluSupport::empty(),
     );
     dispatch.features = PcuFeatureSupport::new(
         PcuDispatchFeatureCaps::MUTABLE_RESOURCES
@@ -691,10 +912,37 @@ const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_
     .union(PcuDispatchOpCaps::ALU_SUB)
     .union(PcuDispatchOpCaps::ALU_MUL)
     .union(PcuDispatchOpCaps::ALU_DIV)
+    .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
     .union(PcuDispatchOpCaps::CONTROL_RETURN)
     .union(PcuDispatchOpCaps::CONTROL_LOOP)
     .union(PcuDispatchOpCaps::BINDING_LOAD)
+    .union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
     .union(PcuDispatchOpCaps::BINDING_STORE);
+
+const fn f32_alu_caps() -> PcuDispatchOpCaps {
+    PcuDispatchOpCaps::ALU_ADD
+        .union(PcuDispatchOpCaps::ALU_SUB)
+        .union(PcuDispatchOpCaps::ALU_MUL)
+        .union(PcuDispatchOpCaps::ALU_DIV)
+}
+
+const fn int_alu_caps() -> PcuDispatchOpCaps {
+    PcuDispatchOpCaps::ALU_ADD
+        .union(PcuDispatchOpCaps::ALU_SUB)
+        .union(PcuDispatchOpCaps::ALU_MUL)
+}
+
+const fn checked_u32_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+}
+
+const fn checked_u64_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+}
+
+const fn checked_i32_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+}
 
 const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
     id: PcuExecutorId(0),
@@ -705,8 +953,29 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
         primitives: PcuPrimitiveCaps::DISPATCH,
         dispatch_policy: PcuDispatchPolicyCaps::SERIAL
             .union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION),
-        value_types: PcuValueTypeCaps::FLOAT32.union(PcuValueTypeCaps::SCALAR_VALUES),
+        value_types: PcuValueTypeCaps::FLOAT32
+            .union(PcuValueTypeCaps::FLOAT64)
+            .union(PcuValueTypeCaps::INT8)
+            .union(PcuValueTypeCaps::UINT8)
+            .union(PcuValueTypeCaps::UINT16)
+            .union(PcuValueTypeCaps::UINT32)
+            .union(PcuValueTypeCaps::INT32)
+            .union(PcuValueTypeCaps::INT16)
+            .union(PcuValueTypeCaps::UINT64)
+            .union(PcuValueTypeCaps::INT64)
+            .union(PcuValueTypeCaps::SCALAR_VALUES),
         dispatch_instructions: OWNED_DISPATCH_INSTRUCTIONS,
+        dispatch_scalar_alu: fusion_pcu::PcuDispatchScalarAluSupport::empty()
+            .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U16, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I16, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I64, int_alu_caps()),
         dispatch_features: PcuDispatchFeatureCaps::MUTABLE_RESOURCES
             .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES),
         stream_instructions: fusion_pcu::PcuStreamCapabilities::empty(),
@@ -719,7 +988,12 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
 #[cfg(test)]
 mod tests {
     use super::{
+        decode_fault_word,
+        FAULT_WORD_SENTINEL,
         RocmOwnedDispatchError,
+        OWNED_DISPATCH_INSTRUCTIONS,
+        OWNED_EXECUTORS,
+        owned_dispatch_support,
         find_binding,
         memory_access_supports_binding,
         launch_grid,
@@ -730,14 +1004,37 @@ mod tests {
         PcuBindingType,
         PcuMemoryAccess,
         PcuDeviceIdentity,
+        PcuDispatchOpCaps,
         PcuObjectKind,
         PcuObjectRef,
         PcuOwnedBinding,
         PcuProviderId,
         PcuValueType,
+        PcuExecutionFault,
+        PcuExecutionFaultKind,
     };
 
     struct Noop;
+
+    #[test]
+    fn checked_division_fault_word_decodes_sentinel_and_logical_invocation() {
+        assert_eq!(decode_fault_word(FAULT_WORD_SENTINEL), Ok(None));
+        assert_eq!(
+            decode_fault_word((37_u64 << 2) | 1),
+            Ok(Some(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: 37,
+            }))
+        );
+        assert_eq!(
+            decode_fault_word((37_u64 << 2) | 2),
+            Ok(Some(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                invocation_id: 37,
+            }))
+        );
+        assert!(decode_fault_word((37_u64 << 2) | 3).is_err());
+    }
 
     #[test]
     fn launch_geometry_covers_non_multiple_shapes_without_id_wrap() {
@@ -751,6 +1048,131 @@ mod tests {
             launch_grid(10, 0),
             Err(RocmOwnedDispatchError::InvalidBlockSize)
         ));
+    }
+
+    #[test]
+    fn owned_dispatch_advertises_element_zero_load_support() {
+        let required =
+            PcuDispatchOpCaps::BINDING_LOAD.union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO);
+        assert!(
+            owned_dispatch_support()
+                .dispatch_support
+                .instructions
+                .direct
+                .contains(required)
+        );
+        assert!(OWNED_DISPATCH_INSTRUCTIONS.contains(required));
+        assert!(!PcuDispatchOpCaps::BINDING_LOAD.contains(required));
+    }
+
+    #[test]
+    fn owned_dispatch_advertises_f64_type_with_its_alu_operations() {
+        let required = fusion_pcu::PcuValueTypeCaps::FLOAT64
+            .union(fusion_pcu::PcuValueTypeCaps::SCALAR_VALUES);
+        assert!(
+            owned_dispatch_support()
+                .value_type_support
+                .direct
+                .contains(required)
+        );
+        assert!(OWNED_EXECUTORS[0].support.value_types.contains(required));
+        assert!(
+            owned_dispatch_support()
+                .dispatch_support
+                .scalar_alu
+                .direct
+                .for_scalar(fusion_pcu::PcuScalarType::F64)
+                .contains(PcuDispatchOpCaps::ALU_ADD)
+        );
+    }
+
+    #[test]
+    fn owned_dispatch_advertises_only_supported_u32_alu_operations() {
+        let supported = PcuDispatchOpCaps::ALU_ADD
+            .union(PcuDispatchOpCaps::ALU_SUB)
+            .union(PcuDispatchOpCaps::ALU_MUL);
+        let support = owned_dispatch_support()
+            .dispatch_support
+            .scalar_alu
+            .direct
+            .for_scalar(fusion_pcu::PcuScalarType::U32);
+        assert!(support.contains(supported));
+        assert!(!support.contains(PcuDispatchOpCaps::ALU_DIV));
+        assert!(support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
+        assert!(
+            owned_dispatch_support()
+                .dispatch_support
+                .instructions
+                .direct
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        );
+        assert!(OWNED_DISPATCH_INSTRUCTIONS.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
+        assert!(
+            OWNED_EXECUTORS[0]
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::U32)
+                .contains(supported)
+        );
+        assert!(
+            OWNED_EXECUTORS[0]
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::U32)
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        );
+        assert!(
+            !OWNED_EXECUTORS[0]
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::U32)
+                .contains(PcuDispatchOpCaps::ALU_DIV)
+        );
+        let u64_support = OWNED_EXECUTORS[0]
+            .support
+            .dispatch_scalar_alu
+            .for_scalar(fusion_pcu::PcuScalarType::U64);
+        assert!(u64_support.contains(supported));
+        assert!(u64_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
+        assert!(!u64_support.contains(PcuDispatchOpCaps::ALU_DIV));
+        let u16_support = OWNED_EXECUTORS[0]
+            .support
+            .dispatch_scalar_alu
+            .for_scalar(fusion_pcu::PcuScalarType::U16);
+        assert!(u16_support.contains(supported));
+        assert!(!u16_support.contains(PcuDispatchOpCaps::ALU_DIV));
+        let u8_support = OWNED_EXECUTORS[0]
+            .support
+            .dispatch_scalar_alu
+            .for_scalar(fusion_pcu::PcuScalarType::U8);
+        assert!(u8_support.contains(supported));
+        assert!(!u8_support.contains(PcuDispatchOpCaps::ALU_DIV));
+        let i16_support = OWNED_EXECUTORS[0]
+            .support
+            .dispatch_scalar_alu
+            .for_scalar(fusion_pcu::PcuScalarType::I16);
+        assert!(i16_support.contains(supported));
+        assert!(!i16_support.contains(PcuDispatchOpCaps::ALU_DIV));
+        let i8_support = OWNED_EXECUTORS[0]
+            .support
+            .dispatch_scalar_alu
+            .for_scalar(fusion_pcu::PcuScalarType::I8);
+        assert!(i8_support.contains(supported));
+        assert!(!i8_support.contains(PcuDispatchOpCaps::ALU_DIV));
+        let i32_support = OWNED_EXECUTORS[0]
+            .support
+            .dispatch_scalar_alu
+            .for_scalar(fusion_pcu::PcuScalarType::I32);
+        assert!(i32_support.contains(supported));
+        assert!(i32_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
+        assert!(!i32_support.contains(PcuDispatchOpCaps::ALU_DIV));
+        assert!(
+            !OWNED_EXECUTORS[0]
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::I64)
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        );
     }
 
     #[test]

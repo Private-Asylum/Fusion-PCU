@@ -15,6 +15,22 @@ use core::ops::{
     BitOrAssign,
 };
 
+/// Kind of deterministic arithmetic fault reported by a completed execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuExecutionFaultKind {
+    /// An integer division or remainder used a zero divisor.
+    DivideByZero,
+    /// Signed division or remainder evaluated the minimum value with divisor `-1`.
+    SignedDivisionOverflow,
+}
+
+/// A deterministic arithmetic fault attributed to the first affected logical invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuExecutionFault {
+    pub kind: PcuExecutionFaultKind,
+    pub invocation_id: u64,
+}
+
 /// Scalar element types surfaced by the current PCU core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuScalarType {
@@ -36,6 +52,28 @@ pub enum PcuScalarType {
 }
 
 impl PcuScalarType {
+    /// Number of scalar variants represented by the core scalar vocabulary.
+    pub const COUNT: usize = 15;
+
+    /// All scalar variants in stable capability-table order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Bool,
+        Self::I4,
+        Self::U4,
+        Self::I8,
+        Self::U8,
+        Self::I16,
+        Self::U16,
+        Self::I32,
+        Self::U32,
+        Self::I64,
+        Self::U64,
+        Self::F16,
+        Self::BF16,
+        Self::F32,
+        Self::F64,
+    ];
+
     /// Returns the honest bit width for this scalar type.
     #[must_use]
     pub const fn bit_width(self) -> u8 {

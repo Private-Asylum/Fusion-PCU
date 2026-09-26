@@ -481,6 +481,7 @@ mod tests {
                     dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
                     value_types: PcuValueTypeCaps::empty(),
                     dispatch_instructions: PcuDispatchOpCaps::empty(),
+                    dispatch_scalar_alu: crate::PcuDispatchScalarAluSupport::empty(),
                     dispatch_features: PcuDispatchFeatureCaps::empty(),
                     stream_instructions: PcuStreamCapabilities::empty(),
                     command_instructions: PcuCommandOpCaps::empty(),

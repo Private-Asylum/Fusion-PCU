@@ -16,38 +16,43 @@
 #[cfg(test)]
 extern crate std;
 
-pub mod activation;
-pub mod assessment;
-pub mod borrowed;
 pub mod builder;
 #[path = "contract/contract.rs"]
 pub mod contract;
 pub mod core;
 pub mod dialect;
-pub mod dialect_builder;
-pub mod discovery;
+pub use dialect::builder as dialect_builder;
 pub mod dispatch;
-pub mod f32_map_validation;
 pub mod ir;
-pub mod memory;
+pub mod map_validation;
 #[path = "model/model.rs"]
 pub mod model;
-pub mod owned;
-pub mod registry;
+pub mod resource;
+pub mod runtime;
 pub mod scalar;
 pub mod validation;
 
 pub use contract::*;
-pub use activation::*;
-pub use assessment::*;
+pub use runtime::{
+    activation,
+    assessment,
+    discovery,
+    registry,
+};
+pub use runtime::activation::*;
+pub use runtime::assessment::*;
+pub use runtime::discovery::*;
+pub use runtime::registry::*;
+pub use resource::{
+    borrowed,
+    memory,
+    owned,
+};
 pub use borrowed::*;
 pub use builder::*;
 pub use dispatch::*;
-pub use f32_map_validation::*;
+pub use map_validation::*;
 pub use dialect::*;
-pub use dialect_builder::*;
-pub use discovery::*;
 pub use memory::*;
 pub use owned::*;
-pub use registry::*;
 pub use scalar::*;

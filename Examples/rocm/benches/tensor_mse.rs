@@ -16,6 +16,7 @@ use criterion::{
 use fusion_pcu::PcuOwnedDispatchMemorySession;
 use fusion_pcu_rocm::{
     compile_hip_source_for_device,
+    DeviceBuffer,
     HipKernel,
     HipKernelArgument,
     HipRuntime,
@@ -61,15 +62,28 @@ impl NativeRoute {
         prediction_buffer.copy_from(bytemuck::cast_slice(prediction))?;
         let mut target_buffer = self.runtime.allocate(bytes)?;
         target_buffer.copy_from(bytemuck::cast_slice(target))?;
+        self.execute_resident(&prediction_buffer, &target_buffer, count)
+    }
+
+    fn execute_resident(
+        &self,
+        prediction: &DeviceBuffer,
+        target: &DeviceBuffer,
+        count: usize,
+    ) -> Result<f32, Box<dyn Error>> {
+        if count == 0 {
+            return Err("MSE inputs must be nonempty".into());
+        }
+        let bytes = count
+            .checked_mul(size_of::<f32>())
+            .ok_or("MSE byte size overflow")?;
         let squared = self.runtime.allocate(bytes)?;
-        let mut ones = self.runtime.allocate(bytes)?;
-        ones.copy_from(bytemuck::cast_slice(&vec![1.0_f32; count]))?;
         let output = self.runtime.allocate(size_of::<f32>())?;
         let count_u32 = u32::try_from(count)?;
         let count_bytes = count_u32.to_ne_bytes();
         let arguments = [
-            HipKernelArgument::Buffer(&prediction_buffer),
-            HipKernelArgument::Buffer(&target_buffer),
+            HipKernelArgument::Buffer(prediction),
+            HipKernelArgument::Buffer(target),
             HipKernelArgument::Buffer(&squared),
             HipKernelArgument::Bytes(&count_bytes),
         ];
@@ -89,9 +103,8 @@ impl NativeRoute {
         // Both benchmark sizes are at most 2^20, so their integer divisors are exactly f32.
         #[allow(clippy::cast_precision_loss)]
         let reciprocal = 1.0 / count as f32;
-        self.blas.sgemm(
-            false, false, 1, 1, count, reciprocal, &squared, 1, &ones, count, 0.0, &output, 1,
-        )?;
+        self.blas
+            .sasum_scaled(count, &squared, 1, reciprocal, &output)?;
         let mut result = 0.0_f32;
         output.copy_to(bytemuck::bytes_of_mut(&mut result))?;
         Ok(result)
@@ -118,6 +131,7 @@ fn run(criterion: &mut Criterion) -> Result<(), Box<dyn Error>> {
     .into())
 }
 
+#[allow(clippy::too_many_lines)] // Keeps paired cold, resident, and post-sample checks together.
 fn run_on(
     criterion: &mut Criterion,
     discovery: &RocmDiscovery,
@@ -134,7 +148,9 @@ fn run_on(
         blas: Rocblas::new(&runtime)?,
         runtime,
     };
-    let session = RocmOwnedDispatchBackend::open(discovery, selected.device, 64)?;
+    verify_reduction_contract(&native.runtime, &native.blas)?;
+    // Match the native HIP squared-difference launch geometry.
+    let session = RocmOwnedDispatchBackend::open(discovery, selected.device, 256)?;
     let assessor = RocmTensorAssessor::new(&session)?;
     println!("Device: {}; workload: MSE", selected.name);
     for count in [65_usize, 1_048_576] {
@@ -158,11 +174,36 @@ fn run_on(
         ];
         let reference = graph.evaluate(&inputs)?.value(loss)?.clone();
         let mut memory = PcuOwnedDispatchMemorySession::memory_provider(&session, selected.pool);
+        let prepared = assessor.prepare_graph(&graph, loss)?;
+        let resident_prediction =
+            assessor.upload_input(&inputs[0].1, selected.pool, &mut memory)?;
+        let resident_target = assessor.upload_input(&inputs[1].1, selected.pool, &mut memory)?;
+        let resident_inputs = [
+            (prediction_id, &resident_prediction),
+            (target_id, &resident_target),
+        ];
+        let mut native_prediction = native.runtime.allocate(count * size_of::<f32>())?;
+        native_prediction.copy_from(bytemuck::cast_slice(&prediction))?;
+        let mut native_target = native.runtime.allocate(count * size_of::<f32>())?;
+        native_target.copy_from(bytemuck::cast_slice(&target))?;
         let cold = support::cold_once(&format!("MSE {count} PCU cold"), || {
             assessor.execute_graph(&graph, &inputs, loss, selected.pool, &mut memory)
         })?;
         verify(reference.data(), cold.data())?;
         verify(reference.data(), &[native.execute(&prediction, &target)?])?;
+        let resident_cold = support::cold_once(&format!("MSE {count} PCU resident cold"), || {
+            assessor.execute_prepared_with_resources(
+                &prepared,
+                &resident_inputs,
+                selected.pool,
+                &mut memory,
+            )
+        })?;
+        verify(reference.data(), resident_cold.data())?;
+        verify(
+            reference.data(),
+            &[native.execute_resident(&native_prediction, &native_target, count)?],
+        )?;
         {
             let mut group = criterion.benchmark_group(format!("tensor_mse/{count}"));
             group.throughput(Throughput::Elements(u64::try_from(count)?));
@@ -172,6 +213,15 @@ fn run_on(
                         assessor
                             .execute_graph(&graph, &inputs, loss, selected.pool, &mut memory)
                             .expect("PCU MSE execution failed"),
+                    );
+                });
+            });
+            group.bench_function("pcu_prepared", |bencher| {
+                bencher.iter(|| {
+                    black_box(
+                        assessor
+                            .execute_prepared(&prepared, &inputs, selected.pool, &mut memory)
+                            .expect("prepared PCU MSE execution failed"),
                     );
                 });
             });
@@ -186,6 +236,34 @@ fn run_on(
             });
             group.finish();
         }
+        {
+            let mut group = criterion.benchmark_group(format!("tensor_mse_resident/{count}"));
+            group.throughput(Throughput::Elements(u64::try_from(count)?));
+            group.bench_function("pcu_resident_inputs", |bencher| {
+                bencher.iter(|| {
+                    black_box(
+                        assessor
+                            .execute_prepared_with_resources(
+                                &prepared,
+                                &resident_inputs,
+                                selected.pool,
+                                &mut memory,
+                            )
+                            .expect("resident PCU MSE execution failed"),
+                    );
+                });
+            });
+            group.bench_function("native_resident_inputs", |bencher| {
+                bencher.iter(|| {
+                    black_box(
+                        native
+                            .execute_resident(&native_prediction, &native_target, count)
+                            .expect("resident native MSE execution failed"),
+                    );
+                });
+            });
+            group.finish();
+        }
         verify(
             reference.data(),
             assessor
@@ -193,6 +271,70 @@ fn run_on(
                 .data(),
         )?;
         verify(reference.data(), &[native.execute(&prediction, &target)?])?;
+        let resident_after = assessor.execute_prepared_with_resources(
+            &prepared,
+            &resident_inputs,
+            selected.pool,
+            &mut memory,
+        )?;
+        verify(reference.data(), resident_after.data())?;
+    }
+    Ok(())
+}
+
+fn verify_reduction_contract(runtime: &HipRuntime, blas: &Rocblas) -> Result<(), Box<dyn Error>> {
+    let fixtures = [
+        (
+            "finite nonnegative",
+            (0..1_048_576)
+                .map(|index| match index % 8 {
+                    0 => 0.0_f32,
+                    1 => 0.25,
+                    2 | 6 => 1.0,
+                    3 => f32::MIN_POSITIVE,
+                    4 => 3.0,
+                    5 => 1.0e20,
+                    _ => 2.0,
+                })
+                .collect(),
+            0,
+        ),
+        ("signed zero", vec![-0.0_f32, 0.0, -0.0, 0.0], 1),
+        ("infinity", vec![0.0_f32, f32::INFINITY, 2.0], 2),
+        ("NaN", vec![0.0_f32, f32::NAN, f32::INFINITY], 3),
+    ];
+    for (name, values, expected_kind) in fixtures {
+        let count = values.len();
+        let mut input = runtime.allocate(count * size_of::<f32>())?;
+        input.copy_from(bytemuck::cast_slice(&values))?;
+        let mut ones = runtime.allocate(count * size_of::<f32>())?;
+        ones.copy_from(bytemuck::cast_slice(&vec![1.0_f32; count]))?;
+        let dot = runtime.allocate(size_of::<f32>())?;
+        let asum = runtime.allocate(size_of::<f32>())?;
+        blas.sdot_scaled(count, &input, 1, &ones, 1, 1.0, &dot)?;
+        blas.sasum_scaled(count, &input, 1, 1.0, &asum)?;
+        let mut dot_value = 0.0_f32;
+        let mut asum_value = 0.0_f32;
+        dot.copy_to(bytemuck::bytes_of_mut(&mut dot_value))?;
+        asum.copy_to(bytemuck::bytes_of_mut(&mut asum_value))?;
+        let agrees = match expected_kind {
+            0 => dot_value.to_bits() == asum_value.to_bits(),
+            1 => {
+                dot_value == 0.0
+                    && asum_value == 0.0
+                    && !dot_value.is_sign_negative()
+                    && !asum_value.is_sign_negative()
+            }
+            2 => dot_value.is_infinite() && asum_value.is_infinite(),
+            3 => dot_value.is_nan() && asum_value.is_nan(),
+            _ => unreachable!(),
+        };
+        if !agrees {
+            return Err(format!(
+                "rocBLAS sasum is not a safe MSE reduction replacement for {name}: sdot={dot_value:?}, sasum={asum_value:?}"
+            )
+            .into());
+        }
     }
     Ok(())
 }

@@ -1,596 +1,1603 @@
-//! Opt-in CPU execution oracle for the current scalar `f32` Dispatch subset.
+//! Opt-in CPU execution oracle for the bounded scalar Dispatch and U32 Stream profiles.
 //!
-//! This reference deliberately covers only the direct indexed-map profile shared with the
-//! current `ROCm` and SPIR-V lowerers. It validates the whole program before writing outputs.
+//! The implementation is split by semantic concern: integer maps, floating-point maps,
+//! stream transforms, and f32 program validation/execution.
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 use fusion_pcu::{
-    PcuBindingAccess,
-    PcuBindingRef,
-    PcuDispatchKernelIr,
-    PcuDispatchAluOp,
-    PcuDispatchControlOp,
-    PcuDispatchDataOp,
-    PcuDispatchIndex,
-    PcuDispatchOp,
-    PcuDispatchSubmission,
-    PcuDispatchValueId,
-    PcuHostScalarBinding,
-    PcuHostScalarSlice,
-    PcuInvocationParameters,
-    PcuParameterValue,
-    PcuSynchronousHostDispatchBackend,
-    PcuStreamKernelIr,
-    PcuStreamPattern,
-    PcuStreamValueType,
-    validate_host_scalar_bindings,
+    PcuExecutionFault,
+    PcuExecutionFaultKind,
 };
 
-/// Failure to interpret the normative one-pattern U32 stream profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PcuU32StreamReferenceError {
-    InvalidPortShape,
-    KernelBindingsPresent,
-    ParametersPresent,
-    InvalidPatternCount(usize),
-    UnsupportedPattern(PcuStreamPattern),
-    InvalidPattern(PcuStreamPattern),
-}
-
-/// Stateless, one-word CPU reference for the common U32 Stream transform profile.
-///
-/// A call consumes one logical input word and returns its corresponding output word. FIFO
-/// framing, buffering, and end-of-stream behavior remain the responsibility of an adapter.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PcuU32StreamReference;
-
-impl PcuU32StreamReference {
-    /// Validates and applies the kernel's single U32 transform to one word.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first profile shape or pattern error.
-    pub fn transform(
-        &self,
-        kernel: &PcuStreamKernelIr<'_>,
-        input: u32,
-    ) -> Result<u32, PcuU32StreamReferenceError> {
-        if kernel.simple_transform_type() != Some(PcuStreamValueType::U32) {
-            return Err(PcuU32StreamReferenceError::InvalidPortShape);
-        }
-        if !kernel.bindings.is_empty() {
-            return Err(PcuU32StreamReferenceError::KernelBindingsPresent);
-        }
-        if !kernel.parameters.is_empty() {
-            return Err(PcuU32StreamReferenceError::ParametersPresent);
-        }
-        let [pattern] = kernel.patterns else {
-            return Err(PcuU32StreamReferenceError::InvalidPatternCount(
-                kernel.patterns.len(),
-            ));
-        };
-        apply_u32_stream_pattern(*pattern, input)
-    }
-}
-
-fn apply_u32_stream_pattern(
-    pattern: PcuStreamPattern,
-    input: u32,
-) -> Result<u32, PcuU32StreamReferenceError> {
-    let value = match pattern {
-        PcuStreamPattern::BitReverse => input.reverse_bits(),
-        PcuStreamPattern::BitInvert => !input,
-        PcuStreamPattern::Increment => input.wrapping_add(1),
-        PcuStreamPattern::Decrement => input.wrapping_sub(1),
-        PcuStreamPattern::ShiftLeft { bits } if (1..=32).contains(&bits) => {
-            if bits == 32 {
-                0
-            } else {
-                input << bits
-            }
-        }
-        PcuStreamPattern::ShiftRight { bits } if (1..=32).contains(&bits) => {
-            if bits == 32 {
-                0
-            } else {
-                input >> bits
-            }
-        }
-        PcuStreamPattern::ExtractBits { offset, width }
-            if width >= 1 && offset < 32 && u16::from(offset) + u16::from(width) <= 32 =>
-        {
-            let mask = if width == 32 {
-                u32::MAX
-            } else {
-                (1_u32 << width) - 1
-            };
-            (input >> offset) & mask
-        }
-        PcuStreamPattern::MaskLower { bits } if (1..=32).contains(&bits) => {
-            if bits == 32 {
-                input
-            } else {
-                input & ((1_u32 << bits) - 1)
-            }
-        }
-        PcuStreamPattern::ByteSwap32 => input.swap_bytes(),
-        PcuStreamPattern::AddParameter { .. } | PcuStreamPattern::XorParameter { .. } => {
-            return Err(PcuU32StreamReferenceError::UnsupportedPattern(pattern));
-        }
-        _ => return Err(PcuU32StreamReferenceError::InvalidPattern(pattern)),
-    };
-    Ok(value)
-}
+#[path = "cpu/floats.rs"]
+mod floats;
+#[path = "cpu/integer.rs"]
+mod integer;
+#[path = "cpu/stream.rs"]
+mod stream;
+#[path = "cpu/validation.rs"]
+mod validation;
 
 const VALUE_SLOTS: usize = 256;
 
-/// Failure to interpret the bounded `f32` map profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PcuF32ReferenceError {
-    InvalidSubmission,
-    UnsupportedInstruction(usize),
-    InvalidValue(PcuDispatchValueId),
-    MissingBinding(PcuBindingRef),
-    AccessMismatch(PcuBindingRef),
-    MissingReturn,
-    MissingStore,
-}
-
-/// CPU oracle for the bounded `f32` indexed-map profile.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PcuF32Reference;
-
-// SAFETY: The reference executes on the calling thread, never retains slice references or raw
-// pointers, and returns only after its final read/write has completed, including every error path.
-unsafe impl PcuSynchronousHostDispatchBackend<f32> for PcuF32Reference {
-    type Error = PcuF32ReferenceError;
-
-    fn run_host_direct(
-        &self,
-        submission: PcuDispatchSubmission<'_>,
-        bindings: &mut [PcuHostScalarBinding<'_, f32>],
-        _parameters: PcuInvocationParameters<'_>,
-    ) -> Result<(), Self::Error> {
-        validate_host_scalar_bindings::<f32, ()>(submission, bindings)
-            .map_err(|_| PcuF32ReferenceError::InvalidSubmission)?;
-        validate_program(submission, bindings)?;
-        for invocation in 0..submission.shape.invocation_count().get() as usize {
-            let mut values = [None; VALUE_SLOTS];
-            for op in submission.kernel.ops {
-                match op {
-                    PcuDispatchOp::GridStrideLoop { extent, body } => {
-                        let stride = submission.shape.invocation_count().get() as usize;
-                        let mut logical = invocation;
-                        while logical < *extent as usize {
-                            execute_grid_stride_body(body, logical, bindings)?;
-                            if (*extent as usize - logical) <= stride {
-                                break;
-                            }
-                            logical += stride;
-                        }
-                    }
-                    PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                        result, binding, ..
-                    }) => {
-                        let source = bindings
-                            .iter()
-                            .find(|candidate| candidate.target == *binding)
-                            .ok_or(PcuF32ReferenceError::MissingBinding(*binding))?;
-                        let value = match &source.slice {
-                            PcuHostScalarSlice::Read(slice) => slice[invocation],
-                            PcuHostScalarSlice::ReadWrite(slice) => slice[invocation],
-                        };
-                        values[usize::from(result.0)] = Some(value);
-                    }
-                    PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
-                        let PcuParameterValue::F32(bits) = value else {
-                            unreachable!("preflight checks constants");
-                        };
-                        values[usize::from(result.0)] = Some(f32::from_bits(*bits));
-                    }
-                    PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                        result,
-                        op,
-                        lhs,
-                        rhs,
-                    }) => {
-                        let left = values[usize::from(lhs.0)]
-                            .ok_or(PcuF32ReferenceError::InvalidValue(*lhs))?;
-                        let right = values[usize::from(rhs.0)]
-                            .ok_or(PcuF32ReferenceError::InvalidValue(*rhs))?;
-                        let value = match op {
-                            PcuDispatchAluOp::Add => left + right,
-                            PcuDispatchAluOp::Sub => left - right,
-                            PcuDispatchAluOp::Mul => left * right,
-                            PcuDispatchAluOp::Div => left / right,
-                            PcuDispatchAluOp::Min => f32_min(left, right),
-                            PcuDispatchAluOp::Max => f32_max(left, right),
-                            _ => unreachable!("preflight checks arithmetic"),
-                        };
-                        values[usize::from(result.0)] = Some(value);
-                    }
-                    PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                        binding, value, ..
-                    }) => {
-                        let destination = bindings
-                            .iter_mut()
-                            .find(|candidate| candidate.target == *binding)
-                            .ok_or(PcuF32ReferenceError::MissingBinding(*binding))?;
-                        let PcuHostScalarSlice::ReadWrite(slice) = &mut destination.slice else {
-                            return Err(PcuF32ReferenceError::AccessMismatch(*binding));
-                        };
-                        slice[invocation] = values[usize::from(value.0)]
-                            .ok_or(PcuF32ReferenceError::InvalidValue(*value))?;
-                    }
-                    PcuDispatchOp::Control(PcuDispatchControlOp::Return) => break,
-                    _ => unreachable!("preflight checks instructions"),
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn validate_program(
-    submission: PcuDispatchSubmission<'_>,
-    bindings: &[PcuHostScalarBinding<'_, f32>],
-) -> Result<(), PcuF32ReferenceError> {
-    if let Some((position, extent, body)) =
-        submission
-            .kernel
-            .ops
-            .iter()
-            .enumerate()
-            .find_map(|(position, op)| match op {
-                PcuDispatchOp::GridStrideLoop { extent, body } => Some((position, extent, body)),
-                _ => None,
-            })
-    {
-        if *extent == 0 || submission.kernel.ops.len() != 2 || position != 0 {
-            return Err(PcuF32ReferenceError::UnsupportedInstruction(position));
-        }
-        if !matches!(
-            submission.kernel.ops[1],
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return)
-        ) {
-            return Err(PcuF32ReferenceError::UnsupportedInstruction(position));
-        }
-        validate_grid_stride_body(submission.kernel, body, bindings)?;
-        return Ok(());
-    }
-    let mut defined = [false; VALUE_SLOTS];
-    let mut saw_store = false;
-    let mut saw_return = false;
-    for (position, op) in submission.kernel.ops.iter().copied().enumerate() {
-        if saw_return {
-            return Err(PcuF32ReferenceError::UnsupportedInstruction(position));
-        }
-        match op {
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result,
-                binding,
-                index,
-            }) => {
-                check_index(index, position)?;
-                check_binding(submission.kernel, bindings, binding, false)?;
-                define(&mut defined, result)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
-                if !matches!(value, PcuParameterValue::F32(_)) {
-                    return Err(PcuF32ReferenceError::UnsupportedInstruction(position));
-                }
-                define(&mut defined, result)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                result,
-                op,
-                lhs,
-                rhs,
-            }) => {
-                if !matches!(
-                    op,
-                    PcuDispatchAluOp::Add
-                        | PcuDispatchAluOp::Sub
-                        | PcuDispatchAluOp::Mul
-                        | PcuDispatchAluOp::Div
-                        | PcuDispatchAluOp::Min
-                        | PcuDispatchAluOp::Max
-                ) {
-                    return Err(PcuF32ReferenceError::UnsupportedInstruction(position));
-                }
-                require(&defined, lhs)?;
-                require(&defined, rhs)?;
-                define(&mut defined, result)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding,
-                index,
-                value,
-            }) => {
-                check_index(index, position)?;
-                check_binding(submission.kernel, bindings, binding, true)?;
-                require(&defined, value)?;
-                saw_store = true;
-            }
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return) => saw_return = true,
-            _ => return Err(PcuF32ReferenceError::UnsupportedInstruction(position)),
-        }
-    }
-    if !saw_store {
-        return Err(PcuF32ReferenceError::MissingStore);
-    }
-    if !saw_return {
-        return Err(PcuF32ReferenceError::MissingReturn);
-    }
-    Ok(())
-}
-
-fn f32_min(left: f32, right: f32) -> f32 {
-    if left == 0.0 && right == 0.0 {
-        return f32::from_bits(1 << 31);
-    }
-    left.min(right)
-}
-
-fn f32_max(left: f32, right: f32) -> f32 {
-    if left == 0.0 && right == 0.0 {
-        return 0.0;
-    }
-    left.max(right)
-}
-
-fn validate_grid_stride_body(
-    kernel: &PcuDispatchKernelIr<'_>,
-    body: &[PcuDispatchOp<'_>],
-    bindings: &[PcuHostScalarBinding<'_, f32>],
-) -> Result<(), PcuF32ReferenceError> {
-    let mut saw_store = false;
-    for (position, op) in body.iter().copied().enumerate() {
-        match op {
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result,
-                binding,
-                index,
-            }) => {
-                check_grid_index(index, position)?;
-                check_binding(kernel, bindings, binding, false)?;
-                grid_define(body, position, result)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
-                if !matches!(value, PcuParameterValue::F32(_)) {
-                    return Err(PcuF32ReferenceError::UnsupportedInstruction(position));
-                }
-                grid_define(body, position, result)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                result,
-                op,
-                lhs,
-                rhs,
-            }) => {
-                if !matches!(
-                    op,
-                    PcuDispatchAluOp::Add
-                        | PcuDispatchAluOp::Sub
-                        | PcuDispatchAluOp::Mul
-                        | PcuDispatchAluOp::Div
-                        | PcuDispatchAluOp::Min
-                        | PcuDispatchAluOp::Max
-                ) {
-                    return Err(PcuF32ReferenceError::UnsupportedInstruction(position));
-                }
-                grid_require(body, position, lhs)?;
-                grid_require(body, position, rhs)?;
-                grid_define(body, position, result)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding,
-                index,
-                value,
-            }) => {
-                check_grid_index(index, position)?;
-                check_binding(kernel, bindings, binding, true)?;
-                grid_require(body, position, value)?;
-                saw_store = true;
-            }
-            _ => return Err(PcuF32ReferenceError::UnsupportedInstruction(position)),
-        }
-    }
-    if saw_store {
-        Ok(())
-    } else {
-        Err(PcuF32ReferenceError::MissingStore)
-    }
-}
-
-fn execute_grid_stride_body(
-    body: &[PcuDispatchOp<'_>],
-    logical: usize,
-    bindings: &mut [PcuHostScalarBinding<'_, f32>],
-) -> Result<(), PcuF32ReferenceError> {
-    let mut values = [None; VALUE_SLOTS];
-    for op in body {
-        match op {
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result, binding, ..
-            }) => {
-                let source = bindings
-                    .iter()
-                    .find(|candidate| candidate.target == *binding)
-                    .ok_or(PcuF32ReferenceError::MissingBinding(*binding))?;
-                let value = match &source.slice {
-                    PcuHostScalarSlice::Read(slice) => slice[logical],
-                    PcuHostScalarSlice::ReadWrite(slice) => slice[logical],
-                };
-                values[usize::from(result.0)] = Some(value);
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
-                result,
-                value: PcuParameterValue::F32(bits),
-            }) => {
-                values[usize::from(result.0)] = Some(f32::from_bits(*bits));
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                result,
-                op,
-                lhs,
-                rhs,
-            }) => {
-                let left =
-                    values[usize::from(lhs.0)].ok_or(PcuF32ReferenceError::InvalidValue(*lhs))?;
-                let right =
-                    values[usize::from(rhs.0)].ok_or(PcuF32ReferenceError::InvalidValue(*rhs))?;
-                values[usize::from(result.0)] = Some(match op {
-                    PcuDispatchAluOp::Add => left + right,
-                    PcuDispatchAluOp::Sub => left - right,
-                    PcuDispatchAluOp::Mul => left * right,
-                    PcuDispatchAluOp::Div => left / right,
-                    PcuDispatchAluOp::Min => f32_min(left, right),
-                    PcuDispatchAluOp::Max => f32_max(left, right),
-                    _ => return Err(PcuF32ReferenceError::UnsupportedInstruction(0)),
-                });
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { binding, value, .. }) => {
-                let destination = bindings
-                    .iter_mut()
-                    .find(|candidate| candidate.target == *binding)
-                    .ok_or(PcuF32ReferenceError::MissingBinding(*binding))?;
-                let PcuHostScalarSlice::ReadWrite(slice) = &mut destination.slice else {
-                    return Err(PcuF32ReferenceError::AccessMismatch(*binding));
-                };
-                slice[logical] = values[usize::from(value.0)]
-                    .ok_or(PcuF32ReferenceError::InvalidValue(*value))?;
-            }
-            _ => return Err(PcuF32ReferenceError::UnsupportedInstruction(0)),
-        }
-    }
-    Ok(())
-}
-
-const fn check_grid_index(
-    index: PcuDispatchIndex,
-    position: usize,
-) -> Result<(), PcuF32ReferenceError> {
-    if matches!(index, PcuDispatchIndex::GridStrideId) {
-        Ok(())
-    } else {
-        Err(PcuF32ReferenceError::UnsupportedInstruction(position))
-    }
-}
-
-fn grid_define(
-    body: &[PcuDispatchOp<'_>],
-    position: usize,
-    id: PcuDispatchValueId,
-) -> Result<(), PcuF32ReferenceError> {
-    if usize::from(id.0) >= VALUE_SLOTS
-        || id.0 == 0
-        || body[..position].iter().any(|op| match op {
-            PcuDispatchOp::Data(
-                PcuDispatchDataOp::BindingLoad { result, .. }
-                | PcuDispatchDataOp::Constant { result, .. }
-                | PcuDispatchDataOp::Alu { result, .. },
-            ) => *result == id,
-            _ => false,
-        })
-    {
-        Err(PcuF32ReferenceError::InvalidValue(id))
-    } else {
-        Ok(())
-    }
-}
-
-fn grid_require(
-    body: &[PcuDispatchOp<'_>],
-    position: usize,
-    id: PcuDispatchValueId,
-) -> Result<(), PcuF32ReferenceError> {
-    if usize::from(id.0) < VALUE_SLOTS
-        && body[..position].iter().any(|op| match op {
-            PcuDispatchOp::Data(
-                PcuDispatchDataOp::BindingLoad { result, .. }
-                | PcuDispatchDataOp::Constant { result, .. }
-                | PcuDispatchDataOp::Alu { result, .. },
-            ) => *result == id,
-            _ => false,
-        })
-    {
-        Ok(())
-    } else {
-        Err(PcuF32ReferenceError::InvalidValue(id))
-    }
-}
-
-const fn check_index(index: PcuDispatchIndex, position: usize) -> Result<(), PcuF32ReferenceError> {
-    if matches!(index, PcuDispatchIndex::InvocationId) {
-        Ok(())
-    } else {
-        Err(PcuF32ReferenceError::UnsupportedInstruction(position))
-    }
-}
-
-fn check_binding(
-    kernel: &PcuDispatchKernelIr<'_>,
-    bindings: &[PcuHostScalarBinding<'_, f32>],
-    target: PcuBindingRef,
-    write: bool,
-) -> Result<(), PcuF32ReferenceError> {
-    let Some(declared) = kernel
-        .bindings
-        .iter()
-        .find(|binding| binding.reference() == target)
-    else {
-        return Err(PcuF32ReferenceError::MissingBinding(target));
-    };
-    let Some(binding) = bindings.iter().find(|binding| binding.target == target) else {
-        return Err(PcuF32ReferenceError::MissingBinding(target));
-    };
-    if (write
-        && (declared.access == PcuBindingAccess::ReadOnly
-            || binding.slice.access() != PcuBindingAccess::ReadWrite))
-        || (!write && declared.access == PcuBindingAccess::WriteOnly)
-    {
-        return Err(PcuF32ReferenceError::AccessMismatch(target));
-    }
-    Ok(())
-}
-
-fn define(
-    defined: &mut [bool; VALUE_SLOTS],
-    id: PcuDispatchValueId,
-) -> Result<(), PcuF32ReferenceError> {
-    let Some(slot) = defined.get_mut(usize::from(id.0)) else {
-        return Err(PcuF32ReferenceError::InvalidValue(id));
-    };
-    if id.0 == 0 || *slot {
-        return Err(PcuF32ReferenceError::InvalidValue(id));
-    }
-    *slot = true;
-    Ok(())
-}
-
-fn require(
-    defined: &[bool; VALUE_SLOTS],
-    id: PcuDispatchValueId,
-) -> Result<(), PcuF32ReferenceError> {
-    if defined.get(usize::from(id.0)) == Some(&true) {
-        Ok(())
-    } else {
-        Err(PcuF32ReferenceError::InvalidValue(id))
-    }
-}
+pub use floats::{
+    PcuF32Reference,
+    PcuF32ReferenceError,
+    PcuF64Reference,
+    PcuF64ReferenceError,
+};
+pub use integer::{
+    PcuI8MapReference,
+    PcuI8MapReferenceError,
+    PcuI16MapReference,
+    PcuI16MapReferenceError,
+    PcuI32MapReference,
+    PcuI32MapReferenceError,
+    PcuI64MapReference,
+    PcuI64MapReferenceError,
+    PcuU8MapReference,
+    PcuU8MapReferenceError,
+    PcuU16MapReference,
+    PcuU16MapReferenceError,
+    PcuU32MapReference,
+    PcuU32MapReferenceError,
+    PcuU64MapReference,
+    PcuU64MapReferenceError,
+};
+pub use stream::{
+    PcuU32StreamReference,
+    PcuU32StreamReferenceError,
+};
 
 #[cfg(test)]
 mod tests {
     use core::num::NonZeroU32;
+    use std::boxed::Box;
 
     use super::{
         PcuF32Reference,
         PcuF32ReferenceError,
+        PcuF64Reference,
+        PcuI8MapReference,
+        PcuI16MapReference,
+        PcuI32MapReference,
+        PcuI64MapReference,
+        PcuU8MapReference,
+        PcuU16MapReference,
+        PcuU32MapReference,
+        PcuU64MapReference,
+        PcuExecutionFault,
+        PcuExecutionFaultKind,
         PcuU32StreamReference,
         PcuU32StreamReferenceError,
     };
+
+    #[test]
+    fn u32_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<u32>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u32>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u32>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [u32::MAX, 0, 0x1_0000];
+        let b = [1, 1, 0x1_0000];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [0, 1, 0x2_0000]),
+            (PcuDispatchAluOp::Sub, [u32::MAX - 1, u32::MAX, 0]),
+            (PcuDispatchAluOp::Mul, [u32::MAX, 0, 0]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::u32(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "u32_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U32),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuU32MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("u32 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    fn checked_div_rem_kernel(extent: Option<u32>) -> PcuDispatchKernelIr<'static> {
+        let bindings = Box::leak(Box::new([
+            PcuBinding::scalar::<u32>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u32>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u32>(
+                Some("q"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+            PcuBinding::scalar::<u32>(
+                Some("r"),
+                0,
+                3,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ]));
+        let index = if extent.is_some() {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = Box::leak(Box::new([
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                value_type: PcuValueType::u32(),
+                flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                quotient: PcuDispatchValueId(3),
+                remainder: PcuDispatchValueId(4),
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 3),
+                index,
+                value: PcuDispatchValueId(4),
+            }),
+        ]));
+        let ops = match extent {
+            Some(extent) => Box::leak(Box::new([
+                PcuDispatchOp::GridStrideLoop { extent, body },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])) as &'static [PcuDispatchOp<'static>],
+            None => Box::leak(Box::new([
+                body[0],
+                body[1],
+                body[2],
+                body[3],
+                body[4],
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])),
+        };
+        PcuDispatchKernelIr {
+            id: PcuKernelId(77),
+            entry: PcuDispatchEntryPoint {
+                name: "checked_divrem",
+                logical_shape: [2, 1, 1],
+            },
+            bindings,
+            ports: &[],
+            parameters: &[],
+            ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U32),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        }
+    }
+
+    #[test]
+    fn checked_u32_divrem_cpu_direct_and_grid_and_zero_fault() {
+        for extent in [None, Some(5)] {
+            let count = extent.unwrap_or(2) as usize;
+            let a: std::vec::Vec<u32> = (0..count)
+                .map(|i| 100 + u32::try_from(i).expect("test index fits u32"))
+                .collect();
+            let b = if extent.is_some() {
+                std::vec![3, 4, 5, 0, 2]
+            } else {
+                std::vec![3, 4]
+            };
+            let mut q = std::vec![0; count];
+            let mut r = std::vec![0; count];
+            let kernel = checked_div_rem_kernel(extent);
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+            };
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut q),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 3),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut r),
+                },
+            ];
+            let outcome = PcuU32MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty(),
+            );
+            if extent.is_some() {
+                assert_eq!(
+                    outcome,
+                    Err(super::PcuU32MapReferenceError::Fault(
+                        fusion_pcu::PcuExecutionFault {
+                            kind: fusion_pcu::PcuExecutionFaultKind::DivideByZero,
+                            invocation_id: 3
+                        }
+                    ))
+                );
+            } else {
+                outcome.expect("valid direct DivRem executes");
+                assert_eq!(q, [33, 25]);
+                assert_eq!(r, [1, 1]);
+            }
+        }
+    }
+
+    fn checked_u64_div_rem_kernel(extent: Option<u32>) -> PcuDispatchKernelIr<'static> {
+        let bindings = Box::leak(Box::new([
+            PcuBinding::scalar::<u64>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u64>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u64>(
+                Some("q"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+            PcuBinding::scalar::<u64>(
+                Some("r"),
+                0,
+                3,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ]));
+        let index = if extent.is_some() {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = Box::leak(Box::new([
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                value_type: PcuValueType::u64(),
+                flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                quotient: PcuDispatchValueId(3),
+                remainder: PcuDispatchValueId(4),
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 3),
+                index,
+                value: PcuDispatchValueId(4),
+            }),
+        ]));
+        let ops = match extent {
+            Some(extent) => Box::leak(Box::new([
+                PcuDispatchOp::GridStrideLoop { extent, body },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])) as &'static [PcuDispatchOp<'static>],
+            None => Box::leak(Box::new([
+                body[0],
+                body[1],
+                body[2],
+                body[3],
+                body[4],
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])),
+        };
+        PcuDispatchKernelIr {
+            id: PcuKernelId(78),
+            entry: PcuDispatchEntryPoint {
+                name: "checked_divrem_u64",
+                logical_shape: [2, 1, 1],
+            },
+            bindings,
+            ports: &[],
+            parameters: &[],
+            ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U64),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        }
+    }
+
+    #[test]
+    fn checked_u64_divrem_cpu_direct_and_grid_and_terminal_lowest_zero() {
+        let kernel = checked_u64_div_rem_kernel(None);
+        let a = [u64::MAX, 0x1234_5678_9abc_def0];
+        let b = [2, 3];
+        let mut q = [0; 2];
+        let mut r = [0; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        PcuU64MapReference
+            .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+            .expect("u64 DivRem executes");
+        assert_eq!(q, [u64::MAX / 2, 0x1234_5678_9abc_def0 / 3]);
+        assert_eq!(r, [u64::MAX % 2, 0x1234_5678_9abc_def0 % 3]);
+
+        let kernel = checked_u64_div_rem_kernel(Some(5));
+        let a = [10, 20, 30, 40, 50];
+        let b = [2, 4, 5, 0, 0];
+        let mut q = [91; 5];
+        let mut r = [92; 5];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuU64MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuU64MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: 3,
+            }))
+        );
+        assert_eq!(q, [91; 5]);
+        assert_eq!(r, [92; 5]);
+    }
+
+    fn checked_i32_div_rem_kernel(extent: Option<u32>) -> PcuDispatchKernelIr<'static> {
+        let bindings = Box::leak(Box::new([
+            PcuBinding::scalar::<i32>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i32>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i32>(
+                Some("q"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+            PcuBinding::scalar::<i32>(
+                Some("r"),
+                0,
+                3,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ]));
+        let index = if extent.is_some() {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = Box::leak(Box::new([
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                value_type: PcuValueType::i32(),
+                flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                quotient: PcuDispatchValueId(3),
+                remainder: PcuDispatchValueId(4),
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 3),
+                index,
+                value: PcuDispatchValueId(4),
+            }),
+        ]));
+        let ops = match extent {
+            Some(extent) => Box::leak(Box::new([
+                PcuDispatchOp::GridStrideLoop { extent, body },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])) as &'static [PcuDispatchOp<'static>],
+            None => Box::leak(Box::new([
+                body[0],
+                body[1],
+                body[2],
+                body[3],
+                body[4],
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])),
+        };
+        PcuDispatchKernelIr {
+            id: PcuKernelId(79),
+            entry: PcuDispatchEntryPoint {
+                name: "checked_divrem_i32",
+                logical_shape: [2, 1, 1],
+            },
+            bindings,
+            ports: &[],
+            parameters: &[],
+            ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I32),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checked_i32_divrem_reports_both_fault_kinds_and_lowest_grid_id() {
+        let kernel = checked_i32_div_rem_kernel(None);
+        let a = [-13, 10];
+        let b = [3, -2];
+        let mut q = [0; 2];
+        let mut r = [0; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        PcuI32MapReference
+            .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+            .expect("i32 DivRem executes");
+        assert_eq!(q, [-4, -5]);
+        assert_eq!(r, [-1, 0]);
+
+        let kernel = checked_i32_div_rem_kernel(Some(5));
+        let a = [8, 12, i32::MIN, 99, 20];
+        let b = [2, 3, -1, 0, 0];
+        let mut q = [91; 5];
+        let mut r = [92; 5];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI32MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI32MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                invocation_id: 2,
+            }))
+        );
+        assert_eq!(q, [91; 5]);
+        assert_eq!(r, [92; 5]);
+
+        let kernel = checked_i32_div_rem_kernel(None);
+        let a = [i32::MIN, 0];
+        let b = [-1, 1];
+        let mut q = [91; 2];
+        let mut r = [92; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI32MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI32MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                invocation_id: 0,
+            }))
+        );
+        assert_eq!(q, [91; 2]);
+        assert_eq!(r, [92; 2]);
+
+        let kernel = checked_i32_div_rem_kernel(None);
+        let a = [4, 5];
+        let b = [0, 1];
+        let mut q = [91; 2];
+        let mut r = [92; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI32MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI32MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: 0,
+            }))
+        );
+        assert_eq!(q, [91; 2]);
+        assert_eq!(r, [92; 2]);
+    }
+
+    #[test]
+    fn u16_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<u16>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u16>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u16>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [u16::MAX, 0, 20_000];
+        let b = [1, 1, 3];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [0, 1, 20_003]),
+            (PcuDispatchAluOp::Sub, [u16::MAX - 1, u16::MAX, 19_997]),
+            (PcuDispatchAluOp::Mul, [u16::MAX, 0, 60_000]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::u16(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "u16_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U16),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuU16MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("u16 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn u8_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<u8>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u8>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u8>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [u8::MAX, 0, 20];
+        let b = [1, 1, 3];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [0, 1, 23]),
+            (PcuDispatchAluOp::Sub, [u8::MAX - 1, u8::MAX, 17]),
+            (PcuDispatchAluOp::Mul, [u8::MAX, 0, 60]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::u8(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "u8_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U8),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuU8MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("u8 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn u64_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<u64>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u64>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u64>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [u64::MAX, 0, 0x1_0000_0000];
+        let b = [1, 1, 0x1_0000_0000];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [0, 1, 0x2_0000_0000]),
+            (PcuDispatchAluOp::Sub, [u64::MAX - 1, u64::MAX, 0]),
+            (PcuDispatchAluOp::Mul, [u64::MAX, 0, 0]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::u64(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "u64_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U64),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuU64MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("u64 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn i64_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<i64>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i64>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i64>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [i64::MAX, i64::MIN, -2];
+        let b = [1, -1, i64::MAX];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [i64::MIN, i64::MAX, i64::MAX - 2]),
+            (
+                PcuDispatchAluOp::Sub,
+                [i64::MAX - 1, i64::MIN + 1, i64::MAX],
+            ),
+            (PcuDispatchAluOp::Mul, [i64::MAX, i64::MIN, 2]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::i64(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "i64_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I64),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuI64MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("i64 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn i32_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<i32>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i32>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i32>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [i32::MAX, i32::MIN, -2];
+        let b = [1, -1, i32::MAX];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [i32::MIN, i32::MAX, i32::MAX - 2]),
+            (
+                PcuDispatchAluOp::Sub,
+                [i32::MAX - 1, i32::MIN + 1, i32::MAX],
+            ),
+            (PcuDispatchAluOp::Mul, [i32::MAX, i32::MIN, 2]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::i32(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "i32_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I32),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuI32MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("i32 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn i16_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<i16>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i16>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i16>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [i16::MAX, i16::MIN, -2];
+        let b = [1, -1, i16::MAX];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [i16::MIN, i16::MAX, i16::MAX - 2]),
+            (
+                PcuDispatchAluOp::Sub,
+                [i16::MAX - 1, i16::MIN + 1, i16::MAX],
+            ),
+            (PcuDispatchAluOp::Mul, [i16::MAX, i16::MIN, 2]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::i16(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "i16_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I16),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuI16MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("i16 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn i8_map_reference_wraps_add_sub_and_mul() {
+        let binding_ir = [
+            PcuBinding::scalar::<i8>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i8>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i8>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let a = [i8::MAX, i8::MIN, -2];
+        let b = [1, -1, i8::MAX];
+        for (alu, expected) in [
+            (PcuDispatchAluOp::Add, [i8::MIN, i8::MAX, i8::MAX - 2]),
+            (PcuDispatchAluOp::Sub, [i8::MAX - 1, i8::MIN + 1, i8::MAX]),
+            (PcuDispatchAluOp::Mul, [i8::MAX, i8::MIN, 2]),
+        ] {
+            let ops = [
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index: PcuDispatchIndex::InvocationId,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type: PcuValueType::i8(),
+                    result: PcuDispatchValueId(3),
+                    op: alu,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index: PcuDispatchIndex::InvocationId,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(42),
+                entry: PcuDispatchEntryPoint {
+                    name: "i8_map",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &binding_ir,
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I8),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(3).expect("nonzero")),
+            };
+            let mut output = [0; 3];
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            PcuI8MapReference
+                .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+                .expect("i8 operation executes");
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn u64_map_reference_copies_identity_values() {
+        let binding_ir = [
+            PcuBinding::scalar::<u64>(
+                Some("input"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u64>(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(1),
+            }),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let kernel = PcuDispatchKernelIr {
+            id: PcuKernelId(99),
+            entry: PcuDispatchEntryPoint {
+                name: "u64_identity",
+                logical_shape: [4, 1, 1],
+            },
+            bindings: &binding_ir,
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U64),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        };
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(4).expect("nonzero")),
+        };
+        let input = [0, 1, 1_u64 << 63, u64::MAX];
+        let mut output = [0; 4];
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&input),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::ReadWrite(&mut output),
+            },
+        ];
+        PcuU64MapReference
+            .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+            .expect("u64 identity copy executes");
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn u32_map_reference_executes_chained_wrapping_alu() {
+        let bindings = [
+            PcuBinding::scalar::<u32>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u32>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<u32>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: PcuValueType::u32(),
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Add,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: PcuValueType::u32(),
+                result: PcuDispatchValueId(4),
+                op: PcuDispatchAluOp::Mul,
+                lhs: PcuDispatchValueId(3),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(4),
+            }),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let kernel = PcuDispatchKernelIr {
+            id: PcuKernelId(43),
+            entry: PcuDispatchEntryPoint {
+                name: "u32_chain",
+                logical_shape: [2, 1, 1],
+            },
+            bindings: &bindings,
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U32),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        };
+        let a = [u32::MAX, 3];
+        let b = [2, 4];
+        let mut output = [0; 2];
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut output),
+            },
+        ];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        PcuU32MapReference
+            .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+            .expect("chain executes");
+        assert_eq!(output, [2, 28]);
+    }
     use fusion_pcu::{
         PcuBinding,
         PcuBindingAccess,
@@ -602,6 +1609,7 @@ mod tests {
         PcuDispatchEntryPoint,
         PcuDispatchIndex,
         PcuDispatchKernelIr,
+        PcuDispatchOpCaps,
         PcuDispatchOp,
         PcuDispatchSubmission,
         PcuDispatchValueId,
@@ -617,8 +1625,78 @@ mod tests {
         PcuValueType,
         PcuValueTypeCaps,
         PcuStreamPattern,
+        F32MapBuilder,
+        validate_host_scalar_bindings,
     };
     use fusion_pcu::model::PcuStreamKernelBuilder;
+
+    #[test]
+    fn f32_reference_broadcasts_single_element_binding() {
+        assert!(PcuF32Reference::SUPPORTED_INSTRUCTIONS.contains(
+            PcuDispatchOpCaps::BINDING_LOAD.union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
+        ));
+        let bindings = [
+            PcuBinding::scalar::<f32>(
+                Some("scalar"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f32>(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let (builder, scalar) = F32MapBuilder::<3>::new(7, "broadcast", [4, 1, 1], &bindings)
+            .load_f32_broadcast(PcuBindingRef::new(0, 0))
+            .expect("scalar load");
+        let builder = builder
+            .store_f32(PcuBindingRef::new(0, 1), scalar)
+            .expect("output store");
+        let kernel = builder.ir();
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(4).expect("nonzero")),
+        };
+        let mut rejected_output = [0.0_f32; 4];
+        let rejected_bindings = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&[]),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::ReadWrite(&mut rejected_output),
+            },
+        ];
+        assert!(validate_host_scalar_bindings::<f32, ()>(submission, &rejected_bindings).is_err());
+        let scalar_input = [12.5_f32];
+        let mut output = [0.0_f32; 4];
+        let mut host_bindings = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&scalar_input),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::ReadWrite(&mut output),
+            },
+        ];
+
+        PcuF32Reference
+            .run_host_direct(
+                submission,
+                &mut host_bindings,
+                PcuInvocationParameters::empty(),
+            )
+            .expect("broadcast executes");
+
+        assert_eq!(output.map(f32::to_bits), [12.5_f32; 4].map(f32::to_bits));
+    }
 
     #[test]
     fn u32_stream_reference_matches_common_profile_vectors() {
@@ -748,12 +1826,14 @@ mod tests {
                 index: PcuDispatchIndex::InvocationId,
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
                 result: id2,
                 op: PcuDispatchAluOp::Min,
                 lhs: id0,
                 rhs: id1,
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
                 result: id3,
                 op: PcuDispatchAluOp::Max,
                 lhs: id0,
@@ -911,6 +1991,7 @@ mod tests {
                 value: PcuParameterValue::F32(1.0_f32.to_bits()),
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
                 result: PcuDispatchValueId(3),
                 op: PcuDispatchAluOp::Add,
                 lhs: PcuDispatchValueId(1),
@@ -971,5 +2052,98 @@ mod tests {
             destination.map(f32::to_bits),
             [2.25_f32, 3.5, 4.75, 5.0, 6.0, 7.0, 8.0].map(f32::to_bits)
         );
+    }
+
+    #[test]
+    fn f64_reference_preserves_source_order_for_basic_arithmetic() {
+        let bindings = [
+            PcuBinding::scalar::<f64>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f64>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f64>(
+                Some("out"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: PcuValueType::f64(),
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Add,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let kernel = PcuDispatchKernelIr {
+            id: PcuKernelId(95),
+            entry: PcuDispatchEntryPoint {
+                name: "f64_add",
+                logical_shape: [2, 1, 1],
+            },
+            bindings: &bindings,
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::F64),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        };
+        let a = [1.25_f64, 2.5];
+        let b = [0.5_f64, 4.0];
+        let mut output = [0.0_f64; 2];
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut output),
+            },
+        ];
+        PcuF64Reference
+            .run_host_direct(
+                PcuDispatchSubmission {
+                    kernel: &kernel,
+                    shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+                },
+                &mut host,
+                PcuInvocationParameters::empty(),
+            )
+            .expect("f64 profile executes");
+        assert_eq!(output.map(f64::to_bits), [1.75_f64, 6.5].map(f64::to_bits));
     }
 }

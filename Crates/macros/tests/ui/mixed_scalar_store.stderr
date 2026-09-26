@@ -1,0 +1,5 @@
+error: PCU store value type must match the output binding element type
+ --> tests/ui/mixed_scalar_store.rs:6:26
+  |
+6 |     output[invocation] = input[invocation];
+  |                          ^^^^^^^^^^^^^^^^^

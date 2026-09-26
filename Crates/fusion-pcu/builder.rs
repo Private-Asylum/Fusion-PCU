@@ -73,13 +73,33 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
     /// # Errors
     ///
     /// Returns an error when the binding is missing, incompatible, or operation storage is full.
-    pub fn load_f32(mut self, binding: PcuBindingRef) -> Result<(Self, F32Value), PcuError> {
+    pub fn load_f32(self, binding: PcuBindingRef) -> Result<(Self, F32Value), PcuError> {
+        self.load_f32_at(binding, PcuDispatchIndex::InvocationId)
+    }
+
+    /// Load element zero from one scalar resource and reuse it for every invocation.
+    ///
+    /// The referenced host or device binding must contain at least one `f32`; it need not be
+    /// sized to the invocation count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding is missing, incompatible, or operation storage is full.
+    pub fn load_f32_broadcast(self, binding: PcuBindingRef) -> Result<(Self, F32Value), PcuError> {
+        self.load_f32_at(binding, PcuDispatchIndex::BindingElementZero)
+    }
+
+    fn load_f32_at(
+        mut self,
+        binding: PcuBindingRef,
+        index: PcuDispatchIndex,
+    ) -> Result<(Self, F32Value), PcuError> {
         self.check_binding(binding, false)?;
         let value = self.fresh_value()?;
         self.push(PcuDispatchDataOp::BindingLoad {
             result: PcuDispatchValueId(value.id),
             binding,
-            index: PcuDispatchIndex::InvocationId,
+            index,
         })?;
         Ok((self, value))
     }
@@ -109,6 +129,7 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
         self.check_value(rhs)?;
         let result = self.fresh_value()?;
         self.push(PcuDispatchDataOp::Alu {
+            value_type: crate::PcuValueType::f32(),
             result: PcuDispatchValueId(result.id),
             op: PcuDispatchAluOp::Add,
             lhs: PcuDispatchValueId(lhs.id),
@@ -128,6 +149,7 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
         self.check_value(rhs)?;
         let result = self.fresh_value()?;
         self.push(PcuDispatchDataOp::Alu {
+            value_type: crate::PcuValueType::f32(),
             result: PcuDispatchValueId(result.id),
             op: PcuDispatchAluOp::Mul,
             lhs: PcuDispatchValueId(lhs.id),

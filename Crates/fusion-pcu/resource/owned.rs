@@ -126,11 +126,207 @@ pub enum PcuOwnedDispatchBindingError {
     TypeMismatch(PcuBindingRef),
     UnsupportedLayout(PcuBindingRef),
     UnsupportedPorts,
+    BindingCountMismatch {
+        expected: usize,
+        available: usize,
+    },
     BufferTooSmall {
         binding: PcuBindingRef,
         required: u64,
         available: u64,
     },
+}
+
+/// Minimum owned binding metadata required by one prepared Dispatch executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuOwnedBindingRequirement {
+    pub target: PcuBindingRef,
+    pub access: PcuBindingAccess,
+    pub binding_type: PcuBindingType,
+    pub min_required_bytes: u64,
+}
+
+/// Owned, backend-neutral binding admission schema for a prepared Dispatch executable.
+///
+/// The fixed array keeps this usable in `no_std` builds without requiring an allocator.
+/// Construct it from a verified kernel before discarding the source IR. `N` must equal the
+/// declared binding count; construction rejects a mismatch explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuOwnedDispatchBindingSchema<const N: usize> {
+    shape: PcuInvocationShape,
+    requirements: [PcuOwnedBindingRequirement; N],
+}
+
+impl<const N: usize> PcuOwnedDispatchBindingSchema<N> {
+    /// Copies binding requirements from a verified kernel for one fixed invocation shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns a binding-count mismatch or unsupported layout when the schema cannot represent
+    /// the verified kernel's requirements.
+    pub fn from_verified_kernel(
+        kernel: &PcuDispatchKernelIr<'_>,
+        shape: PcuInvocationShape,
+    ) -> Result<Self, PcuOwnedDispatchBindingError> {
+        if kernel.bindings.len() != N {
+            return Err(PcuOwnedDispatchBindingError::BindingCountMismatch {
+                expected: N,
+                available: kernel.bindings.len(),
+            });
+        }
+        let mut requirements = [PcuOwnedBindingRequirement {
+            target: PcuBindingRef::new(0, 0),
+            access: PcuBindingAccess::ReadOnly,
+            binding_type: PcuBindingType::Value(crate::PcuValueType::f32()),
+            min_required_bytes: 0,
+        }; N];
+        for (slot, declared) in requirements.iter_mut().zip(kernel.bindings) {
+            *slot = PcuOwnedBindingRequirement::from_verified_binding(
+                kernel,
+                declared.reference(),
+                shape,
+            )?;
+        }
+        Ok(Self {
+            shape,
+            requirements,
+        })
+    }
+
+    #[must_use]
+    pub const fn shape(&self) -> PcuInvocationShape {
+        self.shape
+    }
+
+    #[must_use]
+    pub const fn requirements(&self) -> &[PcuOwnedBindingRequirement; N] {
+        &self.requirements
+    }
+
+    /// Validates complete coverage and metadata without accessing source IR.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first duplicate, missing, unexpected, mismatched, or undersized binding.
+    pub fn validate<R>(
+        &self,
+        device: PcuDeviceIdentity,
+        bindings: &[PcuOwnedBinding<R>],
+    ) -> Result<(), PcuOwnedDispatchBindingError> {
+        validate_owned_binding_requirements(&self.requirements, device, bindings)
+    }
+}
+
+impl PcuOwnedBindingRequirement {
+    /// Copies one binding's metadata and minimum byte extent from a verified kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnsupportedLayout` when the binding has no scalar byte-layout rule.
+    pub fn from_verified_binding(
+        kernel: &PcuDispatchKernelIr<'_>,
+        target: PcuBindingRef,
+        shape: PcuInvocationShape,
+    ) -> Result<Self, PcuOwnedDispatchBindingError> {
+        let Some(declared) = kernel.bindings.iter().find(|b| b.reference() == target) else {
+            return Err(PcuOwnedDispatchBindingError::Unexpected(target));
+        };
+        let Some(bytes_per_element) = scalar_value_bytes(declared.binding_type) else {
+            return Err(PcuOwnedDispatchBindingError::UnsupportedLayout(target));
+        };
+        let elements = kernel.minimum_binding_elements_for(target, shape.invocation_count().get());
+        let Some(min_required_bytes) = bytes_per_element.checked_mul(u64::from(elements)) else {
+            return Err(PcuOwnedDispatchBindingError::UnsupportedLayout(target));
+        };
+        Ok(Self {
+            target,
+            access: declared.access,
+            binding_type: declared.binding_type,
+            min_required_bytes,
+        })
+    }
+}
+
+/// Type-erased validation interface for fixed-size owned binding schemas.
+pub trait PcuOwnedDispatchBindingSchemaContract {
+    /// Validates bindings against this schema and the selected device.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first duplicate, missing, unexpected, mismatched, or undersized binding.
+    fn validate<R>(
+        &self,
+        device: PcuDeviceIdentity,
+        bindings: &[PcuOwnedBinding<R>],
+    ) -> Result<(), PcuOwnedDispatchBindingError>;
+}
+
+impl<const N: usize> PcuOwnedDispatchBindingSchemaContract for PcuOwnedDispatchBindingSchema<N> {
+    fn validate<R>(
+        &self,
+        device: PcuDeviceIdentity,
+        bindings: &[PcuOwnedBinding<R>],
+    ) -> Result<(), PcuOwnedDispatchBindingError> {
+        Self::validate(self, device, bindings)
+    }
+}
+
+impl PcuOwnedDispatchBindingSchemaContract for [PcuOwnedBindingRequirement] {
+    fn validate<R>(
+        &self,
+        device: PcuDeviceIdentity,
+        bindings: &[PcuOwnedBinding<R>],
+    ) -> Result<(), PcuOwnedDispatchBindingError> {
+        validate_owned_binding_requirements(self, device, bindings)
+    }
+}
+
+/// Validates owned bindings against an owned requirement slice.
+///
+/// # Errors
+///
+/// Returns the first duplicate, missing, unexpected, mismatched, or undersized binding.
+pub fn validate_owned_binding_requirements<R>(
+    requirements: &[PcuOwnedBindingRequirement],
+    device: PcuDeviceIdentity,
+    bindings: &[PcuOwnedBinding<R>],
+) -> Result<(), PcuOwnedDispatchBindingError> {
+    for (index, binding) in bindings.iter().enumerate() {
+        if bindings[..index]
+            .iter()
+            .any(|previous| previous.target == binding.target)
+        {
+            return Err(PcuOwnedDispatchBindingError::Duplicate(binding.target));
+        }
+        let Some(required) = requirements.iter().find(|r| r.target == binding.target) else {
+            return Err(PcuOwnedDispatchBindingError::Unexpected(binding.target));
+        };
+        if binding.device != device {
+            return Err(PcuOwnedDispatchBindingError::WrongDevice(binding.target));
+        }
+        if !access_supports(binding.access, required.access) {
+            return Err(PcuOwnedDispatchBindingError::AccessMismatch(binding.target));
+        }
+        if binding.binding_type != required.binding_type {
+            return Err(PcuOwnedDispatchBindingError::TypeMismatch(binding.target));
+        }
+        if binding.byte_len < required.min_required_bytes {
+            return Err(PcuOwnedDispatchBindingError::BufferTooSmall {
+                binding: binding.target,
+                required: required.min_required_bytes,
+                available: binding.byte_len,
+            });
+        }
+    }
+    for required in requirements {
+        if !bindings
+            .iter()
+            .any(|binding| binding.target == required.target)
+        {
+            return Err(PcuOwnedDispatchBindingError::Missing(required.target));
+        }
+    }
+    Ok(())
 }
 
 /// Failure returned by the common owned Dispatch admission path.
@@ -273,10 +469,12 @@ pub trait PcuOwnedDispatchBackend: PcuBaseContract {
 pub trait PcuPreparedOwnedDispatch {
     type Resource;
     type Bindings: AsRef<[PcuOwnedBinding<Self::Resource>]>;
+    type BindingSchema: PcuOwnedDispatchBindingSchemaContract + ?Sized;
     type Completion: PcuOwnedCompletion;
     type Error;
 
-    fn kernel(&self) -> &PcuDispatchKernelIr<'_>;
+    /// Owned admission metadata captured during preparation; independent of source IR lifetime.
+    fn binding_schema(&self) -> &Self::BindingSchema;
     fn shape(&self) -> PcuInvocationShape;
     fn device_identity(&self) -> PcuDeviceIdentity;
 
@@ -301,13 +499,9 @@ pub trait PcuPreparedOwnedDispatch {
         &self,
         bindings: Self::Bindings,
     ) -> Result<Self::Completion, PcuOwnedDispatchError<Self::Error>> {
-        validate_owned_dispatch_bindings(
-            self.kernel(),
-            self.shape(),
-            self.device_identity(),
-            bindings.as_ref(),
-        )
-        .map_err(PcuOwnedDispatchError::Binding)?;
+        self.binding_schema()
+            .validate(self.device_identity(), bindings.as_ref())
+            .map_err(PcuOwnedDispatchError::Binding)?;
         self.submit_owned_direct(bindings)
             .map_err(PcuOwnedDispatchError::Backend)
     }
@@ -400,7 +594,8 @@ pub fn validate_owned_dispatch_bindings<R>(
                 binding.target,
             ));
         };
-        let required_elements = kernel.minimum_binding_elements(shape.invocation_count().get());
+        let required_elements =
+            kernel.minimum_binding_elements_for(binding.target, shape.invocation_count().get());
         let Some(required) = bytes_per_element.checked_mul(u64::from(required_elements)) else {
             return Err(PcuOwnedDispatchBindingError::UnsupportedLayout(
                 binding.target,
@@ -467,13 +662,25 @@ impl PcuCompletionState {
 
 /// Terminal result of a finite operation.
 ///
-/// Both variants mean the operation is quiescent: the device no longer accesses resources owned
-/// by the completion handle. Backend-specific diagnostics can be retained on the handle or
-/// exposed through its error type.
+/// Every variant means the operation is quiescent: the device no longer accesses resources owned
+/// by the completion handle. A structured arithmetic fault identifies its kind and first
+/// invocation; backends may retain additional diagnostics on the handle or its error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuCompletionOutcome {
     Succeeded,
     Failed,
+    Fault(crate::PcuExecutionFault),
+}
+
+/// Error returned by [`PcuOwnedSubmission::wait_result`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuSubmissionWaitError<E> {
+    /// The backend could not establish completion; the submission remains owned and retryable.
+    Backend(E),
+    /// Completion is terminal and quiescent, but failed without a structured execution fault.
+    Failed,
+    /// Completion is terminal and quiescent with a deterministic arithmetic fault.
+    Fault(crate::PcuExecutionFault),
 }
 
 /// Owned completion contract for one finite operation.
@@ -506,14 +713,184 @@ pub trait PcuOwnedCompletion {
     fn wait(&mut self) -> Result<PcuCompletionOutcome, Self::Error>;
 }
 
+/// Coarse status exposed by the allocation-free core submission queue.
+///
+/// `Unknown` means the backend could not establish progress. It is deliberately distinct from
+/// either terminal result and must never be treated as permission to reuse or release storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuQueueCompletionStatus {
+    Pending,
+    Running,
+    Complete,
+    Failed,
+    Unknown,
+}
+
+/// One queued finite operation together with every resource whose lifetime it protects.
+///
+/// This is a small provider-independent ownership envelope, not a scheduler. The backend may
+/// complete synchronously or asynchronously through [`PcuOwnedCompletion`]. The resource bundle
+/// is returned only after terminal quiescence is observed. If the envelope is dropped while its
+/// status is pending, running, or unknown, both completion and resources are intentionally
+/// forgotten so their destructors cannot free storage that may still be in use.
+#[derive(Debug)]
+pub struct PcuOwnedSubmission<C, R>
+where
+    C: PcuOwnedCompletion,
+{
+    completion: Option<C>,
+    resources: Option<R>,
+    terminal: Option<PcuCompletionOutcome>,
+    terminal_confirmed_by_wait: bool,
+}
+
+impl<C, R> PcuOwnedSubmission<C, R>
+where
+    C: PcuOwnedCompletion,
+{
+    /// Places one backend completion and its retained resource bundle in the core queue.
+    #[must_use]
+    pub const fn new(completion: C, resources: R) -> Self {
+        Self {
+            completion: Some(completion),
+            resources: Some(resources),
+            terminal: None,
+            terminal_confirmed_by_wait: false,
+        }
+    }
+
+    /// Queries progress, mapping a backend query error to the conservative `Unknown` state.
+    pub fn status(&mut self) -> PcuQueueCompletionStatus {
+        if let Some(outcome) = self.terminal {
+            return status_from_outcome(outcome);
+        }
+        let Some(completion) = self.completion.as_ref() else {
+            return PcuQueueCompletionStatus::Unknown;
+        };
+        match completion.state() {
+            Ok(PcuCompletionState::Pending) => PcuQueueCompletionStatus::Pending,
+            Ok(PcuCompletionState::Running) => PcuQueueCompletionStatus::Running,
+            Ok(PcuCompletionState::Succeeded) => {
+                self.terminal = Some(PcuCompletionOutcome::Succeeded);
+                PcuQueueCompletionStatus::Complete
+            }
+            Ok(PcuCompletionState::Failed) => {
+                self.terminal = Some(PcuCompletionOutcome::Failed);
+                PcuQueueCompletionStatus::Failed
+            }
+            Err(_) => PcuQueueCompletionStatus::Unknown,
+        }
+    }
+
+    /// Waits for terminal completion. An error leaves ownership in the queue for retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's error when it cannot establish completion.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if internal ownership invariants have been violated; public methods never
+    /// remove the completion handle.
+    pub fn wait(&mut self) -> Result<PcuCompletionOutcome, C::Error> {
+        if let Some(outcome) = self.terminal
+            && (outcome != PcuCompletionOutcome::Failed || self.terminal_confirmed_by_wait)
+        {
+            return Ok(outcome);
+        }
+        let outcome = self
+            .completion
+            .as_mut()
+            .expect("live submission always owns its completion")
+            .wait()?;
+        self.terminal = Some(outcome);
+        self.terminal_confirmed_by_wait = true;
+        Ok(outcome)
+    }
+
+    /// Waits for completion and lifts terminal failure and arithmetic fault into a typed result.
+    ///
+    /// A backend error is uncertain and leaves completion and resources owned for retry. The
+    /// `Failed` and `Fault` variants are terminal and quiescent, so retained resources may be
+    /// extracted safely after either result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcuSubmissionWaitError::Backend`] when backend completion remains uncertain,
+    /// [`PcuSubmissionWaitError::Failed`] for an unstructured terminal failure, or
+    /// [`PcuSubmissionWaitError::Fault`] for a structured execution fault.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the submission's internal completion ownership invariant is violated.
+    pub fn wait_result(&mut self) -> Result<(), PcuSubmissionWaitError<C::Error>> {
+        let outcome = match self.terminal {
+            Some(PcuCompletionOutcome::Succeeded) => return Ok(()),
+            Some(PcuCompletionOutcome::Fault(fault)) => {
+                return Err(PcuSubmissionWaitError::Fault(fault));
+            }
+            Some(PcuCompletionOutcome::Failed) if self.terminal_confirmed_by_wait => {
+                return Err(PcuSubmissionWaitError::Failed);
+            }
+            Some(PcuCompletionOutcome::Failed) => {
+                self.wait().map_err(PcuSubmissionWaitError::Backend)?
+            }
+            None => self.wait().map_err(PcuSubmissionWaitError::Backend)?,
+        };
+        match outcome {
+            PcuCompletionOutcome::Succeeded => Ok(()),
+            PcuCompletionOutcome::Failed => Err(PcuSubmissionWaitError::Failed),
+            PcuCompletionOutcome::Fault(fault) => Err(PcuSubmissionWaitError::Fault(fault)),
+        }
+    }
+
+    /// Extracts the retained resource bundle after terminal quiescence has been confirmed.
+    ///
+    /// Returns `None` while the operation is pending, running, or unknown.
+    pub fn take_resources(&mut self) -> Option<R> {
+        self.terminal.map(|_| ())?;
+        self.resources.take()
+    }
+}
+
+impl<C, R> Drop for PcuOwnedSubmission<C, R>
+where
+    C: PcuOwnedCompletion,
+{
+    fn drop(&mut self) {
+        if self.terminal.is_none() {
+            // `forget` is safe and intentionally prevents unconfirmed native/device resources
+            // from being released by either their own destructor or the completion destructor.
+            if let Some(completion) = self.completion.take() {
+                core::mem::forget(completion);
+            }
+            if let Some(resources) = self.resources.take() {
+                core::mem::forget(resources);
+            }
+        }
+    }
+}
+
+const fn status_from_outcome(outcome: PcuCompletionOutcome) -> PcuQueueCompletionStatus {
+    match outcome {
+        PcuCompletionOutcome::Succeeded => PcuQueueCompletionStatus::Complete,
+        PcuCompletionOutcome::Failed | PcuCompletionOutcome::Fault(_) => {
+            PcuQueueCompletionStatus::Failed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         PcuCompletionOutcome,
         PcuCompletionState,
+        PcuSubmissionWaitError,
         PcuDeviceIdentity,
         PcuOwnedBinding,
         PcuOwnedCompletion,
+        PcuOwnedSubmission,
+        PcuQueueCompletionStatus,
         PcuOwnedDispatchBackend,
         PcuOwnedDispatchBindingError,
         PcuPreparedOwnedDispatch,
@@ -604,19 +981,21 @@ mod tests {
     }
 
     struct FakePrepared<'kernel> {
-        kernel: &'kernel crate::PcuDispatchKernelIr<'kernel>,
+        schema: super::PcuOwnedDispatchBindingSchema<1>,
         shape: PcuInvocationShape,
         device: PcuDeviceIdentity,
+        marker: core::marker::PhantomData<&'kernel ()>,
     }
 
     impl PcuPreparedOwnedDispatch for FakePrepared<'_> {
         type Resource = Resource;
         type Bindings = [PcuOwnedBinding<Resource>; 1];
+        type BindingSchema = super::PcuOwnedDispatchBindingSchema<1>;
         type Completion = FakeCompletion;
         type Error = &'static str;
 
-        fn kernel(&self) -> &crate::PcuDispatchKernelIr<'_> {
-            self.kernel
+        fn binding_schema(&self) -> &Self::BindingSchema {
+            &self.schema
         }
 
         fn shape(&self) -> PcuInvocationShape {
@@ -679,9 +1058,14 @@ mod tests {
             _parameters: PcuInvocationParameters<'parameters>,
         ) -> Result<Self::Prepared<'kernel, 'parameters>, Self::Error> {
             Ok(FakePrepared {
-                kernel: submission.kernel,
+                schema: super::PcuOwnedDispatchBindingSchema::from_verified_kernel(
+                    submission.kernel,
+                    submission.shape,
+                )
+                .expect("test kernel has supported binding layout"),
                 shape: submission.shape,
                 device: self.device,
+                marker: core::marker::PhantomData,
             })
         }
     }
@@ -806,13 +1190,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owned_schema_copies_binding_element_zero_and_invocation_extents() {
+        use crate::{
+            PcuDispatchDataOp,
+            PcuDispatchIndex,
+            PcuDispatchOp,
+            PcuDispatchValueId,
+        };
+        let declarations = [
+            PcuBinding::scalar::<f32>(
+                Some("scalar"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f32>(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::BindingElementZero,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(1),
+            }),
+        ];
+        let builder = PcuDispatchKernelBuilder::<2>::new(1, "broadcast", [64, 1, 1])
+            .with_bindings(&declarations)
+            .with_ops(&ops)
+            .expect("operations fit");
+        let shape = PcuInvocationShape::invocations(core::num::NonZeroU32::new(64).unwrap());
+        let schema =
+            super::PcuOwnedDispatchBindingSchema::<2>::from_verified_kernel(&builder.ir(), shape)
+                .unwrap();
+        assert_eq!(schema.shape(), shape);
+        assert_eq!(schema.requirements()[0].min_required_bytes, 4);
+        assert_eq!(schema.requirements()[1].min_required_bytes, 256);
+        assert_eq!(
+            super::PcuOwnedDispatchBindingSchema::<1>::from_verified_kernel(&builder.ir(), shape),
+            Err(PcuOwnedDispatchBindingError::BindingCountMismatch {
+                expected: 1,
+                available: 2,
+            })
+        );
+    }
+
     impl PcuOwnedCompletion for FakeCompletion {
         type Error = &'static str;
 
         fn state(&self) -> Result<PcuCompletionState, Self::Error> {
             Ok(match self.terminal {
                 Some(PcuCompletionOutcome::Succeeded) => PcuCompletionState::Succeeded,
-                Some(PcuCompletionOutcome::Failed) => PcuCompletionState::Failed,
+                Some(PcuCompletionOutcome::Failed | PcuCompletionOutcome::Fault(_)) => {
+                    PcuCompletionState::Failed
+                }
                 None if self.attempts == 0 => PcuCompletionState::Pending,
                 None => PcuCompletionState::Running,
             })
@@ -898,5 +1340,202 @@ mod tests {
         assert!(!accepted_drop.get());
         drop(completion);
         assert!(accepted_drop.get());
+    }
+
+    struct QueueFixtureCompletion {
+        outcome: Option<PcuCompletionOutcome>,
+        query_fails: bool,
+        wait_fails: bool,
+        drops: Rc<Cell<u32>>,
+    }
+
+    impl Drop for QueueFixtureCompletion {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    impl PcuOwnedCompletion for QueueFixtureCompletion {
+        type Error = &'static str;
+
+        fn state(&self) -> Result<PcuCompletionState, Self::Error> {
+            if self.query_fails {
+                return Err("status unavailable");
+            }
+            Ok(match self.outcome {
+                Some(PcuCompletionOutcome::Succeeded) => PcuCompletionState::Succeeded,
+                Some(PcuCompletionOutcome::Failed | PcuCompletionOutcome::Fault(_)) => {
+                    PcuCompletionState::Failed
+                }
+                None => PcuCompletionState::Running,
+            })
+        }
+
+        fn wait(&mut self) -> Result<PcuCompletionOutcome, Self::Error> {
+            if self.wait_fails {
+                return Err("wait uncertain");
+            }
+            let outcome = self.outcome.unwrap_or(PcuCompletionOutcome::Succeeded);
+            self.outcome = Some(outcome);
+            Ok(outcome)
+        }
+    }
+
+    struct QueueFixtureResource(Rc<Cell<u32>>);
+
+    impl Drop for QueueFixtureResource {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn queue_quarantines_unknown_and_releases_after_terminal_wait() {
+        let completion_drops = Rc::new(Cell::new(0));
+        let resource_drops = Rc::new(Cell::new(0));
+        {
+            let mut queued = PcuOwnedSubmission::new(
+                QueueFixtureCompletion {
+                    outcome: None,
+                    query_fails: true,
+                    wait_fails: true,
+                    drops: Rc::clone(&completion_drops),
+                },
+                QueueFixtureResource(Rc::clone(&resource_drops)),
+            );
+            assert_eq!(queued.status(), PcuQueueCompletionStatus::Unknown);
+            assert!(queued.take_resources().is_none());
+            assert_eq!(queued.wait(), Err("wait uncertain"));
+        }
+        assert_eq!(completion_drops.get(), 0);
+        assert_eq!(resource_drops.get(), 0);
+
+        let completion_drops = Rc::new(Cell::new(0));
+        let resource_drops = Rc::new(Cell::new(0));
+        {
+            let mut queued = PcuOwnedSubmission::new(
+                QueueFixtureCompletion {
+                    outcome: None,
+                    query_fails: false,
+                    wait_fails: false,
+                    drops: Rc::clone(&completion_drops),
+                },
+                QueueFixtureResource(Rc::clone(&resource_drops)),
+            );
+            assert_eq!(queued.status(), PcuQueueCompletionStatus::Running);
+            assert_eq!(queued.wait(), Ok(PcuCompletionOutcome::Succeeded));
+            assert_eq!(queued.status(), PcuQueueCompletionStatus::Complete);
+            drop(queued.take_resources());
+        }
+        assert_eq!(completion_drops.get(), 1);
+        assert_eq!(resource_drops.get(), 1);
+    }
+
+    #[test]
+    fn queue_accepts_synchronous_terminal_failure_as_quiescent() {
+        let completion_drops = Rc::new(Cell::new(0));
+        let resource_drops = Rc::new(Cell::new(0));
+        let mut queued = PcuOwnedSubmission::new(
+            QueueFixtureCompletion {
+                outcome: Some(PcuCompletionOutcome::Failed),
+                query_fails: false,
+                wait_fails: false,
+                drops: Rc::clone(&completion_drops),
+            },
+            QueueFixtureResource(Rc::clone(&resource_drops)),
+        );
+        assert_eq!(queued.status(), PcuQueueCompletionStatus::Failed);
+        drop(queued);
+        assert_eq!(completion_drops.get(), 1);
+        assert_eq!(resource_drops.get(), 1);
+    }
+
+    #[test]
+    fn wait_result_distinguishes_backend_failure_generic_failure_and_fault() {
+        let completion_drops = Rc::new(Cell::new(0));
+        let resource_drops = Rc::new(Cell::new(0));
+        let mut uncertain = PcuOwnedSubmission::new(
+            QueueFixtureCompletion {
+                outcome: None,
+                query_fails: false,
+                wait_fails: true,
+                drops: Rc::clone(&completion_drops),
+            },
+            QueueFixtureResource(Rc::clone(&resource_drops)),
+        );
+        assert_eq!(
+            uncertain.wait_result(),
+            Err(PcuSubmissionWaitError::Backend("wait uncertain"))
+        );
+        assert!(uncertain.take_resources().is_none());
+        drop(uncertain);
+        assert_eq!(completion_drops.get(), 0);
+        assert_eq!(resource_drops.get(), 0);
+
+        let completion_drops = Rc::new(Cell::new(0));
+        let resource_drops = Rc::new(Cell::new(0));
+        let fault = crate::PcuExecutionFault {
+            kind: crate::PcuExecutionFaultKind::DivideByZero,
+            invocation_id: 17,
+        };
+        let mut faulted = PcuOwnedSubmission::new(
+            QueueFixtureCompletion {
+                outcome: Some(PcuCompletionOutcome::Fault(fault)),
+                query_fails: false,
+                wait_fails: false,
+                drops: Rc::clone(&completion_drops),
+            },
+            QueueFixtureResource(Rc::clone(&resource_drops)),
+        );
+        assert_eq!(faulted.status(), PcuQueueCompletionStatus::Failed);
+        assert_eq!(
+            faulted.wait_result(),
+            Err(PcuSubmissionWaitError::Fault(fault))
+        );
+        drop(faulted.take_resources());
+        drop(faulted);
+        assert_eq!(completion_drops.get(), 1);
+        assert_eq!(resource_drops.get(), 1);
+
+        let mut failed = PcuOwnedSubmission::new(
+            QueueFixtureCompletion {
+                outcome: Some(PcuCompletionOutcome::Failed),
+                query_fails: false,
+                wait_fails: false,
+                drops: Rc::new(Cell::new(0)),
+            },
+            (),
+        );
+        assert_eq!(failed.wait_result(), Err(PcuSubmissionWaitError::Failed));
+        assert_eq!(failed.status(), PcuQueueCompletionStatus::Failed);
+    }
+
+    #[test]
+    fn wait_refreshes_status_only_failure_to_recover_structured_fault() {
+        let completion_drops = Rc::new(Cell::new(0));
+        let resource_drops = Rc::new(Cell::new(0));
+        let fault = crate::PcuExecutionFault {
+            kind: crate::PcuExecutionFaultKind::SignedDivisionOverflow,
+            invocation_id: 29,
+        };
+        let mut queued = PcuOwnedSubmission::new(
+            QueueFixtureCompletion {
+                outcome: Some(PcuCompletionOutcome::Fault(fault)),
+                query_fails: false,
+                wait_fails: false,
+                drops: Rc::clone(&completion_drops),
+            },
+            QueueFixtureResource(Rc::clone(&resource_drops)),
+        );
+        assert_eq!(queued.status(), PcuQueueCompletionStatus::Failed);
+        assert_eq!(queued.wait(), Ok(PcuCompletionOutcome::Fault(fault)));
+        assert_eq!(
+            queued.wait_result(),
+            Err(PcuSubmissionWaitError::Fault(fault))
+        );
+        drop(queued.take_resources());
+        drop(queued);
+        assert_eq!(completion_drops.get(), 1);
+        assert_eq!(resource_drops.get(), 1);
     }
 }

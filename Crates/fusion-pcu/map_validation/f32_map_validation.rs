@@ -32,7 +32,8 @@ pub enum PcuF32MapValidationError {
 
 /// Validates the shared f32 indexed-map IR law before any backend-specific assessment.
 ///
-/// This profile admits only storage buffers of scalar f32, invocation-ID indexed loads/stores,
+/// This profile admits only storage buffers of scalar f32, invocation-ID indexed loads, element-
+/// zero broadcast loads, invocation-ID indexed stores,
 /// f32 constants, f32 add/subtract/multiply/divide/minimum/maximum, and one terminal return. It
 /// does not assert
 /// backend numeric equivalence or resource availability. The current cross-backend numeric
@@ -102,7 +103,7 @@ pub fn validate_f32_map_kernel(
                 binding,
                 index,
             }) => {
-                check_index(index, position)?;
+                check_load_index(index, position)?;
                 check_binding(kernel, binding, false)?;
                 define(kernel, position, result)?;
             }
@@ -113,11 +114,15 @@ pub fn validate_f32_map_kernel(
                 define(kernel, position, result)?;
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type,
                 result,
                 op,
                 lhs,
                 rhs,
             }) => {
+                if value_type != PcuValueType::f32() {
+                    return Err(PcuF32MapValidationError::UnsupportedOperation(position));
+                }
                 if !matches!(
                     op,
                     PcuDispatchAluOp::Add
@@ -138,7 +143,7 @@ pub fn validate_f32_map_kernel(
                 index,
                 value,
             }) => {
-                check_index(index, position)?;
+                check_store_index(index, position)?;
                 check_binding(kernel, binding, true)?;
                 require(kernel, position, value)?;
                 saw_store = true;
@@ -168,7 +173,7 @@ fn validate_grid_stride_body(
                 binding,
                 index,
             }) => {
-                check_grid_index(index, body_position)?;
+                check_grid_load_index(index, body_position)?;
                 check_binding(kernel, binding, false)?;
                 define_in(body, body_position, result)?;
             }
@@ -181,11 +186,17 @@ fn validate_grid_stride_body(
                 define_in(body, body_position, result)?;
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type,
                 result,
                 op,
                 lhs,
                 rhs,
             }) => {
+                if value_type != PcuValueType::f32() {
+                    return Err(PcuF32MapValidationError::UnsupportedOperation(
+                        body_position,
+                    ));
+                }
                 if !matches!(
                     op,
                     PcuDispatchAluOp::Add
@@ -208,7 +219,7 @@ fn validate_grid_stride_body(
                 index,
                 value,
             }) => {
-                check_grid_index(index, body_position)?;
+                check_grid_store_index(index, body_position)?;
                 check_binding(kernel, binding, true)?;
                 require_in(body, body_position, value)?;
                 saw_store = true;
@@ -227,7 +238,21 @@ fn validate_grid_stride_body(
     }
 }
 
-const fn check_index(
+const fn check_load_index(
+    index: PcuDispatchIndex,
+    position: usize,
+) -> Result<(), PcuF32MapValidationError> {
+    if matches!(
+        index,
+        PcuDispatchIndex::InvocationId | PcuDispatchIndex::BindingElementZero
+    ) {
+        Ok(())
+    } else {
+        Err(PcuF32MapValidationError::InvalidIndex(position))
+    }
+}
+
+const fn check_store_index(
     index: PcuDispatchIndex,
     position: usize,
 ) -> Result<(), PcuF32MapValidationError> {
@@ -238,7 +263,21 @@ const fn check_index(
     }
 }
 
-const fn check_grid_index(
+const fn check_grid_load_index(
+    index: PcuDispatchIndex,
+    position: usize,
+) -> Result<(), PcuF32MapValidationError> {
+    if matches!(
+        index,
+        PcuDispatchIndex::GridStrideId | PcuDispatchIndex::BindingElementZero
+    ) {
+        Ok(())
+    } else {
+        Err(PcuF32MapValidationError::InvalidIndex(position))
+    }
+}
+
+const fn check_grid_store_index(
     index: PcuDispatchIndex,
     position: usize,
 ) -> Result<(), PcuF32MapValidationError> {
@@ -370,6 +409,7 @@ mod tests {
     };
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercises the accepted profile and two distinct SSA failures together.
     fn accepts_builder_ir_and_rejects_duplicate_or_unbound_values() {
         let bindings = [
             PcuBinding::scalar::<f32>(
@@ -408,12 +448,14 @@ mod tests {
                 value: crate::PcuParameterValue::F32(2.0_f32.to_bits()),
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: crate::PcuValueType::f32(),
                 result: PcuDispatchValueId(3),
                 op: PcuDispatchAluOp::Min,
                 lhs: PcuDispatchValueId(1),
                 rhs: PcuDispatchValueId(2),
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: crate::PcuValueType::f32(),
                 result: PcuDispatchValueId(4),
                 op: PcuDispatchAluOp::Max,
                 lhs: PcuDispatchValueId(1),
@@ -459,6 +501,7 @@ mod tests {
             ))
         );
         let unbound = [PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+            value_type: crate::PcuValueType::f32(),
             result: PcuDispatchValueId(2),
             op: PcuDispatchAluOp::Add,
             lhs: PcuDispatchValueId(1),

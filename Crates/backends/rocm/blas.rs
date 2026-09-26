@@ -23,6 +23,8 @@ use super::{
     HipError,
     HipRuntime,
 };
+#[cfg(feature = "tensor")]
+use super::HipStreamHandle;
 
 type RocblasStatus = c_int;
 type RocblasHandle = *mut c_void;
@@ -53,10 +55,14 @@ type Sdot = unsafe extern "C" fn(
     c_int,
     *mut f32,
 ) -> RocblasStatus;
+type Sasum =
+    unsafe extern "C" fn(RocblasHandle, c_int, *const f32, c_int, *mut f32) -> RocblasStatus;
 type Sscal =
     unsafe extern "C" fn(RocblasHandle, c_int, *const f32, *mut f32, c_int) -> RocblasStatus;
 type GetPointerMode = unsafe extern "C" fn(RocblasHandle, *mut c_int) -> RocblasStatus;
 type SetPointerMode = unsafe extern "C" fn(RocblasHandle, c_int) -> RocblasStatus;
+#[cfg(feature = "tensor")]
+type SetStream = unsafe extern "C" fn(RocblasHandle, *mut c_void) -> RocblasStatus;
 
 const ROCBLAS_SUCCESS: RocblasStatus = 0;
 const ROCBLAS_OPERATION_NONE: c_int = 111;
@@ -142,6 +148,8 @@ pub struct Rocblas {
     library: Arc<Library>,
     handle: RocblasHandle,
     poisoned: Cell<bool>,
+    #[cfg(feature = "tensor")]
+    bound_stream: Option<HipStreamHandle>,
 }
 
 impl Rocblas {
@@ -195,6 +203,10 @@ impl Rocblas {
                     unsafe { library.get::<Sdot>(b"rocblas_sdot\0") }.map(|_| ()),
                 ),
                 (
+                    "rocblas_sasum",
+                    unsafe { library.get::<Sasum>(b"rocblas_sasum\0") }.map(|_| ()),
+                ),
+                (
                     "rocblas_sscal",
                     unsafe { library.get::<Sscal>(b"rocblas_sscal\0") }.map(|_| ()),
                 ),
@@ -226,11 +238,47 @@ impl Rocblas {
                 library,
                 handle,
                 poisoned: Cell::new(false),
+                #[cfg(feature = "tensor")]
+                bound_stream: None,
             });
         }
         Err(RocblasError::LibraryUnavailable(
             last_error.unwrap_or_else(|| "no library candidates".into()),
         ))
+    }
+
+    /// Binds this handle to a selected HIP stream before graph operations are submitted.
+    ///
+    /// The handle retains the stream owner. Call only while no rocBLAS operation is in flight;
+    /// the tensor adapter binds once during preparation and keeps its synchronous behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity, missing-symbol, or rocBLAS status error.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn bind_stream(&mut self, stream: &HipStreamHandle) -> Result<(), RocblasError> {
+        if self.bound_stream.is_some() {
+            return Err(RocblasError::Busy);
+        }
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocblasError::DifferentRuntime);
+        }
+        self.runtime.hip_set_device(self.runtime.0.device)?;
+        // SAFETY: rocblas_set_stream has the documented C ABI in rocblas-auxiliary.h.
+        let set_stream = unsafe { self.library.get::<SetStream>(b"rocblas_set_stream\0") }
+            .map_err(|error| RocblasError::MissingSymbol {
+                symbol: "rocblas_set_stream",
+                detail: error.to_string(),
+            })?;
+        let status = unsafe { set_stream(self.handle, stream.raw_stream()) };
+        if status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_set_stream",
+                code: status,
+            });
+        }
+        self.bound_stream = Some(stream.clone());
+        Ok(())
     }
 
     /// Compute column-major `C = alpha * op(A) * op(B) + beta * C` and wait for device completion.
@@ -528,6 +576,171 @@ impl Rocblas {
             return Err(RocblasError::Status {
                 operation: "rocblas_sdot",
                 code: dot_status,
+            });
+        }
+        if scale_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_sscal",
+                code: scale_status,
+            });
+        }
+        Ok(())
+    }
+
+    /// Compute `result[0] = scale * sum(abs(x))` on the device and wait for completion.
+    ///
+    /// rocBLAS writes the reduction result through a device pointer, then scales that scalar in
+    /// place. This is suitable for reducing MSE's squared-difference buffer without allocating a
+    /// same-length vector of ones. For finite nonnegative values, the mathematical reduction is
+    /// equivalent to a dot product with ones; rocBLAS does not promise bitwise-identical reduction
+    /// order or NaN payload behavior relative to [`Self::sdot_scaled`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid extents or strides, a different runtime/device, buffer use,
+    /// or a HIP/rocBLAS failure. If completion or pointer-mode restoration is uncertain, the
+    /// handle is poisoned and cannot admit further work.
+    #[allow(clippy::too_many_lines)]
+    pub fn sasum_scaled(
+        &self,
+        n: usize,
+        x: &DeviceBuffer,
+        incx: usize,
+        scale: f32,
+        result: &DeviceBuffer,
+    ) -> Result<(), RocblasError> {
+        if self.poisoned.get() {
+            return Err(RocblasError::CompletionUnknown);
+        }
+        if n == 0 || incx == 0 {
+            return Err(RocblasError::InvalidVector(
+                "length and strides must be positive",
+            ));
+        }
+        let x_required = vector_bytes(n, incx)?;
+        if x_required > x.len() {
+            return Err(RocblasError::BufferTooSmall {
+                matrix: "x",
+                allocation: x.len(),
+                required: x_required,
+            });
+        }
+        if result.len() < size_of::<f32>() {
+            return Err(RocblasError::BufferTooSmall {
+                matrix: "result",
+                allocation: result.len(),
+                required: size_of::<f32>(),
+            });
+        }
+        for buffer in [x, result] {
+            self.runtime
+                .ensure_same_runtime(&buffer.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+        }
+        if Rc::ptr_eq(&x.allocation, &result.allocation) {
+            return Err(RocblasError::AliasedBuffers);
+        }
+        let x_lease = x.acquire_access().map_err(|_| RocblasError::Busy)?;
+        let result_lease = result.acquire_access().map_err(|_| RocblasError::Busy)?;
+        let (n, incx) = (
+            c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(incx).map_err(|_| RocblasError::DimensionOverflow)?,
+        );
+        self.runtime.hip_set_device(self.runtime.0.device)?;
+        // SAFETY: symbols match rocBLAS public declarations; leased allocations remain alive
+        // until synchronization confirms the operation has completed.
+        let get_mode = unsafe {
+            self.library
+                .get::<GetPointerMode>(b"rocblas_get_pointer_mode\0")
+        }
+        .map_err(|e| RocblasError::MissingSymbol {
+            symbol: "rocblas_get_pointer_mode",
+            detail: e.to_string(),
+        })?;
+        let set_mode = unsafe {
+            self.library
+                .get::<SetPointerMode>(b"rocblas_set_pointer_mode\0")
+        }
+        .map_err(|e| RocblasError::MissingSymbol {
+            symbol: "rocblas_set_pointer_mode",
+            detail: e.to_string(),
+        })?;
+        let sasum = unsafe { self.library.get::<Sasum>(b"rocblas_sasum\0") }.map_err(|e| {
+            RocblasError::MissingSymbol {
+                symbol: "rocblas_sasum",
+                detail: e.to_string(),
+            }
+        })?;
+        let sscal = unsafe { self.library.get::<Sscal>(b"rocblas_sscal\0") }.map_err(|e| {
+            RocblasError::MissingSymbol {
+                symbol: "rocblas_sscal",
+                detail: e.to_string(),
+            }
+        })?;
+        let mut prior_mode = ROCBLAS_POINTER_MODE_HOST;
+        let get_status = unsafe { get_mode(self.handle, &raw mut prior_mode) };
+        if get_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_get_pointer_mode",
+                code: get_status,
+            });
+        }
+        let set_status = unsafe { set_mode(self.handle, ROCBLAS_POINTER_MODE_DEVICE) };
+        if set_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_set_pointer_mode",
+                code: set_status,
+            });
+        }
+        let reduction_status = unsafe {
+            sasum(
+                self.handle,
+                n,
+                x.allocation.pointer.cast(),
+                incx,
+                result.allocation.pointer.cast(),
+            )
+        };
+        let scale_status = if reduction_status == ROCBLAS_SUCCESS {
+            let host_status = unsafe { set_mode(self.handle, ROCBLAS_POINTER_MODE_HOST) };
+            if host_status == ROCBLAS_SUCCESS {
+                unsafe {
+                    sscal(
+                        self.handle,
+                        1,
+                        std::ptr::from_ref(&scale),
+                        result.allocation.pointer.cast(),
+                        1,
+                    )
+                }
+            } else {
+                host_status
+            }
+        } else {
+            ROCBLAS_SUCCESS
+        };
+        let restore_status = unsafe { set_mode(self.handle, prior_mode) };
+        let sync = self.runtime.call(
+            "hipDeviceSynchronize",
+            |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
+        );
+        if let Err(error) = sync {
+            self.poisoned.set(true);
+            std::mem::forget(x_lease);
+            std::mem::forget(result_lease);
+            return Err(error.into());
+        }
+        if restore_status != ROCBLAS_SUCCESS {
+            self.poisoned.set(true);
+            return Err(RocblasError::Status {
+                operation: "rocblas_set_pointer_mode(restore)",
+                code: restore_status,
+            });
+        }
+        if reduction_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_sasum",
+                code: reduction_status,
             });
         }
         if scale_status != ROCBLAS_SUCCESS {

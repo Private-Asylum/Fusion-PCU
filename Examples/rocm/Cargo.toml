@@ -30,6 +30,10 @@ path = "rtc.rs"
 name = "fusion-rocm-train-step"
 path = "train_step.rs"
 
+[[bin]]
+name = "fusion-rocm-fma-witness"
+path = "fma_witness.rs"
+
 [[bench]]
 name = "dispatch"
 path = "benches/dispatch.rs"
@@ -68,6 +72,101 @@ harness = false
 [[bench]]
 name = "tensor_mlp_train"
 path = "benches/tensor_mlp_train.rs"
+harness = false
+
+[[bench]]
+name = "tensor_sgd_contract"
+path = "benches/tensor_sgd_contract.rs"
+harness = false
+
+[[bench]]
+name = "tensor_uniform"
+path = "benches/tensor_uniform.rs"
+harness = false
+
+[[bench]]
+name = "tensor_add_relu_fusion"
+path = "benches/tensor_add_relu_fusion.rs"
+harness = false
+
+[[bench]]
+name = "tensor_add_sub_chain"
+path = "benches/tensor_add_sub_chain.rs"
+harness = false
+
+[[bench]]
+name = "tensor_add_sub_identity"
+path = "benches/tensor_add_sub_identity.rs"
+harness = false
+
+[[bench]]
+name = "tensor_mul_chain"
+path = "benches/tensor_mul_chain.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u32"
+path = "benches/dispatch_u32.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u32_alu"
+path = "benches/dispatch_u32_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u32_checked_div_rem"
+path = "benches/dispatch_u32_checked_div_rem.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u64_checked_div_rem"
+path = "benches/dispatch_u64_checked_div_rem.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_i32_checked_div_rem"
+path = "benches/dispatch_i32_checked_div_rem.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u16_alu"
+path = "benches/dispatch_u16_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u8_alu"
+path = "benches/dispatch_u8_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u64_alu"
+path = "benches/dispatch_u64_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_i64_alu"
+path = "benches/dispatch_i64_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_i32_alu"
+path = "benches/dispatch_i32_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_i16_alu"
+path = "benches/dispatch_i16_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_i8_alu"
+path = "benches/dispatch_i8_alu.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_f64_alu"
+path = "benches/dispatch_f64_alu.rs"
 harness = false
 
 [dependencies]

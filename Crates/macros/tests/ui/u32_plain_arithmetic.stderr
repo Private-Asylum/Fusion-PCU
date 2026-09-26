@@ -1,0 +1,5 @@
+error: PCU floating arithmetic requires matching f32 or f64 operands
+ --> tests/ui/u32_plain_arithmetic.rs:8:26
+  |
+8 |     output[invocation] = input[invocation] + rhs[invocation];
+  |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

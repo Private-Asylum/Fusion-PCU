@@ -4,6 +4,7 @@ use super::caps::{
     PcuCommandOpCaps,
     PcuDispatchOpCaps,
     PcuDispatchPolicyCaps,
+    PcuDispatchScalarAluSupport,
     PcuPrimitiveCaps,
     PcuSignalOpCaps,
     PcuTransactionFeatureCaps,
@@ -65,6 +66,7 @@ pub struct PcuExecutorSupport {
     pub dispatch_policy: PcuDispatchPolicyCaps,
     pub value_types: PcuValueTypeCaps,
     pub dispatch_instructions: PcuDispatchOpCaps,
+    pub dispatch_scalar_alu: PcuDispatchScalarAluSupport,
     pub dispatch_features: PcuDispatchFeatureCaps,
     pub stream_instructions: PcuStreamCapabilities,
     pub command_instructions: PcuCommandOpCaps,
@@ -80,6 +82,7 @@ impl PcuExecutorSupport {
             dispatch_policy: PcuDispatchPolicyCaps::empty(),
             value_types: PcuValueTypeCaps::empty(),
             dispatch_instructions: PcuDispatchOpCaps::empty(),
+            dispatch_scalar_alu: PcuDispatchScalarAluSupport::empty(),
             dispatch_features: PcuDispatchFeatureCaps::empty(),
             stream_instructions: PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::empty(),
@@ -103,13 +106,17 @@ impl PcuExecutorSupport {
         self,
         kernel: crate::PcuDispatchKernelIr<'_>,
     ) -> bool {
-        self.primitives.contains(PcuPrimitiveCaps::DISPATCH)
+        !kernel.has_non_scalar_alu_type()
+            && self.primitives.contains(PcuPrimitiveCaps::DISPATCH)
             && self
                 .dispatch_policy
                 .contains(kernel.required_dispatch_policy())
             && self
                 .dispatch_instructions
                 .contains(kernel.required_instruction_support())
+            && self
+                .dispatch_scalar_alu
+                .supports(kernel.required_scalar_alu_support())
     }
 
     #[must_use]
@@ -175,6 +182,14 @@ mod tests {
         PcuCommandOpCaps,
         PcuCommandStep,
         PcuDispatchFeatureCaps,
+        PcuDispatchAluOp,
+        PcuDispatchDataOp,
+        PcuDispatchEntryPoint,
+        PcuDispatchKernelIr,
+        PcuDispatchOp,
+        PcuDispatchOpCaps,
+        PcuDispatchScalarAluSupport,
+        PcuDispatchValueId,
         PcuDispatchPolicyCaps,
         PcuKernel,
         PcuKernelId,
@@ -203,12 +218,50 @@ mod tests {
     }
 
     #[test]
+    fn executor_requires_type_specific_alu_support() {
+        let mut support = PcuExecutorSupport::unsupported();
+        support.primitives = PcuPrimitiveCaps::DISPATCH;
+        support.dispatch_policy = PcuDispatchPolicyCaps::ORDERED_SUBMISSION;
+        support.value_types =
+            PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES;
+        support.dispatch_instructions = PcuDispatchOpCaps::ALU_ADD;
+        support.dispatch_scalar_alu = PcuDispatchScalarAluSupport::empty()
+            .with(crate::PcuScalarType::F32, PcuDispatchOpCaps::ALU_ADD);
+        let ops = [PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+            result: PcuDispatchValueId(3),
+            op: PcuDispatchAluOp::Add,
+            value_type: PcuValueType::u32(),
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        })];
+        let kernel = PcuDispatchKernelIr {
+            id: PcuKernelId(12),
+            entry: PcuDispatchEntryPoint {
+                name: "u32-add-capability",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        assert!(!support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
+        support.dispatch_scalar_alu = support
+            .dispatch_scalar_alu
+            .with(crate::PcuScalarType::U32, PcuDispatchOpCaps::ALU_ADD);
+        assert!(support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
+    }
+
+    #[test]
     fn executor_support_requires_dispatch_policy() {
         let support = PcuExecutorSupport {
             primitives: PcuPrimitiveCaps::COMMAND,
             dispatch_policy: PcuDispatchPolicyCaps::empty(),
             value_types: crate::PcuValueTypeCaps::empty(),
             dispatch_instructions: crate::PcuDispatchOpCaps::empty(),
+            dispatch_scalar_alu: crate::PcuDispatchScalarAluSupport::empty(),
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
             stream_instructions: crate::PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::WRITE,
@@ -231,6 +284,7 @@ mod tests {
                 dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
                 value_types: crate::PcuValueTypeCaps::empty(),
                 dispatch_instructions: crate::PcuDispatchOpCaps::empty(),
+                dispatch_scalar_alu: crate::PcuDispatchScalarAluSupport::empty(),
                 dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
                 stream_instructions: crate::PcuStreamCapabilities::empty(),
                 command_instructions: PcuCommandOpCaps::WRITE,
@@ -249,6 +303,7 @@ mod tests {
             dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
             value_types: crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
             dispatch_instructions: crate::PcuDispatchOpCaps::ALU_ADD,
+            dispatch_scalar_alu: crate::PcuDispatchScalarAluSupport::empty(),
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
             stream_instructions: crate::PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::empty(),
@@ -279,6 +334,7 @@ mod tests {
             dispatch_policy: PcuDispatchPolicyCaps::ORDERED_SUBMISSION,
             value_types: crate::PcuValueTypeCaps::UINT32 | crate::PcuValueTypeCaps::SCALAR_VALUES,
             dispatch_instructions: crate::PcuDispatchOpCaps::ALU_ADD,
+            dispatch_scalar_alu: crate::PcuDispatchScalarAluSupport::empty(),
             dispatch_features: crate::PcuDispatchFeatureCaps::empty(),
             stream_instructions: crate::PcuStreamCapabilities::empty(),
             command_instructions: PcuCommandOpCaps::empty(),

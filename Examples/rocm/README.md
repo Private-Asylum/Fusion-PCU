@@ -25,14 +25,27 @@ cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-tensor --relea
 cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-rtc --release
 cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-train-step --release
 cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch
+cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch_u32
+cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch_u32_alu
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_relu
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mse
+cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_uniform
+cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add_relu_fusion
+cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add_sub_chain
+cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add_sub_identity
+cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mul_chain
+cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_sgd_contract
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_resident
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_train_step
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mlp_train
 ```
+
+`dispatch_u32_alu` pairs a macro-authored `wrapping_add` kernel with an independent HIP
+unsigned-add kernel at 65 and 1,048,576 elements. Both keep three buffers resident, verify
+overflow results, and report prepared PCU versus native whole-route submission/completion and
+benchmark-thread Rust allocations. Cold PCU compilation is reported separately.
 
 `fusion-rocm-tensor` builds a small two-layer MLP forward graph
 (`MatMul → Add → ReLU → MatMul`), asks an explicitly selected ROCm
@@ -68,6 +81,11 @@ resident buffers. It runs a 65-element
 orchestration-heavy case and a 1,048,576-element memory-traffic case with identical launch
 geometry and verified output. The generated and handwritten kernels may compile to different
 machine code; interpret total-time differences as whole-route results, not pure PCU call overhead.
+The `dispatch_u32` target applies the same paired setup to a concrete `#[pcu]` u32 identity copy
+and a handwritten native HIP copy. A third timed case compares a macro-authored grid-stride copy
+against an independent native HIP grid-stride loop: 250 logical invocations cover 2048 elements.
+Both paths verify the full output, and the PCU grid-stride path also runs a correctness preflight.
+U32 arithmetic remains outside ROCm's supported subset.
 The Cargo `[[bench]]` targets use Criterion with a custom harness; the shared configuration uses
 30 samples, a 300 ms warmup, and a two-second measurement window per case. The dispatch target
 keeps paired, alternating PCU/native launches inside its Criterion measurement and reports PCU binding
@@ -119,13 +137,50 @@ the CPU reference contract.
 One RX 6900 XT Criterion run estimated 72.25 µs PCU versus 59.56 µs HIP at 65 elements, and
 1.22 ms versus 1.19 ms at 1,048,576 elements. First PCU execution took about 0.75 seconds.
 
+The `tensor_add_relu_fusion` target isolates the opt-in PCU `SingleUseAddRelu` grouping at 65 and
+1,048,576 f32 elements. It compares the prepared separate Add/ReLU schedule, the grouped PCU
+schedule, and a handwritten single-kernel HIP peer. Inputs and PCU scratch/output banks are
+resident across samples; the native peer also reuses its two input buffers and one output buffer.
+Graph preparation, compilation, uploads, device allocation, correctness readback, and output
+verification are outside Criterion sampling. Samples include submission and completion, but no
+readback. This measures the execution path with its selected schedule and associated resident
+storage footprint, rather than allocation or transfer cost. Both PCU variants and HIP are checked
+bitwise against the same CPU result before and after sampling.
+
+The `tensor_add_sub_chain` target extends that comparison to a three-step Add/Sub/Add chain
+ending in ReLU. It compares separate PCU kernels, the opt-in bounded group, and a native HIP
+single kernel at 65 and 1,048,576 elements. All warm routes reuse resident inputs and outputs;
+the grouped route needs no intermediate scratch. The benchmark checks bitwise results before and
+after timing, reports cold graph preparation, explicit executable prewarm, and first execution separately, and prints an
+alternating-order paired grouped/native timing and Rust heap allocation diagnostic. Cold scopes
+are labeled by what they include: PCU executable prewarm includes compilation, while PCU first
+execution, native compile/setup, and native first launch are reported separately.
+
+The `tensor_add_sub_identity` target uses the same bounded three-step chain with its final
+arithmetic result as the output. It compares separate PCU kernels, the opt-in Identity-epilogue
+group, and a native HIP single kernel under the same resident, bitwise-check, prewarm, and paired
+timing conditions. This measures whether the grouping works without a terminal activation.
+
+The `tensor_mul_chain` target applies the same comparison to a three-step Mul-only chain. Its
+opt-in group preserves each separate f32 multiplication and excludes mixed Mul/Add/Sub regions,
+where contraction would require a distinct numerical contract.
+
 The `tensor_mse` target compares a scalar mean-squared-error graph with a native route that
-launches a squared-difference HIP kernel and uses rocBLAS SGEMM for the final mean reduction.
-Both routes allocate and upload inputs and a vector of ones, allocate temporary and scalar output
-buffers, synchronize both GPU operations, and read back the scalar. Alternating inputs exercise
-both zero and nonzero squared differences. The CPU graph evaluates the
-same inputs as a correctness oracle before and after Criterion sampling. This measures the whole
-host call, including allocation and transfers; it does not isolate GPU kernel duration.
+launches a squared-difference HIP kernel and reduces the nonnegative squared values with rocBLAS
+SASUM. It reports both end-to-end host-input calls and resident-input calls; both include temporary
+and scalar output allocation, synchronization, and scalar readback, while the resident pair keeps
+inputs uploaded across samples. Neither route allocates or uploads a dense vector of ones. Before
+sampling, the target compares SASUM against the previous dot-with-ones reduction for finite
+nonnegative, signed-zero, infinity, and NaN fixtures. The CPU graph checks MSE results before and
+after Criterion sampling. The end-to-end group includes host allocation and transfers; the
+resident group excludes input uploads.
+
+The `tensor_uniform` target compares a dense splat constant with a graph-level Uniform consumed
+through scalar-index Dispatch. It reports cold provider allocation/upload bytes separately from
+warm execution; requested outputs remain dense. The `tensor_sgd_contract` target compares strict
+separate-rounding SGD and explicitly opted-in FMA contraction against matching native HIP routes,
+with preparation, resident execution, and readback reported separately. The two arithmetic modes
+have different bitwise results for the included rounding witness.
 
 The `tensor_resident` target measures prepared MatMul graphs with input buffers uploaded once and
 reused across calls. It includes the existing PCU host-input route as a control and a direct
@@ -181,7 +236,7 @@ construction; the full-size CPU oracle would be impractical. Preparation is repo
 Set `FUSION_PCU_MLP_BATCH=1024` to run the larger batch; the default is 256. The target keeps
 separate prepared PCU routes with fresh owned outputs and reusable output banks, alongside the
 native route. PCU's first-class `SgdUpdate` performs each weight update in one HIP launch. Prepared
-MSE scratch retains its squared-difference and ones buffers, and both routes defer reading the two
+MSE scratch retains its squared-difference buffer, and both routes defer reading the two
 losses until after step two. The banked route uses two validated, non-aliasing output banks to
 ping-pong weights and makes zero allocations or uploads during the measured two-step pass.
 

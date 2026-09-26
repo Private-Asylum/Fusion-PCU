@@ -420,6 +420,7 @@ fn validate_f32_dataflow_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), 
                 op,
                 lhs,
                 rhs,
+                ..
             }) => {
                 validate_result_slot(kernel, op_index, result)?;
                 validate_defined_before(kernel, op_index, lhs)?;
@@ -538,6 +539,7 @@ fn validate_grid_stride_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), P
                 op,
                 lhs,
                 rhs,
+                ..
             }) => {
                 validate_value_result(result)?;
                 if !matches!(
@@ -610,6 +612,9 @@ fn validate_dataflow_binding(
 fn validate_invocation_index(index: PcuDispatchIndex) -> Result<(), PcuSpirvError> {
     match index {
         PcuDispatchIndex::InvocationId => Ok(()),
+        PcuDispatchIndex::BindingElementZero => Err(PcuSpirvError::UnsupportedInstruction(
+            PcuDispatchOpCaps::BINDING_LOAD | PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO,
+        )),
         PcuDispatchIndex::GridStrideId | PcuDispatchIndex::Value(_) => {
             Err(PcuSpirvError::UnsupportedInstruction(
                 PcuDispatchOpCaps::BINDING_LOAD | PcuDispatchOpCaps::BINDING_STORE,
@@ -679,6 +684,7 @@ const fn dataflow_result(op: PcuDispatchOp<'_>) -> Option<PcuDispatchValueId> {
 mod tests {
     use super::{
         lower_dispatch_to_spirv,
+        validate_invocation_index,
         validate_dispatch_for_spirv,
     };
     use super::super::{
@@ -711,6 +717,16 @@ mod tests {
         PcuValueType,
     };
     use fusion_pcu::model::PcuDispatchKernelBuilder;
+
+    #[test]
+    fn element_zero_load_reports_its_specific_unsupported_capability() {
+        assert_eq!(
+            validate_invocation_index(PcuDispatchIndex::BindingElementZero),
+            Err(PcuSpirvError::UnsupportedInstruction(
+                PcuDispatchOpCaps::BINDING_LOAD.union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
+            ))
+        );
+    }
 
     #[test]
     fn minimal_dispatch_lowers_to_spirv_header_and_compute_entry() {
@@ -913,6 +929,7 @@ mod tests {
             })
             .expect("test builder should accept constant")
             .with_data_op(PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
                 result: PcuDispatchValueId(3),
                 op: PcuDispatchAluOp::Mul,
                 lhs: PcuDispatchValueId(1),
@@ -926,6 +943,7 @@ mod tests {
             })
             .expect("test builder should accept input load")
             .with_data_op(PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
                 result: PcuDispatchValueId(5),
                 op: PcuDispatchAluOp::Add,
                 lhs: PcuDispatchValueId(3),
@@ -938,6 +956,7 @@ mod tests {
             })
             .expect("test builder should accept constant")
             .with_data_op(PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
                 result: PcuDispatchValueId(7),
                 op: PcuDispatchAluOp::Add,
                 lhs: PcuDispatchValueId(5),
@@ -1004,6 +1023,7 @@ mod tests {
                 value: PcuParameterValue::F32(1.0_f32.to_bits()),
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
                 result: PcuDispatchValueId(3),
                 op: PcuDispatchAluOp::Add,
                 lhs: PcuDispatchValueId(1),

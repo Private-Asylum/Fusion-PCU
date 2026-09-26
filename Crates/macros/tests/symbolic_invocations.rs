@@ -10,6 +10,7 @@ use fusion_pcu_cpu::{
 use pcu_alias::PcuBindingAccess;
 use pcu_alias::{
     PcuBindingRef,
+    PcuDispatchDataOp,
     PcuDispatchAluOp,
     PcuDispatchOp,
     PcuDispatchSubmission,
@@ -18,6 +19,7 @@ use pcu_alias::{
     PcuHostScalarSlice,
     PcuInvocationParameters,
     PcuInvocationShape,
+    PcuValueType,
     PcuSynchronousHostDispatchBackend,
 };
 
@@ -87,8 +89,207 @@ fn padded_grid_stride_map<const N: usize>(input: &[f32], output: &mut [f32]) {
     }
 }
 
+#[pcu(invocations = N, crate_path = ::renamed_pcu)]
+fn u32_copy<const N: usize>(input: &[u32], output: &mut [u32]) {
+    let invocation = context.global_invocation_id;
+    output[invocation] = input[invocation];
+}
+
+#[pcu(invocations = N, crate_path = ::renamed_pcu)]
+fn u32_checked_div_rem<const N: usize>(
+    left: &[u32],
+    right: &[u32],
+    quotient: &mut [u32],
+    remainder: &mut [u32],
+) {
+    let id = context.global_invocation_id;
+    let (q, r) = pcu::checked_div_rem(left[id], right[id]);
+    quotient[id] = q;
+    remainder[id] = r;
+}
+
+#[pcu_dispatch(invocations = 2, crate_path = ::renamed_pcu)]
+fn u32_checked_div_rem_grid<const N: usize>(
+    left: &[u32],
+    right: &[u32],
+    quotient: &mut [u32],
+    remainder: &mut [u32],
+) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        let (q, r) = pcu::checked_div_rem(left[id], right[id]);
+        quotient[id] = q;
+        remainder[id] = r;
+        id += stride;
+    }
+}
+
+#[test]
+fn u32_checked_div_rem_macro_builds_admitted_direct_and_grid_stride_ir() {
+    let bindings = u32_checked_div_rem_bindings();
+    let direct = u32_checked_div_rem::<8>(&bindings).expect("direct DivRem builds");
+    pcu_alias::validate_u32_checked_div_rem_kernel(&direct.ir())
+        .expect("direct checked DivRem profile admits");
+    assert!(matches!(
+        direct.ir().ops[2],
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. })
+    ));
+
+    let bindings = u32_checked_div_rem_grid_bindings();
+    let grid = u32_checked_div_rem_grid::<8>(&bindings).expect("grid DivRem builds");
+    pcu_alias::validate_u32_checked_div_rem_kernel(&grid.ir())
+        .expect("grid-stride checked DivRem profile admits");
+    assert!(matches!(
+        grid.ir().ops[0],
+        PcuDispatchOp::GridStrideLoop { extent: 8, .. }
+    ));
+}
+
+#[pcu_dispatch(invocations = N, crate_path = ::renamed_pcu)]
+fn u16_wrapping_map<const N: usize>(left: &[u16], right: &[u16], output: &mut [u16]) {
+    let invocation = context.global_invocation_id;
+    output[invocation] = left[invocation].wrapping_add(right[invocation]);
+}
+
+#[pcu_dispatch(invocations = 2, crate_path = ::renamed_pcu)]
+fn u16_grid_stride_map<const N: usize>(left: &[u16], right: &[u16], output: &mut [u16]) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        output[id] = left[id].wrapping_add(right[id]).wrapping_mul(right[id]);
+        id += stride;
+    }
+}
+
+#[pcu_dispatch(invocations = N, crate_path = ::renamed_pcu)]
+fn u8_wrapping_map<const N: usize>(left: &[u8], right: &[u8], output: &mut [u8]) {
+    let invocation = context.global_invocation_id;
+    output[invocation] = left[invocation].wrapping_add(right[invocation]);
+}
+
+#[pcu_dispatch(invocations = 2, crate_path = ::renamed_pcu)]
+fn u8_grid_stride_map<const N: usize>(left: &[u8], right: &[u8], output: &mut [u8]) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        output[id] = left[id].wrapping_add(right[id]).wrapping_mul(right[id]);
+        id += stride;
+    }
+}
+
+#[pcu_dispatch(invocations = N, crate_path = ::renamed_pcu)]
+fn i16_wrapping_map<const N: usize>(left: &[i16], right: &[i16], output: &mut [i16]) {
+    let invocation = context.global_invocation_id;
+    output[invocation] = left[invocation].wrapping_add(right[invocation]);
+}
+
+#[pcu_dispatch(invocations = 2, crate_path = ::renamed_pcu)]
+fn i16_grid_stride_map<const N: usize>(left: &[i16], right: &[i16], output: &mut [i16]) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        output[id] = left[id].wrapping_add(right[id]).wrapping_mul(right[id]);
+        id += stride;
+    }
+}
+
+#[pcu_dispatch(invocations = N, crate_path = ::renamed_pcu)]
+fn i8_wrapping_map<const N: usize>(left: &[i8], right: &[i8], output: &mut [i8]) {
+    let invocation = context.global_invocation_id;
+    output[invocation] = left[invocation].wrapping_add(right[invocation]);
+}
+
+#[pcu_dispatch(invocations = 2, crate_path = ::renamed_pcu)]
+fn i8_grid_stride_map<const N: usize>(left: &[i8], right: &[i8], output: &mut [i8]) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        output[id] = left[id].wrapping_add(right[id]).wrapping_mul(right[id]);
+        id += stride;
+    }
+}
+
+#[test]
+fn i8_wrapping_dispatch_macro_builds_admitted_direct_and_grid_stride_maps() {
+    let bindings = i8_wrapping_map_bindings();
+    assert_eq!(bindings[0].value_type(), Some(PcuValueType::i8()));
+    let direct = i8_wrapping_map::<8>(&bindings).expect("i8 direct map builds");
+    pcu_alias::validate_i8_map_kernel(&direct.ir()).expect("direct i8 profile admits");
+
+    let loop_bindings = i8_grid_stride_map_bindings();
+    let grid = i8_grid_stride_map::<8>(&loop_bindings).expect("i8 grid-stride map builds");
+    pcu_alias::validate_i8_map_kernel(&grid.ir()).expect("grid-stride i8 profile admits");
+    assert!(matches!(
+        grid.ir().ops[0],
+        PcuDispatchOp::GridStrideLoop { extent: 8, .. }
+    ));
+}
+
+#[test]
+fn i16_wrapping_dispatch_macro_builds_admitted_direct_and_grid_stride_maps() {
+    let bindings = i16_wrapping_map_bindings();
+    assert_eq!(bindings[0].value_type(), Some(PcuValueType::i16()));
+    let direct = i16_wrapping_map::<8>(&bindings).expect("i16 direct map builds");
+    pcu_alias::validate_i16_map_kernel(&direct.ir()).expect("direct i16 profile admits");
+
+    let loop_bindings = i16_grid_stride_map_bindings();
+    let grid = i16_grid_stride_map::<8>(&loop_bindings).expect("i16 grid-stride map builds");
+    pcu_alias::validate_i16_map_kernel(&grid.ir()).expect("grid-stride i16 profile admits");
+    assert!(matches!(
+        grid.ir().ops[0],
+        PcuDispatchOp::GridStrideLoop { extent: 8, .. }
+    ));
+}
+
+#[test]
+fn u8_wrapping_dispatch_macro_builds_admitted_direct_and_grid_stride_maps() {
+    let bindings = u8_wrapping_map_bindings();
+    assert_eq!(bindings[0].value_type(), Some(PcuValueType::u8()));
+    let direct = u8_wrapping_map::<8>(&bindings).expect("u8 direct map builds");
+    pcu_alias::validate_u8_map_kernel(&direct.ir()).expect("direct u8 profile admits");
+
+    let loop_bindings = u8_grid_stride_map_bindings();
+    let grid = u8_grid_stride_map::<8>(&loop_bindings).expect("u8 grid-stride map builds");
+    pcu_alias::validate_u8_map_kernel(&grid.ir()).expect("grid-stride u8 profile admits");
+    assert!(matches!(
+        grid.ir().ops[0],
+        PcuDispatchOp::GridStrideLoop { extent: 8, .. }
+    ));
+}
+
+#[test]
+fn u16_wrapping_dispatch_macro_builds_admitted_direct_and_grid_stride_maps() {
+    let bindings = u16_wrapping_map_bindings();
+    assert_eq!(bindings[0].value_type(), Some(PcuValueType::u16()));
+    let direct = u16_wrapping_map::<8>(&bindings).expect("u16 direct map builds");
+    pcu_alias::validate_u16_map_kernel(&direct.ir()).expect("direct u16 profile admits");
+
+    let loop_bindings = u16_grid_stride_map_bindings();
+    let grid = u16_grid_stride_map::<8>(&loop_bindings).expect("u16 grid-stride map builds");
+    pcu_alias::validate_u16_map_kernel(&grid.ir()).expect("grid-stride u16 profile admits");
+    assert!(matches!(
+        grid.ir().ops[0],
+        PcuDispatchOp::GridStrideLoop { extent: 8, .. }
+    ));
+}
+
 #[test]
 fn const_generic_invocations_specialize_to_the_declared_shape() {
+    let typed_bindings = u32_copy_bindings();
+    assert_eq!(typed_bindings[0].value_type(), Some(PcuValueType::u32()));
+    assert_eq!(typed_bindings[1].value_type(), Some(PcuValueType::u32()));
+    let typed = u32_copy::<8>(&typed_bindings).expect("u32 identity copy builds typed IR");
+    assert_eq!(typed.ir().entry.logical_shape, [8, 1, 1]);
+    assert!(matches!(
+        typed.ir().ops[0],
+        PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { .. })
+    ));
+    assert!(matches!(
+        typed.ir().ops[1],
+        PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { .. })
+    ));
+
     let alias_bindings = concise_alias_map_bindings();
     let alias = concise_alias_map::<12>(&alias_bindings).expect("the alias lowers identically");
     assert_eq!(alias.ir().entry.logical_shape, [24, 1, 1]);
@@ -403,7 +604,7 @@ fn bounded_grid_stride_vectors_execute_and_lower_consistently() {
         pcu_alias::validate_f32_map_kernel(&kernel).expect("shared validator admits the vector");
         let hip = fusion_pcu_rocm::lower_dispatch_to_hip_source(&kernel)
             .expect("HIP structural lowering accepts the vector");
-        assert!(hip.contains(&format!("fusion_idx < {extent}ull")));
+        assert!(hip.contains(&format!("fusion_idx < {extent}u")));
         let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<4096>::new();
         fusion_pcu_spirv::lower_dispatch_to_spirv(
             &kernel,

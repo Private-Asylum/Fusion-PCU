@@ -8,6 +8,7 @@ use fusion_pcu::{
     PcuMemoryImportDescriptor,
     PcuMemoryImportOwnership,
     PcuMemoryMapping,
+    PcuMemoryOverlap,
     PcuMemoryPoolId,
     PcuMemoryPoolSnapshot,
     PcuMemoryProvider,
@@ -17,6 +18,7 @@ use fusion_pcu::{
     PcuMemoryRange,
     PcuMemoryRequestError,
     PcuMemoryResource,
+    PcuMemoryResourceCapability,
     PcuMemoryResourceOrigin,
 };
 
@@ -114,22 +116,56 @@ impl PcuMemoryResource for RocmMemoryResource {
     fn origin(&self) -> PcuMemoryResourceOrigin {
         PcuMemoryResourceOrigin::ProviderManaged
     }
+
+    fn supports(&self, capability: PcuMemoryResourceCapability) -> bool {
+        matches!(
+            capability,
+            PcuMemoryResourceCapability::ReusableStorage
+                | PcuMemoryResourceCapability::ResourceCopy
+        )
+    }
+
+    fn overlap(
+        &self,
+        other: &Self,
+        self_range: PcuMemoryRange,
+        other_range: PcuMemoryRange,
+    ) -> PcuMemoryOverlap {
+        let Some(self_end) = self_range.checked_end() else {
+            return PcuMemoryOverlap::Unknown;
+        };
+        let Some(other_end) = other_range.checked_end() else {
+            return PcuMemoryOverlap::Unknown;
+        };
+        if self_end > self.size_bytes() || other_end > other.size_bytes() {
+            return PcuMemoryOverlap::Unknown;
+        }
+        if !std::rc::Rc::ptr_eq(&self.buffer.allocation, &other.buffer.allocation) {
+            return PcuMemoryOverlap::Disjoint;
+        }
+        if self_range.offset_bytes < other_end && other_range.offset_bytes < self_end {
+            PcuMemoryOverlap::Overlapping
+        } else {
+            PcuMemoryOverlap::Disjoint
+        }
+    }
 }
 
 impl RocmMemoryResource {
-    /// Whether two provider resources share the same underlying HIP allocation.
+    /// Conservatively checks whether two complete resources can refer to the same bytes.
     #[cfg(feature = "tensor")]
-    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
-        std::rc::Rc::ptr_eq(&self.buffer.allocation, &other.buffer.allocation)
-    }
-
-    #[cfg(feature = "tensor")]
-    pub(crate) fn copy_from_resource(
-        &mut self,
-        source: &Self,
-        bytes: usize,
-    ) -> Result<(), HipError> {
-        self.buffer.copy_from_device(&source.buffer, bytes)
+    pub(crate) fn may_overlap(&self, other: &Self) -> bool {
+        self.overlap(
+            other,
+            PcuMemoryRange {
+                offset_bytes: 0,
+                size_bytes: self.size_bytes(),
+            },
+            PcuMemoryRange {
+                offset_bytes: 0,
+                size_bytes: other.size_bytes(),
+            },
+        ) != PcuMemoryOverlap::Disjoint
     }
 
     /// Whether this allocation belongs to the same HIP runtime and selected device.
@@ -405,6 +441,74 @@ impl PcuMemoryProvider for RocmMemoryProvider {
         resource
             .buffer
             .copy_to_at(offset, bytes)
+            .map_err(|error| hip_failure(self, op, &error))
+    }
+
+    fn copy_resource(
+        &mut self,
+        destination: &mut Self::Resource,
+        source: &Self::Resource,
+        size_bytes: u64,
+    ) -> Result<(), PcuMemoryProviderError> {
+        let op = PcuMemoryProviderOperation::CopyResource;
+        self.validate_resource(destination, op)?;
+        self.validate_resource(source, op)?;
+        if size_bytes == 0
+            || !range_fits(
+                destination.size_bytes(),
+                PcuMemoryRange {
+                    offset_bytes: 0,
+                    size_bytes,
+                },
+            )
+            || !range_fits(
+                source.size_bytes(),
+                PcuMemoryRange {
+                    offset_bytes: 0,
+                    size_bytes,
+                },
+            )
+        {
+            return Err(self.error(
+                op,
+                PcuMemoryProviderFailure::RangeOutOfBounds,
+                PcuMemoryDisposition::Reject,
+            ));
+        }
+        if !matches!(
+            destination.access(),
+            PcuMemoryAccess::WriteOnly | PcuMemoryAccess::ReadWrite
+        ) || !matches!(
+            source.access(),
+            PcuMemoryAccess::ReadOnly | PcuMemoryAccess::ReadWrite
+        ) {
+            return Err(self.error(
+                op,
+                PcuMemoryProviderFailure::AccessDenied,
+                PcuMemoryDisposition::Reject,
+            ));
+        }
+        let range = PcuMemoryRange {
+            offset_bytes: 0,
+            size_bytes,
+        };
+        if destination.overlap(source, range, range) != PcuMemoryOverlap::Disjoint {
+            return Err(self.error(
+                op,
+                PcuMemoryProviderFailure::ResourceContractViolation,
+                PcuMemoryDisposition::Reject,
+            ));
+        }
+        let bytes = usize::try_from(size_bytes).map_err(|_| {
+            self.error(
+                op,
+                PcuMemoryProviderFailure::RangeOutOfBounds,
+                PcuMemoryDisposition::Reject,
+            )
+        })?;
+        destination
+            .buffer
+            .copy_from_device(&source.buffer, bytes)
             .map_err(|error| hip_failure(self, op, &error))
     }
 }

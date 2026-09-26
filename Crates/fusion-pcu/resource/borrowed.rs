@@ -154,7 +154,7 @@ pub fn validate_host_scalar_bindings<T: PcuScalar, E>(
         }
         let required = submission
             .kernel
-            .minimum_binding_elements(submission.shape.invocation_count().get())
+            .minimum_binding_elements_for(binding.target, submission.shape.invocation_count().get())
             as usize;
         if binding.slice.len() < required {
             return Err(PcuHostDispatchError::BufferTooSmall(binding.target));

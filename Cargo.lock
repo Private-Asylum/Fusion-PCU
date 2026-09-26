@@ -528,6 +528,7 @@ dependencies = [
  "fusion-pcu",
  "fusion-pcu-tensor",
  "libloading",
+ "smallvec",
 ]
 
 [[package]]
@@ -549,6 +550,9 @@ dependencies = [
 [[package]]
 name = "fusion-pcu-tensor"
 version = "0.1.0"
+dependencies = [
+ "fusion-pcu",
+]
 
 [[package]]
 name = "fusion-pcu-vm-reference"

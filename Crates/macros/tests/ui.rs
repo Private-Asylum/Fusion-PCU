@@ -15,4 +15,10 @@ fn dispatch_macro_ui() {
     #[cfg(target_pointer_width = "64")]
     tests.compile_fail("tests/ui/invocation_too_large.rs");
     tests.pass("tests/ui/renamed_crate.rs");
+    tests.compile_fail("tests/ui/mixed_scalar_store.rs");
+    tests.compile_fail("tests/ui/mixed_scalar_operation.rs");
+    tests.pass("tests/ui/u32_wrapping_arithmetic.rs");
+    tests.compile_fail("tests/ui/u32_plain_arithmetic.rs");
+    tests.pass("tests/ui/u32_checked_div_rem.rs");
+    tests.compile_fail("tests/ui/u32_checked_div_rem_bad.rs");
 }

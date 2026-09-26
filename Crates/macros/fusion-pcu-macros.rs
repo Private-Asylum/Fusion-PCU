@@ -1,3 +1,6 @@
+#[path = "fusion-pcu-macros/checked_div_rem.rs"]
+mod checked_div_rem;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{
@@ -19,6 +22,7 @@ use syn::{
     ExprField,
     ExprIndex,
     ExprLit,
+    ExprMethodCall,
     FnArg,
     GenericParam,
     Ident,
@@ -98,16 +102,48 @@ impl Parse for PcuDispatchArgs {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BindingAccess {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScalarKind {
+    F32,
+    F64,
+    U8,
+    U16,
+    U32,
+    U64,
+    I8,
+    I16,
+    I32,
+    I64,
+}
+
+impl ScalarKind {
+    fn rust_type(self) -> TokenStream2 {
+        match self {
+            Self::F32 => quote! { f32 },
+            Self::F64 => quote! { f64 },
+            Self::U8 => quote! { u8 },
+            Self::U16 => quote! { u16 },
+            Self::U32 => quote! { u32 },
+            Self::U64 => quote! { u64 },
+            Self::I8 => quote! { i8 },
+            Self::I16 => quote! { i16 },
+            Self::I32 => quote! { i32 },
+            Self::I64 => quote! { i64 },
+        }
+    }
 }
 
 struct BindingSpec {
     ident: Ident,
     access: BindingAccess,
     binding: u32,
+    scalar: ScalarKind,
 }
 
 struct ExprEmitter<'a> {
@@ -136,12 +172,13 @@ impl<'a> ExprEmitter<'a> {
         }
     }
 
-    fn emit_expr(&mut self, expr: &Expr) -> Result<u16, Error> {
+    fn emit_expr(&mut self, expr: &Expr) -> Result<(u16, ScalarKind), Error> {
         match expr {
             Expr::Binary(binary) => self.emit_binary(binary),
             Expr::Index(index) => self.emit_index_load(index),
             Expr::Lit(lit) => self.emit_lit(lit),
             Expr::Paren(paren) => self.emit_expr(&paren.expr),
+            Expr::MethodCall(call) => self.emit_wrapping_method(call),
             _ => Err(Error::new(
                 unsupported_expression_span(expr),
                 "unsupported PCU expression; supported subset is binding[index], f32 literals, parentheses, and + - * /",
@@ -149,9 +186,15 @@ impl<'a> ExprEmitter<'a> {
         }
     }
 
-    fn emit_binary(&mut self, binary: &ExprBinary) -> Result<u16, Error> {
-        let lhs = self.emit_expr(&binary.left)?;
-        let rhs = self.emit_expr(&binary.right)?;
+    fn emit_binary(&mut self, binary: &ExprBinary) -> Result<(u16, ScalarKind), Error> {
+        let (lhs, lhs_type) = self.emit_expr(&binary.left)?;
+        let (rhs, rhs_type) = self.emit_expr(&binary.right)?;
+        if lhs_type != rhs_type || !matches!(lhs_type, ScalarKind::F32 | ScalarKind::F64) {
+            return Err(Error::new(
+                binary.span(),
+                "PCU floating arithmetic requires matching f32 or f64 operands",
+            ));
+        }
         let result = self.alloc_value(binary.span())?;
         let pcu = self.crate_path;
         let op = match &binary.op {
@@ -166,18 +209,89 @@ impl<'a> ExprEmitter<'a> {
                 ));
             }
         };
+        let value_type = match lhs_type {
+            ScalarKind::F32 => quote! { #pcu::PcuValueType::f32() },
+            ScalarKind::F64 => quote! { #pcu::PcuValueType::f64() },
+            _ => unreachable!("floating type checked above"),
+        };
         self.ops.push(quote! {
             #pcu::PcuDispatchDataOp::Alu {
+                value_type: #value_type,
                 result: #pcu::PcuDispatchValueId(#result),
                 op: #op,
                 lhs: #pcu::PcuDispatchValueId(#lhs),
                 rhs: #pcu::PcuDispatchValueId(#rhs),
             }
         });
-        Ok(result)
+        Ok((result, lhs_type))
     }
 
-    fn emit_index_load(&mut self, index: &ExprIndex) -> Result<u16, Error> {
+    fn emit_wrapping_method(&mut self, call: &ExprMethodCall) -> Result<(u16, ScalarKind), Error> {
+        let method = call.method.to_string();
+        let op = match method.as_str() {
+            "wrapping_add" => quote! { Add },
+            "wrapping_sub" => quote! { Sub },
+            "wrapping_mul" => quote! { Mul },
+            _ => {
+                return Err(Error::new(
+                    unsupported_expression_span(&Expr::MethodCall(call.clone())),
+                    "unsupported PCU expression; supported subset is binding[index], f32 literals, parentheses, and + - * /",
+                ));
+            }
+        };
+        if call.args.len() != 1 || call.turbofish.is_some() {
+            return Err(Error::new(
+                call.span(),
+                "wrapping arithmetic requires exactly one argument",
+            ));
+        }
+        let rhs_expr = call.args.first().expect("argument count checked");
+        let (lhs, lhs_type) = self.emit_expr(&call.receiver)?;
+        let (rhs, rhs_type) = self.emit_expr(rhs_expr)?;
+        if lhs_type != rhs_type
+            || !matches!(
+                lhs_type,
+                ScalarKind::U8
+                    | ScalarKind::U16
+                    | ScalarKind::U32
+                    | ScalarKind::U64
+                    | ScalarKind::I8
+                    | ScalarKind::I16
+                    | ScalarKind::I32
+                    | ScalarKind::I64
+            )
+        {
+            return Err(Error::new(
+                call.span(),
+                "wrapping PCU arithmetic requires matching u8, u16, u32, u64, i8, i16, i32, or i64 operands",
+            ));
+        }
+        let result = self.alloc_value(call.span())?;
+        let pcu = self.crate_path;
+        let value_type = match lhs_type {
+            ScalarKind::U8 => quote! { #pcu::PcuValueType::u8() },
+            ScalarKind::U16 => quote! { #pcu::PcuValueType::u16() },
+            ScalarKind::U32 => quote! { #pcu::PcuValueType::u32() },
+            ScalarKind::U64 => quote! { #pcu::PcuValueType::u64() },
+            ScalarKind::I8 => quote! { #pcu::PcuValueType::i8() },
+            ScalarKind::I16 => quote! { #pcu::PcuValueType::i16() },
+            ScalarKind::I32 => quote! { #pcu::PcuValueType::i32() },
+            ScalarKind::I64 => quote! { #pcu::PcuValueType::i64() },
+            ScalarKind::F32 | ScalarKind::F64 => unreachable!("integer operand checked"),
+        };
+        self.ops.push(quote! {
+            #pcu::PcuDispatchDataOp::Alu {
+                value_type: #value_type,
+                result: #pcu::PcuDispatchValueId(#result),
+                op: #pcu::PcuDispatchAluOp::#op,
+                lhs: #pcu::PcuDispatchValueId(#lhs),
+                rhs: #pcu::PcuDispatchValueId(#rhs),
+            }
+        });
+        Ok((result, lhs_type))
+    }
+
+    fn emit_index_load(&mut self, index: &ExprIndex) -> Result<(u16, ScalarKind), Error> {
         validate_invocation_index(&index.index, self.invocation_ident)?;
         let Some(binding_ident) = expr_ident(&index.expr) else {
             return Err(Error::new(
@@ -198,10 +312,13 @@ impl<'a> ExprEmitter<'a> {
                 index: #dispatch_index,
             }
         });
-        Ok(result)
+        Ok((
+            result,
+            self.binding(binding_ident, BindingAccess::ReadOnly)?.scalar,
+        ))
     }
 
-    fn emit_lit(&mut self, lit: &ExprLit) -> Result<u16, Error> {
+    fn emit_lit(&mut self, lit: &ExprLit) -> Result<(u16, ScalarKind), Error> {
         let Lit::Float(float) = &lit.lit else {
             return Err(Error::new(
                 lit.span(),
@@ -217,7 +334,7 @@ impl<'a> ExprEmitter<'a> {
                 value: #pcu::PcuParameterValue::from_f32_bits(#bits),
             }
         });
-        Ok(result)
+        Ok((result, ScalarKind::F32))
     }
 
     fn index(&self) -> TokenStream2 {
@@ -326,41 +443,50 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
         quote! { <'a, #params> }
     };
     let binding_specs = parse_bindings(&function.sig.inputs)?;
-    let body = validate_body(function)?;
-    let (invocation_ident, assignment, loop_extent) = match &body {
-        ValidatedBody::Indexed {
-            invocation,
-            assignment,
-        } => (invocation, *assignment, None),
-        ValidatedBody::GridStride {
-            invocation,
-            assignment,
-            extent,
-        } => (invocation, *assignment, Some(*extent)),
-    };
-    let output_binding = validate_assignment_target(assignment, &binding_specs, invocation_ident)?;
-    let mut emitter = ExprEmitter::new(
-        &binding_specs,
-        invocation_ident,
-        &crate_path,
-        loop_extent.is_some(),
-    );
-    let result_value = emitter.emit_expr(&assignment.right)?;
-    let output_slot = output_binding.binding;
-    let mut data_ops = emitter.ops;
-    let store_index = if loop_extent.is_some() {
-        quote! { GridStrideId }
+    let (loop_extent, data_ops) = if let Some((extent, data_ops)) =
+        checked_div_rem::lower(function, &binding_specs, &crate_path)?
+    {
+        (extent, data_ops)
     } else {
-        quote! { InvocationId }
+        let body = validate_body(function)?;
+        let (invocation, assignment, extent) = match &body {
+            ValidatedBody::Indexed {
+                invocation,
+                assignment,
+            } => (invocation, *assignment, None),
+            ValidatedBody::GridStride {
+                invocation,
+                assignment,
+                extent,
+            } => (invocation, *assignment, Some(*extent)),
+        };
+        let output_binding = validate_assignment_target(assignment, &binding_specs, invocation)?;
+        let mut emitter =
+            ExprEmitter::new(&binding_specs, invocation, &crate_path, extent.is_some());
+        let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
+        if result_type != output_binding.scalar {
+            return Err(Error::new(
+                assignment.right.span(),
+                "PCU store value type must match the output binding element type",
+            ));
+        }
+        let pcu = &crate_path;
+        let output_slot = output_binding.binding;
+        let store_index = if extent.is_some() {
+            quote! { GridStrideId }
+        } else {
+            quote! { InvocationId }
+        };
+        emitter.ops.push(quote! {
+            #pcu::PcuDispatchDataOp::BindingStore {
+                binding: #pcu::PcuBindingRef::new(0, #output_slot),
+                index: #pcu::PcuDispatchIndex::#store_index,
+                value: #pcu::PcuDispatchValueId(#result_value),
+            }
+        });
+        (extent, emitter.ops)
     };
     let pcu = &crate_path;
-    data_ops.push(quote! {
-        #pcu::PcuDispatchDataOp::BindingStore {
-            binding: #pcu::PcuBindingRef::new(0, #output_slot),
-            index: #pcu::PcuDispatchIndex::#store_index,
-            value: #pcu::PcuDispatchValueId(#result_value),
-        }
-    });
 
     let (operations, op_count) =
         build_body_operations(&data_ops, loop_extent, &const_generics, &crate_path)?;
@@ -418,7 +544,7 @@ fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
         let GenericParam::Const(parameter) = parameter else {
             return Err(Error::new(
                 parameter.span(),
-                "PCU dispatch does not yet support type generics: binding metadata and emitted constants currently use f32, so a `T: PcuScalar` bound alone would not make the lowered operations type-safe; use `const NAME: usize` generics for invocation shapes",
+                "PCU dispatch does not yet support type generics: binding metadata and expression typing require concrete supported element types, so a `T: PcuScalar` bound alone would not make lowered operations type-safe; use `const NAME: usize` generics for invocation shapes",
             ));
         };
         let Type::Path(ty) = &parameter.ty else {
@@ -516,23 +642,24 @@ fn parse_bindings(
                 "PCU kernel bindings must be identifiers",
             ));
         };
-        let access = parse_binding_type(&input.ty)?;
+        let (access, scalar) = parse_binding_type(&input.ty)?;
         let binding = u32::try_from(bindings.len())
             .map_err(|_| Error::new(input.span(), "too many PCU bindings for this macro"))?;
         bindings.push(BindingSpec {
             ident: pat.ident.clone(),
             access,
             binding,
+            scalar,
         });
     }
     Ok(bindings)
 }
 
-fn parse_binding_type(ty: &Type) -> Result<BindingAccess, Error> {
+fn parse_binding_type(ty: &Type) -> Result<(BindingAccess, ScalarKind), Error> {
     let Type::Reference(reference) = ty else {
         return Err(Error::new(
             ty.span(),
-            "PCU binding types must be `&[f32]` or `&mut [f32]`",
+            "PCU binding types must be slices of f32, f64, u8, u16, u32, u64, i8, i16, i32, or i64",
         ));
     };
     if reference.lifetime.is_some() {
@@ -544,26 +671,49 @@ fn parse_binding_type(ty: &Type) -> Result<BindingAccess, Error> {
     let Type::Slice(slice) = reference.elem.as_ref() else {
         return Err(Error::new(
             reference.elem.span(),
-            "PCU dispatch resources must be slices of f32",
+            "PCU dispatch resources must be slices of f32, f64, u8, u16, u32, u64, i8, i16, i32, or i64",
         ));
     };
     let Type::Path(element) = slice.elem.as_ref() else {
         return Err(Error::new(
             slice.elem.span(),
-            "this PCU dispatch macro currently supports only f32 elements",
+            "this PCU dispatch macro currently supports only f32, f64, u8, u16, u32, u64, i8, i16, i32, and i64 elements",
         ));
     };
-    if !element.path.is_ident("f32") {
+    let scalar = if element.path.is_ident("f32") {
+        ScalarKind::F32
+    } else if element.path.is_ident("f64") {
+        ScalarKind::F64
+    } else if element.path.is_ident("u8") {
+        ScalarKind::U8
+    } else if element.path.is_ident("u16") {
+        ScalarKind::U16
+    } else if element.path.is_ident("u32") {
+        ScalarKind::U32
+    } else if element.path.is_ident("u64") {
+        ScalarKind::U64
+    } else if element.path.is_ident("i8") {
+        ScalarKind::I8
+    } else if element.path.is_ident("i16") {
+        ScalarKind::I16
+    } else if element.path.is_ident("i32") {
+        ScalarKind::I32
+    } else if element.path.is_ident("i64") {
+        ScalarKind::I64
+    } else {
         return Err(Error::new(
             element.span(),
-            "this PCU dispatch macro currently supports only f32 elements",
+            "this PCU dispatch macro currently supports only f32, f64, u8, u16, u32, u64, i8, i16, i32, and i64 elements",
         ));
-    }
-    Ok(if reference.mutability.is_some() {
-        BindingAccess::ReadWrite
-    } else {
-        BindingAccess::ReadOnly
-    })
+    };
+    Ok((
+        if reference.mutability.is_some() {
+            BindingAccess::ReadWrite
+        } else {
+            BindingAccess::ReadOnly
+        },
+        scalar,
+    ))
 }
 
 enum ValidatedBody<'a> {
@@ -843,7 +993,7 @@ fn validate_assignment_target<'a>(
     if !matches!(binding.access, BindingAccess::ReadWrite) {
         return Err(Error::new(
             output_ident.span(),
-            "PCU assignment target must be an `&mut [f32]` binding",
+            "PCU assignment target must be a mutable f32, u32, u64, i32, or i64 slice binding",
         ));
     }
     Ok(binding)
@@ -888,8 +1038,9 @@ fn binding_tokens(binding: &BindingSpec, pcu: &Path) -> TokenStream2 {
         BindingAccess::ReadOnly => quote! { #pcu::PcuBindingAccess::ReadOnly },
         BindingAccess::ReadWrite => quote! { #pcu::PcuBindingAccess::ReadWrite },
     };
+    let scalar = binding.scalar.rust_type();
     quote! {
-        #pcu::PcuBinding::scalar::<f32>(
+        #pcu::PcuBinding::scalar::<#scalar>(
             ::core::option::Option::Some(#name),
             0,
             #slot,
@@ -926,6 +1077,394 @@ mod tests {
         assert!(generated.contains("BindingStore"));
         assert!(generated.contains("PcuDispatchAluOp :: Mul"));
         assert!(generated.contains(":: fusion_pcu :: PcuBinding"));
+    }
+
+    #[test]
+    fn lowers_supported_indexed_f64_map() {
+        let function = syn::parse_str::<ItemFn>("fn kernel(input: &[f64], rhs: &[f64], output: &mut [f64]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] + rhs[invocation]; }")
+            .expect("f64 function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64").expect("arguments parse");
+        let generated = expand_pcu_dispatch(args, &function)
+            .expect("f64 map lowers")
+            .to_string();
+        assert!(generated.contains("PcuValueType :: f64"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+    }
+
+    fn expand_u32(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
+        let function = syn::parse_str::<ItemFn>(&format!(
+            "fn kernel(input: &[u32], rhs: &[u32], output: &mut [u32]) {{ {body} }}"
+        ))
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default crate path arguments parse");
+        expand_pcu_dispatch(args, &function)
+    }
+
+    fn expand_u32_div_rem(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
+        let function = syn::parse_str::<ItemFn>(&format!(
+            "fn kernel(a: &[u32], b: &[u32], quotient: &mut [u32], remainder: &mut [u32]) {{ {body} }}"
+        ))
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default crate path arguments parse");
+        expand_pcu_dispatch(args, &function)
+    }
+
+    #[test]
+    fn lowers_checked_u32_div_rem_direct_and_grid_stride() {
+        let direct = expand_u32_div_rem(
+            "let id = context.global_invocation_id; let (q, r) = pcu::checked_div_rem(a[id], b[id]); quotient[id] = q; remainder[id] = r;",
+        )
+        .expect("direct checked DivRem lowers")
+        .to_string();
+        assert!(
+            direct.contains("PcuDispatchDataOp :: CheckedDivRem"),
+            "{direct}"
+        );
+        assert!(direct.contains("PcuIntegerDivFlags :: CHECKED"), "{direct}");
+        assert!(direct.contains("PcuValueType :: u32"), "{direct}");
+        assert_eq!(
+            direct.matches("PcuDispatchDataOp :: BindingStore").count(),
+            2
+        );
+
+        let grid = expand_u32_div_rem(
+            "let mut id = context.global_invocation_id; let stride = context.invocation_count; while id < 64 { let (q, r) = pcu::checked_div_rem(a[id], b[id]); quotient[id] = q; remainder[id] = r; id += stride; }",
+        );
+        let grid = grid.expect("grid-stride checked DivRem lowers").to_string();
+        assert!(grid.contains("PcuDispatchOp :: GridStrideLoop"), "{grid}");
+        assert!(
+            grid.contains("PcuDispatchDataOp :: CheckedDivRem"),
+            "{grid}"
+        );
+        assert_eq!(grid.matches("PcuDispatchDataOp :: BindingStore").count(), 2);
+    }
+
+    #[test]
+    fn rejects_invalid_checked_u32_div_rem_shapes_and_plain_operators() {
+        for body in [
+            "let id = context.global_invocation_id; let (q, r) = pcu::checked_div_rem(a[id], b[id]); quotient[id] = q; quotient[id] = r;",
+            "let id = context.global_invocation_id; let (q, r) = pcu::checked_div_rem(a[id], b[id]); quotient[id] = q; remainder[id] = q;",
+            "let id = context.global_invocation_id; let (q, r) = pcu::checked_div_rem(a[id] / b[id], b[id]); quotient[id] = q; remainder[id] = r;",
+            "let id = context.global_invocation_id; let (q, r) = pcu::checked_div_rem(a[id] % b[id], b[id]); quotient[id] = q; remainder[id] = r;",
+            "let id = context.global_invocation_id; let (q, r) = pcu::checked_div_rem(a[id], b[id]); quotient[id] = q;",
+        ] {
+            assert!(expand_u32_div_rem(body).is_err(), "accepted `{body}`");
+        }
+        let mixed = syn::parse_str::<ItemFn>("fn kernel(a: &[u32], b: &[i32], quotient: &mut [u32], remainder: &mut [u32]) { let id = context.global_invocation_id; let (q, r) = pcu::checked_div_rem(a[id], b[id]); quotient[id] = q; remainder[id] = r; }").expect("mixed function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64").expect("arguments parse");
+        assert!(expand_pcu_dispatch(args, &mixed).is_err());
+    }
+
+    fn expand_u16(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
+        let function = syn::parse_str::<ItemFn>(&format!(
+            "fn kernel(input: &[u16], rhs: &[u16], output: &mut [u16]) {{ {body} }}"
+        ))
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default crate path arguments parse");
+        expand_pcu_dispatch(args, &function)
+    }
+
+    #[test]
+    fn lowers_u16_wrapping_arithmetic_and_rejects_plain_operators() {
+        for (method, op) in [
+            ("wrapping_add", "Add"),
+            ("wrapping_sub", "Sub"),
+            ("wrapping_mul", "Mul"),
+        ] {
+            let body = format!(
+                "let invocation = context.global_invocation_id; output[invocation] = input[invocation].{method}(rhs[invocation]);"
+            );
+            let generated = expand_u16(&body)
+                .expect("u16 wrapping map lowers")
+                .to_string();
+            assert!(
+                generated.contains(&format!("PcuDispatchAluOp :: {op}")),
+                "{generated}"
+            );
+            assert!(generated.contains("PcuValueType :: u16"), "{generated}");
+            assert!(
+                generated.contains("PcuBinding :: scalar :: < u16 >"),
+                "{generated}"
+            );
+        }
+        assert!(expand_u16(
+            "let invocation = context.global_invocation_id; output[invocation] = input[invocation] + rhs[invocation];"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lowers_u16_wrapping_chain_inside_grid_stride_loop() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel<const N: usize>(input: &[u16], rhs: &[u16], output: &mut [u16]) { let mut id = context.global_invocation_id; let stride = context.invocation_count; while id < N { output[id] = input[id].wrapping_add(rhs[id]).wrapping_mul(rhs[id]); id += stride; } }",
+        )
+        .expect("grid-stride function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 4").expect("arguments parse");
+        let generated = expand_pcu_dispatch(args, &function)
+            .expect("u16 grid-stride map lowers")
+            .to_string();
+        assert!(
+            generated.contains("PcuDispatchOp :: GridStrideLoop"),
+            "{generated}"
+        );
+        assert!(generated.contains("PcuValueType :: u16"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Mul"), "{generated}");
+    }
+
+    fn expand_u8(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
+        let function = syn::parse_str::<ItemFn>(&format!(
+            "fn kernel(input: &[u8], rhs: &[u8], output: &mut [u8]) {{ {body} }}"
+        ))
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default crate path arguments parse");
+        expand_pcu_dispatch(args, &function)
+    }
+
+    #[test]
+    fn lowers_u8_wrapping_arithmetic_and_rejects_plain_operators() {
+        for (method, op) in [
+            ("wrapping_add", "Add"),
+            ("wrapping_sub", "Sub"),
+            ("wrapping_mul", "Mul"),
+        ] {
+            let body = format!(
+                "let invocation = context.global_invocation_id; output[invocation] = input[invocation].{method}(rhs[invocation]);"
+            );
+            let generated = expand_u8(&body)
+                .expect("u8 wrapping map lowers")
+                .to_string();
+            assert!(
+                generated.contains(&format!("PcuDispatchAluOp :: {op}")),
+                "{generated}"
+            );
+            assert!(generated.contains("PcuValueType :: u8"), "{generated}");
+            assert!(
+                generated.contains("PcuBinding :: scalar :: < u8 >"),
+                "{generated}"
+            );
+        }
+        assert!(expand_u8(
+            "let invocation = context.global_invocation_id; output[invocation] = input[invocation] + rhs[invocation];"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lowers_u8_wrapping_chain_inside_grid_stride_loop() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel<const N: usize>(input: &[u8], rhs: &[u8], output: &mut [u8]) { let mut id = context.global_invocation_id; let stride = context.invocation_count; while id < N { output[id] = input[id].wrapping_add(rhs[id]).wrapping_mul(rhs[id]); id += stride; } }",
+        )
+        .expect("grid-stride function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 4").expect("arguments parse");
+        let generated = expand_pcu_dispatch(args, &function)
+            .expect("u8 grid-stride map lowers")
+            .to_string();
+        assert!(
+            generated.contains("PcuDispatchOp :: GridStrideLoop"),
+            "{generated}"
+        );
+        assert!(generated.contains("PcuValueType :: u8"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Mul"), "{generated}");
+    }
+
+    fn expand_i8(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
+        let function = syn::parse_str::<ItemFn>(&format!(
+            "fn kernel(input: &[i8], rhs: &[i8], output: &mut [i8]) {{ {body} }}"
+        ))
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default crate path arguments parse");
+        expand_pcu_dispatch(args, &function)
+    }
+
+    #[test]
+    fn lowers_i8_wrapping_arithmetic_and_rejects_plain_operators() {
+        for (method, op) in [
+            ("wrapping_add", "Add"),
+            ("wrapping_sub", "Sub"),
+            ("wrapping_mul", "Mul"),
+        ] {
+            let body = format!(
+                "let invocation = context.global_invocation_id; output[invocation] = input[invocation].{method}(rhs[invocation]);"
+            );
+            let generated = expand_i8(&body)
+                .expect("i8 wrapping map lowers")
+                .to_string();
+            assert!(
+                generated.contains(&format!("PcuDispatchAluOp :: {op}")),
+                "{generated}"
+            );
+            assert!(generated.contains("PcuValueType :: i8"), "{generated}");
+            assert!(
+                generated.contains("PcuBinding :: scalar :: < i8 >"),
+                "{generated}"
+            );
+        }
+        assert!(expand_i8(
+            "let invocation = context.global_invocation_id; output[invocation] = input[invocation] + rhs[invocation];"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lowers_i8_wrapping_chain_inside_grid_stride_loop() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel<const N: usize>(input: &[i8], rhs: &[i8], output: &mut [i8]) { let mut id = context.global_invocation_id; let stride = context.invocation_count; while id < N { output[id] = input[id].wrapping_add(rhs[id]).wrapping_mul(rhs[id]); id += stride; } }",
+        )
+        .expect("grid-stride function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 4").expect("arguments parse");
+        let generated = expand_pcu_dispatch(args, &function)
+            .expect("i8 grid-stride map lowers")
+            .to_string();
+        assert!(
+            generated.contains("PcuDispatchOp :: GridStrideLoop"),
+            "{generated}"
+        );
+        assert!(generated.contains("PcuValueType :: i8"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Mul"), "{generated}");
+    }
+
+    #[test]
+    fn lowers_u32_wrapping_arithmetic_with_typed_alu_ops() {
+        for (method, op) in [
+            ("wrapping_add", "Add"),
+            ("wrapping_sub", "Sub"),
+            ("wrapping_mul", "Mul"),
+        ] {
+            let body = format!(
+                "let invocation = context.global_invocation_id; output[invocation] = (input[invocation]).{method}((rhs[invocation]));"
+            );
+            let generated = expand_u32(&body)
+                .expect("supported wrapping map lowers")
+                .to_string();
+            assert!(
+                generated.contains(&format!("PcuDispatchAluOp :: {op}")),
+                "{generated}"
+            );
+            assert!(generated.contains("PcuValueType :: u32"), "{generated}");
+        }
+    }
+
+    #[test]
+    fn lowers_chained_u32_wrapping_arithmetic_in_ssa_order() {
+        let generated = expand_u32(
+            "let invocation = context.global_invocation_id; output[invocation] = (input[invocation]).wrapping_add(rhs[invocation]).wrapping_mul(rhs[invocation]);",
+        )
+        .expect("chained wrapping arithmetic lowers")
+        .to_string();
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Mul"), "{generated}");
+        assert!(
+            generated.contains("lhs : :: fusion_pcu :: PcuDispatchValueId (3u16)"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("value : :: fusion_pcu :: PcuDispatchValueId (5u16)"),
+            "{generated}"
+        );
+    }
+
+    fn expand_u64(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
+        let function = syn::parse_str::<ItemFn>(&format!(
+            "fn kernel(input: &[u64], rhs: &[u64], output: &mut [u64]) {{ {body} }}"
+        ))
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default crate path arguments parse");
+        expand_pcu_dispatch(args, &function)
+    }
+
+    #[test]
+    fn lowers_u64_wrapping_arithmetic_with_typed_alu_ops() {
+        for (method, op) in [
+            ("wrapping_add", "Add"),
+            ("wrapping_sub", "Sub"),
+            ("wrapping_mul", "Mul"),
+        ] {
+            let body = format!(
+                "let invocation = context.global_invocation_id; output[invocation] = (input[invocation]).{method}(rhs[invocation]);"
+            );
+            let generated = expand_u64(&body)
+                .expect("u64 wrapping map lowers")
+                .to_string();
+            assert!(
+                generated.contains(&format!("PcuDispatchAluOp :: {op}")),
+                "{generated}"
+            );
+            assert!(generated.contains("PcuValueType :: u64"), "{generated}");
+            assert!(
+                generated.contains("PcuBinding :: scalar :: < u64 >"),
+                "{generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowers_i32_wrapping_arithmetic_with_typed_alu_ops() {
+        let function = syn::parse_str::<ItemFn>("fn kernel(input: &[i32], rhs: &[i32], output: &mut [i32]) { let invocation = context.global_invocation_id; output[invocation] = (input[invocation]).wrapping_add(rhs[invocation]); }").expect("function parses");
+        let generated = expand_pcu_dispatch(
+            PcuDispatchArgs {
+                kernel_id: 1,
+                invocations: syn::parse_quote!(8),
+                crate_path: syn::parse_quote!(::fusion_pcu),
+            },
+            &function,
+        )
+        .expect("i32 wrapping map lowers")
+        .to_string();
+        assert!(generated.contains("PcuValueType :: i32 ()"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+    }
+
+    #[test]
+    fn lowers_i16_wrapping_arithmetic_with_typed_alu_ops() {
+        let function = syn::parse_str::<ItemFn>("fn kernel(input: &[i16], rhs: &[i16], output: &mut [i16]) { let invocation = context.global_invocation_id; output[invocation] = (input[invocation]).wrapping_add(rhs[invocation]); }").expect("function parses");
+        let generated = expand_pcu_dispatch(
+            PcuDispatchArgs {
+                kernel_id: 1,
+                invocations: syn::parse_quote!(8),
+                crate_path: syn::parse_quote!(::fusion_pcu),
+            },
+            &function,
+        )
+        .expect("i16 wrapping map lowers")
+        .to_string();
+        assert!(generated.contains("PcuValueType :: i16 ()"), "{generated}");
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+    }
+
+    #[test]
+    fn lowers_i64_wrapping_arithmetic_with_typed_alu_ops() {
+        let function = syn::parse_str::<ItemFn>("fn kernel(input: &[i64], rhs: &[i64], output: &mut [i64]) { let invocation = context.global_invocation_id; output[invocation] = (input[invocation]).wrapping_add(rhs[invocation]); }")
+            .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default crate path arguments parse");
+        let generated = expand_pcu_dispatch(args, &function).expect("i64 wrapping map lowers");
+        let generated = generated.to_string();
+        assert!(generated.contains("PcuValueType :: i64"), "{generated}");
+        assert!(
+            generated.contains("PcuBinding :: scalar :: < i64 >"),
+            "{generated}"
+        );
+        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+    }
+
+    #[test]
+    fn rejects_plain_u32_arithmetic_as_overflow_mode_dependent() {
+        for operator in ["+", "-", "*"] {
+            let body = format!(
+                "let invocation = context.global_invocation_id; output[invocation] = input[invocation] {operator} rhs[invocation];"
+            );
+            let error = expand_u32(&body).expect_err("plain u32 arithmetic is rejected");
+            assert!(error.to_string().contains("matching f32 or f64 operands"));
+        }
     }
 
     #[test]
@@ -1013,7 +1552,7 @@ mod tests {
         let error = expand_pcu_dispatch(args, &function).expect_err("type generic is unsupported");
         let message = error.to_string();
         assert!(message.contains("does not yet support type generics"));
-        assert!(message.contains("binding metadata and emitted constants currently use f32"));
+        assert!(message.contains("expression typing require concrete supported element types"));
         assert!(message.contains("T: PcuScalar"));
         assert!(message.contains("const NAME: usize"));
     }

@@ -40,15 +40,15 @@ static BENCH_ALLOCATOR: TrackingAllocator = TrackingAllocator;
 struct TrackingAllocator;
 
 #[derive(Clone, Copy, Default)]
-struct AllocationCounts {
-    alloc_calls: usize,
-    realloc_calls: usize,
-    dealloc_calls: usize,
-    requested_bytes: usize,
+pub struct AllocationCounts {
+    pub alloc_calls: usize,
+    pub realloc_calls: usize,
+    pub dealloc_calls: usize,
+    pub requested_bytes: usize,
 }
 
 impl AllocationCounts {
-    const fn since(self, previous: Self) -> Self {
+    pub const fn since(self, previous: Self) -> Self {
         Self {
             alloc_calls: self.alloc_calls.saturating_sub(previous.alloc_calls),
             realloc_calls: self.realloc_calls.saturating_sub(previous.realloc_calls),
@@ -128,21 +128,21 @@ fn record_deallocation() {
     });
 }
 
-struct AllocationCapture;
+pub struct AllocationCapture;
 
 impl AllocationCapture {
-    fn start() -> Self {
+    pub fn start() -> Self {
         ALLOCATION_COUNTS.with(|counts| counts.set(AllocationCounts::default()));
         TRACK_ALLOCATIONS.with(|tracking| tracking.set(true));
         Self
     }
 
-    fn finish() -> AllocationCounts {
+    pub fn finish() -> AllocationCounts {
         TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
         ALLOCATION_COUNTS.with(Cell::get)
     }
 
-    fn snapshot() -> AllocationCounts {
+    pub fn snapshot() -> AllocationCounts {
         ALLOCATION_COUNTS.with(Cell::get)
     }
 }
@@ -164,8 +164,73 @@ pub fn timed_copy(
 
 pub fn run_prepared(
     backend: &RocmOwnedDispatchBackend,
-    prepared: &fusion_pcu_rocm::RocmPreparedDispatch<'_>,
+    prepared: &fusion_pcu_rocm::RocmPreparedDispatch,
     input: &fusion_pcu_rocm::DeviceBuffer,
+    output: &fusion_pcu_rocm::DeviceBuffer,
+) -> Result<Sample, Box<dyn Error>> {
+    run_prepared_typed(
+        backend,
+        prepared,
+        input,
+        output,
+        PcuValueType::f32(),
+        PcuBindingAccess::WriteOnly,
+    )
+}
+
+pub fn run_prepared_typed(
+    backend: &RocmOwnedDispatchBackend,
+    prepared: &fusion_pcu_rocm::RocmPreparedDispatch,
+    input: &fusion_pcu_rocm::DeviceBuffer,
+    output: &fusion_pcu_rocm::DeviceBuffer,
+    value_type: PcuValueType,
+    output_access: PcuBindingAccess,
+) -> Result<Sample, Box<dyn Error>> {
+    let _capture = AllocationCapture::start();
+    let total_started = Instant::now();
+    let bind_started = Instant::now();
+    let bindings = [
+        backend.binding(
+            PcuBindingRef::new(0, 0),
+            PcuBindingAccess::ReadOnly,
+            PcuBindingType::Value(value_type),
+            input.clone(),
+        )?,
+        backend.binding(
+            PcuBindingRef::new(0, 1),
+            output_access,
+            PcuBindingType::Value(value_type),
+            output.clone(),
+        )?,
+    ];
+    let bind = bind_started.elapsed();
+    let after_bind = AllocationCapture::snapshot();
+    let launch_started = Instant::now();
+    let mut completion = prepared.submit(&bindings)?;
+    let launch_return = launch_started.elapsed();
+    let after_submit = AllocationCapture::snapshot();
+    let wait_started = Instant::now();
+    if completion.wait()? != PcuCompletionOutcome::Succeeded {
+        return Err("prepared dispatch did not succeed".into());
+    }
+    let allocations = AllocationCapture::finish();
+    Ok(Sample {
+        bind: Some(bind),
+        launch_return,
+        wait: wait_started.elapsed(),
+        total: total_started.elapsed(),
+        allocations,
+        bind_allocations: Some(after_bind),
+        submit_allocations: after_submit.since(after_bind),
+        wait_allocations: allocations.since(after_submit),
+    })
+}
+
+pub fn run_prepared_u32_binary(
+    backend: &RocmOwnedDispatchBackend,
+    prepared: &fusion_pcu_rocm::RocmPreparedDispatch,
+    left: &fusion_pcu_rocm::DeviceBuffer,
+    right: &fusion_pcu_rocm::DeviceBuffer,
     output: &fusion_pcu_rocm::DeviceBuffer,
 ) -> Result<Sample, Box<dyn Error>> {
     let _capture = AllocationCapture::start();
@@ -175,13 +240,73 @@ pub fn run_prepared(
         backend.binding(
             PcuBindingRef::new(0, 0),
             PcuBindingAccess::ReadOnly,
-            PcuBindingType::Value(PcuValueType::f32()),
-            input.clone(),
+            PcuBindingType::Value(PcuValueType::u32()),
+            left.clone(),
         )?,
         backend.binding(
             PcuBindingRef::new(0, 1),
-            PcuBindingAccess::WriteOnly,
-            PcuBindingType::Value(PcuValueType::f32()),
+            PcuBindingAccess::ReadOnly,
+            PcuBindingType::Value(PcuValueType::u32()),
+            right.clone(),
+        )?,
+        backend.binding(
+            PcuBindingRef::new(0, 2),
+            PcuBindingAccess::ReadWrite,
+            PcuBindingType::Value(PcuValueType::u32()),
+            output.clone(),
+        )?,
+    ];
+    let bind = bind_started.elapsed();
+    let after_bind = AllocationCapture::snapshot();
+    let launch_started = Instant::now();
+    let mut completion = prepared.submit(&bindings)?;
+    let launch_return = launch_started.elapsed();
+    let after_submit = AllocationCapture::snapshot();
+    let wait_started = Instant::now();
+    if completion.wait()? != PcuCompletionOutcome::Succeeded {
+        return Err("prepared dispatch did not succeed".into());
+    }
+    let allocations = AllocationCapture::finish();
+    Ok(Sample {
+        bind: Some(bind),
+        launch_return,
+        wait: wait_started.elapsed(),
+        total: total_started.elapsed(),
+        allocations,
+        bind_allocations: Some(after_bind),
+        submit_allocations: after_submit.since(after_bind),
+        wait_allocations: allocations.since(after_submit),
+    })
+}
+
+pub fn run_prepared_typed_binary(
+    backend: &RocmOwnedDispatchBackend,
+    prepared: &fusion_pcu_rocm::RocmPreparedDispatch,
+    value_type: PcuValueType,
+    left: &fusion_pcu_rocm::DeviceBuffer,
+    right: &fusion_pcu_rocm::DeviceBuffer,
+    output: &fusion_pcu_rocm::DeviceBuffer,
+) -> Result<Sample, Box<dyn Error>> {
+    let _capture = AllocationCapture::start();
+    let total_started = Instant::now();
+    let bind_started = Instant::now();
+    let bindings = [
+        backend.binding(
+            PcuBindingRef::new(0, 0),
+            PcuBindingAccess::ReadOnly,
+            PcuBindingType::Value(value_type),
+            left.clone(),
+        )?,
+        backend.binding(
+            PcuBindingRef::new(0, 1),
+            PcuBindingAccess::ReadOnly,
+            PcuBindingType::Value(value_type),
+            right.clone(),
+        )?,
+        backend.binding(
+            PcuBindingRef::new(0, 2),
+            PcuBindingAccess::ReadWrite,
+            PcuBindingType::Value(value_type),
             output.clone(),
         )?,
     ];
@@ -217,7 +342,7 @@ pub fn run_direct(
     let _capture = AllocationCapture::start();
     let total_started = Instant::now();
     let launch_started = Instant::now();
-    let mut completion = direct_launch(function, stream, arguments, grid)?;
+    let mut completion = direct_launch_unwaited(function, stream, arguments, grid)?;
     let launch_return = launch_started.elapsed();
     let after_submit = AllocationCapture::snapshot();
     let wait_started = Instant::now();
@@ -236,7 +361,7 @@ pub fn run_direct(
 }
 
 #[allow(unsafe_code)]
-fn direct_launch(
+pub fn direct_launch_unwaited(
     function: &HipKernel,
     stream: &fusion_pcu_rocm::HipStreamHandle,
     arguments: &[HipKernelArgument<'_>],
@@ -363,6 +488,30 @@ pub fn encode_f32(values: &[f32]) -> Vec<u8> {
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect()
+}
+
+pub fn encode_u32(values: &[u32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect()
+}
+
+pub fn verify_u32_copy(label: &str, bytes: &[u8], input: &[u32]) -> Result<(), Box<dyn Error>> {
+    if bytes.len() != std::mem::size_of_val(input) {
+        return Err(format!("{label} output length differs from input").into());
+    }
+    for (index, chunk) in bytes.chunks_exact(size_of::<u32>()).enumerate() {
+        let actual = u32::from_ne_bytes(chunk.try_into()?);
+        if actual != input[index] {
+            return Err(format!(
+                "{label} output[{index}]={actual}; expected {}",
+                input[index]
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_output(label: &str, bytes: &[u8], input: &[f32]) -> Result<(), Box<dyn Error>> {

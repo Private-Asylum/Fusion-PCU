@@ -12,6 +12,7 @@ use criterion::{
 };
 use fusion_pcu::PcuOwnedDispatchMemorySession;
 use fusion_pcu_rocm::{
+    DeviceBuffer,
     HipKernel,
     HipKernelArgument,
     HipRuntime,
@@ -62,6 +63,7 @@ pub fn run(criterion: &mut Criterion, case: &ElementwiseCase) -> Result<(), Box<
     .into())
 }
 
+#[allow(clippy::too_many_lines)] // Keep matched host/resident setup and route verification together.
 fn run_on(
     criterion: &mut Criterion,
     case: &ElementwiseCase,
@@ -75,7 +77,8 @@ fn run_on(
     let module = runtime.load_module(&image)?;
     let kernel = module.function(case.kernel_name)?;
     let stream = runtime.create_stream()?;
-    let session = RocmOwnedDispatchBackend::open(discovery, selected.device, 64)?;
+    // Match the native HIP launch geometry for the timed comparison.
+    let session = RocmOwnedDispatchBackend::open(discovery, selected.device, 256)?;
     let assessor = RocmTensorAssessor::new(&session)?;
     println!("Device: {}; workload: {}", selected.name, case.name);
     for size in [65_usize, 1_048_576] {
@@ -103,9 +106,49 @@ fn run_on(
             assessor.execute_graph(&graph, &inputs, output, selected.pool, &mut memory)
         })?;
         verify(&expected, cold.data())?;
+        let prepared = assessor.prepare_graph(&graph, output)?;
+        verify(
+            &expected,
+            assessor
+                .execute_prepared(&prepared, &inputs, selected.pool, &mut memory)?
+                .data(),
+        )?;
         verify(
             &expected,
             &native_execute(&runtime, &kernel, &stream, &host_values)?,
+        )?;
+        let resident_inputs = inputs
+            .iter()
+            .map(|(id, tensor)| {
+                assessor
+                    .upload_input(tensor, selected.pool, &mut memory)
+                    .map(|resource| (*id, resource))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pcu_resident_inputs = resident_inputs
+            .iter()
+            .map(|(id, resource)| (*id, resource))
+            .collect::<Vec<_>>();
+        let mut native_resident_inputs = Vec::with_capacity(host_values.len());
+        for values in &host_values {
+            let mut resource = runtime.allocate(size * size_of::<f32>())?;
+            resource.copy_from(bytemuck::cast_slice(values))?;
+            native_resident_inputs.push(resource);
+        }
+        verify(
+            &expected,
+            assessor
+                .execute_prepared_with_resources(
+                    &prepared,
+                    &pcu_resident_inputs,
+                    selected.pool,
+                    &mut memory,
+                )?
+                .data(),
+        )?;
+        verify(
+            &expected,
+            &native_execute_resident(&runtime, &kernel, &stream, &native_resident_inputs, size)?,
         )?;
 
         {
@@ -120,11 +163,54 @@ fn run_on(
                     )
                 });
             });
+            group.bench_function("pcu_prepared", |bencher| {
+                bencher.iter(|| {
+                    black_box(
+                        assessor
+                            .execute_prepared(&prepared, &inputs, selected.pool, &mut memory)
+                            .expect("prepared PCU elementwise execution failed"),
+                    )
+                });
+            });
             group.bench_function("native_hip", |bencher| {
                 bencher.iter(|| {
                     black_box(
                         native_execute(&runtime, &kernel, &stream, &host_values)
                             .expect("native HIP elementwise execution failed"),
+                    )
+                });
+            });
+            group.finish();
+        }
+        {
+            let mut group =
+                criterion.benchmark_group(format!("tensor_{}_resident/{size}", case.name));
+            group.throughput(Throughput::Elements(u64::try_from(size)?));
+            group.bench_function("pcu_resident_inputs", |bencher| {
+                bencher.iter(|| {
+                    black_box(
+                        assessor
+                            .execute_prepared_with_resources(
+                                &prepared,
+                                &pcu_resident_inputs,
+                                selected.pool,
+                                &mut memory,
+                            )
+                            .expect("resident PCU elementwise execution failed"),
+                    )
+                });
+            });
+            group.bench_function("native_resident_inputs", |bencher| {
+                bencher.iter(|| {
+                    black_box(
+                        native_execute_resident(
+                            &runtime,
+                            &kernel,
+                            &stream,
+                            &native_resident_inputs,
+                            size,
+                        )
+                        .expect("resident native HIP elementwise execution failed"),
                     )
                 });
             });
@@ -174,6 +260,19 @@ fn native_execute(
         resource.copy_from(bytemuck::cast_slice(values))?;
         resources.push(resource);
     }
+    native_execute_resident(runtime, kernel, stream, &resources, count)
+}
+
+fn native_execute_resident(
+    runtime: &HipRuntime,
+    kernel: &HipKernel,
+    stream: &HipStreamHandle,
+    resources: &[DeviceBuffer],
+    count: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let bytes = count
+        .checked_mul(size_of::<f32>())
+        .ok_or("byte size overflow")?;
     let output = runtime.allocate(bytes)?;
     let count_u32 = u32::try_from(count)?;
     let count_bytes = count_u32.to_ne_bytes();

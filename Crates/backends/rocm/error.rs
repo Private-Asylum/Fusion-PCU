@@ -25,6 +25,9 @@ pub enum HipError {
         actual: String,
     },
     DifferentRuntime,
+    DifferentStream,
+    BatchPoisoned,
+    InvalidExecutionFaultWord(u64),
     Busy,
     InvalidLaunchDimensions,
     BufferTooSmall {
@@ -72,6 +75,16 @@ impl fmt::Display for HipError {
             ),
             Self::DifferentRuntime => formatter
                 .write_str("HIP resources belong to different runtime instances or devices"),
+            Self::DifferentStream => {
+                formatter.write_str("HIP completion belongs to a different stream")
+            }
+            Self::BatchPoisoned => formatter.write_str(
+                "HIP completion batch cannot accept work after a launch failure",
+            ),
+            Self::InvalidExecutionFaultWord(word) => write!(
+                formatter,
+                "HIP returned an invalid checked-division fault word {word:#x}"
+            ),
             Self::Busy => formatter.write_str("HIP device allocation is busy"),
             Self::InvalidLaunchDimensions => {
                 formatter.write_str("HIP grid and block dimensions must all be nonzero")

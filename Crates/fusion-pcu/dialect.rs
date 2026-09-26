@@ -10,6 +10,10 @@ use crate::{
     PcuValueType,
 };
 
+pub mod builder;
+
+pub use builder::*;
+
 /// Stable, namespaced identity supplied by a dialect author (for example `org.example.vm`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuDialectId<'a>(pub &'a str);

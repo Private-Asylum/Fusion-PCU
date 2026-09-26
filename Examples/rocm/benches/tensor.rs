@@ -85,6 +85,7 @@ fn run(criterion: &mut Criterion) -> Result<(), Box<dyn Error>> {
     );
     resident_matmul(criterion, &device, &assessor)?;
     graph_matmul(criterion, &device, &assessor)?;
+    graph_elementwise_batch(criterion, &device, &assessor)?;
     Ok(())
 }
 
@@ -266,6 +267,88 @@ fn graph_matmul(
                         &device.blas,
                     )
                     .expect("direct graph execution failed"),
+                );
+            });
+        });
+    }
+    group.finish();
+    Ok(())
+}
+
+#[allow(clippy::significant_drop_tightening)]
+fn graph_elementwise_batch(
+    criterion: &mut Criterion,
+    device: &Device,
+    assessor: &RocmTensorAssessor<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let mut group = criterion.benchmark_group("prepared_add_relu_matmul_batch");
+    for size in [8_usize, 256] {
+        let (a_values, b_values, c_values) = graph_inputs(size);
+        let mut graph = Graph::default();
+        let a = graph.input([size, size])?;
+        let b = graph.input([size, size])?;
+        let bias = graph.input([size, size])?;
+        let c = graph.input([size, size])?;
+        let product = graph.matmul(a, b)?;
+        let biased = graph.add(product, bias)?;
+        let activated = graph.relu(biased)?;
+        let output = graph.matmul(activated, c)?;
+        let inputs = [
+            (a, Tensor::new([size, size], a_values.clone())?),
+            (b, Tensor::new([size, size], b_values.clone())?),
+            (
+                bias,
+                Tensor::new([size, size], vec![0.25_f32; size * size])?,
+            ),
+            (c, Tensor::new([size, size], c_values.clone())?),
+        ];
+        let reference = graph.evaluate(&inputs)?.value(output)?.clone();
+        let prepared =
+            support::cold_once(&format!("{size}x{size} batched graph preparation"), || {
+                assessor.prepare_graph(&graph, output)
+            })?;
+        let mut memory =
+            PcuOwnedDispatchMemorySession::memory_provider(&device.session, device.candidate.pool);
+        for (mode, result) in [
+            (
+                "sync",
+                assessor.execute_prepared(&prepared, &inputs, device.candidate.pool, &mut memory),
+            ),
+            (
+                "batched",
+                assessor.execute_prepared_batched(
+                    &prepared,
+                    &inputs,
+                    device.candidate.pool,
+                    &mut memory,
+                ),
+            ),
+        ] {
+            let result = result?;
+            verify_tensor(&reference, &result)
+                .map_err(|error| format!("{mode} graph parity failed: {error}"))?;
+        }
+
+        group.bench_function(BenchmarkId::new("PCU_prepared_sync", size), |bench| {
+            bench.iter(|| {
+                black_box(
+                    assessor
+                        .execute_prepared(&prepared, &inputs, device.candidate.pool, &mut memory)
+                        .expect("synchronous prepared graph failed"),
+                );
+            });
+        });
+        group.bench_function(BenchmarkId::new("PCU_prepared_batched", size), |bench| {
+            bench.iter(|| {
+                black_box(
+                    assessor
+                        .execute_prepared_batched(
+                            &prepared,
+                            &inputs,
+                            device.candidate.pool,
+                            &mut memory,
+                        )
+                        .expect("batched prepared graph failed"),
                 );
             });
         });

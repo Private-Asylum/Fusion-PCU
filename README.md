@@ -27,7 +27,7 @@ The currently tested executable profiles are deliberately small:
 | --- | --- | --- |
 | Hosted CPU Stream | Stream transforms pass local tests | The hosted CPU adapter and its broader Stream behavior live in Fusion. |
 | Fusion RP2350 PIO Stream integration | Adapter compiles for `thumbv8m.main-none-eabihf` in the Fusion repository | Hardware parity on a board is not yet demonstrated; the Cortex-M adapter stays in Fusion. |
-| ROCm Dispatch | RX 6900 XT runs a 250-invocation/2048-value grid-stride f32 map; separate HIP and rocBLAS smoke checks pass | Only a bounded f32 indexed-map subset and its structured grid-stride loop lower to HIP; device architecture discovery and runtime compilation have limited hardware coverage. |
+| ROCm Dispatch | RX 6900 XT runs bounded direct and grid-stride scalar maps for f32/f64 and wrapping 8/16/32/64-bit integers; separate HIP and rocBLAS smoke checks pass | These are exact, narrow profiles rather than general Rust compilation; device architecture discovery and runtime compilation have limited hardware coverage. |
 | SPIR-V/Vulkan Dispatch | Vulkan example runs a 250-invocation/2048-value grid-stride map on RX 6900 XT | SPIR-V 1.0–1.3 only; current emitter uses LocalSize `[1, 1, 1]` and the runner is a synchronous, fixed three-buffer, one-dimensional adapter. |
 | Fusion AML Command/Signal integration | Firmware VM fixtures execute in the Fusion repository | No AML method is lowered and executed through PCU yet; the ACPI integration stays in Fusion. |
 
@@ -46,20 +46,20 @@ until all aliases and in-flight uses have ended.
 
 The experimental owned Dispatch contract admits only tightly packed scalar buffers, sized for
 the full indexed extent of a supported grid-stride loop; it rejects other layouts and ports. Its
-completion law retains resources through uncertain waits and releases them only after quiescence. ROCm now implements
-that contract for the bounded f32 map subset. Cloned ROCm device buffers share an access gate,
+completion law retains resources through uncertain waits and releases them only after quiescence. ROCm implements
+that contract for its bounded scalar map profiles. Cloned ROCm device buffers share an access gate,
 so safe copies and rocBLAS reject overlapping use while a launched kernel owns an allocation.
 The host example prepares once, submits twice through the PCU owned-dispatch contract, and proves
 completion and readback on the RX 6900 XT.
-ROCm also exposes a reusable prepared executable for this f32
-profile: lowering, HIP compilation, module/function resolution, and stream creation happen at
+ROCm also exposes a reusable prepared executable for these profiles:
+lowering, HIP compilation, module/function resolution, and stream creation happen at
 prepare time, while each launch owns its bindings and completion. The separate benchmark submits it
 repeatedly and reports cold preparation separately from warm bind/submit/wait samples. Per-launch
 binding checks, argument allocation, access gates, and events remain; no zero-overhead claim is
 made. The original synchronous helper remains available. Command has a
 typed read-result verifier, but there is no AML-to-PCU executor yet.
 
-`PcuScalar` is sealed to `f32` and `u32` for now, with explicit host layout and lossless
+`PcuScalar` is sealed to `f32`, `f64`, and signed/unsigned 8/16/32/64-bit integers, with explicit host layout and lossless
 little-endian encoding; it does not grant a backend a zero-copy device ABI or arithmetic support.
 `F32MapBuilder` constructs the current scalar f32 indexed-map subset without heap allocation and
 with automatic nonzero value IDs. Both ROCm and SPIR-V lowerers accept its output in tests. It is
@@ -69,10 +69,17 @@ statements and expressions and a renamed-crate compile-pass test. The macro is a
 `#[pcu]` for the guiding-star spelling. It accepts literal counts
 and checked const-generic `usize` expressions such as `invocations = R * C`; specialization rejects
 zero, overflow, and counts beyond `u32`. The old logical-thread spelling is rejected. The core
-shape and context use invocation terminology directly. Macro resources use `&[f32]` for read-only
-access and `&mut [f32]` for read/write access. The macro still accepts only its narrow f32
-assignment body and one canonical grid-stride loop; generic element types and general control flow
-remain planned frontend work. Within that subset, source may use
+shape and context use invocation terminology directly. Macro resources use concrete scalar slices
+for read-only access and their mutable slice forms for read/write access. It tracks concrete
+binding/value types and rejects mixed-type stores and arithmetic. For two indexed integer sources,
+explicit `wrapping_add`, `wrapping_sub`, and `wrapping_mul` lower to modulo-2ⁿ operations on the
+CPU reference and ROCm for 8/16/32/64-bit signed and unsigned values. Plain integer arithmetic
+stays rejected because Rust's overflow-check setting changes its behavior; integer division and
+general Rust expressions remain outside this bounded profile. ROCm also lowers u32/u64 identity
+copy and canonical grid-stride copy forms.
+The macro accepts only its narrow assignment body and one canonical grid-stride loop;
+generic element types and general control flow remain planned frontend work. Within that subset,
+source may use
 `pcu::context::global_invocation_id()` and `pcu::context::invocation_count()`; other function calls
 are rejected. The loop carries a semantic extent distinct from the launch width,
 so a smaller dispatch can cover a larger buffer with repeated per-lane iterations.

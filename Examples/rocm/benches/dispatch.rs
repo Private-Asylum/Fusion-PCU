@@ -1,6 +1,7 @@
 //! Compare repeated prepared PCU submissions with repeated direct HIP launches.
 
 #[path = "support/dispatch.rs"]
+#[allow(dead_code)] // Shared dispatch support also contains the u32 benchmark's helpers.
 mod dispatch_support;
 mod support;
 

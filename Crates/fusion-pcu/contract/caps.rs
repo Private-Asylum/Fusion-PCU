@@ -271,6 +271,11 @@ impl PcuDispatchOpCaps {
     pub const RAY_ACCEPT_HIT_AND_END_SEARCH: Self = Self(1 << 48);
     pub const RAY_PAYLOAD_READ: Self = Self(1 << 49);
     pub const RAY_PAYLOAD_WRITE: Self = Self(1 << 50);
+    /// Read element zero from a resource binding, broadcasting it across invocations.
+    /// This is an additional indexing mode and does not replace `BINDING_LOAD`.
+    pub const BINDING_LOAD_ELEMENT_ZERO: Self = Self(1 << 51);
+    /// Checked scalar integer quotient and remainder with completion-level domain faults.
+    pub const ALU_CHECKED_DIV_REM: Self = Self(1 << 52);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -279,7 +284,7 @@ impl PcuDispatchOpCaps {
 
     #[must_use]
     pub const fn all() -> Self {
-        Self((1u64 << 51) - 1)
+        Self((1u64 << 53) - 1)
     }
 
     #[must_use]
@@ -571,11 +576,74 @@ impl PcuPrimitiveSupport {
     }
 }
 
+/// Scalar arithmetic support by value type.
+///
+/// Operations are advertised independently for each value type.
+/// The generic instruction flags still describe the instruction family, but cannot
+/// establish that a particular scalar type supports that instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuDispatchScalarAluSupport {
+    pub by_scalar: [PcuDispatchOpCaps; crate::PcuScalarType::COUNT],
+}
+
+impl PcuDispatchScalarAluSupport {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            by_scalar: [PcuDispatchOpCaps::empty(); crate::PcuScalarType::COUNT],
+        }
+    }
+
+    #[must_use]
+    pub const fn with(mut self, scalar: crate::PcuScalarType, support: PcuDispatchOpCaps) -> Self {
+        self.by_scalar[scalar_index(scalar)] = support;
+        self
+    }
+
+    #[must_use]
+    pub const fn for_scalar(self, scalar: crate::PcuScalarType) -> PcuDispatchOpCaps {
+        self.by_scalar[scalar_index(scalar)]
+    }
+
+    #[must_use]
+    pub const fn supports(self, required: Self) -> bool {
+        let mut index = 0;
+        while index < self.by_scalar.len() {
+            if !self.by_scalar[index].contains(required.by_scalar[index]) {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+}
+
+const fn scalar_index(scalar: crate::PcuScalarType) -> usize {
+    match scalar {
+        crate::PcuScalarType::Bool => 0,
+        crate::PcuScalarType::I4 => 1,
+        crate::PcuScalarType::U4 => 2,
+        crate::PcuScalarType::I8 => 3,
+        crate::PcuScalarType::U8 => 4,
+        crate::PcuScalarType::I16 => 5,
+        crate::PcuScalarType::U16 => 6,
+        crate::PcuScalarType::I32 => 7,
+        crate::PcuScalarType::U32 => 8,
+        crate::PcuScalarType::I64 => 9,
+        crate::PcuScalarType::U64 => 10,
+        crate::PcuScalarType::F16 => 11,
+        crate::PcuScalarType::BF16 => 12,
+        crate::PcuScalarType::F32 => 13,
+        crate::PcuScalarType::F64 => 14,
+    }
+}
+
 /// Dispatch-model support surfaced by one backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuDispatchSupport {
     pub flags: PcuDispatchPolicyCaps,
     pub instructions: PcuFeatureSupport<PcuDispatchOpCaps>,
+    pub scalar_alu: PcuFeatureSupport<PcuDispatchScalarAluSupport>,
     pub features: PcuFeatureSupport<PcuDispatchFeatureCaps>,
 }
 
@@ -587,6 +655,10 @@ impl PcuDispatchSupport {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
+            ),
+            scalar_alu: PcuFeatureSupport::new(
+                PcuDispatchScalarAluSupport::empty(),
+                PcuDispatchScalarAluSupport::empty(),
             ),
             features: PcuFeatureSupport::new(
                 PcuDispatchFeatureCaps::empty(),
@@ -785,8 +857,10 @@ impl PcuSupport {
         let required_policy = kernel.required_dispatch_policy();
         match kernel {
             PcuKernel::Dispatch(kernel) => {
-                self.primitive_support
-                    .supports_direct(PcuPrimitiveCaps::DISPATCH)
+                !kernel.has_non_scalar_alu_type()
+                    && self
+                        .primitive_support
+                        .supports_direct(PcuPrimitiveCaps::DISPATCH)
                     && self.dispatch_support.allows(required_policy)
                     && self
                         .value_type_support
@@ -798,6 +872,11 @@ impl PcuSupport {
                     && self
                         .dispatch_support
                         .supports_direct_instructions(kernel.required_instruction_support())
+                    && self
+                        .dispatch_support
+                        .scalar_alu
+                        .direct
+                        .supports(kernel.required_scalar_alu_support())
             }
             PcuKernel::Stream(kernel) => {
                 self.primitive_support
@@ -840,8 +919,10 @@ impl PcuSupport {
         let required_policy = kernel.required_dispatch_policy();
         match kernel {
             PcuKernel::Dispatch(kernel) => {
-                self.primitive_support
-                    .supports_cpu_fallback(PcuPrimitiveCaps::DISPATCH)
+                !kernel.has_non_scalar_alu_type()
+                    && self
+                        .primitive_support
+                        .supports_cpu_fallback(PcuPrimitiveCaps::DISPATCH)
                     && self.dispatch_support.allows(required_policy)
                     && self
                         .value_type_support
@@ -853,6 +934,11 @@ impl PcuSupport {
                     && self
                         .dispatch_support
                         .supports_cpu_fallback_instructions(kernel.required_instruction_support())
+                    && self
+                        .dispatch_support
+                        .scalar_alu
+                        .cpu_fallback
+                        .supports(kernel.required_scalar_alu_support())
             }
             PcuKernel::Stream(kernel) => {
                 self.primitive_support
@@ -898,6 +984,7 @@ mod tests {
         PcuDispatchOpCaps,
         PcuDispatchPolicyCaps,
         PcuDispatchSupport,
+        PcuDispatchScalarAluSupport,
         PcuFeatureSupport,
         PcuPrimitiveCaps,
         PcuPrimitiveSupport,
@@ -912,6 +999,12 @@ mod tests {
         PcuCommandOp,
         PcuCommandStep,
         PcuDispatchFeatureCaps,
+        PcuDispatchAluOp,
+        PcuDispatchDataOp,
+        PcuDispatchEntryPoint,
+        PcuDispatchKernelIr,
+        PcuDispatchOp,
+        PcuDispatchValueId,
         PcuDispatchRayTraceOp,
         PcuKernel,
         PcuKernelId,
@@ -940,6 +1033,64 @@ mod tests {
     }
 
     #[test]
+    fn typed_alu_capability_does_not_infer_u32_add_from_global_add() {
+        let mut support = PcuSupport::unsupported();
+        support.primitive_support = PcuPrimitiveSupport {
+            primitives: PcuFeatureSupport::new(
+                PcuPrimitiveCaps::DISPATCH,
+                PcuPrimitiveCaps::empty(),
+            ),
+        };
+        support.value_type_support = PcuFeatureSupport::new(
+            PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES,
+            PcuValueTypeCaps::empty(),
+        );
+        support.dispatch_support.flags = PcuDispatchPolicyCaps::ORDERED_SUBMISSION;
+        support.dispatch_support.instructions =
+            PcuFeatureSupport::new(PcuDispatchOpCaps::ALU_ADD, PcuDispatchOpCaps::empty());
+        support.dispatch_support.scalar_alu = PcuFeatureSupport::new(
+            PcuDispatchScalarAluSupport::empty()
+                .with(crate::PcuScalarType::F32, PcuDispatchOpCaps::ALU_ADD),
+            PcuDispatchScalarAluSupport::empty(),
+        );
+
+        for (value_type, expected) in [(PcuValueType::f32(), true), (PcuValueType::u32(), false)] {
+            let ops = [PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Add,
+                value_type,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            })];
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(8),
+                entry: PcuDispatchEntryPoint {
+                    name: "typed-alu-capability",
+                    logical_shape: [1, 1, 1],
+                },
+                bindings: &[],
+                ports: &[],
+                parameters: &[],
+                ops: &ops,
+                type_caps: PcuValueTypeCaps::empty(),
+                feature_caps: PcuDispatchFeatureCaps::empty(),
+            };
+            assert_eq!(
+                support.supports_kernel_direct(PcuKernel::Dispatch(kernel)),
+                expected
+            );
+            if value_type == PcuValueType::u32() {
+                support.dispatch_support.scalar_alu.direct = support
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .with(crate::PcuScalarType::U32, PcuDispatchOpCaps::ALU_ADD);
+                assert!(support.supports_kernel_direct(PcuKernel::Dispatch(kernel)));
+            }
+        }
+    }
+
+    #[test]
     fn support_reports_direct_command_coverage() {
         let mut support = PcuSupport::unsupported();
         support.primitive_support = PcuPrimitiveSupport {
@@ -956,6 +1107,10 @@ mod tests {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
+            ),
+            scalar_alu: PcuFeatureSupport::new(
+                PcuDispatchScalarAluSupport::empty(),
+                PcuDispatchScalarAluSupport::empty(),
             ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
@@ -994,6 +1149,10 @@ mod tests {
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::empty(),
             ),
+            scalar_alu: PcuFeatureSupport::new(
+                PcuDispatchScalarAluSupport::empty(),
+                PcuDispatchScalarAluSupport::empty(),
+            ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
                 crate::PcuDispatchFeatureCaps::empty(),
@@ -1024,6 +1183,10 @@ mod tests {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::ALU_ADD,
                 PcuDispatchOpCaps::ALU_ADD,
+            ),
+            scalar_alu: PcuFeatureSupport::new(
+                PcuDispatchScalarAluSupport::empty(),
+                PcuDispatchScalarAluSupport::empty(),
             ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
@@ -1064,6 +1227,10 @@ mod tests {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::ALU_ADD,
                 PcuDispatchOpCaps::ALU_ADD,
+            ),
+            scalar_alu: PcuFeatureSupport::new(
+                PcuDispatchScalarAluSupport::empty(),
+                PcuDispatchScalarAluSupport::empty(),
             ),
             features: PcuFeatureSupport::new(
                 crate::PcuDispatchFeatureCaps::empty(),
@@ -1128,6 +1295,10 @@ mod tests {
             instructions: PcuFeatureSupport::new(
                 PcuDispatchOpCaps::empty(),
                 PcuDispatchOpCaps::RAY_TRACE,
+            ),
+            scalar_alu: PcuFeatureSupport::new(
+                PcuDispatchScalarAluSupport::empty(),
+                PcuDispatchScalarAluSupport::empty(),
             ),
             features: PcuFeatureSupport::new(
                 PcuDispatchFeatureCaps::READ_ONLY_RESOURCES,

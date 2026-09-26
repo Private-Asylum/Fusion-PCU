@@ -13,16 +13,42 @@ use std::sync::atomic::{
     Ordering,
 };
 
+#[path = "tensor/storage.rs"]
+mod storage;
+pub use storage::{
+    TensorGraphRequirements,
+    TensorStorageConstraint,
+    TensorStorageValidationError,
+    TensorValueLiveness,
+    TensorValueRequirement,
+};
+use storage::node_output_bytes;
+
+#[path = "tensor/feedback.rs"]
+mod feedback;
+pub use feedback::{
+    TensorFeedbackBinding,
+    TensorFeedbackInput,
+    TensorFeedbackPlan,
+};
+
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_graph_id() -> u64 {
     NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Tensor {
     shape: Vec<usize>,
     data: Vec<f32>,
+    known_uniform_value: Option<f32>,
+}
+
+impl PartialEq for Tensor {
+    fn eq(&self, other: &Self) -> bool {
+        self.shape == other.shape && self.data == other.data
+    }
 }
 
 impl Tensor {
@@ -41,7 +67,31 @@ impl Tensor {
                 actual: data.len(),
             });
         }
-        Ok(Self { shape, data })
+        Ok(Self {
+            shape,
+            data,
+            known_uniform_value: None,
+        })
+    }
+
+    /// Creates a tensor whose elements are all `value` and records that fact for dialect
+    /// optimizations that can use uniform data without rescanning a potentially large buffer.
+    ///
+    /// The returned tensor still owns ordinary contiguous data, so evaluators and backends see
+    /// the same representation and upload behavior as for [`Self::new`]. Empty tensors have no
+    /// known element value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::ShapeOverflow`] if the element count overflows.
+    pub fn splat(shape: impl Into<Vec<usize>>, value: f32) -> Result<Self, TensorError> {
+        let shape = shape.into();
+        let len = element_count(&shape)?;
+        Ok(Self {
+            shape,
+            data: vec![value; len],
+            known_uniform_value: (len != 0).then_some(value),
+        })
     }
 
     #[must_use]
@@ -49,6 +99,7 @@ impl Tensor {
         Self {
             shape: vec![],
             data: vec![value],
+            known_uniform_value: Some(value),
         }
     }
     #[must_use]
@@ -58,6 +109,14 @@ impl Tensor {
     #[must_use]
     pub fn data(&self) -> &[f32] {
         &self.data
+    }
+
+    /// Returns a uniform element value when the tensor was constructed with a uniformity-aware
+    /// constructor. General tensors created with [`Self::new`] remain unknown until an
+    /// optimization elects to inspect their data.
+    #[must_use]
+    pub const fn known_uniform_value(&self) -> Option<f32> {
+        self.known_uniform_value
     }
 
     /// Consumes the tensor and returns its contiguous data without copying it.
@@ -78,6 +137,9 @@ pub enum TensorError {
     MissingInput(ValueId),
     DuplicateInput(ValueId),
     ExtraInput(ValueId),
+    EmptyOutputs,
+    DuplicateOutput(ValueId),
+    FeedbackRequiresMultipleBanks(usize),
     WrongGraph,
     GraphChanged,
     InvalidSeed,
@@ -112,6 +174,11 @@ pub struct ValueId {
 pub enum OpDescriptor<'a> {
     Input,
     Constant(&'a Tensor),
+    /// A compact graph-level constant whose logical output is a dense tensor filled with `value`.
+    /// Storage and liveness metadata continue to describe the full logical tensor extent.
+    Uniform {
+        value: f32,
+    },
     Add {
         left: ValueId,
         right: ValueId,
@@ -165,6 +232,17 @@ pub enum TensorExecutionRoute {
     Reference,
 }
 
+/// Physical representation offered for an input operand of a tensor operation.
+///
+/// This does not change the operand's logical shape or the graph's value semantics. An adapter
+/// must affirm a compact representation for every consumer before allocating less than the
+/// logical tensor extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TensorOperandRepresentation {
+    Dense,
+    UniformScalar,
+}
+
 /// Structured reason why an assessor cannot support a graph operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TensorUnsupportedReason {
@@ -191,6 +269,20 @@ pub enum TensorOperationSupport {
 /// Adapter contract for assessing one operation on an explicitly selected target.
 pub trait TensorOperationAssessor {
     fn assess_node(&self, graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport;
+
+    /// Whether `node` can consume `operand` in the given physical representation.
+    ///
+    /// Dense operands retain the existing assessment contract. Compact forms require an
+    /// explicit backend affirmation; the conservative default prevents accidental compression.
+    fn supports_operand_representation(
+        &self,
+        _graph: &Graph,
+        _node: NodeDescriptor<'_>,
+        _operand: ValueId,
+        representation: TensorOperandRepresentation,
+    ) -> bool {
+        representation == TensorOperandRepresentation::Dense
+    }
 }
 
 /// Synchronous execution of one dense row-major f32 matrix multiplication.
@@ -271,26 +363,6 @@ impl TensorGraphAssessment<'_> {
     }
 }
 
-/// Backend-neutral storage facts for graph values.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TensorGraphRequirements<'a> {
-    /// Dense row-major f32 values are the only layout and element type currently represented.
-    pub values: Vec<TensorValueRequirement<'a>>,
-    /// Sum of all graph-value output storage, not a peak/live memory estimate.
-    pub total_value_bytes: Option<usize>,
-}
-
-/// Inclusive lifetime and output-storage facts for one value in an execution plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TensorValueLiveness {
-    pub value: ValueId,
-    pub output_bytes: Option<usize>,
-    /// Index in `TensorExecutionPlan::node_order` where this value is produced.
-    pub first_live_node: usize,
-    /// Last node that reads this value, or its production node when it has no consumers.
-    pub last_live_node: usize,
-}
-
 /// Stable CPU reference execution order and checked storage/liveness facts for a graph.
 ///
 /// Nodes are currently appended only after their operands, so append order is a valid stable
@@ -303,13 +375,420 @@ pub struct TensorExecutionPlan<'a> {
     input_values: Vec<ValueId>,
     output_values: Vec<ValueId>,
     value_liveness: Vec<TensorValueLiveness>,
+    index_by_value: Vec<usize>,
+    use_counts: Vec<usize>,
     peak_live_bytes: Option<usize>,
 }
 
-impl TensorExecutionPlan<'_> {
+/// Controls whether a backend-neutral lowering plan may replace a multiply followed by
+/// subtraction with the fused SGD operation.
+///
+/// `AllowContractedArithmetic` explicitly permits the target to contract `weight - rate * grad`
+/// and therefore change intermediate f32 rounding. It never changes graph construction or the
+/// CPU reference evaluator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TensorArithmeticRewritePolicy {
+    /// Preserve the graph's operation boundaries in every lowering plan.
+    #[default]
+    Disabled,
+    /// Permit SGD recognition when the selected target declares support for contracted arithmetic.
+    AllowContractedArithmetic,
+}
+
+/// Numerical behavior the selected target explicitly accepts for one lowered operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TensorArithmeticCapability {
+    /// The target has not proved that contracted arithmetic is acceptable.
+    #[default]
+    Strict,
+    /// The selected target accepts a fused multiply-add with one final rounding.
+    ContractedMultiplyAdd,
+}
+
+/// Controls whether selected-plan metadata may group a narrow pointwise operation chain.
+///
+/// This policy is independent from arithmetic rewriting: grouping Add followed by `ReLU` retains
+/// the Add rounding point and does not permit reassociation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TensorPointwiseGroupingPolicy {
+    /// Keep each selected graph operation as a separate scheduled operation.
+    #[default]
+    Disabled,
+    /// Group a same-shape Add -> `ReLU` chain when Add has exactly one reader, that `ReLU`.
+    SingleUseAddRelu,
+    /// Group a same-shape Add/Sub expression with one to eight single-use arithmetic nodes and
+    /// at most four external operands, followed by a terminal `ReLU`.
+    BoundedAddSubRelu,
+    /// Group a same-shape Add/Sub expression with one to eight single-use arithmetic nodes and
+    /// at most four external operands, retaining the terminal arithmetic result as its output.
+    BoundedAddSubIdentity,
+    /// Group a same-shape Mul expression with one to eight single-use nodes and at most four
+    /// external operands, retaining its terminal multiplication result.
+    BoundedMulIdentity,
+}
+
+/// Epilogue applied after an ordered Add/Sub pointwise expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorPointwiseEpilogue {
+    /// Return the final arithmetic result without another operation.
+    Identity,
+    /// Apply `max(value, 0)` after the final arithmetic result.
+    Relu,
+}
+
+/// Arithmetic operation in a bounded pointwise expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorPointwiseArithmeticOp {
+    /// IEEE-754 addition in source order.
+    Add,
+    /// IEEE-754 subtraction in source order.
+    Sub,
+}
+
+/// Operand reference in a bounded pointwise expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorPointwiseOperand {
+    /// Index into [`TensorBoundedPointwiseFusionGroup::leaves`].
+    Leaf(usize),
+    /// Index into the preceding entries in [`TensorBoundedPointwiseFusionGroup::steps`].
+    Step(usize),
+}
+
+/// One ordered arithmetic instruction in a bounded pointwise expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TensorPointwiseStep {
+    /// Result produced by the corresponding source graph operation.
+    pub output: ValueId,
+    /// Source arithmetic operation.
+    pub op: TensorPointwiseArithmeticOp,
+    /// First source operand, preserving operand order.
+    pub left: TensorPointwiseOperand,
+    /// Second source operand, preserving operand order.
+    pub right: TensorPointwiseOperand,
+}
+
+/// Bounded straight-line Add/Sub expression with an explicit terminal epilogue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorBoundedPointwiseFusionGroup {
+    /// Value produced by the selected terminal operation.
+    pub output: ValueId,
+    /// Operation applied after the ordered arithmetic steps.
+    pub epilogue: TensorPointwiseEpilogue,
+    /// Unique external values in stable first-use order. Uniforms remain ordinary leaves.
+    pub leaves: Vec<ValueId>,
+    /// Arithmetic nodes in source topological order. Each node keeps its original operand order.
+    pub steps: Vec<TensorPointwiseStep>,
+    /// Common logical shape of every leaf, arithmetic node, and terminal `ReLU`.
+    pub shape: Vec<usize>,
+}
+
+/// One ordered multiplication instruction in a bounded Mul expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TensorPointwiseMulStep {
+    /// Result produced by the corresponding source graph operation.
+    pub output: ValueId,
+    /// First source operand.
+    pub left: TensorPointwiseOperand,
+    /// Second source operand.
+    pub right: TensorPointwiseOperand,
+}
+
+/// Bounded straight-line Mul expression retaining the terminal result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorBoundedMulFusionGroup {
+    /// Value produced by the selected terminal operation.
+    pub output: ValueId,
+    /// Unique external values in stable first-use order. Uniforms remain ordinary leaves.
+    pub leaves: Vec<ValueId>,
+    /// Multiplication nodes in source topological order.
+    pub steps: Vec<TensorPointwiseMulStep>,
+    /// Common logical shape of every leaf and multiplication node.
+    pub shape: Vec<usize>,
+}
+
+/// Source provenance for a grouped Add -> `ReLU` selected operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorPointwiseFusionGroup {
+    /// Add result suppressed as a separate scheduled operation.
+    pub add_output: ValueId,
+    /// `ReLU` result and selected output of the group.
+    pub relu_output: ValueId,
+    /// First Add operand.
+    pub left: ValueId,
+    /// Second Add operand.
+    pub right: ValueId,
+    /// Common logical shape of both Add inputs, Add result, and `ReLU` result.
+    pub shape: Vec<usize>,
+}
+
+/// An operation in an opt-in selected lowering schedule.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TensorSelectedOperation<'a> {
+    /// A selected source operation, including any separately authorized arithmetic rewrite.
+    Node(NodeDescriptor<'a>),
+    /// Add followed by `ReLU`. The Add result does not require a scheduled output allocation.
+    FusedAddRelu {
+        add_output: ValueId,
+        relu_output: ValueId,
+        left: ValueId,
+        right: ValueId,
+        shape: &'a [usize],
+    },
+    /// A bounded ordered Add/Sub expression with an identity or `ReLU` epilogue.
+    FusedAddSub {
+        /// Group description with source provenance and external operands.
+        group: TensorBoundedPointwiseFusionGroup,
+    },
+    /// A bounded same-shape Mul expression retaining the source operation order.
+    FusedMul { group: TensorBoundedMulFusionGroup },
+}
+
+/// An inspectable lowering-only replacement for `Sub(weights, Mul(rate, gradient))`.
+///
+/// Consuming a candidate authorizes a different floating-point result whenever contraction
+/// changes rounding. It does not modify the graph or authorize in-place storage reuse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TensorSgdRewriteCandidate {
+    /// Value produced by the subtraction in the original graph.
+    pub output: ValueId,
+    /// The multiplication intermediate that the lowering may omit.
+    pub multiply: ValueId,
+    pub weights: ValueId,
+    pub gradient: ValueId,
+    pub learning_rate: f32,
+}
+
+/// Backend-neutral, inspectable operation schedule selected for a tensor execution plan.
+///
+/// This is a description only. It does not mutate the graph or cause a backend to execute a
+/// rewrite. Values and output pins remain identified by their original [`ValueId`]s.
+#[derive(Clone, Debug)]
+pub struct TensorSelectedLoweringPlan<'a> {
+    graph_id: u64,
+    nodes: Vec<NodeDescriptor<'a>>,
+    input_values: Vec<ValueId>,
+    output_values: Vec<ValueId>,
+    index_by_value: Vec<usize>,
+    use_counts: Vec<usize>,
+    rewritten: Vec<TensorSgdRewriteCandidate>,
+    suppressed_values: Vec<ValueId>,
+    pointwise_groups: Vec<TensorPointwiseFusionGroup>,
+    bounded_pointwise_groups: Vec<TensorBoundedPointwiseFusionGroup>,
+    bounded_mul_groups: Vec<TensorBoundedMulFusionGroup>,
+    operations: Vec<TensorSelectedOperation<'a>>,
+    operation_index_by_value: Vec<usize>,
+    operation_use_counts: Vec<usize>,
+}
+
+impl<'a> TensorSelectedLoweringPlan<'a> {
+    /// Node descriptors after arithmetic rewriting and before optional pointwise grouping.
+    ///
+    /// For an execution schedule that applies pointwise grouping, use [`Self::operations`].
+    #[must_use]
+    pub fn nodes(&self) -> &[NodeDescriptor<'a>] {
+        &self.nodes
+    }
+
+    /// Selected graph inputs, preserved from the source plan.
+    #[must_use]
+    pub fn input_values(&self) -> &[ValueId] {
+        &self.input_values
+    }
+
+    /// Requested outputs, preserved and pinned from the source plan.
+    #[must_use]
+    pub fn output_values(&self) -> &[ValueId] {
+        &self.output_values
+    }
+
+    /// Operand-reader counts aligned with [`Self::nodes`], including output pins.
+    #[must_use]
+    pub fn use_counts(&self) -> &[usize] {
+        &self.use_counts
+    }
+
+    /// Index in [`Self::nodes`], or `None` for values outside that schedule or removed by an
+    /// arithmetic rewrite. For the opt-in pointwise schedule, use [`Self::operation_index_of`].
+    #[must_use]
+    pub fn index_of(&self, value: ValueId) -> Option<usize> {
+        if value.graph_id != self.graph_id {
+            return None;
+        }
+        self.index_by_value
+            .get(value.index)
+            .copied()
+            .filter(|index| *index != usize::MAX)
+    }
+
+    /// Rewrites actually selected by the lowering policy.
+    #[must_use]
+    pub fn rewrites(&self) -> &[TensorSgdRewriteCandidate] {
+        &self.rewritten
+    }
+
+    /// Values whose operation was removed from this schedule.
+    #[must_use]
+    pub fn suppressed_values(&self) -> &[ValueId] {
+        &self.suppressed_values
+    }
+
+    /// Opt-in operation schedule, including selected pointwise groups.
+    ///
+    /// `nodes()` remains the arithmetic-selected graph-node view. This typed schedule is the
+    /// execution view when pointwise grouping is enabled; its own use counts, indices, and
+    /// storage requirements are exposed separately below.
+    #[must_use]
+    pub fn operations(&self) -> &[TensorSelectedOperation<'a>] {
+        &self.operations
+    }
+
+    /// Pointwise groups selected by the independent grouping policy.
+    #[must_use]
+    pub fn pointwise_fusion_groups(&self) -> &[TensorPointwiseFusionGroup] {
+        &self.pointwise_groups
+    }
+
+    /// Bounded ordered Add/Sub expressions with a terminal `ReLU` selected for this plan.
+    #[must_use]
+    pub fn bounded_pointwise_fusion_groups(&self) -> &[TensorBoundedPointwiseFusionGroup] {
+        &self.bounded_pointwise_groups
+    }
+
+    /// Bounded ordered Mul expressions with an identity epilogue selected for this plan.
+    #[must_use]
+    pub fn bounded_mul_fusion_groups(&self) -> &[TensorBoundedMulFusionGroup] {
+        &self.bounded_mul_groups
+    }
+
+    /// Reader counts aligned with [`Self::operations`], including requested-output pins.
+    #[must_use]
+    pub fn operation_use_counts(&self) -> &[usize] {
+        &self.operation_use_counts
+    }
+
+    /// Index in [`Self::operations`] for a selected value. Grouped Add intermediates return None.
+    #[must_use]
+    pub fn operation_index_of(&self, value: ValueId) -> Option<usize> {
+        if value.graph_id != self.graph_id {
+            return None;
+        }
+        self.operation_index_by_value
+            .get(value.index)
+            .copied()
+            .filter(|index| *index != usize::MAX)
+    }
+
+    /// Storage disjointness constraints for the typed operation schedule.
+    ///
+    /// The grouped Add intermediate is omitted and the fused operation reads both original Add
+    /// operands, so this reflects the storage the selected schedule actually requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeOverflow` if any scheduled value's byte extent cannot be represented.
+    pub fn operation_storage_constraints(
+        &self,
+    ) -> Result<Vec<TensorStorageConstraint>, TensorError> {
+        let mut last_use: Vec<usize> = (0..self.operations.len()).collect();
+        for (position, operation) in self.operations.iter().enumerate() {
+            for_each_selected_operand(operation, |operand| {
+                if let Some(index) = self.operation_index_of(operand) {
+                    last_use[index] = position;
+                }
+            });
+        }
+        let final_position = self.operations.len().saturating_sub(1);
+        for output in &self.output_values {
+            if let Some(index) = self.operation_index_of(*output) {
+                last_use[index] = final_position;
+            }
+        }
+        let mut constraints = Vec::new();
+        for (left_index, left) in self.operations.iter().enumerate() {
+            for (right_index, right) in self.operations.iter().enumerate().skip(left_index + 1) {
+                if last_use[left_index] < right_index
+                    || (selected_operation_is_read_only(left)
+                        && selected_operation_is_read_only(right))
+                {
+                    continue;
+                }
+                let left_bytes = selected_operation_bytes(left)?;
+                let right_bytes = selected_operation_bytes(right)?;
+                constraints.push(TensorStorageConstraint {
+                    left: selected_operation_output(left),
+                    right: selected_operation_output(right),
+                    left_bytes,
+                    right_bytes,
+                });
+            }
+        }
+        Ok(constraints)
+    }
+
+    /// Storage disjointness required by the arithmetic-selected node schedule in [`Self::nodes`].
+    ///
+    /// Rewrites can extend an operand's lifetime as well as remove intermediates, so these
+    /// constraints are derived from the selected operands and output pins rather than filtered
+    /// from the source plan. For the optional pointwise schedule, use
+    /// [`Self::operation_storage_constraints`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeOverflow` when a surviving value's byte extent cannot be represented.
+    pub fn storage_constraints(&self) -> Result<Vec<TensorStorageConstraint>, TensorError> {
+        let mut last_use: Vec<usize> = (0..self.nodes.len()).collect();
+        for (position, node) in self.nodes.iter().enumerate() {
+            for_each_descriptor_operand(node.op, |operand| {
+                if let Some(index) = self.index_of(operand) {
+                    last_use[index] = position;
+                }
+            });
+        }
+        let final_position = self.nodes.len().saturating_sub(1);
+        for output in &self.output_values {
+            if let Some(index) = self.index_of(*output) {
+                last_use[index] = final_position;
+            }
+        }
+        let mut constraints = Vec::new();
+        for (left_index, left) in self.nodes.iter().enumerate() {
+            for (right_index, right) in self.nodes.iter().enumerate().skip(left_index + 1) {
+                if last_use[left_index] < right_index
+                    || (is_read_only_descriptor(left.op) && is_read_only_descriptor(right.op))
+                {
+                    continue;
+                }
+                let left_bytes =
+                    u64::try_from(node_output_bytes(left.shape).ok_or(TensorError::ShapeOverflow)?)
+                        .map_err(|_| TensorError::ShapeOverflow)?;
+                let right_bytes = u64::try_from(
+                    node_output_bytes(right.shape).ok_or(TensorError::ShapeOverflow)?,
+                )
+                .map_err(|_| TensorError::ShapeOverflow)?;
+                constraints.push(TensorStorageConstraint {
+                    left: left.value,
+                    right: right.value,
+                    left_bytes,
+                    right_bytes,
+                });
+            }
+        }
+        Ok(constraints)
+    }
+}
+
+impl<'a> TensorExecutionPlan<'a> {
     #[must_use]
     pub fn node_order(&self) -> &[ValueId] {
         &self.node_order
+    }
+
+    /// Borrowed descriptors for the nodes in this plan's selected dependency closure.
+    #[must_use]
+    pub fn nodes(&self) -> impl ExactSizeIterator<Item = NodeDescriptor<'a>> + use<'a, '_> {
+        self.node_order
+            .iter()
+            .map(|value| self.graph.node_descriptor(value.index))
     }
 
     #[must_use]
@@ -322,9 +801,299 @@ impl TensorExecutionPlan<'_> {
         &self.output_values
     }
 
+    /// Returns the selected-plan index for a graph value, if it is in the dependency closure.
+    #[must_use]
+    pub fn index_of(&self, value: ValueId) -> Option<usize> {
+        if value.graph_id != self.graph.id {
+            return None;
+        }
+        self.index_by_value
+            .get(value.index)
+            .copied()
+            .filter(|&index| index != usize::MAX)
+    }
+
+    /// Operand-reader counts aligned with [`Self::node_order`]. Requested outputs each receive
+    /// one extra pin count so a backend can keep them alive after their final graph consumer.
+    #[must_use]
+    pub fn use_counts(&self) -> &[usize] {
+        &self.use_counts
+    }
+
+    /// Finds safe-to-select SGD rewrite candidates in this plan's dependency closure.
+    ///
+    /// Candidates are returned only when `policy` opts into altered f32 rounding,
+    /// `target_supports_contracted_arithmetic` is true, the multiply has exactly one reader,
+    /// and its rate operand is a finite, elementwise-uniform constant matching the gradient
+    /// shape. The target flag is the selected backend's explicit declaration that fused
+    /// multiply-add semantics are accepted for this lowering. This method only describes
+    /// replacements; it never mutates the graph or evaluator. A backend that cannot verify that
+    /// arithmetic contract must pass `false` and preserve both operations.
+    #[must_use]
+    pub fn sgd_rewrite_candidates(
+        &self,
+        policy: TensorArithmeticRewritePolicy,
+        target_arithmetic: TensorArithmeticCapability,
+    ) -> Vec<TensorSgdRewriteCandidate> {
+        if policy != TensorArithmeticRewritePolicy::AllowContractedArithmetic
+            || target_arithmetic != TensorArithmeticCapability::ContractedMultiplyAdd
+        {
+            return Vec::new();
+        }
+        let mut candidates = Vec::new();
+        for output in self.nodes() {
+            let OpDescriptor::Sub {
+                left: weights,
+                right,
+            } = output.op
+            else {
+                continue;
+            };
+            let Some(multiply_index) = self.index_of(right) else {
+                continue;
+            };
+            // A requested intermediate is pinned and therefore has an additional use count.
+            if self.use_counts[multiply_index] != 1 {
+                continue;
+            }
+            let Some(multiply) = self.graph.nodes.get(right.index) else {
+                continue;
+            };
+            let Op::Mul(rate_value, gradient) = &multiply.op else {
+                continue;
+            };
+            let (rate_value, gradient) = (*rate_value, *gradient);
+            if self.graph.shape(weights).ok() != self.graph.shape(gradient).ok()
+                || self.graph.shape(right).ok() != self.graph.shape(gradient).ok()
+            {
+                continue;
+            }
+            let Some(rate_node) = self.graph.nodes.get(rate_value.index) else {
+                continue;
+            };
+            let (learning_rate, rate_shape, rate_is_uniform) = match &rate_node.op {
+                Op::Constant(rate_tensor) => {
+                    let Some(value) = rate_tensor
+                        .known_uniform_value
+                        .or_else(|| rate_tensor.data.first().copied())
+                    else {
+                        continue;
+                    };
+                    (
+                        value,
+                        rate_tensor.shape.as_slice(),
+                        rate_tensor.known_uniform_value.is_some()
+                            || rate_tensor
+                                .data
+                                .iter()
+                                .all(|rate| rate.to_bits() == value.to_bits()),
+                    )
+                }
+                Op::Uniform(value) => (*value, rate_node.shape.as_slice(), true),
+                _ => continue,
+            };
+            if !learning_rate.is_finite()
+                || rate_shape != rate_node.shape
+                || rate_shape != self.graph.nodes[gradient.index].shape
+                || !rate_is_uniform
+            {
+                continue;
+            }
+            candidates.push(TensorSgdRewriteCandidate {
+                output: output.value,
+                multiply: right,
+                weights,
+                gradient,
+                learning_rate,
+            });
+        }
+        candidates
+    }
+
+    /// Selects an inspectable operation schedule without modifying the source graph.
+    ///
+    /// Rewrites are enabled only when both the user policy and the target's declared arithmetic
+    /// capability permit them. The schedule retains requested outputs and recomputes value-use
+    /// counts after suppressing the uniquely consumed multiply node and any orphaned rate
+    /// constant. Shared or explicitly requested constants remain in the schedule.
+    #[must_use]
+    pub fn select_lowering(
+        &self,
+        policy: TensorArithmeticRewritePolicy,
+        target_arithmetic: TensorArithmeticCapability,
+    ) -> TensorSelectedLoweringPlan<'a> {
+        self.select_lowering_with_grouping(
+            policy,
+            target_arithmetic,
+            TensorPointwiseGroupingPolicy::Disabled,
+        )
+    }
+
+    /// Selects a lowering and, independently, an optional pointwise grouping schedule.
+    ///
+    /// Grouping metadata does not change graph construction or CPU reference execution. The
+    /// returned typed operation schedule suppresses the single-use Add intermediate and carries
+    /// the original Add operands to the fused Add-ReLU operation. Arithmetic rewrite policy
+    /// remains independent, so the Add rounding point is preserved in the grouped operation.
+    #[allow(clippy::too_many_lines)] // Keep policy selection and schedule assembly together.
+    #[must_use]
+    pub fn select_lowering_with_grouping(
+        &self,
+        policy: TensorArithmeticRewritePolicy,
+        target_arithmetic: TensorArithmeticCapability,
+        grouping_policy: TensorPointwiseGroupingPolicy,
+    ) -> TensorSelectedLoweringPlan<'a> {
+        let rewritten = self.sgd_rewrite_candidates(policy, target_arithmetic);
+        let mut suppressed_values: Vec<_> = rewritten
+            .iter()
+            .map(|candidate| candidate.multiply)
+            .collect();
+        let mut nodes = Vec::with_capacity(
+            self.node_order
+                .len()
+                .saturating_sub(suppressed_values.len()),
+        );
+        for mut node in self.nodes() {
+            if suppressed_values.contains(&node.value) {
+                continue;
+            }
+            if let Some(candidate) = rewritten
+                .iter()
+                .find(|candidate| candidate.output == node.value)
+            {
+                node.op = OpDescriptor::SgdUpdate {
+                    weights: candidate.weights,
+                    gradient: candidate.gradient,
+                    learning_rate: candidate.learning_rate,
+                };
+            }
+            nodes.push(node);
+        }
+        let count_uses = |nodes: &[NodeDescriptor<'_>]| {
+            let mut index_by_value = vec![usize::MAX; self.graph.nodes.len()];
+            for (index, node) in nodes.iter().enumerate() {
+                index_by_value[node.value.index] = index;
+            }
+            let mut use_counts = vec![0usize; nodes.len()];
+            for node in nodes {
+                for_each_descriptor_operand(node.op, |operand| {
+                    if let Some(index) = index_by_value.get(operand.index).copied()
+                        && index != usize::MAX
+                    {
+                        use_counts[index] += 1;
+                    }
+                });
+            }
+            for output in &self.output_values {
+                if let Some(index) = index_by_value.get(output.index).copied()
+                    && index != usize::MAX
+                {
+                    use_counts[index] += 1;
+                }
+            }
+            (index_by_value, use_counts)
+        };
+        let (mut index_by_value, mut use_counts) = count_uses(&nodes);
+        // A rewrite can orphan its uniform rate constant. Keep shared or requested constants,
+        // but do not make a backend upload a value that the selected schedule never reads.
+        if !rewritten.is_empty() {
+            let mut removed = Vec::new();
+            nodes.retain(|node| {
+                let unused_constant = matches!(
+                    node.op,
+                    OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+                ) && use_counts[index_by_value[node.value.index]] == 0;
+                if unused_constant {
+                    removed.push(node.value);
+                }
+                !unused_constant
+            });
+            if !removed.is_empty() {
+                suppressed_values.extend(removed);
+                (index_by_value, use_counts) = count_uses(&nodes);
+            }
+        }
+        let (pointwise_groups, bounded_pointwise_groups, bounded_mul_groups) =
+            select_pointwise_groups(
+                &nodes,
+                &index_by_value,
+                &use_counts,
+                &self.output_values,
+                grouping_policy,
+            );
+        let (operations, operation_index_by_value, operation_use_counts) =
+            build_selected_operations(
+                &nodes,
+                &pointwise_groups,
+                &bounded_pointwise_groups,
+                &bounded_mul_groups,
+                self.graph.nodes.len(),
+                &self.output_values,
+            );
+        TensorSelectedLoweringPlan {
+            graph_id: self.graph.id,
+            nodes,
+            input_values: self.input_values.clone(),
+            output_values: self.output_values.clone(),
+            index_by_value,
+            use_counts,
+            rewritten,
+            suppressed_values,
+            pointwise_groups,
+            bounded_pointwise_groups,
+            bounded_mul_groups,
+            operations,
+            operation_index_by_value,
+            operation_use_counts,
+        }
+    }
+
     #[must_use]
     pub fn value_liveness(&self) -> &[TensorValueLiveness] {
         &self.value_liveness
+    }
+
+    /// Returns all pairwise storage disjointness requirements implied by live writable values.
+    ///
+    /// Lifetimes are inclusive, so values whose intervals touch at a node are both considered
+    /// live there. Read-only input/constant pairs are omitted; all computed values require unique
+    /// storage until an operation explicitly grants an in-place alias permission.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeOverflow` if a selected value's byte extent cannot be represented.
+    pub fn storage_constraints(&self) -> Result<Vec<TensorStorageConstraint>, TensorError> {
+        let mut constraints = Vec::new();
+        for (i, left) in self.value_liveness.iter().enumerate() {
+            for right in &self.value_liveness[i + 1..] {
+                if left.last_live_node < right.first_live_node
+                    || right.last_live_node < left.first_live_node
+                    || (!self.is_writable_value(left.value) && !self.is_writable_value(right.value))
+                {
+                    continue;
+                }
+                let left_bytes =
+                    u64::try_from(left.output_bytes.ok_or(TensorError::ShapeOverflow)?)
+                        .map_err(|_| TensorError::ShapeOverflow)?;
+                let right_bytes =
+                    u64::try_from(right.output_bytes.ok_or(TensorError::ShapeOverflow)?)
+                        .map_err(|_| TensorError::ShapeOverflow)?;
+                constraints.push(TensorStorageConstraint {
+                    left: left.value,
+                    right: right.value,
+                    left_bytes,
+                    right_bytes,
+                });
+            }
+        }
+        Ok(constraints)
+    }
+
+    fn is_writable_value(&self, value: ValueId) -> bool {
+        !matches!(
+            self.graph.nodes[value.index].op,
+            Op::Input | Op::Constant(_) | Op::Uniform(_)
+        )
     }
 
     #[must_use]
@@ -345,25 +1114,807 @@ impl TensorExecutionPlan<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TensorValueRequirement<'a> {
-    pub value: ValueId,
-    pub shape: &'a [usize],
-    pub output_bytes: Option<usize>,
+fn for_each_descriptor_operand(op: OpDescriptor<'_>, mut visit: impl FnMut(ValueId)) {
+    match op {
+        OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. } => {}
+        OpDescriptor::Add { left, right }
+        | OpDescriptor::Sub { left, right }
+        | OpDescriptor::Mul { left, right }
+        | OpDescriptor::MatMul { left, right, .. } => {
+            visit(left);
+            visit(right);
+        }
+        OpDescriptor::SgdUpdate {
+            weights, gradient, ..
+        } => {
+            visit(weights);
+            visit(gradient);
+        }
+        OpDescriptor::Relu { input } => visit(input),
+        OpDescriptor::ReluBackward { input, upstream } => {
+            visit(input);
+            visit(upstream);
+        }
+        OpDescriptor::MeanSquaredError { prediction, target } => {
+            visit(prediction);
+            visit(target);
+        }
+    }
 }
 
-fn node_output_bytes(shape: &[usize]) -> Option<usize> {
-    shape
+fn identify_pointwise_groups(
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+) -> Vec<TensorPointwiseFusionGroup> {
+    let mut groups = Vec::new();
+    for relu in nodes {
+        let OpDescriptor::Relu { input: add_output } = relu.op else {
+            continue;
+        };
+        let Some(add_index) = index_by_value
+            .get(add_output.index)
+            .copied()
+            .filter(|index| *index != usize::MAX)
+        else {
+            continue;
+        };
+        // A second graph consumer or output pin makes the intermediate observable.
+        if use_counts[add_index] != 1 {
+            continue;
+        }
+        let add = nodes[add_index];
+        let OpDescriptor::Add { left, right } = add.op else {
+            continue;
+        };
+        let same_shape = |value: ValueId| {
+            index_by_value
+                .get(value.index)
+                .copied()
+                .filter(|index| *index != usize::MAX)
+                .is_some_and(|index| nodes[index].shape == add.shape)
+        };
+        if relu.shape != add.shape || !same_shape(left) || !same_shape(right) {
+            continue;
+        }
+        groups.push(TensorPointwiseFusionGroup {
+            add_output,
+            relu_output: relu.value,
+            left,
+            right,
+            shape: add.shape.to_vec(),
+        });
+    }
+    groups
+}
+
+fn select_pointwise_groups(
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+    output_values: &[ValueId],
+    policy: TensorPointwiseGroupingPolicy,
+) -> (
+    Vec<TensorPointwiseFusionGroup>,
+    Vec<TensorBoundedPointwiseFusionGroup>,
+    Vec<TensorBoundedMulFusionGroup>,
+) {
+    match policy {
+        TensorPointwiseGroupingPolicy::Disabled => (Vec::new(), Vec::new(), Vec::new()),
+        TensorPointwiseGroupingPolicy::SingleUseAddRelu => (
+            identify_pointwise_groups(nodes, index_by_value, use_counts),
+            Vec::new(),
+            Vec::new(),
+        ),
+        TensorPointwiseGroupingPolicy::BoundedAddSubRelu => (
+            Vec::new(),
+            identify_bounded_pointwise_groups(
+                nodes,
+                index_by_value,
+                use_counts,
+                output_values,
+                TensorPointwiseEpilogue::Relu,
+            ),
+            Vec::new(),
+        ),
+        TensorPointwiseGroupingPolicy::BoundedAddSubIdentity => (
+            Vec::new(),
+            identify_bounded_pointwise_groups(
+                nodes,
+                index_by_value,
+                use_counts,
+                output_values,
+                TensorPointwiseEpilogue::Identity,
+            ),
+            Vec::new(),
+        ),
+        TensorPointwiseGroupingPolicy::BoundedMulIdentity => (
+            Vec::new(),
+            Vec::new(),
+            identify_bounded_mul_groups(nodes, index_by_value, use_counts, output_values),
+        ),
+    }
+}
+
+const MAX_BOUNDED_POINTWISE_STEPS: usize = 8;
+const MAX_BOUNDED_POINTWISE_LEAVES: usize = 4;
+
+fn identify_bounded_pointwise_groups(
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+    output_values: &[ValueId],
+    epilogue: TensorPointwiseEpilogue,
+) -> Vec<TensorBoundedPointwiseFusionGroup> {
+    match epilogue {
+        TensorPointwiseEpilogue::Relu => nodes
+            .iter()
+            .filter_map(|relu| {
+                identify_bounded_pointwise_relu_group(relu, nodes, index_by_value, use_counts)
+            })
+            .collect(),
+        TensorPointwiseEpilogue::Identity => nodes
+            .iter()
+            .filter(|node| {
+                matches!(node.op, OpDescriptor::Add { .. } | OpDescriptor::Sub { .. })
+                    && is_identity_group_boundary(node, nodes, output_values)
+            })
+            .filter_map(|terminal| {
+                identify_bounded_pointwise_identity_group(
+                    terminal,
+                    nodes,
+                    index_by_value,
+                    use_counts,
+                )
+            })
+            .collect(),
+    }
+}
+
+fn identify_bounded_mul_groups(
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+    output_values: &[ValueId],
+) -> Vec<TensorBoundedMulFusionGroup> {
+    nodes
         .iter()
-        .try_fold(std::mem::size_of::<f32>(), |bytes, &dimension| {
-            bytes.checked_mul(dimension)
+        .filter(|node| matches!(node.op, OpDescriptor::Mul { .. }))
+        .filter(|terminal| {
+            output_values.contains(&terminal.value)
+                || nodes.iter().any(|consumer| {
+                    consumer.value != terminal.value
+                        && !matches!(consumer.op, OpDescriptor::Mul { .. })
+                        && descriptor_reads(consumer.op, terminal.value)
+                })
+                || use_counts[index_by_value[terminal.value.index]] > 1
         })
+        .filter_map(|terminal| {
+            let mut included = Vec::new();
+            if !collect_bounded_mul(
+                terminal.value,
+                terminal.shape,
+                nodes,
+                index_by_value,
+                use_counts,
+                &mut included,
+                false,
+            ) {
+                return None;
+            }
+            included.sort_unstable();
+            included.dedup();
+            if !(2..=MAX_BOUNDED_POINTWISE_STEPS).contains(&included.len()) {
+                return None;
+            }
+            make_bounded_mul_group(terminal, &included, nodes, index_by_value)
+        })
+        .collect()
+}
+
+fn descriptor_reads(op: OpDescriptor<'_>, value: ValueId) -> bool {
+    let mut reads = false;
+    for_each_descriptor_operand(op, |operand| reads |= operand == value);
+    reads
+}
+
+fn collect_bounded_mul(
+    value: ValueId,
+    shape: &[usize],
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+    included: &mut Vec<usize>,
+    require_single_use: bool,
+) -> bool {
+    let Some(index) = index_by_value
+        .get(value.index)
+        .copied()
+        .filter(|index| *index != usize::MAX)
+    else {
+        return false;
+    };
+    let node = nodes[index];
+    if node.shape != shape
+        || (require_single_use && use_counts[index] != 1)
+        || !matches!(node.op, OpDescriptor::Mul { .. })
+    {
+        return false;
+    }
+    if included.contains(&index) || included.len() >= MAX_BOUNDED_POINTWISE_STEPS {
+        return false;
+    }
+    included.push(index);
+    let OpDescriptor::Mul { left, right } = node.op else {
+        return false;
+    };
+    let is_same_shape_mul = |child: ValueId| {
+        index_by_value
+            .get(child.index)
+            .copied()
+            .filter(|child_index| *child_index != usize::MAX)
+            .is_some_and(|child_index| {
+                nodes[child_index].shape == shape
+                    && matches!(nodes[child_index].op, OpDescriptor::Mul { .. })
+            })
+    };
+    let left_mul = is_same_shape_mul(left);
+    let right_mul = is_same_shape_mul(right);
+    let left_eligible = left_mul && use_counts[index_by_value[left.index]] == 1;
+    let right_eligible = right_mul && use_counts[index_by_value[right.index]] == 1;
+    if (left_mul && !left_eligible)
+        || (right_mul && !right_eligible)
+        || (left_eligible && right_eligible)
+    {
+        return false;
+    }
+    (!left_eligible
+        || collect_bounded_mul(
+            left,
+            shape,
+            nodes,
+            index_by_value,
+            use_counts,
+            included,
+            true,
+        ))
+        && (!right_eligible
+            || collect_bounded_mul(
+                right,
+                shape,
+                nodes,
+                index_by_value,
+                use_counts,
+                included,
+                true,
+            ))
+}
+
+fn make_bounded_mul_group(
+    terminal: &NodeDescriptor<'_>,
+    included: &[usize],
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+) -> Option<TensorBoundedMulFusionGroup> {
+    let mut leaves = Vec::new();
+    let mut steps = Vec::with_capacity(included.len());
+    let mut step_by_node = vec![usize::MAX; nodes.len()];
+    for &node_index in included {
+        let node = nodes[node_index];
+        let OpDescriptor::Mul { left, right } = node.op else {
+            return None;
+        };
+        let mut resolve = |value: ValueId| {
+            let producer = index_by_value
+                .get(value.index)
+                .copied()
+                .unwrap_or(usize::MAX);
+            if producer != usize::MAX && step_by_node[producer] != usize::MAX {
+                TensorPointwiseOperand::Step(step_by_node[producer])
+            } else {
+                let leaf_index = leaves
+                    .iter()
+                    .position(|leaf| *leaf == value)
+                    .unwrap_or_else(|| {
+                        leaves.push(value);
+                        leaves.len() - 1
+                    });
+                TensorPointwiseOperand::Leaf(leaf_index)
+            }
+        };
+        let left = resolve(left);
+        let right = resolve(right);
+        if leaves.len() > MAX_BOUNDED_POINTWISE_LEAVES {
+            return None;
+        }
+        step_by_node[node_index] = steps.len();
+        steps.push(TensorPointwiseMulStep {
+            output: node.value,
+            left,
+            right,
+        });
+    }
+    Some(TensorBoundedMulFusionGroup {
+        output: terminal.value,
+        leaves,
+        steps,
+        shape: terminal.shape.to_vec(),
+    })
+}
+
+fn is_identity_group_boundary(
+    terminal: &NodeDescriptor<'_>,
+    nodes: &[NodeDescriptor<'_>],
+    output_values: &[ValueId],
+) -> bool {
+    if output_values.contains(&terminal.value) {
+        return true;
+    }
+    let mut consumer_count = 0;
+    for consumer in nodes {
+        let mut reads_terminal = false;
+        for_each_descriptor_operand(consumer.op, |operand| {
+            reads_terminal |= operand == terminal.value;
+        });
+        if !reads_terminal {
+            continue;
+        }
+        consumer_count += 1;
+        // A lone terminal ReLU uses the established ReLU epilogue route. Any consumer outside
+        // the Add/Sub chain makes this arithmetic value a real boundary to preserve.
+        if !matches!(
+            consumer.op,
+            OpDescriptor::Add { .. } | OpDescriptor::Sub { .. } | OpDescriptor::Relu { .. }
+        ) {
+            return true;
+        }
+    }
+    // Multiple readers form a cut: preserve the shared result and group only the single-use
+    // chain that computes it.
+    consumer_count > 1
+}
+
+fn identify_bounded_pointwise_relu_group(
+    relu: &NodeDescriptor<'_>,
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+) -> Option<TensorBoundedPointwiseFusionGroup> {
+    let OpDescriptor::Relu { input } = relu.op else {
+        return None;
+    };
+    if relu.shape
+        != nodes
+            .get(
+                index_by_value
+                    .get(input.index)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+            .map_or(&[][..], |node| node.shape)
+    {
+        return None;
+    }
+    let root_index = index_by_value
+        .get(input.index)
+        .copied()
+        .filter(|index| *index != usize::MAX)?;
+    let root = nodes[root_index];
+    if !matches!(root.op, OpDescriptor::Add { .. } | OpDescriptor::Sub { .. })
+        || use_counts[root_index] != 1
+    {
+        return None;
+    }
+
+    let shape = relu.shape;
+    let mut included = Vec::new();
+    if !collect_bounded_arithmetic(
+        input,
+        shape,
+        nodes,
+        index_by_value,
+        use_counts,
+        &mut included,
+        false,
+    ) {
+        return None;
+    }
+    included.sort_unstable();
+    included.dedup();
+    // The existing two-node Add -> ReLU selection remains its own explicit policy. The
+    // bounded policy is for actual arithmetic chains, not a second spelling of that group.
+    if !(2..=MAX_BOUNDED_POINTWISE_STEPS).contains(&included.len()) {
+        return None;
+    }
+
+    let mut leaves = Vec::new();
+    let mut steps = Vec::with_capacity(included.len());
+    let mut step_by_node = vec![usize::MAX; nodes.len()];
+    for &node_index in &included {
+        let node = nodes[node_index];
+        let (op, left, right) = match node.op {
+            OpDescriptor::Add { left, right } => (TensorPointwiseArithmeticOp::Add, left, right),
+            OpDescriptor::Sub { left, right } => (TensorPointwiseArithmeticOp::Sub, left, right),
+            _ => continue,
+        };
+        let resolve = |value: ValueId, leaves: &mut Vec<ValueId>, step_by_node: &[usize]| {
+            let producer = index_by_value
+                .get(value.index)
+                .copied()
+                .unwrap_or(usize::MAX);
+            if producer != usize::MAX && step_by_node[producer] != usize::MAX {
+                TensorPointwiseOperand::Step(step_by_node[producer])
+            } else {
+                let leaf_index = leaves
+                    .iter()
+                    .position(|leaf| *leaf == value)
+                    .unwrap_or_else(|| {
+                        leaves.push(value);
+                        leaves.len() - 1
+                    });
+                TensorPointwiseOperand::Leaf(leaf_index)
+            }
+        };
+        let left = resolve(left, &mut leaves, &step_by_node);
+        let right = resolve(right, &mut leaves, &step_by_node);
+        if leaves.len() > MAX_BOUNDED_POINTWISE_LEAVES {
+            steps.clear();
+            break;
+        }
+        step_by_node[node_index] = steps.len();
+        steps.push(TensorPointwiseStep {
+            output: node.value,
+            op,
+            left,
+            right,
+        });
+    }
+    if steps.len() != included.len() || leaves.len() > MAX_BOUNDED_POINTWISE_LEAVES {
+        return None;
+    }
+    Some(TensorBoundedPointwiseFusionGroup {
+        output: relu.value,
+        epilogue: TensorPointwiseEpilogue::Relu,
+        leaves,
+        steps,
+        shape: shape.to_vec(),
+    })
+}
+
+fn identify_bounded_pointwise_identity_group(
+    terminal: &NodeDescriptor<'_>,
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+) -> Option<TensorBoundedPointwiseFusionGroup> {
+    let mut included = Vec::new();
+    if !collect_bounded_arithmetic(
+        terminal.value,
+        terminal.shape,
+        nodes,
+        index_by_value,
+        use_counts,
+        &mut included,
+        false,
+    ) {
+        return None;
+    }
+    included.sort_unstable();
+    included.dedup();
+    if !(2..=MAX_BOUNDED_POINTWISE_STEPS).contains(&included.len()) {
+        return None;
+    }
+    make_bounded_pointwise_group(
+        terminal.value,
+        terminal.shape,
+        TensorPointwiseEpilogue::Identity,
+        &included,
+        nodes,
+        index_by_value,
+    )
+}
+
+fn make_bounded_pointwise_group(
+    output: ValueId,
+    shape: &[usize],
+    epilogue: TensorPointwiseEpilogue,
+    included: &[usize],
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+) -> Option<TensorBoundedPointwiseFusionGroup> {
+    let mut leaves = Vec::new();
+    let mut steps = Vec::with_capacity(included.len());
+    let mut step_by_node = vec![usize::MAX; nodes.len()];
+    for &node_index in included {
+        let node = nodes[node_index];
+        let (op, left, right) = match node.op {
+            OpDescriptor::Add { left, right } => (TensorPointwiseArithmeticOp::Add, left, right),
+            OpDescriptor::Sub { left, right } => (TensorPointwiseArithmeticOp::Sub, left, right),
+            _ => return None,
+        };
+        let resolve = |value: ValueId, leaves: &mut Vec<ValueId>, step_by_node: &[usize]| {
+            let producer = index_by_value
+                .get(value.index)
+                .copied()
+                .unwrap_or(usize::MAX);
+            if producer != usize::MAX && step_by_node[producer] != usize::MAX {
+                TensorPointwiseOperand::Step(step_by_node[producer])
+            } else {
+                let leaf_index = leaves
+                    .iter()
+                    .position(|leaf| *leaf == value)
+                    .unwrap_or_else(|| {
+                        leaves.push(value);
+                        leaves.len() - 1
+                    });
+                TensorPointwiseOperand::Leaf(leaf_index)
+            }
+        };
+        let left = resolve(left, &mut leaves, &step_by_node);
+        let right = resolve(right, &mut leaves, &step_by_node);
+        if leaves.len() > MAX_BOUNDED_POINTWISE_LEAVES {
+            return None;
+        }
+        step_by_node[node_index] = steps.len();
+        steps.push(TensorPointwiseStep {
+            output: node.value,
+            op,
+            left,
+            right,
+        });
+    }
+    Some(TensorBoundedPointwiseFusionGroup {
+        output,
+        epilogue,
+        leaves,
+        steps,
+        shape: shape.to_vec(),
+    })
+}
+
+fn collect_bounded_arithmetic(
+    value: ValueId,
+    shape: &[usize],
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &[usize],
+    use_counts: &[usize],
+    included: &mut Vec<usize>,
+    require_single_use: bool,
+) -> bool {
+    let Some(index) = index_by_value
+        .get(value.index)
+        .copied()
+        .filter(|index| *index != usize::MAX)
+    else {
+        return false;
+    };
+    let node = nodes[index];
+    if node.shape != shape
+        || (require_single_use && use_counts[index] != 1)
+        || !matches!(node.op, OpDescriptor::Add { .. } | OpDescriptor::Sub { .. })
+    {
+        return false;
+    }
+    if included.contains(&index) {
+        return false;
+    }
+    if included.len() >= MAX_BOUNDED_POINTWISE_STEPS {
+        return false;
+    }
+    included.push(index);
+    if let OpDescriptor::Add { left, right } | OpDescriptor::Sub { left, right } = node.op {
+        let child_is_arithmetic = |value: ValueId| {
+            index_by_value
+                .get(value.index)
+                .copied()
+                .filter(|child| *child != usize::MAX)
+                .is_some_and(|child| {
+                    nodes[child].shape == shape
+                        && matches!(
+                            nodes[child].op,
+                            OpDescriptor::Add { .. } | OpDescriptor::Sub { .. }
+                        )
+                })
+        };
+        let left_arithmetic = child_is_arithmetic(left);
+        let right_arithmetic = child_is_arithmetic(right);
+        let left_eligible = left_arithmetic && use_counts[index_by_value[left.index]] == 1;
+        let right_eligible = right_arithmetic && use_counts[index_by_value[right.index]] == 1;
+        // An arithmetic intermediate with another reader or output pin is a cut in this
+        // candidate. Reject the group instead of smuggling it through as an external leaf.
+        if (left_arithmetic && !left_eligible) || (right_arithmetic && !right_eligible) {
+            return false;
+        }
+        // This first slice is a chain. Branched expressions stay separate until they have a
+        // distinct numeric contract and backend implementation.
+        if left_eligible && right_eligible {
+            return false;
+        }
+        if left_eligible
+            && !collect_bounded_arithmetic(
+                left,
+                shape,
+                nodes,
+                index_by_value,
+                use_counts,
+                included,
+                true,
+            )
+        {
+            return false;
+        }
+        if right_eligible
+            && !collect_bounded_arithmetic(
+                right,
+                shape,
+                nodes,
+                index_by_value,
+                use_counts,
+                included,
+                true,
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn build_selected_operations<'a>(
+    nodes: &[NodeDescriptor<'a>],
+    groups: &[TensorPointwiseFusionGroup],
+    bounded_groups: &[TensorBoundedPointwiseFusionGroup],
+    bounded_mul_groups: &[TensorBoundedMulFusionGroup],
+    graph_node_count: usize,
+    output_values: &[ValueId],
+) -> (Vec<TensorSelectedOperation<'a>>, Vec<usize>, Vec<usize>) {
+    let mut operations = Vec::with_capacity(nodes.len());
+    let mut index_by_value = vec![usize::MAX; graph_node_count];
+    for node in nodes {
+        if groups.iter().any(|group| group.add_output == node.value)
+            || bounded_mul_groups.iter().any(|group| {
+                group.steps.iter().any(|step| step.output == node.value)
+                    && group.output != node.value
+            })
+            || bounded_groups.iter().any(|group| {
+                group.steps.iter().any(|step| step.output == node.value)
+                    && !(group.epilogue == TensorPointwiseEpilogue::Identity
+                        && group.output == node.value)
+            })
+        {
+            continue;
+        }
+        let operation = bounded_groups
+            .iter()
+            .find(|group| group.output == node.value)
+            .cloned()
+            .map_or_else(
+                || {
+                    groups
+                        .iter()
+                        .find(|group| group.relu_output == node.value)
+                        .map_or(TensorSelectedOperation::Node(*node), |group| {
+                            TensorSelectedOperation::FusedAddRelu {
+                                add_output: group.add_output,
+                                relu_output: group.relu_output,
+                                left: group.left,
+                                right: group.right,
+                                shape: node.shape,
+                            }
+                        })
+                },
+                |group| TensorSelectedOperation::FusedAddSub { group },
+            );
+        let operation = bounded_mul_groups
+            .iter()
+            .find(|group| group.output == node.value)
+            .cloned()
+            .map_or(operation, |group| TensorSelectedOperation::FusedMul {
+                group,
+            });
+        index_by_value[node.value.index] = operations.len();
+        operations.push(operation);
+    }
+    let mut use_counts = vec![0usize; operations.len()];
+    for operation in &operations {
+        for_each_selected_operand(operation, |operand| {
+            if let Some(index) = index_by_value.get(operand.index).copied()
+                && index != usize::MAX
+            {
+                use_counts[index] += 1;
+            }
+        });
+    }
+    for output in output_values {
+        if let Some(index) = index_by_value.get(output.index).copied()
+            && index != usize::MAX
+        {
+            use_counts[index] += 1;
+        }
+    }
+    (operations, index_by_value, use_counts)
+}
+
+fn for_each_selected_operand(
+    operation: &TensorSelectedOperation<'_>,
+    mut visit: impl FnMut(ValueId),
+) {
+    match operation {
+        TensorSelectedOperation::Node(node) => for_each_descriptor_operand(node.op, visit),
+        TensorSelectedOperation::FusedAddRelu { left, right, .. } => {
+            visit(*left);
+            visit(*right);
+        }
+        TensorSelectedOperation::FusedAddSub { group } => {
+            for step in &group.steps {
+                for operand in [step.left, step.right] {
+                    if let TensorPointwiseOperand::Leaf(index) = operand
+                        && let Some(leaf) = group.leaves.get(index)
+                    {
+                        visit(*leaf);
+                    }
+                }
+            }
+        }
+        TensorSelectedOperation::FusedMul { group } => {
+            for step in &group.steps {
+                for operand in [step.left, step.right] {
+                    if let TensorPointwiseOperand::Leaf(index) = operand
+                        && let Some(leaf) = group.leaves.get(index)
+                    {
+                        visit(*leaf);
+                    }
+                }
+            }
+        }
+    }
+}
+
+const fn selected_operation_output(operation: &TensorSelectedOperation<'_>) -> ValueId {
+    match operation {
+        TensorSelectedOperation::Node(node) => node.value,
+        TensorSelectedOperation::FusedAddRelu { relu_output, .. } => *relu_output,
+        TensorSelectedOperation::FusedAddSub { group } => group.output,
+        TensorSelectedOperation::FusedMul { group } => group.output,
+    }
+}
+
+fn selected_operation_shape<'op>(operation: &'op TensorSelectedOperation<'_>) -> &'op [usize] {
+    match operation {
+        TensorSelectedOperation::Node(node) => node.shape,
+        TensorSelectedOperation::FusedAddRelu { shape, .. } => shape,
+        TensorSelectedOperation::FusedAddSub { group } => &group.shape,
+        TensorSelectedOperation::FusedMul { group } => &group.shape,
+    }
+}
+
+fn selected_operation_bytes(operation: &TensorSelectedOperation<'_>) -> Result<u64, TensorError> {
+    let bytes =
+        node_output_bytes(selected_operation_shape(operation)).ok_or(TensorError::ShapeOverflow)?;
+    u64::try_from(bytes).map_err(|_| TensorError::ShapeOverflow)
+}
+
+const fn selected_operation_is_read_only(operation: &TensorSelectedOperation<'_>) -> bool {
+    match operation {
+        TensorSelectedOperation::Node(node) => is_read_only_descriptor(node.op),
+        TensorSelectedOperation::FusedAddRelu { .. }
+        | TensorSelectedOperation::FusedAddSub { .. }
+        | TensorSelectedOperation::FusedMul { .. } => false,
+    }
+}
+
+const fn is_read_only_descriptor(op: OpDescriptor<'_>) -> bool {
+    matches!(
+        op,
+        OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+    )
 }
 
 #[derive(Clone, Debug)]
 enum Op {
     Input,
     Constant(Tensor),
+    Uniform(f32),
     Add(ValueId, ValueId),
     Sub(ValueId, ValueId),
     Mul(ValueId, ValueId),
@@ -391,7 +1942,7 @@ fn operands(op: &Op) -> impl Iterator<Item = ValueId> + '_ {
         | Op::MatMul(a, b, _, _) => (Some(*a), Some(*b)),
         Op::Relu(x) => (Some(*x), None),
         Op::ReluBackward(input, upstream) => (Some(*input), Some(*upstream)),
-        Op::Input | Op::Constant(_) => (None, None),
+        Op::Input | Op::Constant(_) | Op::Uniform(_) => (None, None),
     };
     first.into_iter().chain(second)
 }
@@ -420,54 +1971,125 @@ impl Default for Graph {
 
 impl Graph {
     /// Builds a stable topological CPU reference plan with checked liveness facts.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the graph's internally derived terminal outputs fail validation.
     #[must_use]
     pub fn execution_plan(&self) -> TensorExecutionPlan<'_> {
-        let node_order: Vec<_> = self.nodes().map(|node| node.value).collect();
-        let mut last_use: Vec<usize> = (0..self.nodes.len()).collect();
-        let mut has_consumer = vec![false; self.nodes.len()];
-        for (index, node) in self.nodes.iter().enumerate() {
-            for operand in operands(&node.op) {
-                last_use[operand.index] = index;
-                has_consumer[operand.index] = true;
+        if self.nodes.is_empty() {
+            return TensorExecutionPlan {
+                graph: self,
+                node_order: Vec::new(),
+                input_values: Vec::new(),
+                output_values: Vec::new(),
+                value_liveness: Vec::new(),
+                index_by_value: Vec::new(),
+                use_counts: Vec::new(),
+                peak_live_bytes: Some(0),
+            };
+        }
+        let outputs: Vec<_> = self
+            .nodes()
+            .map(|node| node.value)
+            .filter(|value| {
+                !self
+                    .nodes
+                    .iter()
+                    .any(|node| operands(&node.op).any(|operand| operand == *value))
+            })
+            .collect();
+        self.execution_plan_for_outputs(&outputs)
+            .expect("terminal graph outputs always form a valid plan")
+    }
+
+    /// Builds a backend-neutral plan for the dependency closure of the requested outputs.
+    ///
+    /// Node order is stable append order, output order matches the request, and requested outputs
+    /// remain live through the end of the plan. Unrelated graph nodes are omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::EmptyOutputs`], [`TensorError::UnknownValue`], or
+    /// [`TensorError::DuplicateOutput`] when the output selection is invalid.
+    #[allow(clippy::too_many_lines)]
+    pub fn execution_plan_for_outputs(
+        &self,
+        outputs: &[ValueId],
+    ) -> Result<TensorExecutionPlan<'_>, TensorError> {
+        if outputs.is_empty() {
+            return Err(TensorError::EmptyOutputs);
+        }
+        let mut selected = vec![false; self.nodes.len()];
+        let mut requested = Vec::with_capacity(outputs.len());
+        for &output in outputs {
+            let index = if output.graph_id == self.id {
+                output.index
+            } else {
+                return Err(TensorError::UnknownValue(output));
+            };
+            if index >= self.nodes.len() {
+                return Err(TensorError::UnknownValue(output));
+            }
+            if requested.contains(&output) {
+                return Err(TensorError::DuplicateOutput(output));
+            }
+            requested.push(output);
+            let mut stack = vec![index];
+            while let Some(at) = stack.pop() {
+                if selected[at] {
+                    continue;
+                }
+                selected[at] = true;
+                stack.extend(operands(&self.nodes[at].op).map(|operand| operand.index));
             }
         }
-        let input_values = self
-            .nodes
+        let node_order: Vec<_> = selected
             .iter()
             .enumerate()
-            .filter_map(|(index, node)| {
-                matches!(node.op, Op::Input).then_some(ValueId {
+            .filter_map(|(index, is_selected)| {
+                is_selected.then_some(ValueId {
                     graph_id: self.id,
                     index,
                 })
             })
             .collect();
-        let output_values = self
-            .nodes
+        let mut plan_index = vec![usize::MAX; self.nodes.len()];
+        for (position, value) in node_order.iter().enumerate() {
+            plan_index[value.index] = position;
+        }
+        let mut last_use: Vec<usize> = (0..self.nodes.len())
+            .map(|index| plan_index[index])
+            .collect();
+        // Each edge and pin occupies one graph node/output entry, so this count is bounded by
+        // allocations already represented by the graph and requested output slice.
+        let mut use_counts = vec![0usize; node_order.len()];
+        for (position, value) in node_order.iter().enumerate() {
+            for operand in operands(&self.nodes[value.index].op) {
+                last_use[operand.index] = position;
+                use_counts[plan_index[operand.index]] += 1;
+            }
+        }
+        let final_position = node_order.len() - 1;
+        for output in &requested {
+            last_use[output.index] = final_position;
+            use_counts[plan_index[output.index]] += 1;
+        }
+        let input_values = node_order
+            .iter()
+            .filter_map(|value| matches!(self.nodes[value.index].op, Op::Input).then_some(*value))
+            .collect();
+        let value_liveness: Vec<_> = node_order
             .iter()
             .enumerate()
-            .filter_map(|(index, _)| {
-                (!has_consumer[index]).then_some(ValueId {
-                    graph_id: self.id,
-                    index,
-                })
+            .map(|(position, value)| TensorValueLiveness {
+                value: *value,
+                output_bytes: node_output_bytes(&self.nodes[value.index].shape),
+                first_live_node: position,
+                last_live_node: last_use[value.index],
             })
             .collect();
-        let value_liveness: Vec<_> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| TensorValueLiveness {
-                value: ValueId {
-                    graph_id: self.id,
-                    index,
-                },
-                output_bytes: node_output_bytes(&node.shape),
-                first_live_node: index,
-                last_live_node: last_use[index],
-            })
-            .collect();
-        let mut ending_bytes = vec![0usize; self.nodes.len()];
+        let mut ending_bytes = vec![0usize; node_order.len()];
         let mut extents_known = true;
         for life in &value_liveness {
             let Some(bytes) = life.output_bytes else {
@@ -492,14 +2114,16 @@ impl Graph {
             })
             .flatten()
             .map(|(_, peak)| peak);
-        TensorExecutionPlan {
+        Ok(TensorExecutionPlan {
             graph: self,
             node_order,
             input_values,
-            output_values,
+            output_values: requested,
             value_liveness,
+            index_by_value: plan_index,
+            use_counts,
             peak_live_bytes,
-        }
+        })
     }
 
     /// Reports backend-neutral per-value output storage facts.
@@ -546,53 +2170,60 @@ impl Graph {
     /// Iterates over graph nodes in their stable append order without allocating.
     #[must_use]
     pub fn nodes(&self) -> impl ExactSizeIterator<Item = NodeDescriptor<'_>> + '_ {
-        self.nodes.iter().enumerate().map(|(index, node)| {
-            let value = ValueId {
-                graph_id: self.id,
-                index,
-            };
-            let op = match &node.op {
-                Op::Input => OpDescriptor::Input,
-                Op::Constant(tensor) => OpDescriptor::Constant(tensor),
-                Op::Add(left, right) => OpDescriptor::Add {
-                    left: *left,
-                    right: *right,
-                },
-                Op::Sub(left, right) => OpDescriptor::Sub {
-                    left: *left,
-                    right: *right,
-                },
-                Op::Mul(left, right) => OpDescriptor::Mul {
-                    left: *left,
-                    right: *right,
-                },
-                Op::SgdUpdate(weights, gradient, learning_rate) => OpDescriptor::SgdUpdate {
-                    weights: *weights,
-                    gradient: *gradient,
-                    learning_rate: *learning_rate,
-                },
-                Op::MatMul(left, right, transpose_left, transpose_right) => OpDescriptor::MatMul {
-                    left: *left,
-                    right: *right,
-                    transpose_left: *transpose_left,
-                    transpose_right: *transpose_right,
-                },
-                Op::Relu(input) => OpDescriptor::Relu { input: *input },
-                Op::ReluBackward(input, upstream) => OpDescriptor::ReluBackward {
-                    input: *input,
-                    upstream: *upstream,
-                },
-                Op::MeanSquaredError(prediction, target) => OpDescriptor::MeanSquaredError {
-                    prediction: *prediction,
-                    target: *target,
-                },
-            };
-            NodeDescriptor {
-                value,
-                op,
-                shape: &node.shape,
-            }
-        })
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(index, _)| self.node_descriptor(index))
+    }
+
+    fn node_descriptor(&self, index: usize) -> NodeDescriptor<'_> {
+        let node = &self.nodes[index];
+        let value = ValueId {
+            graph_id: self.id,
+            index,
+        };
+        let op = match &node.op {
+            Op::Input => OpDescriptor::Input,
+            Op::Constant(tensor) => OpDescriptor::Constant(tensor),
+            Op::Uniform(value) => OpDescriptor::Uniform { value: *value },
+            Op::Add(left, right) => OpDescriptor::Add {
+                left: *left,
+                right: *right,
+            },
+            Op::Sub(left, right) => OpDescriptor::Sub {
+                left: *left,
+                right: *right,
+            },
+            Op::Mul(left, right) => OpDescriptor::Mul {
+                left: *left,
+                right: *right,
+            },
+            Op::SgdUpdate(weights, gradient, learning_rate) => OpDescriptor::SgdUpdate {
+                weights: *weights,
+                gradient: *gradient,
+                learning_rate: *learning_rate,
+            },
+            Op::MatMul(left, right, transpose_left, transpose_right) => OpDescriptor::MatMul {
+                left: *left,
+                right: *right,
+                transpose_left: *transpose_left,
+                transpose_right: *transpose_right,
+            },
+            Op::Relu(input) => OpDescriptor::Relu { input: *input },
+            Op::ReluBackward(input, upstream) => OpDescriptor::ReluBackward {
+                input: *input,
+                upstream: *upstream,
+            },
+            Op::MeanSquaredError(prediction, target) => OpDescriptor::MeanSquaredError {
+                prediction: *prediction,
+                target: *target,
+            },
+        };
+        NodeDescriptor {
+            value,
+            op,
+            shape: &node.shape,
+        }
     }
 
     fn push(&mut self, op: Op, shape: Vec<usize>) -> ValueId {
@@ -617,6 +2248,26 @@ impl Graph {
 
     pub fn constant(&mut self, value: Tensor) -> ValueId {
         self.push(Op::Constant(value.clone()), value.shape)
+    }
+
+    /// Adds a compact graph-level constant with the supplied logical shape.
+    ///
+    /// Unlike [`Tensor::splat`], this stores only the scalar in the graph. The CPU reference
+    /// evaluator materializes the dense logical tensor when executing it. Graph requirement,
+    /// liveness, and storage metadata still report the full dense output size; a backend may use
+    /// scalar physical storage only when its own representation explicitly supports that choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorError::ShapeOverflow`] if the logical element count overflows.
+    pub fn uniform(
+        &mut self,
+        shape: impl Into<Vec<usize>>,
+        value: f32,
+    ) -> Result<ValueId, TensorError> {
+        let shape = shape.into();
+        element_count(&shape)?;
+        Ok(self.push(Op::Uniform(value), shape))
     }
 
     /// Adds two values with identical shapes.
@@ -857,7 +2508,7 @@ impl Graph {
                 continue;
             };
             let op = match &self.nodes[index].op {
-                Op::Input | Op::Constant(_) => continue,
+                Op::Input | Op::Constant(_) | Op::Uniform(_) => continue,
                 Op::Add(left, right) => OpDescriptor::Add {
                     left: *left,
                     right: *right,
@@ -946,6 +2597,7 @@ impl Graph {
                     value.clone()
                 }
                 Op::Constant(t) => t.clone(),
+                Op::Uniform(value) => Tensor::splat(node.shape.clone(), *value)?,
                 Op::Add(a, b) => binary(&values[a.index], &values[b.index], |x, y| x + y),
                 Op::Sub(a, b) => binary(&values[a.index], &values[b.index], |x, y| x - y),
                 Op::Mul(a, b) => binary(&values[a.index], &values[b.index], |x, y| x * y),
@@ -1003,7 +2655,7 @@ fn append_node_gradients(
     gradient: ValueId,
 ) -> Result<(), TensorError> {
     match op {
-        OpDescriptor::Input | OpDescriptor::Constant(_) => {}
+        OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. } => {}
         OpDescriptor::Add { left, right } => {
             accumulate_gradient(graph, gradients, left, gradient)?;
             accumulate_gradient(graph, gradients, right, gradient)?;
@@ -1132,6 +2784,7 @@ fn binary(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32) -> Tensor {
     Tensor {
         shape: a.shape.clone(),
         data: a.data.iter().zip(&b.data).map(|(x, y)| f(*x, *y)).collect(),
+        known_uniform_value: None,
     }
 }
 
@@ -1170,6 +2823,7 @@ fn matmul(left: &Tensor, right: &Tensor, transpose_left: bool, transpose_right: 
     Tensor {
         shape: vec![rows, columns],
         data: output,
+        known_uniform_value: None,
     }
 }
 
@@ -1230,7 +2884,7 @@ impl Execution {
             };
             let node = &graph.nodes[i];
             match node.op {
-                Op::Input | Op::Constant(_) => {}
+                Op::Input | Op::Constant(_) | Op::Uniform(_) => {}
                 Op::Add(a, b) => {
                     accumulate(&mut grads, a, grad.clone());
                     accumulate(&mut grads, b, grad);
@@ -1407,684 +3061,5 @@ fn accumulate(grads: &mut [Option<Tensor>], id: ValueId, add: Tensor) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assert_gradient_graph_matches_reference(
-        graph: &mut Graph,
-        inputs: &[(ValueId, Tensor)],
-        loss: ValueId,
-        values: &[ValueId],
-    ) {
-        let gradient_values = graph.backward_mse(loss).unwrap();
-        let execution = graph.evaluate(inputs).unwrap();
-        let reference = execution.gradients(graph, loss).unwrap();
-        for value in values {
-            let graph_gradient = execution
-                .value(gradient_values[value.index].unwrap())
-                .unwrap();
-            let reference_gradient = reference[value.index].as_ref().unwrap();
-            assert_eq!(graph_gradient.shape(), reference_gradient.shape());
-            for (actual, expected) in graph_gradient.data().iter().zip(reference_gradient.data()) {
-                assert!(
-                    (actual - expected).abs() <= 1.0e-5,
-                    "{actual} != {expected}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn backward_mse_graph_matches_reference_with_fanout() {
-        let mut graph = Graph::default();
-        let samples = graph.input([2, 3]).unwrap();
-        let weights = graph.input([3, 2]).unwrap();
-        let prediction = graph.matmul(samples, weights).unwrap();
-        let squared = graph.mul(prediction, prediction).unwrap();
-        let target = graph.input([2, 2]).unwrap();
-        let loss = graph.mean_squared_error(squared, target).unwrap();
-        let inputs = [
-            (
-                samples,
-                Tensor::new([2, 3], vec![1.0, 2.0, -1.0, 0.5, -2.0, 3.0]).unwrap(),
-            ),
-            (
-                weights,
-                Tensor::new([3, 2], vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.2]).unwrap(),
-            ),
-            (
-                target,
-                Tensor::new([2, 2], vec![0.0, 1.0, -1.0, 0.5]).unwrap(),
-            ),
-        ];
-        assert_gradient_graph_matches_reference(
-            &mut graph,
-            &inputs,
-            loss,
-            &[samples, weights, prediction],
-        );
-    }
-
-    #[test]
-    fn backward_mse_graph_matches_reference_for_transposed_matmul() {
-        let mut graph = Graph::default();
-        let left = graph.input([3, 2]).unwrap();
-        let right = graph.input([4, 3]).unwrap();
-        let prediction = graph.matmul_transposed(left, right, true, true).unwrap();
-        let target = graph.input([2, 4]).unwrap();
-        let loss = graph.mean_squared_error(prediction, target).unwrap();
-        let inputs = [
-            (
-                left,
-                Tensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5]).unwrap(),
-            ),
-            (
-                right,
-                Tensor::new(
-                    [4, 3],
-                    vec![
-                        0.2, -0.1, 0.3, 0.4, 0.5, -0.2, 0.1, -0.3, 0.6, 0.7, 0.2, 0.8,
-                    ],
-                )
-                .unwrap(),
-            ),
-            (target, Tensor::new([2, 4], vec![0.0; 8]).unwrap()),
-        ];
-        assert_gradient_graph_matches_reference(&mut graph, &inputs, loss, &[left, right]);
-    }
-
-    #[test]
-    fn relu_backward_checks_shapes_and_matches_strict_derivative() {
-        let mut graph = Graph::default();
-        let input = graph.input([2]).unwrap();
-        let upstream = graph.input([2]).unwrap();
-        let wrong_shape = graph.constant(Tensor::new([1, 2], vec![0.0, 0.0]).unwrap());
-        assert_eq!(
-            graph.relu_backward(input, wrong_shape),
-            Err(TensorError::ShapeMismatch {
-                left: vec![2],
-                right: vec![1, 2]
-            })
-        );
-        let derivative = graph.relu_backward(input, upstream).unwrap();
-        let inputs = [
-            (input, Tensor::new([2], vec![f32::NAN, 0.0]).unwrap()),
-            (upstream, Tensor::new([2], vec![3.0, 4.0]).unwrap()),
-        ];
-        assert_eq!(
-            graph
-                .evaluate(&inputs)
-                .unwrap()
-                .value(derivative)
-                .unwrap()
-                .data(),
-            &[0.0, 0.0]
-        );
-    }
-
-    #[test]
-    fn backward_mse_graph_matches_reference_for_two_hidden_relu_layers() {
-        let mut graph = Graph::default();
-        let samples = graph.input([2, 3]).unwrap();
-        let weights1 = graph.input([3, 4]).unwrap();
-        let hidden1 = graph.matmul(samples, weights1).unwrap();
-        let activated1 = graph.relu(hidden1).unwrap();
-        let weights2 = graph.input([4, 4]).unwrap();
-        let hidden2 = graph.matmul(activated1, weights2).unwrap();
-        let activated2 = graph.relu(hidden2).unwrap();
-        let weights3 = graph.input([4, 2]).unwrap();
-        let prediction = graph.matmul(activated2, weights3).unwrap();
-        let target = graph.input([2, 2]).unwrap();
-        let loss = graph.mean_squared_error(prediction, target).unwrap();
-        let inputs = [
-            (
-                samples,
-                Tensor::new([2, 3], vec![1.0, -2.0, 0.5, -1.0, 0.25, 2.0]).unwrap(),
-            ),
-            (
-                weights1,
-                Tensor::new(
-                    [3, 4],
-                    vec![
-                        0.2, -0.3, 0.5, 0.1, -0.4, 0.6, 0.2, -0.1, 0.3, 0.2, -0.5, 0.4,
-                    ],
-                )
-                .unwrap(),
-            ),
-            (
-                weights2,
-                Tensor::new(
-                    [4, 4],
-                    vec![
-                        0.1, 0.2, -0.3, 0.4, -0.2, 0.5, 0.1, -0.1, 0.3, -0.4, 0.2, 0.6, 0.5, 0.1,
-                        -0.2, 0.3,
-                    ],
-                )
-                .unwrap(),
-            ),
-            (
-                weights3,
-                Tensor::new([4, 2], vec![0.2, -0.1, 0.4, 0.3, -0.5, 0.2, 0.1, 0.6]).unwrap(),
-            ),
-            (
-                target,
-                Tensor::new([2, 2], vec![0.0, 1.0, -0.5, 0.25]).unwrap(),
-            ),
-        ];
-        assert_gradient_graph_matches_reference(
-            &mut graph,
-            &inputs,
-            loss,
-            &[
-                samples, weights1, hidden1, activated1, weights2, hidden2, activated2, weights3,
-                prediction,
-            ],
-        );
-    }
-
-    struct ReferenceAssessor;
-
-    #[test]
-    fn elementwise_algebra_checks_shapes_and_evaluates_without_broadcasting() {
-        let mut graph = Graph::default();
-        let left = graph.input(vec![2, 2]).unwrap();
-        let right = graph.input(vec![2, 2]).unwrap();
-        let sub = graph.sub(left, right).unwrap();
-        let mul = graph.mul(sub, right).unwrap();
-        let shape_mismatch = graph.input(vec![2]).unwrap();
-        assert!(matches!(
-            graph.mul(left, shape_mismatch),
-            Err(TensorError::ShapeMismatch { .. })
-        ));
-        let execution = graph
-            .evaluate(&[
-                (
-                    left,
-                    Tensor::new(vec![2, 2], vec![3.0, 5.0, 7.0, 9.0]).unwrap(),
-                ),
-                (
-                    right,
-                    Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-                ),
-                (
-                    shape_mismatch,
-                    Tensor::new(vec![2], vec![0.0, 0.0]).unwrap(),
-                ),
-            ])
-            .unwrap();
-        assert_eq!(execution.value(sub).unwrap().data(), &[2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(
-            execution.value(mul).unwrap().data(),
-            &[2.0, 6.0, 12.0, 20.0]
-        );
-        assert!(
-            matches!(graph.nodes().nth(2).unwrap().op, OpDescriptor::Sub { left: a, right: b } if a == left && b == right)
-        );
-        assert!(
-            matches!(graph.nodes().nth(3).unwrap().op, OpDescriptor::Mul { left: a, right: b } if a == sub && b == right)
-        );
-        let plan = graph.execution_plan();
-        assert_eq!(plan.node_order().len(), graph.nodes().len());
-        assert_eq!(plan.output_values(), &[mul, shape_mismatch]);
-    }
-
-    #[test]
-    fn sgd_update_checks_inputs_and_evaluates_explicit_operation() {
-        let mut graph = Graph::default();
-        let weights = graph.input([3]).unwrap();
-        let gradient = graph.input([3]).unwrap();
-        let updated = graph.sgd_update(weights, gradient, 0.25).unwrap();
-        let wrong_shape = graph.input([2]).unwrap();
-        assert!(matches!(
-            graph.sgd_update(weights, wrong_shape, 0.25),
-            Err(TensorError::ShapeMismatch { .. })
-        ));
-        assert!(matches!(
-            graph.sgd_update(weights, gradient, f32::NAN),
-            Err(TensorError::InvalidLearningRate)
-        ));
-        assert!(matches!(
-            graph.sgd_update(weights, gradient, f32::INFINITY),
-            Err(TensorError::InvalidLearningRate)
-        ));
-
-        let execution = graph
-            .evaluate(&[
-                (weights, Tensor::new([3], vec![1.0, 2.0, -3.0]).unwrap()),
-                (gradient, Tensor::new([3], vec![0.4, -2.0, 8.0]).unwrap()),
-                (wrong_shape, Tensor::new([2], vec![0.0, 0.0]).unwrap()),
-            ])
-            .unwrap();
-        for (actual, expected) in execution
-            .value(updated)
-            .unwrap()
-            .data()
-            .iter()
-            .zip([0.9, 2.5, -5.0])
-        {
-            assert!((actual - expected).abs() < 1.0e-6);
-        }
-        assert!(matches!(
-            graph.nodes().nth(2).unwrap().op,
-            OpDescriptor::SgdUpdate {
-                weights: value_weights,
-                gradient: value_gradient,
-                learning_rate
-            } if value_weights == weights
-                && value_gradient == gradient
-                && (learning_rate - 0.25).abs() < f32::EPSILON
-        ));
-    }
-
-    #[test]
-    fn transposed_matmul_evaluates_and_differentiates_in_original_layout() {
-        let mut graph = Graph::default();
-        let left = graph.input(vec![3, 2]).unwrap();
-        let right = graph.input(vec![3, 4]).unwrap();
-        let product = graph.matmul_transposed(left, right, true, false).unwrap();
-        assert_eq!(graph.shape(product).unwrap(), &[2, 4]);
-        assert!(matches!(
-            graph.matmul_transposed(left, right, false, false),
-            Err(TensorError::MatMulShape { .. })
-        ));
-        let execution = graph
-            .evaluate(&[
-                (
-                    left,
-                    Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
-                ),
-                (
-                    right,
-                    Tensor::new(
-                        vec![3, 4],
-                        vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
-                    )
-                    .unwrap(),
-                ),
-            ])
-            .unwrap();
-        assert_eq!(
-            execution.value(product).unwrap().data(),
-            &[1.0, 3.0, 5.0, 5.0, 2.0, 4.0, 6.0, 6.0]
-        );
-        let mut scalar_graph = Graph::default();
-        let x = scalar_graph.input(vec![3, 2]).unwrap();
-        let y = scalar_graph.input(vec![3, 1]).unwrap();
-        let transposed = scalar_graph.matmul_transposed(x, y, true, false).unwrap();
-        let target = scalar_graph.constant(Tensor::new(vec![2, 1], vec![0.0, 0.0]).unwrap());
-        let loss = scalar_graph.mean_squared_error(transposed, target).unwrap();
-        let execution = scalar_graph
-            .evaluate(&[
-                (
-                    x,
-                    Tensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
-                ),
-                (y, Tensor::new(vec![3, 1], vec![1.0, 1.0, 1.0]).unwrap()),
-            ])
-            .unwrap();
-        let gradients = execution.gradients(&scalar_graph, loss).unwrap();
-        assert_eq!(
-            gradients[x.index].as_ref().unwrap().data(),
-            &[9.0, 12.0, 9.0, 12.0, 9.0, 12.0]
-        );
-        assert_eq!(
-            gradients[y.index].as_ref().unwrap().data(),
-            &[33.0, 75.0, 117.0]
-        );
-    }
-
-    impl TensorOperationAssessor for ReferenceAssessor {
-        fn assess_node(&self, _graph: &Graph, _node: NodeDescriptor<'_>) -> TensorOperationSupport {
-            TensorOperationSupport::Supported {
-                route: TensorExecutionRoute::Reference,
-                workspace_bytes: None,
-            }
-        }
-    }
-
-    #[test]
-    fn selected_assessment_and_storage_requirements_preserve_node_order() {
-        let mut graph = Graph::default();
-        let input = graph.input(vec![2, 2]).unwrap();
-        let constant = graph.constant(Tensor::new(vec![2, 2], vec![1.0; 4]).unwrap());
-        let sum = graph.add(input, constant).unwrap();
-        let output = graph.relu(sum).unwrap();
-
-        let assessment = graph.assess_with(&ReferenceAssessor);
-        assert_eq!(assessment.nodes.len(), 4);
-        assert_eq!(assessment.nodes[0].node.value, input);
-        assert_eq!(assessment.nodes[1].node.value, constant);
-        assert_eq!(assessment.nodes[2].node.value, sum);
-        assert_eq!(assessment.nodes[3].node.value, output);
-        assert!(assessment.nodes.iter().all(|node| {
-            matches!(
-                node.support,
-                TensorOperationSupport::Supported {
-                    route: TensorExecutionRoute::Reference,
-                    workspace_bytes: None,
-                }
-            ) && node.output_bytes == Some(16)
-        }));
-        assert!(assessment.is_supported());
-
-        let requirements = graph.requirements();
-        assert_eq!(requirements.values.len(), 4);
-        assert_eq!(requirements.total_value_bytes, Some(64));
-        assert!(
-            requirements
-                .values
-                .iter()
-                .all(|value| value.output_bytes == Some(16))
-        );
-    }
-
-    #[test]
-    fn execution_plan_reports_stable_order_outputs_and_fanout_liveness() {
-        let mut graph = Graph::default();
-        let input = graph.input(vec![2]).unwrap();
-        let constant = graph.constant(Tensor::new(vec![2], vec![1.0, 1.0]).unwrap());
-        let first = graph.add(input, constant).unwrap();
-        let second = graph.relu(first).unwrap();
-        let output = graph.add(first, second).unwrap();
-
-        let plan = graph.execution_plan();
-        assert_eq!(plan.node_order(), &[input, constant, first, second, output]);
-        assert_eq!(plan.input_values(), &[input]);
-        assert_eq!(plan.output_values(), &[output]);
-        assert_eq!(plan.value_liveness()[2].first_live_node, 2);
-        assert_eq!(plan.value_liveness()[2].last_live_node, 4);
-        assert_eq!(plan.peak_live_bytes(), Some(24));
-
-        let inputs = [(input, Tensor::new(vec![2], vec![-1.0, 2.0]).unwrap())];
-        let planned = plan.execute_reference(&inputs).unwrap();
-        let ordinary = graph.evaluate(&inputs).unwrap();
-        assert_eq!(planned.value(output).unwrap().data(), &[0.0, 6.0]);
-        assert_eq!(
-            planned.value(output).unwrap(),
-            ordinary.value(output).unwrap()
-        );
-    }
-
-    #[test]
-    fn unsupported_assessment_has_no_implicit_fallback() {
-        struct RejectAll;
-        impl TensorOperationAssessor for RejectAll {
-            fn assess_node(
-                &self,
-                _graph: &Graph,
-                _node: NodeDescriptor<'_>,
-            ) -> TensorOperationSupport {
-                TensorOperationSupport::Unsupported {
-                    reason: TensorUnsupportedReason::Operation,
-                }
-            }
-        }
-
-        let mut graph = Graph::default();
-        graph.input(vec![1]).unwrap();
-        let assessment = graph.assess_with(&RejectAll);
-        assert!(!assessment.is_supported());
-        assert_eq!(assessment.unsupported_nodes().count(), 1);
-        assert!(matches!(
-            assessment.nodes[0].support,
-            TensorOperationSupport::Unsupported {
-                reason: TensorUnsupportedReason::Operation
-            }
-        ));
-    }
-
-    fn build() -> (Graph, ValueId, ValueId, ValueId, ValueId) {
-        let mut g = Graph::default();
-        let x = g.input(vec![2, 2]).unwrap();
-        let w = g.input(vec![2, 1]).unwrap();
-        let b = g.input(vec![2, 1]).unwrap();
-        let affine = g.matmul(x, w).unwrap();
-        let prediction = g.add(affine, b).unwrap();
-        let target = g.constant(Tensor::new(vec![2, 1], vec![1.0, -1.0]).unwrap());
-        let loss = g.mean_squared_error(prediction, target).unwrap();
-        (g, x, w, b, loss)
-    }
-
-    #[test]
-    fn linear_regression_value_and_finite_difference_gradients() {
-        let (g, x, w, b, loss) = build();
-        let xv = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let wv = Tensor::new(vec![2, 1], vec![0.25, -0.5]).unwrap();
-        let bv = Tensor::new(vec![2, 1], vec![0.1, 0.2]).unwrap();
-        let inputs = [(x, xv.clone()), (w, wv.clone()), (b, bv.clone())];
-        let execution = g.evaluate(&inputs).unwrap();
-        let analytic = execution.gradients(&g, loss).unwrap()[w.index]
-            .as_ref()
-            .unwrap()
-            .data
-            .clone();
-        let eps = 1e-3;
-        for (index, analytic_gradient) in analytic.iter().enumerate() {
-            let mut plus = wv.clone();
-            plus.data[index] += eps;
-            let mut minus = wv.clone();
-            minus.data[index] -= eps;
-            let eval_loss = |candidate_w: Tensor| {
-                let eval = g
-                    .evaluate(&[(x, xv.clone()), (w, candidate_w), (b, bv.clone())])
-                    .unwrap();
-                eval.value(loss).unwrap().data[0]
-            };
-            let numeric = (eval_loss(plus) - eval_loss(minus)) / (2.0 * eps);
-            assert!(
-                (analytic_gradient - numeric).abs() < 1e-3,
-                "{index}: {analytic_gradient} != {numeric}"
-            );
-        }
-        assert_eq!(execution.value(loss).unwrap().shape(), &[]);
-
-        let gradients = execution.gradients(&g, loss).unwrap();
-        let learning_rate = 0.05;
-        let updated_w = Tensor::new(
-            wv.shape.clone(),
-            wv.data
-                .iter()
-                .zip(&gradients[w.index].as_ref().unwrap().data)
-                .map(|(value, grad)| value - learning_rate * grad)
-                .collect(),
-        )
-        .unwrap();
-        let updated_b = Tensor::new(
-            bv.shape.clone(),
-            bv.data
-                .iter()
-                .zip(&gradients[b.index].as_ref().unwrap().data)
-                .map(|(value, grad)| value - learning_rate * grad)
-                .collect(),
-        )
-        .unwrap();
-        let updated = g
-            .evaluate(&[(x, xv), (w, updated_w), (b, updated_b)])
-            .unwrap();
-        assert!(updated.value(loss).unwrap().data[0] < execution.value(loss).unwrap().data[0]);
-    }
-
-    #[test]
-    fn checked_shape_and_operator_shapes() {
-        assert_eq!(
-            Tensor::new(vec![usize::MAX, 2], vec![]),
-            Err(TensorError::ShapeOverflow)
-        );
-        let mut g = Graph::default();
-        let a = g.input(vec![2, 3]).unwrap();
-        let b = g.input(vec![4, 2]).unwrap();
-        assert!(matches!(
-            g.matmul(a, b),
-            Err(TensorError::MatMulShape { .. })
-        ));
-    }
-
-    #[test]
-    fn graph_plan_exposes_borrowed_operations_shapes_and_append_order() {
-        let mut graph = Graph::default();
-        let input = graph.input(vec![2, 2]).unwrap();
-        let weights = graph.input(vec![2, 1]).unwrap();
-        let product = graph.matmul(input, weights).unwrap();
-        let activated = graph.relu(product).unwrap();
-        let bias = graph.constant(Tensor::new(vec![2, 1], vec![0.5, -0.5]).unwrap());
-        let prediction = graph.add(activated, bias).unwrap();
-        let target = graph.constant(Tensor::new(vec![2, 1], vec![1.0, 0.0]).unwrap());
-        let loss = graph.mean_squared_error(prediction, target).unwrap();
-
-        let plan: Vec<_> = graph.nodes().collect();
-        assert_eq!(plan.len(), 8);
-        assert_eq!(
-            plan.iter().map(|node| node.value).collect::<Vec<_>>(),
-            [
-                input, weights, product, activated, bias, prediction, target, loss
-            ]
-        );
-        assert_eq!(plan[0].op, OpDescriptor::Input);
-        assert_eq!(plan[0].shape, [2, 2]);
-        assert_eq!(plan[1].shape, [2, 1]);
-        assert_eq!(
-            plan[2].op,
-            OpDescriptor::MatMul {
-                left: input,
-                right: weights,
-                transpose_left: false,
-                transpose_right: false,
-            }
-        );
-        assert_eq!(plan[2].shape, [2, 1]);
-        assert_eq!(plan[3].op, OpDescriptor::Relu { input: product });
-        assert_eq!(
-            plan[4].op,
-            OpDescriptor::Constant(&Tensor::new(vec![2, 1], vec![0.5, -0.5]).unwrap())
-        );
-        assert_eq!(
-            plan[5].op,
-            OpDescriptor::Add {
-                left: activated,
-                right: bias
-            }
-        );
-        assert_eq!(plan[6].shape, [2, 1]);
-        assert_eq!(
-            plan[7].op,
-            OpDescriptor::MeanSquaredError { prediction, target }
-        );
-        assert_eq!(plan[7].shape, []);
-    }
-
-    #[test]
-    fn graph_plan_value_ids_keep_graph_identity() {
-        let mut first = Graph::default();
-        let first_id = first.input(vec![1]).unwrap();
-        let mut second = Graph::default();
-        let second_id = second.input(vec![1]).unwrap();
-
-        assert_ne!(first_id, second_id);
-        assert_eq!(first.nodes().next().unwrap().value, first_id);
-        assert_eq!(second.nodes().next().unwrap().value, second_id);
-        assert_eq!(
-            second.shape(first_id),
-            Err(TensorError::UnknownValue(first_id))
-        );
-    }
-
-    #[test]
-    fn reference_route_requires_explicit_assessor() {
-        let (graph, ..) = build();
-        let assessment = graph.assess_with(&TensorReferenceAssessor);
-        assert!(assessment.is_supported());
-        assert_eq!(assessment.nodes.len(), graph.nodes().len());
-        assert!(assessment.nodes.iter().all(|node| matches!(
-            node.support,
-            TensorOperationSupport::Supported {
-                route: TensorExecutionRoute::Reference,
-                workspace_bytes: None
-            }
-        )));
-    }
-
-    #[test]
-    fn composed_loss_propagates_incoming_gradient() {
-        let (mut g, x, w, b, loss) = build();
-        let doubled_loss = g.add(loss, loss).unwrap();
-        let inputs = [
-            (
-                x,
-                Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-            ),
-            (w, Tensor::new(vec![2, 1], vec![0.25, -0.5]).unwrap()),
-            (b, Tensor::new(vec![2, 1], vec![0.1, 0.2]).unwrap()),
-        ];
-        let execution = g.evaluate(&inputs).unwrap();
-        let gradients = execution.gradients(&g, doubled_loss).unwrap();
-        let base_gradient = execution.gradients(&g, loss).unwrap();
-        for (actual, base) in gradients[w.index]
-            .as_ref()
-            .unwrap()
-            .data
-            .iter()
-            .zip(&base_gradient[w.index].as_ref().unwrap().data)
-        {
-            assert!((actual - 2.0 * base).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn execution_and_input_bindings_are_graph_checked() {
-        let (mut graph, x, w, b, loss) = build();
-        let inputs = [
-            (
-                x,
-                Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-            ),
-            (w, Tensor::new(vec![2, 1], vec![0.25, -0.5]).unwrap()),
-            (b, Tensor::new(vec![2, 1], vec![0.1, 0.2]).unwrap()),
-        ];
-
-        let duplicated = [
-            inputs[0].clone(),
-            inputs[0].clone(),
-            inputs[1].clone(),
-            inputs[2].clone(),
-        ];
-        assert_eq!(
-            graph.evaluate(&duplicated).unwrap_err(),
-            TensorError::DuplicateInput(x)
-        );
-        let extra = [(loss, Tensor::scalar(0.0))];
-        assert_eq!(
-            graph
-                .evaluate(&[
-                    inputs[0].clone(),
-                    inputs[1].clone(),
-                    inputs[2].clone(),
-                    extra[0].clone()
-                ])
-                .unwrap_err(),
-            TensorError::ExtraInput(loss)
-        );
-
-        let execution = graph.evaluate(&inputs).unwrap();
-        let mut other_graph = Graph::default();
-        let foreign_id = other_graph.input(vec![2, 2]).unwrap();
-        assert_eq!(
-            other_graph.shape(x).unwrap_err(),
-            TensorError::UnknownValue(x)
-        );
-        assert_eq!(
-            other_graph.add(foreign_id, x).unwrap_err(),
-            TensorError::UnknownValue(x)
-        );
-        let other_graph = Graph::default();
-        assert_eq!(
-            execution.gradients(&other_graph, loss).unwrap_err(),
-            TensorError::WrongGraph
-        );
-        let new_scalar = graph.constant(Tensor::scalar(1.0));
-        let _ = graph.add(loss, new_scalar).unwrap();
-        assert_eq!(
-            execution.gradients(&graph, loss).unwrap_err(),
-            TensorError::GraphChanged
-        );
-    }
-}
+#[path = "tensor/tests.rs"]
+mod tests;

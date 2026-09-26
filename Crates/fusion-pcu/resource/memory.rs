@@ -378,6 +378,190 @@ impl PcuMemoryRange {
     }
 }
 
+/// Provider knowledge about whether two resource ranges refer to the same backing bytes.
+///
+/// `Unknown` must be treated as potentially overlapping wherever disjoint storage is required.
+/// This matters for imported resources and views whose allocation identity is not exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuMemoryOverlap {
+    Disjoint,
+    Overlapping,
+    Unknown,
+}
+
+/// Optional storage behavior a provider can affirm for a resource.
+///
+/// Capabilities are opt-in: a missing implementation never implies that an operation is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuMemoryResourceCapability {
+    /// Backing may be reused after the caller has established that prior users are quiescent.
+    ReusableStorage,
+    /// Provider can copy between resources without exposing their addresses.
+    ResourceCopy,
+}
+
+/// Requirements for one member of a reusable bank; members may have different sizes/access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuMemoryMemberRequirement {
+    pub pool: PcuMemoryPoolId,
+    pub minimum_size_bytes: u64,
+    pub access: PcuMemoryAccess,
+    pub require_device_local: bool,
+}
+
+/// Why a set of resources cannot satisfy a reusable bank requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuMemoryBankError {
+    Empty,
+    WrongMemberCount {
+        expected: usize,
+        actual: usize,
+    },
+    WrongPool {
+        index: usize,
+        expected: PcuMemoryPoolId,
+        actual: PcuMemoryPoolId,
+    },
+    TooSmall {
+        index: usize,
+        required: u64,
+        actual: u64,
+    },
+    InsufficientAccess {
+        index: usize,
+        required: PcuMemoryAccess,
+        actual: PcuMemoryAccess,
+    },
+    ReuseUnsupported {
+        index: usize,
+    },
+    DeviceLocalNotEstablished {
+        index: usize,
+    },
+    Overlapping {
+        first: usize,
+        second: usize,
+    },
+    OverlapUnknown {
+        first: usize,
+        second: usize,
+    },
+    InvalidExtent {
+        index: usize,
+    },
+}
+
+/// Validates a reusable bank with independent requirements for each member.
+///
+/// Unknown overlap is rejected: a provider must prove disjoint backing for every pair. The
+/// caller remains responsible for ensuring prior device work is complete before reusing a slot.
+///
+/// # Errors
+///
+/// Returns a structured error for an empty or mismatched bank, an unsatisfied member
+/// requirement, or overlap that is present or cannot be ruled out.
+pub fn validate_reusable_memory_bank_members<R: PcuMemoryResource>(
+    resources: &[R],
+    requirements: &[PcuMemoryMemberRequirement],
+) -> Result<(), PcuMemoryBankError> {
+    validate_reusable_memory_bank_members_by(resources, requirements, |resource| resource)
+}
+
+/// Validates a bank whose entries contain a resource that can be borrowed through `resource_of`.
+/// This lets wrappers keep their leases in place while the contract inspects provider metadata.
+///
+/// # Errors
+///
+/// Returns the same structured contract failures as
+/// [`validate_reusable_memory_bank_members`].
+pub fn validate_reusable_memory_bank_members_by<T, R: PcuMemoryResource>(
+    members: &[T],
+    requirements: &[PcuMemoryMemberRequirement],
+    resource_of: impl Fn(&T) -> &R,
+) -> Result<(), PcuMemoryBankError> {
+    if members.is_empty() {
+        return Err(PcuMemoryBankError::Empty);
+    }
+    if members.len() != requirements.len() {
+        return Err(PcuMemoryBankError::WrongMemberCount {
+            expected: requirements.len(),
+            actual: members.len(),
+        });
+    }
+    for (index, (member, requirement)) in members.iter().zip(requirements).enumerate() {
+        let resource = resource_of(member);
+        if resource.pool() != requirement.pool {
+            return Err(PcuMemoryBankError::WrongPool {
+                index,
+                expected: requirement.pool,
+                actual: resource.pool(),
+            });
+        }
+        if resource.size_bytes() < requirement.minimum_size_bytes {
+            return Err(PcuMemoryBankError::TooSmall {
+                index,
+                required: requirement.minimum_size_bytes,
+                actual: resource.size_bytes(),
+            });
+        }
+        if !memory_access_satisfies(resource.access(), requirement.access) {
+            return Err(PcuMemoryBankError::InsufficientAccess {
+                index,
+                required: requirement.access,
+                actual: resource.access(),
+            });
+        }
+        if !resource.supports(PcuMemoryResourceCapability::ReusableStorage) {
+            return Err(PcuMemoryBankError::ReuseUnsupported { index });
+        }
+        if requirement.require_device_local && resource.is_device_local() != Some(true) {
+            return Err(PcuMemoryBankError::DeviceLocalNotEstablished { index });
+        }
+        if requirement.minimum_size_bytes == 0 {
+            return Err(PcuMemoryBankError::InvalidExtent { index });
+        }
+    }
+    for second in 1..members.len() {
+        for first in 0..second {
+            let first_resource = resource_of(&members[first]);
+            let second_resource = resource_of(&members[second]);
+            let first_range = PcuMemoryRange {
+                offset_bytes: 0,
+                size_bytes: requirements[first].minimum_size_bytes,
+            };
+            let second_range = PcuMemoryRange {
+                offset_bytes: 0,
+                size_bytes: requirements[second].minimum_size_bytes,
+            };
+            match first_resource.overlap(second_resource, first_range, second_range) {
+                PcuMemoryOverlap::Disjoint => {}
+                PcuMemoryOverlap::Overlapping => {
+                    return Err(PcuMemoryBankError::Overlapping { first, second });
+                }
+                PcuMemoryOverlap::Unknown => {
+                    return Err(PcuMemoryBankError::OverlapUnknown { first, second });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn memory_access_satisfies(actual: PcuMemoryAccess, required: PcuMemoryAccess) -> bool {
+    match (actual, required) {
+        (_, PcuMemoryAccess::ReadOnly) => matches!(
+            actual,
+            PcuMemoryAccess::ReadOnly | PcuMemoryAccess::ReadWrite
+        ),
+        (_, PcuMemoryAccess::WriteOnly) => matches!(
+            actual,
+            PcuMemoryAccess::WriteOnly | PcuMemoryAccess::ReadWrite
+        ),
+        (PcuMemoryAccess::ReadWrite, PcuMemoryAccess::ReadWrite) => true,
+        _ => false,
+    }
+}
+
 /// Whether importing an external allocation transfers its ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuMemoryImportOwnership {
@@ -428,6 +612,25 @@ pub trait PcuMemoryResource {
     /// Identifies the accounting/lifetime owner for this resource. Implementers must state this
     /// explicitly so a borrowed import cannot silently appear provider-managed.
     fn origin(&self) -> PcuMemoryResourceOrigin;
+
+    /// Whether the provider explicitly supports an optional storage behavior.
+    fn supports(&self, _capability: PcuMemoryResourceCapability) -> bool {
+        false
+    }
+
+    /// Classifies overlap between two byte ranges in resources of this provider's type.
+    ///
+    /// Implementations may return `Disjoint` only when they can prove distinct backing storage
+    /// or nonintersecting ranges of the same storage. Out-of-bounds or overflowing ranges must
+    /// return `Unknown`; callers must validate extents separately before use.
+    fn overlap(
+        &self,
+        _other: &Self,
+        _self_range: PcuMemoryRange,
+        _other_range: PcuMemoryRange,
+    ) -> PcuMemoryOverlap {
+        PcuMemoryOverlap::Unknown
+    }
 }
 
 /// Scoped mapped view. The view must not outlive the provider's mapping guard.
@@ -445,6 +648,7 @@ pub enum PcuMemoryProviderOperation {
     Map,
     TransferTo,
     TransferFrom,
+    CopyResource,
 }
 
 /// Reason a provider operation failed. Backends should map native failures to the closest honest
@@ -582,6 +786,31 @@ pub trait PcuMemoryProvider {
         offset_bytes: u64,
         bytes: &mut [u8],
     ) -> Result<(), PcuMemoryProviderError>;
+
+    /// Copies a prefix of one resource into another, completing before return.
+    ///
+    /// Providers must reject overlapping or uncertain alias relationships unless they can
+    /// explicitly guarantee correct overlapping-copy semantics. A provider without this
+    /// capability returns `Unsupported`; callers must not silently stage through host memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured provider error for unsupported copies, invalid resources or ranges,
+    /// access violations, uncertain aliasing, or native copy/completion failure.
+    fn copy_resource(
+        &mut self,
+        destination: &mut Self::Resource,
+        source: &Self::Resource,
+        size_bytes: u64,
+    ) -> Result<(), PcuMemoryProviderError> {
+        let _ = (destination, source, size_bytes);
+        Err(PcuMemoryProviderError {
+            pool: source.pool(),
+            operation: PcuMemoryProviderOperation::CopyResource,
+            disposition: PcuMemoryDisposition::Reject,
+            failure: PcuMemoryProviderFailure::Unsupported,
+        })
+    }
 }
 
 /// Optional independent ratio limits for system and process usage.
@@ -589,6 +818,30 @@ pub trait PcuMemoryProvider {
 pub struct PcuMemoryAdmissionPolicy {
     pub system_used: Option<PcuMemoryRatio>,
     pub process_used: Option<PcuMemoryRatio>,
+}
+
+/// Consumer-selected placement and admission requirements for a PCU allocation.
+///
+/// The pool and backend remain selected by the caller. This policy only adds requirements to an
+/// individual allocation request; it does not choose a device, pool, or fallback provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PcuMemoryResourcePolicy {
+    /// Require the provider to affirm that the allocation is device-local.
+    pub require_device_local: bool,
+    /// Optional system and process usage limits enforced by the reservation ledger.
+    pub admission: PcuMemoryAdmissionPolicy,
+}
+
+impl PcuMemoryResourcePolicy {
+    /// Applies this policy to a provider-independent allocation request.
+    #[must_use]
+    pub const fn apply(
+        self,
+        mut request: PcuMemoryAllocationRequest,
+    ) -> PcuMemoryAllocationRequest {
+        request.require_device_local = self.require_device_local;
+        request
+    }
 }
 
 /// Set of up to two ledger reservations. A combined system/process ratio admission uses one
@@ -844,6 +1097,25 @@ pub fn allocate_with_policy<P: PcuMemoryProvider, const N: usize>(
     })
 }
 
+/// Allocates one resource using a typed placement and ratio-admission policy.
+///
+/// The returned admitted resource owns the reservation handles together with the backend
+/// resource. Callers storing the resource beyond this call must retain that wrapper (or transfer
+/// both parts to an owner that can explicitly release the reservations after use is quiescent).
+///
+/// # Errors
+///
+/// Returns the same validation, telemetry, admission, allocation, or rollback errors as
+/// [`allocate_with_policy`].
+pub fn allocate_with_resource_policy<P: PcuMemoryProvider, const N: usize>(
+    provider: &mut P,
+    ledger: &mut PcuMemoryReservationLedger<N>,
+    request: PcuMemoryAllocationRequest,
+    policy: PcuMemoryResourcePolicy,
+) -> Result<PcuAdmittedResource<P::Resource>, PcuMemoryAllocateWithPolicyError> {
+    allocate_with_policy(provider, ledger, policy.apply(request), policy.admission)
+}
+
 fn resource_matches_request<R: PcuMemoryResource>(
     resource: &R,
     request: PcuMemoryAllocationRequest,
@@ -876,6 +1148,30 @@ fn access_supports(actual: PcuMemoryAccess, required: PcuMemoryAccess) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn resource_policy_adds_locality_without_changing_pool_or_shape() {
+        let request = PcuMemoryAllocationRequest {
+            pool: PcuMemoryPoolId(9),
+            size_bytes: 64,
+            alignment_bytes: 16,
+            access: PcuMemoryAccess::ReadWrite,
+            host_access: PcuMemoryHostAccess::TransferOnly,
+            require_device_local: false,
+        };
+        let policy = PcuMemoryResourcePolicy {
+            require_device_local: true,
+            admission: PcuMemoryAdmissionPolicy {
+                system_used: Some(PcuMemoryRatio::new(9, 10)),
+                process_used: None,
+            },
+        };
+        let applied = policy.apply(request);
+        assert_eq!(applied.pool, request.pool);
+        assert_eq!(applied.size_bytes, request.size_bytes);
+        assert_eq!(applied.alignment_bytes, request.alignment_bytes);
+        assert!(applied.require_device_local);
+    }
+
     fn snapshot(system: PcuMemoryUsage, process: PcuMemoryUsage) -> PcuMemoryPoolSnapshot {
         PcuMemoryPoolSnapshot {
             id: PcuMemoryPoolId(3),
@@ -891,6 +1187,130 @@ mod tests {
         mode: PcuMemoryUsageMode::SystemUsed,
         max_fraction: PcuMemoryRatio::new(4, 5),
     };
+
+    struct BankResource {
+        id: u8,
+        pool: PcuMemoryPoolId,
+        size: u64,
+        access: PcuMemoryAccess,
+        local: Option<bool>,
+        reusable: bool,
+        overlap: PcuMemoryOverlap,
+    }
+
+    impl PcuMemoryResource for BankResource {
+        fn pool(&self) -> PcuMemoryPoolId {
+            self.pool
+        }
+        fn size_bytes(&self) -> u64 {
+            self.size
+        }
+        fn alignment_bytes(&self) -> u64 {
+            1
+        }
+        fn access(&self) -> PcuMemoryAccess {
+            self.access
+        }
+        fn is_device_local(&self) -> Option<bool> {
+            self.local
+        }
+        fn origin(&self) -> PcuMemoryResourceOrigin {
+            PcuMemoryResourceOrigin::ProviderManaged
+        }
+        fn supports(&self, capability: PcuMemoryResourceCapability) -> bool {
+            capability == PcuMemoryResourceCapability::ReusableStorage && self.reusable
+        }
+        fn overlap(&self, other: &Self, _: PcuMemoryRange, _: PcuMemoryRange) -> PcuMemoryOverlap {
+            if self.id == other.id {
+                PcuMemoryOverlap::Overlapping
+            } else {
+                self.overlap
+            }
+        }
+    }
+
+    fn bank_resource(id: u8, size: u64, overlap: PcuMemoryOverlap) -> BankResource {
+        BankResource {
+            id,
+            pool: PcuMemoryPoolId(3),
+            size,
+            access: PcuMemoryAccess::ReadWrite,
+            local: Some(true),
+            reusable: true,
+            overlap,
+        }
+    }
+
+    #[test]
+    fn reusable_bank_checks_heterogeneous_contracts_and_requires_proven_disjointness() {
+        let resources = [
+            bank_resource(1, 64, PcuMemoryOverlap::Disjoint),
+            bank_resource(2, 4, PcuMemoryOverlap::Disjoint),
+        ];
+        let requirements = [
+            PcuMemoryMemberRequirement {
+                pool: PcuMemoryPoolId(3),
+                minimum_size_bytes: 32,
+                access: PcuMemoryAccess::WriteOnly,
+                require_device_local: true,
+            },
+            PcuMemoryMemberRequirement {
+                pool: PcuMemoryPoolId(3),
+                minimum_size_bytes: 4,
+                access: PcuMemoryAccess::ReadOnly,
+                require_device_local: true,
+            },
+        ];
+        assert_eq!(
+            validate_reusable_memory_bank_members(&resources, &requirements),
+            Ok(())
+        );
+
+        let unknown = [
+            bank_resource(1, 64, PcuMemoryOverlap::Unknown),
+            bank_resource(2, 64, PcuMemoryOverlap::Unknown),
+        ];
+        assert_eq!(
+            validate_reusable_memory_bank_members(&unknown, &requirements),
+            Err(PcuMemoryBankError::OverlapUnknown {
+                first: 0,
+                second: 1
+            })
+        );
+        let overlapping = [
+            bank_resource(1, 64, PcuMemoryOverlap::Overlapping),
+            bank_resource(2, 64, PcuMemoryOverlap::Overlapping),
+        ];
+        assert_eq!(
+            validate_reusable_memory_bank_members(&overlapping, &requirements),
+            Err(PcuMemoryBankError::Overlapping {
+                first: 0,
+                second: 1
+            })
+        );
+    }
+
+    #[test]
+    fn reusable_bank_rejects_unproven_capabilities_and_locality() {
+        let requirement = [PcuMemoryMemberRequirement {
+            pool: PcuMemoryPoolId(3),
+            minimum_size_bytes: 1,
+            access: PcuMemoryAccess::ReadWrite,
+            require_device_local: true,
+        }];
+        let mut resource = bank_resource(1, 1, PcuMemoryOverlap::Disjoint);
+        resource.reusable = false;
+        assert_eq!(
+            validate_reusable_memory_bank_members(&[resource], &requirement),
+            Err(PcuMemoryBankError::ReuseUnsupported { index: 0 })
+        );
+        let mut resource = bank_resource(1, 1, PcuMemoryOverlap::Disjoint);
+        resource.local = None;
+        assert_eq!(
+            validate_reusable_memory_bank_members(&[resource], &requirement),
+            Err(PcuMemoryBankError::DeviceLocalNotEstablished { index: 0 })
+        );
+    }
 
     struct MockResource {
         pool: PcuMemoryPoolId,
@@ -919,6 +1339,25 @@ mod tests {
         fn origin(&self) -> PcuMemoryResourceOrigin {
             PcuMemoryResourceOrigin::ProviderManaged
         }
+    }
+
+    #[test]
+    fn resource_overlap_defaults_to_unknown_without_provider_proof() {
+        let resource = MockResource {
+            pool: PcuMemoryPoolId(3),
+            size: 16,
+            alignment: 4,
+            access: PcuMemoryAccess::ReadWrite,
+            device_local: Some(true),
+        };
+        let range = PcuMemoryRange {
+            offset_bytes: 0,
+            size_bytes: 16,
+        };
+        assert_eq!(
+            resource.overlap(&resource, range, range),
+            PcuMemoryOverlap::Unknown
+        );
     }
 
     struct MockImport;
@@ -1063,6 +1502,18 @@ mod tests {
             host_access: PcuMemoryHostAccess::TransferOnly,
             require_device_local: true,
         }
+    }
+
+    #[test]
+    fn provider_copy_requires_explicit_backend_support() {
+        let mut provider = mock_provider(0, 0, false);
+        let source = provider.allocate(allocation_request(8)).unwrap();
+        let mut destination = provider.allocate(allocation_request(8)).unwrap();
+        let error = provider
+            .copy_resource(&mut destination, &source, 8)
+            .unwrap_err();
+        assert_eq!(error.operation, PcuMemoryProviderOperation::CopyResource);
+        assert_eq!(error.failure, PcuMemoryProviderFailure::Unsupported);
     }
 
     #[test]

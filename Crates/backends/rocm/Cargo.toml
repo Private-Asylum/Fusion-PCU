@@ -19,6 +19,7 @@ tensor = ["dep:fusion-pcu-tensor"]
 fusion-pcu.workspace = true
 fusion-pcu-tensor = { workspace = true, optional = true }
 libloading = "0.8"
+smallvec.workspace = true
 
 [lints]
 workspace = true

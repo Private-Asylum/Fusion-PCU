@@ -176,6 +176,11 @@ fn run_on(
     let prepared = support::cold_once("PCU MLP graph preparation", || {
         assessor.prepare_graph_outputs(&program.graph, &outputs)
     })?;
+    let feedback = prepared.tensor_plan().feedback_plan(&[
+        (program.updated[0], program.weights[0]),
+        (program.updated[1], program.weights[1]),
+        (program.updated[2], program.weights[2]),
+    ])?;
     let mut memory = PcuOwnedDispatchMemorySession::memory_provider(&session, selected.pool);
     let device_samples = assessor.upload_input(&host_samples, selected.pool, &mut memory)?;
     let device_targets = assessor.upload_input(&host_targets, selected.pool, &mut memory)?;
@@ -187,8 +192,8 @@ fn run_on(
     let scratch = support::cold_once("PCU MLP scratch preparation", || {
         assessor.prepare_scratch(&prepared, selected.pool, &mut memory)
     })?;
-    let output_bank_a = assessor.prepare_output_bank(&prepared, selected.pool, &mut memory)?;
-    let output_bank_b = assessor.prepare_output_bank(&prepared, selected.pool, &mut memory)?;
+    let feedback_resources =
+        assessor.prepare_feedback_resources(&prepared, selected.pool, &mut memory)?;
     let native_inputs = native::TrainInputs {
         batch,
         samples: &samples,
@@ -203,8 +208,7 @@ fn run_on(
     })?;
     let scratch = RefCell::new(scratch);
     let memory = RefCell::new(memory);
-    let output_bank_a = RefCell::new(output_bank_a);
-    let output_bank_b = RefCell::new(output_bank_b);
+    let feedback_resources = RefCell::new(feedback_resources);
 
     let run_pcu = || -> Result<native::MlpWeights, Box<dyn Error>> {
         let mut scratch = scratch.borrow_mut();
@@ -251,40 +255,64 @@ fn run_on(
         })
     };
     let run_pcu_output_bank = || -> Result<native::MlpWeights, Box<dyn Error>> {
-        let mut scratch = scratch.borrow_mut();
         let mut memory = memory.borrow_mut();
-        let mut output_bank_a = output_bank_a.borrow_mut();
-        let mut output_bank_b = output_bank_b.borrow_mut();
-        let first_inputs = [
+        let mut resources = feedback_resources.borrow_mut();
+        let initial_inputs = [
             (program.samples, &device_samples),
             (program.weights[0], &device_weights[0]),
             (program.weights[1], &device_weights[1]),
             (program.weights[2], &device_weights[2]),
             (program.targets, &device_targets),
         ];
-        assessor.execute_prepared_outputs_into_bank(
-            &prepared,
-            &first_inputs,
-            &mut *scratch,
-            &mut *output_bank_a,
+        assessor.execute_feedback_steps(
+            &feedback,
+            &initial_inputs,
+            &mut *resources,
+            std::num::NonZeroUsize::new(2).expect("two feedback steps"),
             &mut *memory,
         )?;
-        let first_outputs = output_bank_a.outputs();
-        let second_inputs = [
+        let first_outputs = resources.outputs_for_step(0)?;
+        let second_outputs = resources.outputs_for_step(1)?;
+        let losses = [
+            assessor
+                .download_output(&first_outputs[3], selected.pool, &mut *memory)?
+                .data()[0],
+            assessor
+                .download_output(&second_outputs[3], selected.pool, &mut *memory)?
+                .data()[0],
+        ];
+        Ok(native::MlpWeights {
+            w1: assessor
+                .download_output(&second_outputs[0], selected.pool, &mut *memory)?
+                .into_data(),
+            w2: assessor
+                .download_output(&second_outputs[1], selected.pool, &mut *memory)?
+                .into_data(),
+            w3: assessor
+                .download_output(&second_outputs[2], selected.pool, &mut *memory)?
+                .into_data(),
+            losses,
+        })
+    };
+    let run_pcu_output_bank_batched = || -> Result<native::MlpWeights, Box<dyn Error>> {
+        let mut memory = memory.borrow_mut();
+        let mut resources = feedback_resources.borrow_mut();
+        let initial_inputs = [
             (program.samples, &device_samples),
-            (program.weights[0], &first_outputs[0]),
-            (program.weights[1], &first_outputs[1]),
-            (program.weights[2], &first_outputs[2]),
+            (program.weights[0], &device_weights[0]),
+            (program.weights[1], &device_weights[1]),
+            (program.weights[2], &device_weights[2]),
             (program.targets, &device_targets),
         ];
-        assessor.execute_prepared_outputs_into_bank(
-            &prepared,
-            &second_inputs,
-            &mut *scratch,
-            &mut *output_bank_b,
+        assessor.execute_feedback_steps_batched(
+            &feedback,
+            &initial_inputs,
+            &mut *resources,
+            std::num::NonZeroUsize::new(2).expect("two feedback steps"),
             &mut *memory,
         )?;
-        let second_outputs = output_bank_b.outputs();
+        let first_outputs = resources.outputs_for_step(0)?;
+        let second_outputs = resources.outputs_for_step(1)?;
         let losses = [
             assessor
                 .download_output(&first_outputs[3], selected.pool, &mut *memory)?
@@ -311,6 +339,8 @@ fn run_on(
     verify_weights(&native_result, &pcu_cold)?;
     let bank_cold = run_pcu_output_bank()?;
     verify_weights(&native_result, &bank_cold)?;
+    let batched_bank_cold = run_pcu_output_bank_batched()?;
+    verify_weights(&native_result, &batched_bank_cold)?;
     let cpu = cpu_small_check()?;
     // A small independent CPU graph check validates gradient construction without running a
     // multi-billion-operation oracle for the full-size workload.
@@ -337,6 +367,20 @@ fn run_on(
                 format!("{batch}x{INPUT}-{HIDDEN}-{HIDDEN}-{OUTPUT}"),
             ),
             |b| b.iter(|| black_box(run_pcu().expect("PCU two-step MLP failed"))),
+        );
+        group.bench_function(
+            BenchmarkId::new(
+                "pcu_prepared_resident_output_bank_batched",
+                format!("{batch}x{INPUT}-{HIDDEN}-{HIDDEN}-{OUTPUT}"),
+            ),
+            |b| {
+                b.iter(|| {
+                    black_box(
+                        run_pcu_output_bank_batched()
+                            .expect("batched PCU output-bank training failed"),
+                    )
+                });
+            },
         );
         group.bench_function(
             BenchmarkId::new(
@@ -370,6 +414,8 @@ fn run_on(
     verify_weights(&native_result, &pcu_result)?;
     let bank_result = run_pcu_output_bank()?;
     verify_weights(&native_result, &bank_result)?;
+    let batched_bank_result = run_pcu_output_bank_batched()?;
+    verify_weights(&native_result, &batched_bank_result)?;
 
     // Order-balanced paired measurements help reveal clock or load drift between routes. These
     // host-wall diagnostics are separate from Criterion and intentionally do not alter its data.
@@ -453,6 +499,52 @@ fn run_on(
             .copied()
             .fold(f64::INFINITY, f64::min),
         paired_bank_ratios.iter().copied().fold(0.0_f64, f64::max),
+    );
+
+    let mut paired_banked_sync = Vec::with_capacity(16);
+    let mut paired_banked_batch = Vec::with_capacity(16);
+    let mut paired_banked_batch_ratios = Vec::with_capacity(16);
+    for pair in 0..16 {
+        let (sync_elapsed, batch_elapsed) = if pair % 2 == 0 {
+            let sync_elapsed = measure_host_wall(|| {
+                drop(black_box(run_pcu_output_bank()?));
+                Ok(())
+            })?;
+            let batch_elapsed = measure_host_wall(|| {
+                drop(black_box(run_pcu_output_bank_batched()?));
+                Ok(())
+            })?;
+            (sync_elapsed, batch_elapsed)
+        } else {
+            let batch_elapsed = measure_host_wall(|| {
+                drop(black_box(run_pcu_output_bank_batched()?));
+                Ok(())
+            })?;
+            let sync_elapsed = measure_host_wall(|| {
+                drop(black_box(run_pcu_output_bank()?));
+                Ok(())
+            })?;
+            (sync_elapsed, batch_elapsed)
+        };
+        let sync_seconds = sync_elapsed.as_secs_f64();
+        let batch_seconds = batch_elapsed.as_secs_f64();
+        paired_banked_sync.push(sync_seconds);
+        paired_banked_batch.push(batch_seconds);
+        paired_banked_batch_ratios.push(batch_seconds / sync_seconds);
+    }
+    println!(
+        "MLP batch {batch} order-balanced banked sync/batched host-wall diagnostic (16 alternating pairs): median sync {:.3} ms, median batched {:.3} ms, paired batched/sync {:.3}x, paired ratio range {:.3}–{:.3}x; separate from Criterion",
+        median(&mut paired_banked_sync) * 1_000.0,
+        median(&mut paired_banked_batch) * 1_000.0,
+        median(&mut paired_banked_batch_ratios),
+        paired_banked_batch_ratios
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min),
+        paired_banked_batch_ratios
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max),
     );
 
     // A separate diagnostic pass records provider work and pool telemetry without contaminating
@@ -613,43 +705,27 @@ fn run_on(
         &session,
         selected.pool,
     ));
-    let mut bank_scratch =
-        assessor.prepare_scratch(&prepared, selected.pool, &mut bank_diagnostic)?;
-    let mut diagnostic_bank_a =
-        assessor.prepare_output_bank(&prepared, selected.pool, &mut bank_diagnostic)?;
-    let mut diagnostic_bank_b =
-        assessor.prepare_output_bank(&prepared, selected.pool, &mut bank_diagnostic)?;
+    let mut diagnostic_resources =
+        assessor.prepare_feedback_resources(&prepared, selected.pool, &mut bank_diagnostic)?;
     let bank_setup_profile = bank_diagnostic.profile();
-    let bank_first_inputs = [
+    let initial_inputs = [
         (program.samples, &device_samples),
         (program.weights[0], &device_weights[0]),
         (program.weights[1], &device_weights[1]),
         (program.weights[2], &device_weights[2]),
         (program.targets, &device_targets),
     ];
-    assessor.execute_prepared_outputs_into_bank(
-        &prepared,
-        &bank_first_inputs,
-        &mut bank_scratch,
-        &mut diagnostic_bank_a,
+    let device_timing_start = assessor.begin_device_timing()?;
+    assessor.execute_feedback_steps(
+        &feedback,
+        &initial_inputs,
+        &mut diagnostic_resources,
+        std::num::NonZeroUsize::new(2).expect("two feedback steps"),
         &mut bank_diagnostic,
     )?;
-    let diagnostic_first_outputs = diagnostic_bank_a.outputs();
-    let bank_second_inputs = [
-        (program.samples, &device_samples),
-        (program.weights[0], &diagnostic_first_outputs[0]),
-        (program.weights[1], &diagnostic_first_outputs[1]),
-        (program.weights[2], &diagnostic_first_outputs[2]),
-        (program.targets, &device_targets),
-    ];
-    assessor.execute_prepared_outputs_into_bank(
-        &prepared,
-        &bank_second_inputs,
-        &mut bank_scratch,
-        &mut diagnostic_bank_b,
-        &mut bank_diagnostic,
-    )?;
-    let diagnostic_second_outputs = diagnostic_bank_b.outputs();
+    let banked_device_timeline_ms = assessor.finish_device_timing(device_timing_start)?;
+    let diagnostic_first_outputs = diagnostic_resources.outputs_for_step(0)?;
+    let diagnostic_second_outputs = diagnostic_resources.outputs_for_step(1)?;
     let bank_diagnostic_result = native::MlpWeights {
         w1: assessor
             .download_output(
@@ -690,6 +766,9 @@ fn run_on(
         ],
     };
     verify_weights(&native_result, &bank_diagnostic_result)?;
+    println!(
+        "PCU batch {batch} banked two-step HIP stream timeline: {banked_device_timeline_ms:.3} ms (includes host submission gaps between synchronous nodes)"
+    );
     let bank_profile = bank_diagnostic.profile();
     println!(
         "PCU batch {batch} output-bank warm two-step provider delta: {} allocations ({} bytes, {:?}); {} uploads ({} bytes, {:?}); {} downloads ({} bytes, {:?}); setup allocated {} bytes",

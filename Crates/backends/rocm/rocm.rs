@@ -27,14 +27,12 @@ use fusion_pcu::{
 };
 
 mod blas;
-mod compiler;
+mod codegen;
 mod discovery;
 mod dispatch;
 mod error;
-mod lower;
 mod memory;
 mod owned_dispatch;
-mod rtc;
 #[cfg(feature = "tensor")]
 mod tensor;
 
@@ -42,7 +40,7 @@ pub use blas::{
     Rocblas,
     RocblasError,
 };
-pub use compiler::{
+pub use codegen::compiler::{
     HipCompileError,
     compile_hip_source,
 };
@@ -53,7 +51,7 @@ pub use dispatch::{
 };
 pub use discovery::RocmDiscovery;
 pub use error::*;
-pub use lower::{
+pub use codegen::lower::{
     RocmLowerError,
     lower_dispatch_to_hip_rtc_source,
     lower_dispatch_to_hip_source,
@@ -70,18 +68,23 @@ pub use owned_dispatch::{
     RocmOwnedDispatchError,
     RocmPreparedDispatch,
 };
-pub use rtc::{
+pub use codegen::rtc::{
     HipRtcError,
     compile_hip_source_for_device,
 };
 #[cfg(feature = "tensor")]
 pub use tensor::{
+    RocmAdmittedTensorFeedbackResources,
     RocmPreparedTensorGraph,
     RocmTensorAssessor,
     RocmTensorError,
     RocmTensorExecutionError,
+    RocmTensorFeedbackPrepareError,
+    RocmTensorFeedbackReleaseError,
+    RocmTensorFeedbackResources,
     RocmTensorInput,
     RocmTensorOutputBank,
+    RocmTensorPrewarmReport,
     RocmTensorScratch,
 };
 
@@ -91,6 +94,8 @@ type HipStream = *mut c_void;
 type HipEvent = *mut c_void;
 
 const HIP_SUCCESS: HipResult = 0;
+const HIP_EVENT_DEFAULT: c_int = 0;
+const HIP_EVENT_DISABLE_TIMING: c_int = 2;
 const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 const HIP_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
@@ -113,6 +118,7 @@ type EventCreate = unsafe extern "C" fn(*mut HipEvent, c_int) -> HipResult;
 type EventDestroy = unsafe extern "C" fn(HipEvent) -> HipResult;
 type EventRecord = unsafe extern "C" fn(HipEvent, HipStream) -> HipResult;
 type EventSynchronize = unsafe extern "C" fn(HipEvent) -> HipResult;
+type EventElapsedTime = unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> HipResult;
 type ModuleHandle = *mut c_void;
 type KernelHandle = *mut c_void;
 type ModuleLoadData = unsafe extern "C" fn(*mut ModuleHandle, *const c_void) -> HipResult;
@@ -438,7 +444,7 @@ impl HipRuntime {
                 pointer,
                 bytes,
                 access: Rc::new(AllocationAccess {
-                    busy: Cell::new(false),
+                    state: Cell::new(AllocationAccessState::Idle),
                 }),
             }),
         })
@@ -493,7 +499,7 @@ impl HipRuntime {
     pub fn create_event(&self) -> Result<HipEventHandle, HipError> {
         let mut event = ptr::null_mut();
         self.call("hipEventCreateWithFlags", |f: EventCreate| unsafe {
-            f(&raw mut event, 2)
+            f(&raw mut event, HIP_EVENT_DISABLE_TIMING)
         })?;
         Ok(HipEventHandle {
             inner: Rc::new(EventInner {
@@ -501,6 +507,52 @@ impl HipRuntime {
                 raw: event,
             }),
         })
+    }
+
+    /// Create an event with timing enabled for device elapsed-time measurements.
+    ///
+    /// Timing events are a separate type so timing-disabled completion events keep their
+    /// existing behavior and cannot accidentally be used for elapsed-time queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when HIP cannot create the event.
+    pub fn create_timing_event(&self) -> Result<HipTimingEventHandle, HipError> {
+        let mut event = ptr::null_mut();
+        self.call("hipEventCreateWithFlags", |f: EventCreate| unsafe {
+            f(&raw mut event, HIP_EVENT_DEFAULT)
+        })?;
+        Ok(HipTimingEventHandle {
+            inner: Rc::new(EventInner {
+                runtime: self.clone(),
+                raw: event,
+            }),
+        })
+    }
+
+    /// Return device elapsed time between two completed timing events, in milliseconds.
+    ///
+    /// Both events are synchronized before querying elapsed time. If HIP cannot confirm either
+    /// event completed, this returns that error and does not report a possibly invalid duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if events belong to different runtime/device pairs, either event cannot
+    /// be confirmed complete, or HIP rejects the elapsed-time query.
+    pub fn elapsed_time_ms(
+        &self,
+        start: &HipTimingEventHandle,
+        end: &HipTimingEventHandle,
+    ) -> Result<f32, HipError> {
+        self.ensure_same_runtime(&start.inner.runtime)?;
+        self.ensure_same_runtime(&end.inner.runtime)?;
+        start.synchronize()?;
+        end.synchronize()?;
+        let mut milliseconds = 0.0_f32;
+        self.call("hipEventElapsedTime", |f: EventElapsedTime| unsafe {
+            f(&raw mut milliseconds, start.inner.raw, end.inner.raw)
+        })?;
+        Ok(milliseconds)
     }
 
     fn device_name(&self, device: HipDevice) -> Result<String, HipError> {
@@ -759,31 +811,120 @@ struct DeviceAllocation {
 
 /// Shared single-operation gate consulted through every cloned device-buffer handle.
 struct AllocationAccess {
-    busy: Cell<bool>,
+    state: Cell<AllocationAccessState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AllocationAccessState {
+    Idle,
+    Exclusive,
+    Stream { identity: usize, leases: usize },
+    Poisoned,
+}
+
+#[derive(Clone, Copy)]
+enum AllocationAccessKind {
+    Exclusive,
+    Stream(usize),
 }
 
 impl AllocationAccess {
     fn acquire(self: &Rc<Self>) -> Result<AllocationAccessGuard, ()> {
-        if self.busy.replace(true) {
-            Err(())
-        } else {
-            Ok(AllocationAccessGuard(Rc::clone(self)))
+        if self.state.get() != AllocationAccessState::Idle {
+            return Err(());
         }
+        self.state.set(AllocationAccessState::Exclusive);
+        Ok(AllocationAccessGuard {
+            access: Rc::clone(self),
+            kind: AllocationAccessKind::Exclusive,
+        })
+    }
+
+    fn acquire_stream(self: &Rc<Self>, identity: usize) -> Result<AllocationAccessGuard, ()> {
+        match self.state.get() {
+            AllocationAccessState::Idle => {
+                self.state.set(AllocationAccessState::Stream {
+                    identity,
+                    leases: 1,
+                });
+            }
+            AllocationAccessState::Stream {
+                identity: active,
+                leases,
+            } if active == identity => {
+                let leases = leases.checked_add(1).ok_or(())?;
+                self.state
+                    .set(AllocationAccessState::Stream { identity, leases });
+            }
+            AllocationAccessState::Exclusive
+            | AllocationAccessState::Stream { .. }
+            | AllocationAccessState::Poisoned => {
+                return Err(());
+            }
+        }
+        Ok(AllocationAccessGuard {
+            access: Rc::clone(self),
+            kind: AllocationAccessKind::Stream(identity),
+        })
     }
 }
 
-struct AllocationAccessGuard(Rc<AllocationAccess>);
+struct AllocationAccessGuard {
+    access: Rc<AllocationAccess>,
+    kind: AllocationAccessKind,
+}
 
 impl Drop for AllocationAccessGuard {
     fn drop(&mut self) {
-        self.0.busy.set(false);
+        let next = match (self.kind, self.access.state.get()) {
+            (AllocationAccessKind::Exclusive, AllocationAccessState::Exclusive) => {
+                AllocationAccessState::Idle
+            }
+            (
+                AllocationAccessKind::Stream(identity),
+                AllocationAccessState::Stream {
+                    identity: active,
+                    leases,
+                },
+            ) if identity == active && leases > 1 => AllocationAccessState::Stream {
+                identity,
+                leases: leases - 1,
+            },
+            (
+                AllocationAccessKind::Stream(identity),
+                AllocationAccessState::Stream {
+                    identity: active,
+                    leases: 1,
+                },
+            ) if identity == active => AllocationAccessState::Idle,
+            // A gate is never reset after a mismatched or forgotten lease. Staying busy is the
+            // safe failure mode if internal ownership invariants are ever violated.
+            _ => return,
+        };
+        self.access.state.set(next);
+    }
+}
+
+impl AllocationAccessGuard {
+    fn quarantine_stream(&self) {
+        if let AllocationAccessKind::Stream(identity) = self.kind
+            && matches!(
+                self.access.state.get(),
+                AllocationAccessState::Stream {
+                    identity: active,
+                    ..
+                } if active == identity
+            )
+        {
+            self.access.state.set(AllocationAccessState::Poisoned);
+        }
     }
 }
 
 /// A live access lease pins both the native allocation and its shared busy gate.
 struct DeviceAccessLease {
     allocation: Rc<DeviceAllocation>,
-    _guard: AllocationAccessGuard,
+    guard: AllocationAccessGuard,
 }
 impl Drop for DeviceAllocation {
     fn drop(&mut self) {
@@ -939,12 +1080,32 @@ impl DeviceBuffer {
             .map_err(|()| HipError::Busy)?;
         Ok(DeviceAccessLease {
             allocation: Rc::clone(&self.allocation),
-            _guard: guard,
+            guard,
+        })
+    }
+
+    fn acquire_stream_access(
+        &self,
+        stream: &HipStreamHandle,
+    ) -> Result<DeviceAccessLease, HipError> {
+        let identity = Rc::as_ptr(&stream.inner) as usize;
+        let guard = self
+            .allocation
+            .access
+            .acquire_stream(identity)
+            .map_err(|()| HipError::Busy)?;
+        Ok(DeviceAccessLease {
+            allocation: Rc::clone(&self.allocation),
+            guard,
         })
     }
 }
 
 impl DeviceAccessLease {
+    fn quarantine(&self) {
+        self.guard.quarantine_stream();
+    }
+
     fn finish_synchronous(self, result: Result<(), HipError>) -> Result<(), HipError> {
         match result {
             Ok(()) => Ok(()),
@@ -1010,6 +1171,18 @@ pub struct HipStreamHandle {
     inner: Rc<StreamInner>,
 }
 impl HipStreamHandle {
+    /// Return the raw stream pointer for internal backend FFI integration.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn raw_stream(&self) -> *mut c_void {
+        self.inner.raw
+    }
+
+    /// Check whether this stream belongs to the supplied runtime/device pair.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn belongs_to_runtime(&self, runtime: &HipRuntime) -> bool {
+        runtime.ensure_same_runtime(&self.inner.runtime).is_ok()
+    }
+
     /// Wait until all operations queued on this stream have completed.
     ///
     /// # Errors
@@ -1028,6 +1201,22 @@ impl HipStreamHandle {
     ///
     /// Returns an error when the event belongs to another runtime or HIP fails to record it.
     pub fn record(&self, event: &HipEventHandle) -> Result<(), HipError> {
+        self.inner
+            .runtime
+            .ensure_same_runtime(&event.inner.runtime)?;
+        self.inner
+            .runtime
+            .call("hipEventRecord", |f: EventRecord| unsafe {
+                f(event.inner.raw, self.inner.raw)
+            })
+    }
+
+    /// Record a timing-enabled event after all work already queued on this stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event belongs to another runtime or HIP fails to record it.
+    pub fn record_timing(&self, event: &HipTimingEventHandle) -> Result<(), HipError> {
         self.inner
             .runtime
             .ensure_same_runtime(&event.inner.runtime)?;
@@ -1056,6 +1245,26 @@ pub struct HipEventHandle {
     inner: Rc<EventInner>,
 }
 impl HipEventHandle {
+    /// Wait until the event has completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HIP synchronization error, if any.
+    pub fn synchronize(&self) -> Result<(), HipError> {
+        self.inner
+            .runtime
+            .call("hipEventSynchronize", |f: EventSynchronize| unsafe {
+                f(self.inner.raw)
+            })
+    }
+}
+
+/// Shared owner for a HIP event created with timing enabled.
+#[derive(Clone)]
+pub struct HipTimingEventHandle {
+    inner: Rc<EventInner>,
+}
+impl HipTimingEventHandle {
     /// Wait until the event has completed.
     ///
     /// # Errors
@@ -1129,6 +1338,14 @@ struct AlignedKernelWord {
 
 const INLINE_KERNEL_PARAMETERS: usize = 8;
 
+const fn ensure_batch_open(failed: bool) -> Result<(), HipError> {
+    if failed {
+        Err(HipError::BatchPoisoned)
+    } else {
+        Ok(())
+    }
+}
+
 struct LaunchAccessLeases {
     inline: [Option<DeviceAccessLease>; INLINE_KERNEL_PARAMETERS],
     overflow: Vec<DeviceAccessLease>,
@@ -1160,6 +1377,14 @@ impl LaunchAccessLeases {
             self.overflow.push(lease);
         }
     }
+
+    fn quarantine(&self) {
+        self.inline[..self.inline_len]
+            .iter()
+            .flatten()
+            .chain(self.overflow.iter())
+            .for_each(DeviceAccessLease::quarantine);
+    }
 }
 
 fn can_inline_kernel_parameters(arguments: &[HipKernelArgument<'_>]) -> bool {
@@ -1184,8 +1409,17 @@ fn copy_inline_kernel_parameter(destination: &mut AlignedKernelWord, bytes: &[u8
 struct LaunchResources {
     _module: Rc<ModuleInner>,
     // Each unique lease owns the allocation as well as its busy gate until completion.
-    _access_leases: LaunchAccessLeases,
-    _stream: HipStreamHandle,
+    access_leases: LaunchAccessLeases,
+    stream: HipStreamHandle,
+}
+impl LaunchResources {
+    fn quarantine(&self) {
+        self.access_leases.quarantine();
+    }
+
+    fn belongs_to_stream(&self, stream: &HipStreamHandle) -> bool {
+        Rc::ptr_eq(&self.stream.inner, &stream.inner)
+    }
 }
 
 /// Completion token for a kernel launch. Dropping it waits for completion; if HIP cannot confirm
@@ -1228,9 +1462,190 @@ impl Drop for HipCompletion {
             // HIP reported an error and did not confirm that the queued kernel has stopped using
             // these resources. Leak the owners rather than risk a device use-after-free.
             if let Some(resources) = self.resources.take() {
+                resources.quarantine();
                 std::mem::forget(resources);
             }
             if let Some(event) = self.event.take() {
+                std::mem::forget(event);
+            }
+        }
+    }
+}
+
+/// Completion for several launches queued in order on one HIP stream.
+///
+/// Every launch's resources remain retained until the final event completes. Use
+/// [`HipCompletionBatch::new`] before submitting nodes, push each launch completion, then call
+/// [`HipCompletionBatch::finish`] after the final launch has been queued.
+pub struct HipCompletionBatch {
+    stream: HipStreamHandle,
+    launch_events: Vec<HipEventHandle>,
+    resources: Vec<LaunchResources>,
+    failed: bool,
+}
+
+impl HipCompletionBatch {
+    /// Start collecting completions for launches queued on `stream`.
+    #[must_use]
+    pub fn new(stream: &HipStreamHandle) -> Self {
+        Self {
+            stream: stream.clone(),
+            launch_events: Vec::new(),
+            resources: Vec::new(),
+            failed: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.resources.is_empty()
+    }
+
+    /// Add one launch completion to this batch.
+    ///
+    /// The launch must have been submitted to the batch stream. Its event and resources are
+    /// retained until the batch's final event is synchronized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HipError::DifferentStream`] when the completion belongs to another stream.
+    pub fn push(&mut self, mut completion: HipCompletion) -> Result<(), HipError> {
+        ensure_batch_open(self.failed)?;
+        if completion
+            .resources
+            .as_ref()
+            .is_some_and(|resources| !resources.belongs_to_stream(&self.stream))
+        {
+            return Err(HipError::DifferentStream);
+        }
+        if let Some(event) = completion.event.take() {
+            self.launch_events.push(event);
+        }
+        if let Some(resources) = completion.resources.take() {
+            self.resources.push(resources);
+        }
+        Ok(())
+    }
+
+    /// Record the final event after all launches already queued on this stream.
+    ///
+    /// If event creation or recording fails, the stream is synchronized before resources are
+    /// released. When synchronization cannot establish quiescence, the complete bundle is
+    /// quarantined and intentionally leaked.
+    ///
+    /// # Errors
+    ///
+    /// Returns the event or stream synchronization error.
+    pub fn finish(&mut self) -> Result<HipBatchCompletion, HipError> {
+        ensure_batch_open(self.failed)?;
+        let event = match self.stream.inner.runtime.create_event() {
+            Ok(event) => event,
+            Err(error) => {
+                self.release_after_stream_sync();
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.stream.record(&event) {
+            if self.stream.synchronize().is_err() {
+                self.failed = true;
+                self.quarantine_and_forget();
+                std::mem::forget(event);
+            } else {
+                // Stream quiescence is proven; the failed event is not needed to release owners.
+                self.resources.clear();
+                self.launch_events.clear();
+            }
+            return Err(error);
+        }
+        Ok(HipBatchCompletion {
+            final_event: Some(event),
+            launch_events: std::mem::take(&mut self.launch_events),
+            resources: std::mem::take(&mut self.resources),
+        })
+    }
+
+    fn release_after_stream_sync(&mut self) {
+        if self.stream.synchronize().is_err() {
+            self.failed = true;
+            self.quarantine_and_forget();
+        } else {
+            self.resources.clear();
+            self.launch_events.clear();
+        }
+    }
+
+    fn quarantine_and_forget(&mut self) {
+        for resources in &self.resources {
+            resources.quarantine();
+        }
+        for resources in self.resources.drain(..) {
+            std::mem::forget(resources);
+        }
+        for event in self.launch_events.drain(..) {
+            std::mem::forget(event);
+        }
+    }
+}
+
+impl Drop for HipCompletionBatch {
+    fn drop(&mut self) {
+        if self.resources.is_empty() {
+            return;
+        }
+        if self.stream.synchronize().is_err() {
+            self.quarantine_and_forget();
+        }
+    }
+}
+
+/// Final-event completion token retaining every launch in a [`HipCompletionBatch`].
+pub struct HipBatchCompletion {
+    final_event: Option<HipEventHandle>,
+    launch_events: Vec<HipEventHandle>,
+    resources: Vec<LaunchResources>,
+}
+
+impl HipBatchCompletion {
+    /// Wait for the batch's final event. On failure the token retains resources for retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HIP event synchronization error.
+    pub fn wait(&mut self) -> Result<(), HipError> {
+        if let Some(event) = &self.final_event {
+            event.synchronize()?;
+        }
+        self.resources.clear();
+        self.launch_events.clear();
+        self.final_event.take();
+        Ok(())
+    }
+}
+
+impl Drop for HipBatchCompletion {
+    fn drop(&mut self) {
+        if self.resources.is_empty() {
+            return;
+        }
+        let completed = self
+            .final_event
+            .as_ref()
+            .is_some_and(|event| event.synchronize().is_ok());
+        if completed {
+            self.resources.clear();
+            self.launch_events.clear();
+            self.final_event.take();
+        } else {
+            for resources in &self.resources {
+                resources.quarantine();
+            }
+            for resources in self.resources.drain(..) {
+                std::mem::forget(resources);
+            }
+            for event in self.launch_events.drain(..) {
+                std::mem::forget(event);
+            }
+            if let Some(event) = self.final_event.take() {
                 std::mem::forget(event);
             }
         }
@@ -1268,9 +1683,71 @@ impl HipKernel {
         shared_memory_bytes: u32,
         arguments: &'a [HipKernelArgument<'a>],
     ) -> Result<HipCompletion, HipError> {
+        // SAFETY: the caller upholds the kernel argument and buffer-access contract documented
+        // above; the helper performs the same enqueue while retaining completion resources.
+        unsafe { self.launch_inner(stream, grid, block, shared_memory_bytes, arguments, None) }
+            .and_then(|completion| completion.ok_or(HipError::BatchPoisoned))
+    }
+
+    /// Queue this kernel into an ordered completion batch without creating a per-launch event.
+    /// The batch must be finished after all launches; it owns all referenced allocations and the
+    /// module until the final event completes. A launch error poisons the batch, which must then
+    /// be dropped so its drop handler synchronizes the stream or quarantines every resource.
+    ///
+    /// # Safety
+    /// The caller must provide arguments in the exact ABI order and representation expected by
+    /// the loaded kernel. Each buffer must be valid for the kernel's accesses, and the kernel must
+    /// not retain argument pointers after returning. All accesses sharing resources with other
+    /// queued batch launches must be ordered on this same stream.
+    ///
+    /// # Errors
+    /// Returns a HIP launch error, a stream/runtime mismatch, or [`HipError::BatchPoisoned`] if a
+    /// prior launch failed.
+    pub unsafe fn launch_into_batch(
+        &self,
+        batch: &mut HipCompletionBatch,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_memory_bytes: u32,
+        arguments: &[HipKernelArgument<'_>],
+    ) -> Result<(), HipError> {
+        ensure_batch_open(batch.failed)?;
+        // Clone first so the mutable batch borrow can be passed alongside its stream identity.
+        let stream = batch.stream.clone();
+        // SAFETY: the caller upholds the ABI and buffer-validity requirements. The batch has
+        // ownership of every successfully attempted launch before the HIP enqueue is invoked.
+        unsafe {
+            self.launch_inner(
+                &stream,
+                grid,
+                block,
+                shared_memory_bytes,
+                arguments,
+                Some(batch),
+            )
+        }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    unsafe fn launch_inner(
+        &self,
+        stream: &HipStreamHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_memory_bytes: u32,
+        arguments: &[HipKernelArgument<'_>],
+        mut batch: Option<&mut HipCompletionBatch>,
+    ) -> Result<Option<HipCompletion>, HipError> {
         self.module
             .runtime
             .ensure_same_runtime(&stream.inner.runtime)?;
+        if let Some(batch) = batch.as_deref() {
+            if !Rc::ptr_eq(&batch.stream.inner, &stream.inner) {
+                return Err(HipError::DifferentStream);
+            }
+            ensure_batch_open(batch.failed)?;
+        }
         for axis in 0..3 {
             if grid[axis] == 0 || block[axis] == 0 {
                 return Err(HipError::InvalidLaunchDimensions);
@@ -1295,7 +1772,7 @@ impl HipKernel {
                         .runtime
                         .ensure_same_runtime(&buffer.allocation.runtime)?;
                     if !access_leases.contains(&buffer.allocation) {
-                        access_leases.push(buffer.acquire_access()?);
+                        access_leases.push(buffer.acquire_stream_access(stream)?);
                     }
                     // HIP kernel parameters receive a device pointer value, not its host address.
                     unsafe {
@@ -1342,12 +1819,24 @@ impl HipKernel {
         } else {
             kernel_params.as_mut_ptr()
         };
-        let resources = LaunchResources {
+        let mut resources = Some(LaunchResources {
             _module: self.module.clone(),
-            _access_leases: access_leases,
-            _stream: stream.clone(),
+            access_leases,
+            stream: stream.clone(),
+        });
+        let direct_batch = batch.is_some();
+        if let Some(batch) = batch.as_deref_mut() {
+            // Retain before the launch call: HIP may report an error after work has entered the
+            // stream, so dropping these owners on the error path would be unsafe.
+            batch
+                .resources
+                .push(resources.take().expect("resources retained once"));
+        }
+        let completion_event = if direct_batch {
+            None
+        } else {
+            Some(self.module.runtime.create_event()?)
         };
-        let completion_event = self.module.runtime.create_event()?;
         let launch_result =
             self.module
                 .runtime
@@ -1367,34 +1856,56 @@ impl HipKernel {
                     )
                 });
         if let Err(error) = launch_result {
-            if stream.synchronize().is_err() {
+            if let Some(batch) = batch {
+                batch.failed = true;
+            } else if stream.synchronize().is_err() {
                 // HIP can surface an earlier asynchronous fault from a later API call. If the
                 // stream cannot confirm quiescence, retain the launch resources conservatively.
+                let Some(resources) = resources.take() else {
+                    return Err(HipError::BatchPoisoned);
+                };
+                resources.quarantine();
                 std::mem::forget(resources);
-                std::mem::forget(completion_event);
             }
             return Err(error);
         }
-        if let Err(error) = stream.record(&completion_event) {
-            if stream.synchronize().is_err() {
-                std::mem::forget(resources);
-                std::mem::forget(completion_event);
+        if let Some(completion_event) = completion_event {
+            if let Err(error) = stream.record(&completion_event) {
+                if stream.synchronize().is_err() {
+                    let Some(resources) = resources.take() else {
+                        return Err(HipError::BatchPoisoned);
+                    };
+                    resources.quarantine();
+                    std::mem::forget(resources);
+                    std::mem::forget(completion_event);
+                }
+                return Err(error);
             }
-            return Err(error);
+            // Keep args borrowed through this call to tie the launch's completion token lifetime
+            // to the argument descriptors as well as its owned resource references.
+            let _ = arguments;
+            return Ok(Some(HipCompletion {
+                event: Some(completion_event),
+                resources,
+            }));
         }
-        // Keep args borrowed through this call to tie the launch's completion token lifetime to
-        // the argument descriptors as well as its owned resource references.
+        // Direct batch launches are covered by the final event recorded after all queued work.
+        // Keep arguments borrowed through this synchronous enqueue call for ABI pointer validity.
         let _ = arguments;
-        Ok(HipCompletion {
-            event: Some(completion_event),
-            resources: Some(resources),
-        })
+        Ok(None)
     }
 }
 
 #[cfg(test)]
 mod memory_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn timing_events_keep_distinct_flags_from_completion_events() {
+        assert_eq!(HIP_EVENT_DEFAULT, 0);
+        assert_eq!(HIP_EVENT_DISABLE_TIMING, 2);
+        assert_ne!(HIP_EVENT_DEFAULT, HIP_EVENT_DISABLE_TIMING);
+    }
 
     #[test]
     fn kfd_target_version_is_formatted_as_an_exact_gfx_target() {
@@ -1432,7 +1943,7 @@ mod memory_snapshot_tests {
     #[test]
     fn cloned_allocation_gate_rejects_busy_access_and_releases_with_lease() {
         let state = Rc::new(AllocationAccess {
-            busy: Cell::new(false),
+            state: Cell::new(AllocationAccessState::Idle),
         });
         let clone = Rc::clone(&state);
         let lease = state.acquire().unwrap();
@@ -1445,13 +1956,134 @@ mod memory_snapshot_tests {
     #[test]
     fn forgotten_gate_lease_stays_busy_after_unconfirmed_completion() {
         let state = Rc::new(AllocationAccess {
-            busy: Cell::new(false),
+            state: Cell::new(AllocationAccessState::Idle),
         });
         let clone = Rc::clone(&state);
         let lease = state.acquire().unwrap();
 
         std::mem::forget(lease);
         assert!(clone.acquire().is_err());
+    }
+
+    #[test]
+    fn allocation_gate_allows_ordered_leases_only_for_the_same_stream() {
+        let state = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let first = state.acquire_stream(11).unwrap();
+        let second = state.acquire_stream(11).unwrap();
+
+        assert!(state.acquire().is_err());
+        assert!(state.acquire_stream(12).is_err());
+        drop(first);
+        assert!(state.acquire().is_err());
+        assert!(state.acquire_stream(11).is_ok());
+        drop(second);
+        assert!(state.acquire().is_ok());
+    }
+
+    #[test]
+    fn queued_node_leases_remain_exclusive_until_the_batch_releases_them() {
+        let state = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let mut retained_by_batch = vec![
+            state.acquire_stream(11).unwrap(),
+            state.acquire_stream(11).unwrap(),
+        ];
+
+        drop(retained_by_batch.pop());
+        assert!(state.acquire().is_err());
+        drop(retained_by_batch);
+        assert!(state.acquire().is_ok());
+    }
+
+    #[test]
+    fn exclusive_gate_blocks_stream_leases_until_release() {
+        let state = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let exclusive = state.acquire().unwrap();
+
+        assert!(state.acquire_stream(11).is_err());
+        drop(exclusive);
+        assert!(state.acquire_stream(11).is_ok());
+    }
+
+    #[test]
+    fn quarantined_stream_gate_rejects_even_the_same_stream() {
+        let state = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let lease = state.acquire_stream(11).unwrap();
+
+        lease.quarantine_stream();
+        assert!(state.acquire_stream(11).is_err());
+        assert!(state.acquire().is_err());
+        std::mem::forget(lease);
+    }
+
+    #[test]
+    fn poisoned_batch_rejects_more_work_and_finish() {
+        assert_eq!(ensure_batch_open(false), Ok(()));
+        assert_eq!(ensure_batch_open(true), Err(HipError::BatchPoisoned));
+    }
+
+    #[test]
+    #[ignore = "requires RX 6900 XT and ROCm device access"]
+    fn rx_6900_xt_two_dependent_launches_complete_through_final_batch_event() {
+        let runtime = HipRuntime::new(0).expect("RX 6900 XT HIP runtime");
+        let info = runtime.device_info().expect("selected HIP device info");
+        assert!(
+            info.name.contains("6900 XT"),
+            "unexpected GPU: {}",
+            info.name
+        );
+
+        let image = crate::compile_hip_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void increment(float* value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] += 1.0f;
+}
+"#,
+        )
+        .expect("compile increment kernel with HIPRTC");
+        let module = runtime.load_module(&image).expect("load increment kernel");
+        let kernel = module
+            .function(c"increment")
+            .expect("resolve increment kernel");
+        let stream = runtime.create_stream().expect("create HIP stream");
+        let mut buffer = runtime
+            .allocate(size_of::<f32>())
+            .expect("allocate device value");
+        buffer
+            .copy_from(&0.0_f32.to_ne_bytes())
+            .expect("initialize device value");
+        let arguments = [HipKernelArgument::Buffer(&buffer)];
+
+        let mut batch = HipCompletionBatch::new(&stream);
+        // SAFETY: HIPRTC compiled one f32 pointer parameter, and the one-element allocation is
+        // valid for both ordered launches. The batch retains it; the final event is the only wait.
+        unsafe {
+            kernel
+                .launch_into_batch(&mut batch, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .expect("queue first increment directly into batch");
+            kernel
+                .launch_into_batch(&mut batch, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .expect("queue dependent increment directly into batch");
+        }
+        batch
+            .finish()
+            .expect("record final batch event")
+            .wait()
+            .expect("wait for final batch event");
+
+        let mut actual = [0_u8; size_of::<f32>()];
+        buffer
+            .copy_to(&mut actual)
+            .expect("read completed device value");
+        assert_eq!(f32::from_ne_bytes(actual).to_bits(), 2.0_f32.to_bits());
     }
 
     #[test]

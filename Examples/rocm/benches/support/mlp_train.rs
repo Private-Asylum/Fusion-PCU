@@ -125,7 +125,6 @@ pub struct NativeMlpTrain {
     a2: DeviceBuffer,
     prediction: DeviceBuffer,
     squared_differences: DeviceBuffer,
-    reduction_ones: DeviceBuffer,
     prediction_gradient: DeviceBuffer,
     gradient_w1: DeviceBuffer,
     gradient_w2: DeviceBuffer,
@@ -186,7 +185,6 @@ impl NativeMlpTrain {
         let a2 = allocate(&runtime, batch_hidden, &mut stats)?;
         let prediction = allocate(&runtime, batch_output, &mut stats)?;
         let squared_differences = allocate(&runtime, batch_output, &mut stats)?;
-        let reduction_ones = upload(&runtime, &vec![1.0_f32; batch_output], &mut stats)?;
         let prediction_gradient = allocate(&runtime, batch_output, &mut stats)?;
         let gradient_w1 = allocate(&runtime, INPUTS * HIDDEN, &mut stats)?;
         let gradient_w2 = allocate(&runtime, HIDDEN * HIDDEN, &mut stats)?;
@@ -225,7 +223,6 @@ impl NativeMlpTrain {
             a2,
             prediction,
             squared_differences,
-            reduction_ones,
             prediction_gradient,
             gradient_w1,
             gradient_w2,
@@ -444,12 +441,11 @@ impl NativeMlpTrain {
             &self.squared_differences,
             output_u32,
         )?;
-        // Match the PCU reduction route: squared differences dotted with a resident ones vector.
-        self.blas.sdot_scaled(
+        // Squared differences are nonnegative, so the L1 reduction computes their sum without
+        // materializing a same-length resident vector of ones.
+        self.blas.sasum_scaled(
             batch_output,
             &self.squared_differences,
-            1,
-            &self.reduction_ones,
             1,
             mse_scale * 0.5,
             loss,
