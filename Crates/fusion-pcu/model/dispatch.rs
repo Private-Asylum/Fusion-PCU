@@ -158,6 +158,12 @@ pub enum PcuDispatchDataOp {
         result: PcuDispatchValueId,
         value: PcuParameterValue,
     },
+    /// One of the explicitly specified scalar conversions supported by typed value flow.
+    Convert {
+        result: PcuDispatchValueId,
+        value: PcuDispatchValueId,
+        conversion: PcuDispatchConversion,
+    },
     Alu {
         value_type: PcuValueType,
         result: PcuDispatchValueId,
@@ -200,9 +206,81 @@ impl PcuDispatchDataOp {
                 }
             }
             Self::Constant { .. } => PcuDispatchOpCaps::VALUE_CONSTANT,
+            Self::Convert { .. } => PcuDispatchOpCaps::VALUE_CAST,
             Self::Alu { op, .. } => op.support_flag(),
             Self::CheckedDivRem { .. } => PcuDispatchOpCaps::ALU_CHECKED_DIV_REM,
             Self::BindingStore { .. } => PcuDispatchOpCaps::BINDING_STORE,
+        }
+    }
+}
+
+/// Closed set of conversions with specified, backend-independent semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuDispatchConversion {
+    /// Sign extend every i8 value to i16 without changing its mathematical value.
+    I8ToI16,
+    /// Zero extend every u8 value to u16 without changing its mathematical value.
+    U8ToU16,
+    /// Sign extend every i16 value to i32 without changing its mathematical value.
+    I16ToI32,
+    /// Zero extend every u16 value to u32 without changing its mathematical value.
+    U16ToU32,
+    /// Sign extend every i32 value to i64 without changing its mathematical value.
+    I32ToI64,
+    /// Zero extend every u32 value to u64 without changing its mathematical value.
+    U32ToU64,
+    /// Convert f32 to binary16 with round-to-nearest, ties-to-even.
+    ///
+    /// Overflow produces signed infinity, underflow rounds to signed zero or a subnormal, and
+    /// NaNs preserve the sign and most significant payload bits while being quieted.
+    F32ToF16Bits,
+    /// Widen binary16 to f32 exactly, preserving the represented value and NaN signaling state.
+    F16BitsToF32,
+    /// Convert f32 to bfloat16 with round-to-nearest, ties-to-even.
+    ///
+    /// Overflow produces signed infinity, underflow rounds to signed zero or a subnormal, and
+    /// NaNs preserve the sign and most significant payload bits while being quieted.
+    F32ToBf16Bits,
+    /// Widen bfloat16 to f32 exactly, preserving the represented value and NaN signaling state.
+    Bf16BitsToF32,
+    /// Widen f32 to f64 exactly, including NaN sign, payload, and signaling state.
+    F32ToF64Exact,
+}
+
+impl PcuDispatchConversion {
+    #[must_use]
+    pub const fn source_type(self) -> PcuValueType {
+        match self {
+            Self::I8ToI16 => PcuValueType::Scalar(crate::PcuScalarType::I8),
+            Self::U8ToU16 => PcuValueType::Scalar(crate::PcuScalarType::U8),
+            Self::I16ToI32 => PcuValueType::Scalar(crate::PcuScalarType::I16),
+            Self::U16ToU32 => PcuValueType::Scalar(crate::PcuScalarType::U16),
+            Self::I32ToI64 => PcuValueType::Scalar(crate::PcuScalarType::I32),
+            Self::U32ToU64 => PcuValueType::Scalar(crate::PcuScalarType::U32),
+            Self::F32ToF16Bits | Self::F32ToBf16Bits => {
+                PcuValueType::Scalar(crate::PcuScalarType::F32)
+            }
+            Self::F32ToF64Exact => PcuValueType::Scalar(crate::PcuScalarType::F32),
+            Self::F16BitsToF32 => PcuValueType::Scalar(crate::PcuScalarType::F16),
+            Self::Bf16BitsToF32 => PcuValueType::Scalar(crate::PcuScalarType::BF16),
+        }
+    }
+
+    #[must_use]
+    pub const fn target_type(self) -> PcuValueType {
+        match self {
+            Self::I8ToI16 => PcuValueType::Scalar(crate::PcuScalarType::I16),
+            Self::U8ToU16 => PcuValueType::Scalar(crate::PcuScalarType::U16),
+            Self::I16ToI32 => PcuValueType::Scalar(crate::PcuScalarType::I32),
+            Self::U16ToU32 => PcuValueType::Scalar(crate::PcuScalarType::U32),
+            Self::I32ToI64 => PcuValueType::Scalar(crate::PcuScalarType::I64),
+            Self::U32ToU64 => PcuValueType::Scalar(crate::PcuScalarType::U64),
+            Self::F32ToF16Bits => PcuValueType::Scalar(crate::PcuScalarType::F16),
+            Self::F16BitsToF32 | Self::Bf16BitsToF32 => {
+                PcuValueType::Scalar(crate::PcuScalarType::F32)
+            }
+            Self::F32ToBf16Bits => PcuValueType::Scalar(crate::PcuScalarType::BF16),
+            Self::F32ToF64Exact => PcuValueType::Scalar(crate::PcuScalarType::F64),
         }
     }
 }
@@ -489,6 +567,11 @@ impl PcuDispatchKernelIr<'_> {
                 ) => {
                     required = required.union(PcuValueTypeCaps::for_value_type(*value_type));
                 }
+                PcuDispatchOp::Data(PcuDispatchDataOp::Convert { conversion, .. }) => {
+                    required = required
+                        .union(PcuValueTypeCaps::for_value_type(conversion.source_type()))
+                        .union(PcuValueTypeCaps::for_value_type(conversion.target_type()));
+                }
                 PcuDispatchOp::GridStrideLoop { body, .. } => {
                     for body_op in *body {
                         if let PcuDispatchOp::Data(
@@ -498,6 +581,14 @@ impl PcuDispatchKernelIr<'_> {
                         {
                             required =
                                 required.union(PcuValueTypeCaps::for_value_type(*value_type));
+                        }
+                        if let PcuDispatchOp::Data(PcuDispatchDataOp::Convert {
+                            conversion, ..
+                        }) = body_op
+                        {
+                            required = required
+                                .union(PcuValueTypeCaps::for_value_type(conversion.source_type()))
+                                .union(PcuValueTypeCaps::for_value_type(conversion.target_type()));
                         }
                     }
                 }

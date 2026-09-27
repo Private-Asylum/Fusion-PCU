@@ -12,15 +12,26 @@ use std::{
 const INLINE_ARGUMENTS: usize = 8;
 const FAULT_WORD_SENTINEL: u64 = u64::MAX;
 
+const fn validate_batch_fault_semantics(
+    checked_division: bool,
+) -> Result<(), RocmOwnedDispatchError> {
+    if checked_division {
+        // Checked DivRem publishes a terminal fault only after its completion token is waited.
+        // A batch can enqueue dependent work before that observation, so accepting the launch
+        // would let consumers read undefined quotient/remainder values.
+        return Err(RocmOwnedDispatchError::CheckedDivisionBatchUnsupported);
+    }
+    Ok(())
+}
+
 fn kernel_uses_checked_div_rem(kernel: &PcuDispatchKernelIr<'_>) -> bool {
-    kernel.ops.iter().any(|op| match op {
+    ops_use_checked_div_rem(kernel.ops)
+}
+
+fn ops_use_checked_div_rem(ops: &[PcuDispatchOp<'_>]) -> bool {
+    ops.iter().any(|op| match op {
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. }) => true,
-        PcuDispatchOp::GridStrideLoop { body, .. } => body.iter().any(|body_op| {
-            matches!(
-                body_op,
-                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. })
-            )
-        }),
+        PcuDispatchOp::GridStrideLoop { body, .. } => ops_use_checked_div_rem(body),
         _ => false,
     })
 }
@@ -128,6 +139,10 @@ pub enum RocmOwnedDispatchError {
     GeometryOverflow,
     Binding(PcuOwnedDispatchBindingError),
     CheckedDivisionBatchUnsupported,
+    CheckedDivisionBatchClosed,
+    CheckedDivisionRequired,
+    CheckedBatchUnavailable,
+    CheckedBatchFaultWordUnavailable,
 }
 
 impl fmt::Display for RocmOwnedDispatchError {
@@ -173,6 +188,18 @@ impl fmt::Display for RocmOwnedDispatchError {
             Self::CheckedDivisionBatchUnsupported => f.write_str(
                 "checked integer division cannot be submitted through the ordered HIP batch path",
             ),
+            Self::CheckedDivisionBatchClosed => f.write_str(
+                "the checked ROCm batch has already submitted its final checked dispatch",
+            ),
+            Self::CheckedDivisionRequired => f.write_str(
+                "a checked ROCm batch must end with a checked integer division dispatch",
+            ),
+            Self::CheckedBatchUnavailable => {
+                f.write_str("the checked ROCm batch no longer has an open HIP batch")
+            }
+            Self::CheckedBatchFaultWordUnavailable => {
+                f.write_str("the checked ROCm completion has no retained fault word")
+            }
         }
     }
 }
@@ -347,6 +374,27 @@ impl RocmOwnedDispatchBackend {
         if !stream.belongs_to_runtime(&self.runtime) {
             return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
         }
+        self.prepare_dispatch_on_stream(kernel, shape, stream)
+    }
+
+    /// Prepare a Dispatch executable on a caller-selected stream from this runtime.
+    ///
+    /// This lets callers build an ordered batch from multiple prepared kernels while preserving
+    /// the batch stream identity. The stream must belong to this backend's HIP runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream belongs to another runtime, or if lowering or compilation
+    /// of the kernel fails.
+    pub fn prepare_dispatch_on_stream(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
+        shape: fusion_pcu::PcuInvocationShape,
+        stream: &crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
+        }
         self.prepare_dispatch_ir_with_stream(kernel, shape, stream.clone())
     }
 
@@ -493,6 +541,18 @@ pub struct RocmPreparedDispatch {
 }
 
 impl RocmPreparedDispatch {
+    /// Clone the stream captured by this executable for preparing related ordered work.
+    #[must_use]
+    pub fn stream_handle(&self) -> crate::HipStreamHandle {
+        self.stream.clone()
+    }
+
+    /// Start a checked-terminal batch on this executable's captured stream.
+    #[must_use]
+    pub fn checked_batch(&self) -> RocmCheckedDispatchBatch {
+        RocmCheckedDispatchBatch::new(&self.stream)
+    }
+
     /// Submit this executable with a fresh set of owned bindings.
     ///
     /// Binding metadata, allocation size, and captured runtime/device identity are checked on
@@ -587,9 +647,11 @@ impl RocmPreparedDispatch {
     /// Submit this executable directly into an ordered HIP completion batch.
     ///
     /// This path avoids creating a per-launch HIP event. The batch must use the stream captured
-    /// by this prepared dispatch and must be finished after the final queued operation. If this
-    /// method returns a HIP launch error, the batch is poisoned and must be dropped; its drop
-    /// path synchronizes the stream or quarantines its retained resources.
+    /// by this prepared dispatch and must be finished after the final queued operation. Checked
+    /// `DivRem` is rejected because its fault word is observed only after completion; subsequent
+    /// queued work could otherwise consume undefined quotient/remainder values before the fault
+    /// becomes visible. If this method returns a HIP launch error, the batch is poisoned and must
+    /// be dropped; its drop path synchronizes the stream or quarantines its retained resources.
     ///
     /// # Errors
     /// Returns an error for invalid bindings, a mismatched runtime/device/stream, a poisoned
@@ -599,9 +661,7 @@ impl RocmPreparedDispatch {
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
         batch: &mut HipCompletionBatch,
     ) -> Result<(), RocmOwnedDispatchError> {
-        if self.checked_division {
-            return Err(RocmOwnedDispatchError::CheckedDivisionBatchUnsupported);
-        }
+        validate_batch_fault_semantics(self.checked_division)?;
         validate_owned_binding_requirements(&self.binding_requirements, self.device, bindings)
             .map_err(RocmOwnedDispatchError::Binding)?;
         for binding in bindings {
@@ -653,6 +713,245 @@ impl RocmPreparedDispatch {
             )
         }?;
         Ok(())
+    }
+
+    fn submit_checked_into_batch(
+        &self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+        batch: &mut HipCompletionBatch,
+        fault_word: &DeviceBuffer,
+    ) -> Result<(), RocmOwnedDispatchError> {
+        if !self.checked_division {
+            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+        }
+        validate_owned_binding_requirements(&self.binding_requirements, self.device, bindings)
+            .map_err(RocmOwnedDispatchError::Binding)?;
+        for binding in bindings {
+            let actual = binding.resource.len();
+            if binding.byte_len != actual as u64 {
+                return Err(RocmOwnedDispatchError::BufferSizeMismatch {
+                    binding: binding.target,
+                    metadata: binding.byte_len,
+                    actual,
+                });
+            }
+            self.runtime
+                .ensure_same_runtime(&binding.resource.allocation.runtime)
+                .map_err(|_| RocmOwnedDispatchError::DifferentRuntime(binding.target))?;
+        }
+        self.runtime
+            .ensure_same_runtime(&fault_word.allocation.runtime)
+            .map_err(|_| RocmOwnedDispatchError::Hip(HipError::DifferentRuntime))?;
+        let argument_count = self.binding_targets.len() + 1;
+        let mut inline_arguments: [HipKernelArgument<'_>; INLINE_ARGUMENTS] =
+            std::array::from_fn(|_| HipKernelArgument::Bytes(&[]));
+        let mut overflow_arguments = Vec::new();
+        let arguments: &[HipKernelArgument<'_>] = if argument_count <= INLINE_ARGUMENTS {
+            for (slot, target) in inline_arguments
+                .iter_mut()
+                .zip(self.binding_targets.iter().copied())
+            {
+                let binding =
+                    find_binding(target, bindings).map_err(RocmOwnedDispatchError::Binding)?;
+                *slot = HipKernelArgument::Buffer(&binding.resource);
+            }
+            inline_arguments[self.binding_targets.len()] = HipKernelArgument::Buffer(fault_word);
+            &inline_arguments[..argument_count]
+        } else {
+            overflow_arguments.reserve(argument_count);
+            for target in self.binding_targets.iter().copied() {
+                let binding =
+                    find_binding(target, bindings).map_err(RocmOwnedDispatchError::Binding)?;
+                overflow_arguments.push(HipKernelArgument::Buffer(&binding.resource));
+            }
+            overflow_arguments.push(HipKernelArgument::Buffer(fault_word));
+            &overflow_arguments
+        };
+
+        // SAFETY: the checked DivRem lowerer appends one u64 fault pointer after the declared
+        // binding pointers. The batch launch retains every argument allocation until its final
+        // event completes, including the fault word owned by the wrapper.
+        unsafe {
+            self.function.launch_into_batch(
+                batch,
+                [self.grid_x, 1, 1],
+                [self.block_size, 1, 1],
+                0,
+                arguments,
+            )
+        }?;
+        Ok(())
+    }
+}
+
+/// Ordered `ROCm` batch that may end in one checked `DivRem` dispatch.
+///
+/// Unchecked dispatches may be appended before the checked dispatch. Once the checked dispatch
+/// is submitted this wrapper exposes no path to enqueue later work. The caller must also avoid
+/// externally enqueueing dependent work on the same stream until `finish`'s completion has been
+/// waited and its checked outcome observed; this wrapper cannot constrain other stream users.
+pub struct RocmCheckedDispatchBatch {
+    batch: Option<HipCompletionBatch>,
+    checked_attempted: bool,
+    checked_submitted: bool,
+    fault_word: Option<DeviceBuffer>,
+}
+
+impl RocmCheckedDispatchBatch {
+    /// Start an ordered batch on `stream`.
+    #[must_use]
+    pub fn new(stream: &crate::HipStreamHandle) -> Self {
+        Self {
+            batch: Some(HipCompletionBatch::new(stream)),
+            checked_attempted: false,
+            checked_submitted: false,
+            fault_word: None,
+        }
+    }
+
+    /// Append an unchecked dispatch before the checked terminal dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checked dispatch was already attempted, if the HIP batch is no
+    /// longer open, or if binding validation or HIP launch fails.
+    pub fn submit_unchecked(
+        &mut self,
+        dispatch: &RocmPreparedDispatch,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+    ) -> Result<(), RocmOwnedDispatchError> {
+        if self.checked_attempted {
+            return Err(RocmOwnedDispatchError::CheckedDivisionBatchClosed);
+        }
+        let batch = self
+            .batch
+            .as_mut()
+            .ok_or(RocmOwnedDispatchError::CheckedBatchUnavailable)?;
+        dispatch.submit_into_batch(bindings, batch)
+    }
+
+    /// Append the checked `DivRem` dispatch as the final launch in this wrapper's batch.
+    ///
+    /// Its fault word stays owned across event synchronization and subsequent device readback.
+    /// If synchronization or readback fails, the returned completion retains the necessary
+    /// owners for a retry. Enqueue failures poison the underlying HIP batch, whose drop path
+    /// synchronizes or quarantines every retained allocation. The caller must not enqueue
+    /// external work that depends on the checked outputs until this batch's result has been read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the executable is not checked `DivRem`, this wrapper is already closed,
+    /// allocation or initialization fails, bindings are invalid, or HIP launch fails.
+    pub fn submit_checked_last(
+        &mut self,
+        dispatch: &RocmPreparedDispatch,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+    ) -> Result<(), RocmOwnedDispatchError> {
+        if self.checked_attempted {
+            return Err(RocmOwnedDispatchError::CheckedDivisionBatchClosed);
+        }
+        if !dispatch.checked_division {
+            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+        }
+        let mut fault_word = dispatch.runtime.allocate(core::mem::size_of::<u64>())?;
+        fault_word.copy_from(&FAULT_WORD_SENTINEL.to_le_bytes())?;
+        // Prevent another enqueue attempt before entering the substrate. A HIP enqueue failure
+        // poisons the batch, so this wrapper is closed even when submission returns an error.
+        // Store the allocation first; on enqueue failure the wrapper keeps the owner until its
+        // poisoned batch has synchronized or quarantined resources.
+        self.checked_attempted = true;
+        self.fault_word = Some(fault_word);
+        let batch = self
+            .batch
+            .as_mut()
+            .ok_or(RocmOwnedDispatchError::CheckedBatchUnavailable)?;
+        let fault_word = self
+            .fault_word
+            .as_ref()
+            .ok_or(RocmOwnedDispatchError::CheckedBatchFaultWordUnavailable)?;
+        dispatch.submit_checked_into_batch(bindings, batch, fault_word)?;
+        self.checked_submitted = true;
+        Ok(())
+    }
+
+    /// Finish the stream batch and return a completion that reports checked execution faults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no checked dispatch was successfully submitted or if HIP cannot
+    /// record the final completion event.
+    pub fn finish(mut self) -> Result<RocmCheckedBatchCompletion, RocmOwnedDispatchError> {
+        if !self.checked_submitted {
+            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+        }
+        let batch = self
+            .batch
+            .as_mut()
+            .ok_or(RocmOwnedDispatchError::CheckedBatchUnavailable)?;
+        let hip = batch.finish()?;
+        self.batch.take();
+        Ok(RocmCheckedBatchCompletion {
+            hip: Some(hip),
+            fault_word: self.fault_word.take(),
+            terminal: None,
+        })
+    }
+}
+
+/// Retryable completion for a `ROCm` batch ending in checked `DivRem`.
+pub struct RocmCheckedBatchCompletion {
+    hip: Option<crate::HipBatchCompletion>,
+    fault_word: Option<DeviceBuffer>,
+    terminal: Option<PcuCompletionOutcome>,
+}
+
+impl RocmCheckedBatchCompletion {
+    /// Wait for all launches and read the terminal checked-arithmetic status.
+    ///
+    /// A returned fault means outputs produced by the checked dispatch are invalid. HIP wait and
+    /// readback errors retain this object's owners, so the caller may retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a HIP wait/readback error, an invalid fault word error, or an invalid-state error
+    /// if the fault-word owner is unavailable.
+    pub fn wait(&mut self) -> Result<PcuCompletionOutcome, RocmOwnedDispatchError> {
+        if let Some(terminal) = self.terminal {
+            return Ok(terminal);
+        }
+        if let Some(hip) = self.hip.as_mut() {
+            hip.wait()?;
+            self.hip.take();
+        }
+        let fault_word = self
+            .fault_word
+            .as_ref()
+            .ok_or(RocmOwnedDispatchError::CheckedBatchFaultWordUnavailable)?;
+        let mut bytes = [0_u8; core::mem::size_of::<u64>()];
+        fault_word.copy_to(&mut bytes)?;
+        let outcome = decode_fault_word(u64::from_le_bytes(bytes))?
+            .map_or(PcuCompletionOutcome::Succeeded, PcuCompletionOutcome::Fault);
+        self.fault_word.take();
+        self.terminal = Some(outcome);
+        Ok(outcome)
+    }
+}
+
+impl PcuOwnedCompletion for RocmCheckedBatchCompletion {
+    type Error = RocmOwnedDispatchError;
+
+    fn state(&self) -> Result<PcuCompletionState, Self::Error> {
+        Ok(match self.terminal {
+            Some(PcuCompletionOutcome::Succeeded) => PcuCompletionState::Succeeded,
+            Some(PcuCompletionOutcome::Failed | PcuCompletionOutcome::Fault(_)) => {
+                PcuCompletionState::Failed
+            }
+            None => PcuCompletionState::Running,
+        })
+    }
+
+    fn wait(&mut self) -> Result<PcuCompletionOutcome, Self::Error> {
+        Self::wait(self)
     }
 }
 
@@ -856,6 +1155,8 @@ const fn owned_dispatch_support() -> PcuSupport {
     };
     support.value_type_support = PcuFeatureSupport::new(
         PcuValueTypeCaps::FLOAT32
+            .union(PcuValueTypeCaps::FLOAT16)
+            .union(PcuValueTypeCaps::BFLOAT16)
             .union(PcuValueTypeCaps::FLOAT64)
             .union(PcuValueTypeCaps::INT8)
             .union(PcuValueTypeCaps::UINT8)
@@ -872,6 +1173,7 @@ const fn owned_dispatch_support() -> PcuSupport {
     dispatch.flags = PcuDispatchPolicyCaps::SERIAL.union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION);
     dispatch.instructions = PcuFeatureSupport::new(
         PcuDispatchOpCaps::VALUE_CONSTANT
+            .union(PcuDispatchOpCaps::VALUE_CAST)
             .union(PcuDispatchOpCaps::ALU_ADD)
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
@@ -889,13 +1191,13 @@ const fn owned_dispatch_support() -> PcuSupport {
             .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
             .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U16, int_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I16, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
             .with(fusion_pcu::PcuScalarType::U8, int_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
             .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I64, int_alu_caps()),
+            .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
         fusion_pcu::PcuDispatchScalarAluSupport::empty(),
     );
     dispatch.features = PcuFeatureSupport::new(
@@ -908,6 +1210,7 @@ const fn owned_dispatch_support() -> PcuSupport {
 }
 
 const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_CONSTANT
+    .union(PcuDispatchOpCaps::VALUE_CAST)
     .union(PcuDispatchOpCaps::ALU_ADD)
     .union(PcuDispatchOpCaps::ALU_SUB)
     .union(PcuDispatchOpCaps::ALU_MUL)
@@ -936,11 +1239,27 @@ const fn checked_u32_alu_caps() -> PcuDispatchOpCaps {
     int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
 }
 
+const fn checked_u16_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+}
+
 const fn checked_u64_alu_caps() -> PcuDispatchOpCaps {
     int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
 }
 
 const fn checked_i32_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+}
+
+const fn checked_i16_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+}
+
+const fn checked_i8_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+}
+
+const fn checked_i64_alu_caps() -> PcuDispatchOpCaps {
     int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
 }
 
@@ -954,6 +1273,8 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
         dispatch_policy: PcuDispatchPolicyCaps::SERIAL
             .union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION),
         value_types: PcuValueTypeCaps::FLOAT32
+            .union(PcuValueTypeCaps::FLOAT16)
+            .union(PcuValueTypeCaps::BFLOAT16)
             .union(PcuValueTypeCaps::FLOAT64)
             .union(PcuValueTypeCaps::INT8)
             .union(PcuValueTypeCaps::UINT8)
@@ -969,13 +1290,13 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
             .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
             .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U16, int_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I16, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
             .with(fusion_pcu::PcuScalarType::U8, int_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
             .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I64, int_alu_caps()),
+            .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
         dispatch_features: PcuDispatchFeatureCaps::MUTABLE_RESOURCES
             .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES),
         stream_instructions: fusion_pcu::PcuStreamCapabilities::empty(),
@@ -989,8 +1310,11 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
 mod tests {
     use super::{
         decode_fault_word,
+        validate_batch_fault_semantics,
+        ops_use_checked_div_rem,
         FAULT_WORD_SENTINEL,
         RocmOwnedDispatchError,
+        RocmCheckedBatchCompletion,
         OWNED_DISPATCH_INSTRUCTIONS,
         OWNED_EXECUTORS,
         owned_dispatch_support,
@@ -1008,13 +1332,67 @@ mod tests {
         PcuObjectKind,
         PcuObjectRef,
         PcuOwnedBinding,
+        PcuOwnedCompletion,
+        PcuCompletionOutcome,
+        PcuCompletionState,
         PcuProviderId,
         PcuValueType,
+        PcuDispatchOp,
+        PcuDispatchDataOp,
+        PcuDispatchValueId,
         PcuExecutionFault,
         PcuExecutionFaultKind,
     };
+    use fusion_pcu::model::PcuIntegerDivFlags;
 
     struct Noop;
+
+    #[test]
+    fn checked_batch_completion_implements_common_owned_completion_contract() {
+        fn state<C: PcuOwnedCompletion>(completion: &C) -> PcuCompletionState {
+            completion
+                .state()
+                .ok()
+                .expect("terminal state is available")
+        }
+
+        let completion = RocmCheckedBatchCompletion {
+            hip: None,
+            fault_word: None,
+            terminal: Some(PcuCompletionOutcome::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: 7,
+            })),
+        };
+        assert_eq!(state(&completion), PcuCompletionState::Failed);
+    }
+
+    #[test]
+    fn ordered_batch_acceptance_preserves_checked_division_fault_boundary() {
+        assert!(validate_batch_fault_semantics(false).is_ok());
+        assert!(matches!(
+            validate_batch_fault_semantics(true),
+            Err(RocmOwnedDispatchError::CheckedDivisionBatchUnsupported)
+        ));
+    }
+
+    #[test]
+    fn checked_division_scan_finds_nested_region_operations() {
+        let checked = PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+            value_type: PcuValueType::Scalar(fusion_pcu::PcuScalarType::I32),
+            flags: PcuIntegerDivFlags::CHECKED,
+            quotient: PcuDispatchValueId(0),
+            remainder: PcuDispatchValueId(1),
+            lhs: PcuDispatchValueId(2),
+            rhs: PcuDispatchValueId(3),
+        });
+        let inner = [checked];
+        let outer = [PcuDispatchOp::GridStrideLoop {
+            extent: 4,
+            body: &inner,
+        }];
+        assert!(ops_use_checked_div_rem(&outer));
+    }
 
     #[test]
     fn checked_division_fault_word_decodes_sentinel_and_logical_invocation() {
@@ -1066,6 +1444,34 @@ mod tests {
     }
 
     #[test]
+    fn owned_dispatch_advertises_prepared_conversion_floor() {
+        let required_types = fusion_pcu::PcuValueTypeCaps::FLOAT16
+            .union(fusion_pcu::PcuValueTypeCaps::BFLOAT16)
+            .union(fusion_pcu::PcuValueTypeCaps::FLOAT32)
+            .union(fusion_pcu::PcuValueTypeCaps::SCALAR_VALUES);
+        assert!(
+            owned_dispatch_support()
+                .value_type_support
+                .direct
+                .contains(required_types)
+        );
+        assert!(
+            OWNED_EXECUTORS[0]
+                .support
+                .value_types
+                .contains(required_types)
+        );
+        assert!(
+            owned_dispatch_support()
+                .dispatch_support
+                .instructions
+                .direct
+                .contains(PcuDispatchOpCaps::VALUE_CAST)
+        );
+        assert!(OWNED_DISPATCH_INSTRUCTIONS.contains(PcuDispatchOpCaps::VALUE_CAST));
+    }
+
+    #[test]
     fn owned_dispatch_advertises_f64_type_with_its_alu_operations() {
         let required = fusion_pcu::PcuValueTypeCaps::FLOAT64
             .union(fusion_pcu::PcuValueTypeCaps::SCALAR_VALUES);
@@ -1087,6 +1493,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn owned_dispatch_advertises_only_supported_u32_alu_operations() {
         let supported = PcuDispatchOpCaps::ALU_ADD
             .union(PcuDispatchOpCaps::ALU_SUB)
@@ -1140,6 +1547,7 @@ mod tests {
             .dispatch_scalar_alu
             .for_scalar(fusion_pcu::PcuScalarType::U16);
         assert!(u16_support.contains(supported));
+        assert!(u16_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
         assert!(!u16_support.contains(PcuDispatchOpCaps::ALU_DIV));
         let u8_support = OWNED_EXECUTORS[0]
             .support
@@ -1152,6 +1560,7 @@ mod tests {
             .dispatch_scalar_alu
             .for_scalar(fusion_pcu::PcuScalarType::I16);
         assert!(i16_support.contains(supported));
+        assert!(i16_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
         assert!(!i16_support.contains(PcuDispatchOpCaps::ALU_DIV));
         let i8_support = OWNED_EXECUTORS[0]
             .support
@@ -1167,7 +1576,7 @@ mod tests {
         assert!(i32_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
         assert!(!i32_support.contains(PcuDispatchOpCaps::ALU_DIV));
         assert!(
-            !OWNED_EXECUTORS[0]
+            OWNED_EXECUTORS[0]
                 .support
                 .dispatch_scalar_alu
                 .for_scalar(fusion_pcu::PcuScalarType::I64)

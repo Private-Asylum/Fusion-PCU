@@ -1,0 +1,5 @@
+error: PCU helper calls must name a `#[pcu_fn]` sibling directly
+  --> tests/ui/helper_call_qualified.rs:12:26
+   |
+12 |     output[invocation] = math::scale(input[invocation]);
+   |                          ^^^^^^^^^^^

@@ -8,6 +8,7 @@ use crate::{
     PcuValueTypeCaps,
 };
 use crate::map_validation::integer_map_validation::{
+    validate_integer_checked_div_rem_kernel,
     validate_integer_map_kernel,
     IntegerMapValidationError,
 };
@@ -65,6 +66,21 @@ pub fn validate_i64_map_kernel(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<(), PcuI64MapValidationError> {
     validate_integer_map_kernel(kernel, PcuValueType::i64(), PcuValueTypeCaps::INT64)
+        .map_err(map_error)
+}
+
+/// Validates the exact two-input/two-output checked `i64` quotient/remainder profile.
+///
+/// Direct indexing or one canonical grid-stride loop is accepted. Zero divisors and
+/// `i64::MIN / -1` are execution faults; both output buffers are unusable after a fault.
+///
+/// # Errors
+///
+/// Returns the first structural violation of the checked `DivRem` profile.
+pub fn validate_i64_checked_div_rem_kernel(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Result<(), PcuI64MapValidationError> {
+    validate_integer_checked_div_rem_kernel(kernel, PcuValueType::i64(), PcuValueTypeCaps::INT64)
         .map_err(map_error)
 }
 

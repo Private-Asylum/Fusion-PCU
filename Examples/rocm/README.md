@@ -39,6 +39,8 @@ cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mul_chain
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_sgd_contract
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_resident
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_train_step
+cargo bench -p fusion-example-hosted-compute-rocm --bench half_transport
+cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch_widen
 cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mlp_train
 ```
 

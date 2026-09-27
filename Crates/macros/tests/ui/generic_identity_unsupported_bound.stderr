@@ -1,0 +1,5 @@
+error: generic PCU kernels require exactly `T: PcuScalar` or `T: PcuWrappingInteger`; both traits are sealed
+ --> tests/ui/generic_identity_unsupported_bound.rs:6:18
+  |
+6 | fn generic_clone<T: Clone>(input: &[T], output: &mut [T]) {
+  |                  ^^^^^^^^

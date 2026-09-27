@@ -5,7 +5,7 @@ mod selection;
 
 use std::error::Error;
 
-use fusion_pcu_macros::pcu;
+use fusion_pcu_macros::pcu_module;
 use fusion_pcu_rocm::{
     HipKernelArgument,
     RocmDiscovery,
@@ -13,19 +13,27 @@ use fusion_pcu_rocm::{
     lower_dispatch_to_hip_rtc_source,
 };
 
-#[pcu(invocations = 250)]
-fn rtc_probe<const N: usize>(input: &[f32], output: &mut [f32]) {
-    let mut id = pcu::context::global_invocation_id();
-    let stride = pcu::context::invocation_count();
-    while id < N {
-        output[id] = input[id] + 1.0;
-        id += stride;
+#[pcu_module]
+mod kernels {
+    #[pcu_fn]
+    fn plus_one(value: f32) -> f32 {
+        value + 1.0
+    }
+
+    #[pcu(invocations = 250)]
+    pub fn rtc_probe<const N: usize>(input: &[f32], output: &mut [f32]) {
+        let mut id = pcu::context::global_invocation_id();
+        let stride = pcu::context::invocation_count();
+        while id < N {
+            output[id] = plus_one(input[id]);
+            id += stride;
+        }
     }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let bindings = rtc_probe_bindings();
-    let builder = rtc_probe::<2048>(&bindings)?;
+    let bindings = kernels::rtc_probe_bindings();
+    let builder = kernels::rtc_probe::<2048>(&bindings)?;
     let kernel = builder.ir();
     let source = lower_dispatch_to_hip_rtc_source(&kernel)?;
     let discovery = RocmDiscovery::new();

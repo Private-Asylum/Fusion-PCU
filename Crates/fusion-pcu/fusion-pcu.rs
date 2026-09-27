@@ -23,6 +23,7 @@ pub mod core;
 pub mod dialect;
 pub use dialect::builder as dialect_builder;
 pub mod dispatch;
+pub mod function;
 pub mod ir;
 pub mod map_validation;
 #[path = "model/model.rs"]
@@ -30,6 +31,8 @@ pub mod model;
 pub mod resource;
 pub mod runtime;
 pub mod scalar;
+pub mod scalar_widen;
+pub mod scalar_wrapping;
 pub mod validation;
 
 pub use contract::*;
@@ -51,8 +54,11 @@ pub use resource::{
 pub use borrowed::*;
 pub use builder::*;
 pub use dispatch::*;
+pub use function::*;
 pub use map_validation::*;
 pub use dialect::*;
 pub use memory::*;
 pub use owned::*;
 pub use scalar::*;
+pub use scalar_widen::*;
+pub use scalar_wrapping::*;

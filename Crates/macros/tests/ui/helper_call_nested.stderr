@@ -1,0 +1,5 @@
+error: PCU helper calls require `#[pcu_module]` and a sibling `#[pcu_fn]` definition
+  --> tests/ui/helper_call_nested.rs:10:26
+   |
+10 |     output[invocation] = scale(input[invocation]) + 1.0;
+   |                          ^^^^^

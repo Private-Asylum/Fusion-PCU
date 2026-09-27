@@ -5,6 +5,7 @@ use super::submission::PcuDispatchSubmission;
 use crate::contract::{
     PcuBinding,
     PcuBindingRef,
+    PcuDispatchDataOp,
     PcuDispatchOp,
     PcuError,
     PcuInvocationBindings,
@@ -129,6 +130,13 @@ pub fn validate_dispatch_submission(submission: PcuDispatchSubmission<'_>) -> Re
     {
         return Err(PcuError::invalid());
     }
+    // Conversion has no meaningful untyped execution. Keep the typed value-flow profile at
+    // common admission so a backend cannot accidentally accept a cast with mistyped SSA or
+    // binding storage merely because its own lowering happens to recognize the op name.
+    if contains_conversion(submission.kernel.ops) {
+        crate::validate_typed_dispatch_value_flow(submission.kernel)
+            .map_err(|_| PcuError::invalid())?;
+    }
     let PcuInvocationTopology::Indexed { logical_shape } =
         submission.kernel.signature().invocation.topology
     else {
@@ -149,6 +157,14 @@ pub fn validate_dispatch_submission(submission: PcuDispatchSubmission<'_>) -> Re
     Ok(())
 }
 
+fn contains_conversion(ops: &[PcuDispatchOp<'_>]) -> bool {
+    ops.iter().any(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::Convert { .. }) => true,
+        PcuDispatchOp::GridStrideLoop { body, .. } => contains_conversion(body),
+        _ => false,
+    })
+}
+
 fn binding_exists(bindings: &[PcuBinding<'_>], reference: PcuBindingRef) -> bool {
     bindings
         .iter()
@@ -158,4 +174,86 @@ fn binding_exists(bindings: &[PcuBinding<'_>], reference: PcuBindingRef) -> bool
 
 fn port_exists(ports: &[PcuPort<'_>], name: &str) -> bool {
     ports.iter().any(|port| port.name == Some(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use core::num::NonZeroU32;
+
+    use crate::{
+        PcuBinding,
+        PcuBindingAccess,
+        PcuBindingRef,
+        PcuBindingStorageClass,
+        PcuDispatchConversion,
+        PcuDispatchDataOp,
+        PcuDispatchEntryPoint,
+        PcuDispatchFeatureCaps,
+        PcuDispatchIndex,
+        PcuDispatchKernelIr,
+        PcuDispatchOp,
+        PcuDispatchSubmission,
+        PcuDispatchValueId,
+        PcuInvocationShape,
+        PcuKernelId,
+        PcuValueType,
+        PcuValueTypeCaps,
+    };
+
+    #[test]
+    fn common_admission_rejects_mistyped_conversion_before_backend_selection() {
+        let bindings = [
+            PcuBinding::value(
+                None,
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::u8(),
+            ),
+            PcuBinding::value(
+                None,
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                PcuValueType::i16(),
+            ),
+        ];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Convert {
+                result: PcuDispatchValueId(2),
+                value: PcuDispatchValueId(1),
+                conversion: PcuDispatchConversion::I8ToI16,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(2),
+            }),
+        ];
+        let kernel = PcuDispatchKernelIr {
+            id: PcuKernelId(1),
+            entry: PcuDispatchEntryPoint {
+                name: "mismatch",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &bindings,
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(1).unwrap()),
+        };
+        assert!(super::validate_dispatch_submission(submission).is_err());
+    }
 }

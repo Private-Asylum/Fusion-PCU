@@ -68,6 +68,25 @@ pub fn validate_u8_map_kernel(
         .map_err(map_error)
 }
 
+/// Validates the exact checked `u8` quotient/remainder map profile.
+///
+/// The body is two indexed loads, checked `DivRem` with empty flags, two output stores, and Return.
+/// Direct invocation indexing and one canonical grid-stride loop are supported.
+///
+/// # Errors
+///
+/// Returns the first structural violation of the checked `DivRem` profile.
+pub fn validate_u8_checked_div_rem_kernel(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Result<(), PcuU8MapValidationError> {
+    crate::map_validation::integer_map_validation::validate_integer_checked_div_rem_kernel(
+        kernel,
+        PcuValueType::u8(),
+        PcuValueTypeCaps::UINT8,
+    )
+    .map_err(map_error)
+}
+
 #[cfg(test)]
 mod tests {
     use std::boxed::Box;

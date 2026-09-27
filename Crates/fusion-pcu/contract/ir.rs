@@ -64,6 +64,7 @@ pub use crate::model::{
     PcuDispatchEntryPoint,
     PcuDispatchCoordinateOp,
     PcuDispatchDataOp,
+    PcuDispatchConversion,
     PcuDispatchFeatureCaps,
     PcuDispatchIndex,
     PcuDispatchInstructionContract,

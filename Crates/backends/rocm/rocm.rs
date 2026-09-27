@@ -63,6 +63,8 @@ pub use memory::{
     RocmMemoryResource,
 };
 pub use owned_dispatch::{
+    RocmCheckedBatchCompletion,
+    RocmCheckedDispatchBatch,
     RocmOwnedCompletion,
     RocmOwnedDispatchBackend,
     RocmOwnedDispatchError,
@@ -1178,7 +1180,6 @@ impl HipStreamHandle {
     }
 
     /// Check whether this stream belongs to the supplied runtime/device pair.
-    #[cfg(feature = "tensor")]
     pub(crate) fn belongs_to_runtime(&self, runtime: &HipRuntime) -> bool {
         runtime.ensure_same_runtime(&self.inner.runtime).is_ok()
     }

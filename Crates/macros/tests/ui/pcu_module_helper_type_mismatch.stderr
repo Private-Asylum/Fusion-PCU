@@ -1,0 +1,5 @@
+error: this PCU helper profile currently accepts only f32 arguments
+  --> tests/ui/pcu_module_helper_type_mismatch.rs:13:30
+   |
+13 |         output[invocation] = scale(input[invocation]);
+   |                              ^^^^^^^^^^^^^^^^^^^^^^^^

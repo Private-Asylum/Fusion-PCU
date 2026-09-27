@@ -22,6 +22,7 @@ use criterion::{
 use fusion_pcu::{
     PcuDispatchSubmission,
     PcuInvocationShape,
+    PcuWrappingInteger,
 };
 use fusion_pcu_macros::pcu;
 use fusion_pcu_rocm::{
@@ -41,7 +42,11 @@ use dispatch_support::{
 };
 
 #[pcu(invocations = N)]
-fn wrapping_add_u32<const N: usize>(left: &[u32], right: &[u32], output: &mut [u32]) {
+fn wrapping_add_generic<T: PcuWrappingInteger, const N: usize>(
+    left: &[T],
+    right: &[T],
+    output: &mut [T],
+) {
     let id = pcu::context::global_invocation_id();
     output[id] = left[id].wrapping_add(right[id]);
 }
@@ -311,8 +316,8 @@ fn run_case<const N: usize>(
     native_left.copy_from(&left_bytes)?;
     native_right.copy_from(&right_bytes)?;
 
-    let bindings = wrapping_add_u32_bindings();
-    let builder = wrapping_add_u32::<N>(&bindings)?;
+    let bindings = wrapping_add_generic_bindings::<u32>();
+    let builder = wrapping_add_generic::<u32, N>(&bindings)?;
     let kernel = builder.ir();
     let invocations = u32::try_from(N)?;
     let prepared = support::cold_once("PCU cold prepare", || {

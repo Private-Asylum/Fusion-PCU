@@ -2,6 +2,7 @@
 
 pub mod command;
 pub mod dispatch;
+pub mod identity;
 pub mod signal;
 pub mod stream;
 pub mod transaction;
@@ -16,6 +17,7 @@ use crate::{
 
 pub use command::*;
 pub use dispatch::*;
+pub use identity::*;
 pub use signal::*;
 pub use stream::*;
 pub use transaction::*;

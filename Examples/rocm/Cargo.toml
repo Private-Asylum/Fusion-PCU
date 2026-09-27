@@ -125,8 +125,38 @@ path = "benches/dispatch_u64_checked_div_rem.rs"
 harness = false
 
 [[bench]]
+name = "dispatch_u16_checked_div_rem"
+path = "benches/dispatch_u16_checked_div_rem.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_u8_checked_div_rem"
+path = "benches/dispatch_u8_checked_div_rem.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_widen"
+path = "benches/dispatch_widen.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_f32_f64_exact"
+path = "benches/dispatch_f32_f64_exact.rs"
+harness = false
+
+[[bench]]
 name = "dispatch_i32_checked_div_rem"
 path = "benches/dispatch_i32_checked_div_rem.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_i16_checked_div_rem"
+path = "benches/dispatch_i16_checked_div_rem.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_i64_checked_div_rem"
+path = "benches/dispatch_i64_checked_div_rem.rs"
 harness = false
 
 [[bench]]
@@ -169,6 +199,16 @@ name = "dispatch_f64_alu"
 path = "benches/dispatch_f64_alu.rs"
 harness = false
 
+[[bench]]
+name = "half_transport"
+path = "benches/half_transport.rs"
+harness = false
+
+[[bench]]
+name = "dispatch_half_convert"
+path = "benches/dispatch_half_convert.rs"
+harness = false
+
 [dependencies]
 fusion-pcu.workspace = true
 fusion-pcu-rocm = { workspace = true, features = ["tensor"] }
@@ -186,3 +226,7 @@ nursery = "warn"
 
 [lints.rust]
 unsafe_code = "deny"
+
+[[bench]]
+name = "dispatch_i8_checked_div_rem"
+harness = false

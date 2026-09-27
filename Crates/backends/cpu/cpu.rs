@@ -20,12 +20,17 @@ mod floats;
 mod integer;
 #[path = "cpu/stream.rs"]
 mod stream;
+#[path = "cpu/typed_conversion.rs"]
+mod typed_conversion;
 #[path = "cpu/validation.rs"]
 mod validation;
 
 const VALUE_SLOTS: usize = 256;
 
 pub use floats::{
+    PcuF16IdentityReference,
+    PcuBf16IdentityReference,
+    PcuHalfIdentityReferenceError,
     PcuF32Reference,
     PcuF32ReferenceError,
     PcuF64Reference,
@@ -53,11 +58,18 @@ pub use stream::{
     PcuU32StreamReference,
     PcuU32StreamReferenceError,
 };
+pub use typed_conversion::{
+    PcuCpuTypedBinding,
+    PcuCpuTypedSlice,
+    PcuTypedConversionReference,
+    PcuTypedConversionReferenceError,
+};
 
 #[cfg(test)]
 mod tests {
     use core::num::NonZeroU32;
     use std::boxed::Box;
+    use std::vec;
 
     use super::{
         PcuF32Reference,
@@ -500,6 +512,101 @@ mod tests {
         assert_eq!(r, [92; 5]);
     }
 
+    fn checked_i16_div_rem_kernel(extent: Option<u32>) -> PcuDispatchKernelIr<'static> {
+        let bindings = Box::leak(Box::new([
+            PcuBinding::scalar::<i16>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i16>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i16>(
+                Some("q"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+            PcuBinding::scalar::<i16>(
+                Some("r"),
+                0,
+                3,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ]));
+        let index = if extent.is_some() {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = Box::leak(Box::new([
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                value_type: PcuValueType::i16(),
+                flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                quotient: PcuDispatchValueId(3),
+                remainder: PcuDispatchValueId(4),
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 3),
+                index,
+                value: PcuDispatchValueId(4),
+            }),
+        ]));
+        let ops = match extent {
+            Some(extent) => Box::leak(Box::new([
+                PcuDispatchOp::GridStrideLoop { extent, body },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])) as &'static [PcuDispatchOp<'static>],
+            None => Box::leak(Box::new([
+                body[0],
+                body[1],
+                body[2],
+                body[3],
+                body[4],
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])),
+        };
+        PcuDispatchKernelIr {
+            id: PcuKernelId(79),
+            entry: PcuDispatchEntryPoint {
+                name: "checked_divrem_i16",
+                logical_shape: [2, 1, 1],
+            },
+            bindings,
+            ports: &[],
+            parameters: &[],
+            ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I16),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        }
+    }
+
     fn checked_i32_div_rem_kernel(extent: Option<u32>) -> PcuDispatchKernelIr<'static> {
         let bindings = Box::leak(Box::new([
             PcuBinding::scalar::<i32>(
@@ -593,6 +700,261 @@ mod tests {
             type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I32),
             feature_caps: PcuDispatchFeatureCaps::default(),
         }
+    }
+
+    fn checked_i64_div_rem_kernel(extent: Option<u32>) -> PcuDispatchKernelIr<'static> {
+        let bindings = Box::leak(Box::new([
+            PcuBinding::scalar::<i64>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i64>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i64>(
+                Some("q"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+            PcuBinding::scalar::<i64>(
+                Some("r"),
+                0,
+                3,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ]));
+        let index = if extent.is_some() {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = Box::leak(Box::new([
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                value_type: PcuValueType::i64(),
+                flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                quotient: PcuDispatchValueId(3),
+                remainder: PcuDispatchValueId(4),
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 3),
+                index,
+                value: PcuDispatchValueId(4),
+            }),
+        ]));
+        let ops = match extent {
+            Some(extent) => Box::leak(Box::new([
+                PcuDispatchOp::GridStrideLoop { extent, body },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])) as &'static [PcuDispatchOp<'static>],
+            None => Box::leak(Box::new([
+                body[0],
+                body[1],
+                body[2],
+                body[3],
+                body[4],
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])),
+        };
+        PcuDispatchKernelIr {
+            id: PcuKernelId(79),
+            entry: PcuDispatchEntryPoint {
+                name: "checked_divrem_i64",
+                logical_shape: [2, 1, 1],
+            },
+            bindings,
+            ports: &[],
+            parameters: &[],
+            ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I64),
+            feature_caps: PcuDispatchFeatureCaps::default(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checked_i16_divrem_reports_both_fault_kinds_and_lowest_grid_id() {
+        let kernel = checked_i16_div_rem_kernel(None);
+        let a = [-13, 10];
+        let b = [3, -2];
+        let mut q = [0; 2];
+        let mut r = [0; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        PcuI16MapReference
+            .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+            .expect("i16 DivRem executes");
+        assert_eq!(q, [-4, -5]);
+        assert_eq!(r, [-1, 0]);
+
+        let kernel = checked_i16_div_rem_kernel(Some(5));
+        let a = [8, 12, i16::MIN, 99, 20];
+        let b = [2, 3, -1, 0, 0];
+        let mut q = [91; 5];
+        let mut r = [92; 5];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI16MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                invocation_id: 2,
+            }))
+        );
+        assert_eq!(q, [91; 5]);
+        assert_eq!(r, [92; 5]);
+
+        let kernel = checked_i16_div_rem_kernel(None);
+        let a = [i16::MIN, 0];
+        let b = [-1, 1];
+        let mut q = [91; 2];
+        let mut r = [92; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI16MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                invocation_id: 0,
+            }))
+        );
+        assert_eq!(q, [91; 2]);
+        assert_eq!(r, [92; 2]);
+
+        let kernel = checked_i16_div_rem_kernel(None);
+        let a = [4, 5];
+        let b = [0, 1];
+        let mut q = [91; 2];
+        let mut r = [92; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI16MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: 0,
+            }))
+        );
+        assert_eq!(q, [91; 2]);
+        assert_eq!(r, [92; 2]);
     }
 
     #[test]
@@ -756,6 +1118,166 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checked_i64_divrem_reports_both_fault_kinds_and_lowest_grid_id() {
+        let kernel = checked_i64_div_rem_kernel(None);
+        let a = [-13, 10];
+        let b = [3, -2];
+        let mut q = [0; 2];
+        let mut r = [0; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        PcuI64MapReference
+            .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
+            .expect("i64 DivRem executes");
+        assert_eq!(q, [-4, -5]);
+        assert_eq!(r, [-1, 0]);
+
+        let kernel = checked_i64_div_rem_kernel(Some(5));
+        let a = [8, 12, i64::MIN, 99, 20];
+        let b = [2, 3, -1, 0, 0];
+        let mut q = [91; 5];
+        let mut r = [92; 5];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI64MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                invocation_id: 2,
+            }))
+        );
+        assert_eq!(q, [91; 5]);
+        assert_eq!(r, [92; 5]);
+
+        let kernel = checked_i64_div_rem_kernel(None);
+        let a = [i64::MIN, 0];
+        let b = [-1, 1];
+        let mut q = [91; 2];
+        let mut r = [92; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI64MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                invocation_id: 0,
+            }))
+        );
+        assert_eq!(q, [91; 2]);
+        assert_eq!(r, [92; 2]);
+
+        let kernel = checked_i64_div_rem_kernel(None);
+        let a = [4, 5];
+        let b = [0, 1];
+        let mut q = [91; 2];
+        let mut r = [92; 2];
+        let submission = PcuDispatchSubmission {
+            kernel: &kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+        };
+        let mut host = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&a),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::Read(&b),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 2),
+                slice: PcuHostScalarSlice::ReadWrite(&mut q),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 3),
+                slice: PcuHostScalarSlice::ReadWrite(&mut r),
+            },
+        ];
+        assert_eq!(
+            PcuI64MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty()
+            ),
+            Err(super::PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: 0,
+            }))
+        );
+        assert_eq!(q, [91; 2]);
+        assert_eq!(r, [92; 2]);
+    }
+
+    #[test]
     fn u16_map_reference_wraps_add_sub_and_mul() {
         let binding_ir = [
             PcuBinding::scalar::<u16>(
@@ -848,6 +1370,463 @@ mod tests {
                 .run_host_direct(submission, &mut host, PcuInvocationParameters::empty())
                 .expect("u16 operation executes");
             assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn u16_checked_div_rem_reference_handles_direct_grid_and_first_fault() {
+        for extent in [None, Some(5)] {
+            let bindings = Box::leak(Box::new([
+                PcuBinding::scalar::<u16>(
+                    Some("a"),
+                    0,
+                    0,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<u16>(
+                    Some("b"),
+                    0,
+                    1,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<u16>(
+                    Some("q"),
+                    0,
+                    2,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+                PcuBinding::scalar::<u16>(
+                    Some("r"),
+                    0,
+                    3,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+            ]));
+            let index = if extent.is_some() {
+                PcuDispatchIndex::GridStrideId
+            } else {
+                PcuDispatchIndex::InvocationId
+            };
+            let body = Box::leak(Box::new([
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                    value_type: PcuValueType::u16(),
+                    flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                    quotient: PcuDispatchValueId(3),
+                    remainder: PcuDispatchValueId(4),
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 3),
+                    index,
+                    value: PcuDispatchValueId(4),
+                }),
+            ]));
+            let ops = match extent {
+                Some(extent) => Box::leak(Box::new([
+                    PcuDispatchOp::GridStrideLoop { extent, body },
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ])) as &'static [PcuDispatchOp<'static>],
+                None => Box::leak(Box::new([
+                    body[0],
+                    body[1],
+                    body[2],
+                    body[3],
+                    body[4],
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ])),
+            };
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(43),
+                entry: PcuDispatchEntryPoint {
+                    name: "u16_checked_divrem",
+                    logical_shape: [2, 1, 1],
+                },
+                bindings,
+                ports: &[],
+                parameters: &[],
+                ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U16),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let count = extent.unwrap_or(2) as usize;
+            let a = vec![u16::MAX; count];
+            let b = if extent.is_some() {
+                vec![2, 3, 4, 0, 5]
+            } else {
+                vec![2, 3]
+            };
+            let mut q = vec![99; count];
+            let mut r = vec![98; count];
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+            };
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut q),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 3),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut r),
+                },
+            ];
+            let result = PcuU16MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty(),
+            );
+            if extent.is_some() {
+                assert_eq!(
+                    result,
+                    Err(super::PcuU16MapReferenceError::Fault(PcuExecutionFault {
+                        kind: PcuExecutionFaultKind::DivideByZero,
+                        invocation_id: 3
+                    }))
+                );
+            } else {
+                result.expect("checked u16 DivRem executes");
+                assert_eq!(q, [u16::MAX / 2, u16::MAX / 3]);
+                assert_eq!(r, [u16::MAX % 2, u16::MAX % 3]);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn u8_checked_div_rem_reference_handles_direct_grid_and_first_fault() {
+        for (extent, b) in [
+            (None, vec![2, 3]),
+            (None, vec![2, 0]),
+            (Some(5), vec![2, 3, 4, 0, 5]),
+        ] {
+            let bindings = Box::leak(Box::new([
+                PcuBinding::scalar::<u8>(
+                    Some("a"),
+                    0,
+                    0,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<u8>(
+                    Some("b"),
+                    0,
+                    1,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<u8>(
+                    Some("q"),
+                    0,
+                    2,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+                PcuBinding::scalar::<u8>(
+                    Some("r"),
+                    0,
+                    3,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+            ]));
+            let index = if extent.is_some() {
+                PcuDispatchIndex::GridStrideId
+            } else {
+                PcuDispatchIndex::InvocationId
+            };
+            let body = Box::leak(Box::new([
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                    value_type: PcuValueType::u8(),
+                    flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                    quotient: PcuDispatchValueId(3),
+                    remainder: PcuDispatchValueId(4),
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 3),
+                    index,
+                    value: PcuDispatchValueId(4),
+                }),
+            ]));
+            let ops = match extent {
+                Some(extent) => Box::leak(Box::new([
+                    PcuDispatchOp::GridStrideLoop { extent, body },
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ])) as &'static [PcuDispatchOp<'static>],
+                None => Box::leak(Box::new([
+                    body[0],
+                    body[1],
+                    body[2],
+                    body[3],
+                    body[4],
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ])),
+            };
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(43),
+                entry: PcuDispatchEntryPoint {
+                    name: "u8_checked_divrem",
+                    logical_shape: [2, 1, 1],
+                },
+                bindings,
+                ports: &[],
+                parameters: &[],
+                ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::U8),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let count = extent.unwrap_or(2) as usize;
+            let a = vec![u8::MAX; count];
+            let mut q = vec![99; count];
+            let mut r = vec![98; count];
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+            };
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut q),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 3),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut r),
+                },
+            ];
+            let result = PcuU8MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty(),
+            );
+            if b.contains(&0) {
+                assert_eq!(
+                    result,
+                    Err(super::PcuU8MapReferenceError::Fault(PcuExecutionFault {
+                        kind: PcuExecutionFaultKind::DivideByZero,
+                        invocation_id: if extent.is_some() { 3 } else { 1 }
+                    }))
+                );
+            } else {
+                result.expect("checked u8 DivRem executes");
+                assert_eq!(q, [u8::MAX / 2, u8::MAX / 3]);
+                assert_eq!(r, [u8::MAX % 2, u8::MAX % 3]);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn i8_checked_div_rem_reference_handles_direct_grid_and_first_fault() {
+        for (extent, b) in [
+            (None, vec![2, 3]),
+            (None, vec![2, 0]),
+            (Some(5), vec![2, 3, 4, 0, 5]),
+            (None, vec![-1, -1]),
+        ] {
+            let bindings = Box::leak(Box::new([
+                PcuBinding::scalar::<i8>(
+                    Some("a"),
+                    0,
+                    0,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<i8>(
+                    Some("b"),
+                    0,
+                    1,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<i8>(
+                    Some("q"),
+                    0,
+                    2,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+                PcuBinding::scalar::<i8>(
+                    Some("r"),
+                    0,
+                    3,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+            ]));
+            let index = if extent.is_some() {
+                PcuDispatchIndex::GridStrideId
+            } else {
+                PcuDispatchIndex::InvocationId
+            };
+            let body = Box::leak(Box::new([
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(1),
+                    binding: PcuBindingRef::new(0, 0),
+                    index,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                    result: PcuDispatchValueId(2),
+                    binding: PcuBindingRef::new(0, 1),
+                    index,
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                    value_type: PcuValueType::i8(),
+                    flags: fusion_pcu::model::PcuIntegerDivFlags::CHECKED,
+                    quotient: PcuDispatchValueId(3),
+                    remainder: PcuDispatchValueId(4),
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 2),
+                    index,
+                    value: PcuDispatchValueId(3),
+                }),
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 3),
+                    index,
+                    value: PcuDispatchValueId(4),
+                }),
+            ]));
+            let ops = match extent {
+                Some(extent) => Box::leak(Box::new([
+                    PcuDispatchOp::GridStrideLoop { extent, body },
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ])) as &'static [PcuDispatchOp<'static>],
+                None => Box::leak(Box::new([
+                    body[0],
+                    body[1],
+                    body[2],
+                    body[3],
+                    body[4],
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ])),
+            };
+            let kernel = PcuDispatchKernelIr {
+                id: PcuKernelId(43),
+                entry: PcuDispatchEntryPoint {
+                    name: "i8_checked_divrem",
+                    logical_shape: [2, 1, 1],
+                },
+                bindings,
+                ports: &[],
+                parameters: &[],
+                ops,
+                type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I8),
+                feature_caps: PcuDispatchFeatureCaps::default(),
+            };
+            let count = extent.unwrap_or(2) as usize;
+            let a = if b.iter().all(|value| *value == -1) {
+                vec![i8::MIN; count]
+            } else {
+                vec![i8::MAX; count]
+            };
+            let mut q = vec![99; count];
+            let mut r = vec![98; count];
+            let submission = PcuDispatchSubmission {
+                kernel: &kernel,
+                shape: PcuInvocationShape::invocations(NonZeroU32::new(2).expect("nonzero")),
+            };
+            let mut host = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&a),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::Read(&b),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 2),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut q),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 3),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut r),
+                },
+            ];
+            let result = PcuI8MapReference.run_host_direct(
+                submission,
+                &mut host,
+                PcuInvocationParameters::empty(),
+            );
+            if b.contains(&0) {
+                assert_eq!(
+                    result,
+                    Err(super::PcuI8MapReferenceError::Fault(PcuExecutionFault {
+                        kind: PcuExecutionFaultKind::DivideByZero,
+                        invocation_id: if extent.is_some() { 3 } else { 1 }
+                    }))
+                );
+            } else if b.iter().all(|value| *value == -1) {
+                assert_eq!(
+                    result,
+                    Err(super::PcuI8MapReferenceError::Fault(PcuExecutionFault {
+                        kind: PcuExecutionFaultKind::SignedDivisionOverflow,
+                        invocation_id: 0,
+                    }))
+                );
+                assert_eq!(q, vec![99; count]);
+                assert_eq!(r, vec![98; count]);
+            } else {
+                result.expect("checked i8 DivRem executes");
+                assert_eq!(q, [i8::MAX / 2, i8::MAX / 3]);
+                assert_eq!(r, [i8::MAX % 2, i8::MAX % 3]);
+            }
         }
     }
 

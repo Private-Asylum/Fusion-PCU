@@ -21,10 +21,14 @@ use super::{
     validate_f32_map_kernel,
     validate_f64_map_kernel,
     validate_i16_map_kernel,
+    validate_i16_checked_div_rem_kernel,
     validate_i32_checked_div_rem_kernel,
+    validate_i64_checked_div_rem_kernel,
     validate_i32_map_kernel,
     validate_i64_map_kernel,
     validate_i8_map_kernel,
+    validate_i8_checked_div_rem_kernel,
+    validate_u16_checked_div_rem_kernel,
     validate_u16_map_kernel,
     validate_u32_checked_div_rem_kernel,
     validate_u32_identity_kernel,
@@ -32,6 +36,7 @@ use super::{
     validate_u64_checked_div_rem_kernel,
     validate_u64_identity_kernel,
     validate_u64_map_kernel,
+    validate_u8_checked_div_rem_kernel,
     validate_u8_map_kernel,
 };
 
@@ -46,10 +51,38 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
     if !kernel.ports.is_empty() || !kernel.parameters.is_empty() {
         return Err(RocmLowerError::UnsupportedKernelInterface);
     }
+    if super::mixed_widening_profile(kernel).is_some() {
+        return Ok(());
+    }
+    if super::half_conversion_profile(kernel).is_some() {
+        return Ok(());
+    }
+    if super::is_exact_f32_f64_profile(kernel) {
+        return Ok(());
+    }
+    if kernel.bindings.iter().any(|binding| {
+        binding.binding_type
+            == PcuBindingType::Value(PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16))
+    }) {
+        return fusion_pcu::validate_f16_identity_kernel(kernel)
+            .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
+    }
+    if kernel.bindings.iter().any(|binding| {
+        binding.binding_type
+            == PcuBindingType::Value(PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16))
+    }) {
+        return fusion_pcu::validate_bf16_identity_kernel(kernel)
+            .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
+    }
     if kernel.bindings.iter().any(|binding| {
         binding.binding_type
             == PcuBindingType::Value(PcuValueType::Scalar(fusion_pcu::PcuScalarType::I8))
     }) {
+        if kernel_uses_checked_div_rem(kernel) {
+            validate_i8_checked_div_rem_kernel(kernel)
+                .map_err(|_| RocmLowerError::UnsupportedKernelInterface)?;
+            return Ok(());
+        }
         return validate_i8_map_kernel(kernel)
             .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
@@ -57,6 +90,11 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         binding.binding_type
             == PcuBindingType::Value(PcuValueType::Scalar(fusion_pcu::PcuScalarType::U8))
     }) {
+        if kernel_uses_checked_div_rem(kernel) {
+            validate_u8_checked_div_rem_kernel(kernel)
+                .map_err(|_| RocmLowerError::UnsupportedKernelInterface)?;
+            return Ok(());
+        }
         return validate_u8_map_kernel(kernel)
             .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
@@ -64,6 +102,11 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         binding.binding_type
             == PcuBindingType::Value(PcuValueType::Scalar(fusion_pcu::PcuScalarType::I16))
     }) {
+        if kernel_uses_checked_div_rem(kernel) {
+            validate_i16_checked_div_rem_kernel(kernel)
+                .map_err(|_| RocmLowerError::UnsupportedKernelInterface)?;
+            return Ok(());
+        }
         return validate_i16_map_kernel(kernel)
             .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
@@ -71,6 +114,11 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         binding.binding_type
             == PcuBindingType::Value(PcuValueType::Scalar(fusion_pcu::PcuScalarType::U16))
     }) {
+        if kernel_uses_checked_div_rem(kernel) {
+            validate_u16_checked_div_rem_kernel(kernel)
+                .map_err(|_| RocmLowerError::UnsupportedKernelInterface)?;
+            return Ok(());
+        }
         return validate_u16_map_kernel(kernel)
             .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
@@ -124,6 +172,11 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         .iter()
         .any(|binding| binding.binding_type == PcuBindingType::Value(PcuValueType::i64()))
     {
+        if kernel_uses_checked_div_rem(kernel) {
+            validate_i64_checked_div_rem_kernel(kernel)
+                .map_err(|_| RocmLowerError::UnsupportedKernelInterface)?;
+            return Ok(());
+        }
         if validate_i64_map_kernel(kernel).is_ok() {
             return Ok(());
         }

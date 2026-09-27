@@ -3,6 +3,12 @@ fn dispatch_macro_ui() {
     let tests = trybuild::TestCases::new();
     tests.compile_fail("tests/ui/unsupported_statement.rs");
     tests.compile_fail("tests/ui/unsupported_expression.rs");
+    tests.compile_fail("tests/ui/helper_call.rs");
+    tests.compile_fail("tests/ui/helper_call_nested.rs");
+    tests.compile_fail("tests/ui/helper_call_qualified.rs");
+    tests.compile_fail("tests/ui/pcu_module_recursive_helper.rs");
+    tests.compile_fail("tests/ui/pcu_module_effectful_helper.rs");
+    tests.compile_fail("tests/ui/pcu_module_helper_type_mismatch.rs");
     tests.pass("tests/ui/grid_stride_multi_iteration.rs");
     tests.pass("tests/ui/grid_stride_symbolic_mismatch.rs");
     tests.pass("tests/ui/qualified_context.rs");
@@ -21,4 +27,7 @@ fn dispatch_macro_ui() {
     tests.compile_fail("tests/ui/u32_plain_arithmetic.rs");
     tests.pass("tests/ui/u32_checked_div_rem.rs");
     tests.compile_fail("tests/ui/u32_checked_div_rem_bad.rs");
+    tests.compile_fail("tests/ui/generic_identity_arithmetic.rs");
+    tests.compile_fail("tests/ui/generic_grid_identity_arithmetic.rs");
+    tests.compile_fail("tests/ui/generic_identity_unsupported_bound.rs");
 }

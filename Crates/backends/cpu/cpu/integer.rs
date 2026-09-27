@@ -1,17 +1,22 @@
 use fusion_pcu::{
     validate_host_scalar_bindings,
     validate_i16_map_kernel,
+    validate_i16_checked_div_rem_kernel,
     validate_i32_checked_div_rem_kernel,
     validate_i32_map_kernel,
+    validate_i64_checked_div_rem_kernel,
     validate_i64_map_kernel,
     validate_i8_map_kernel,
+    validate_i8_checked_div_rem_kernel,
     validate_u16_map_kernel,
+    validate_u16_checked_div_rem_kernel,
     validate_u32_checked_div_rem_kernel,
     validate_u32_map_kernel,
     validate_u64_checked_div_rem_kernel,
     validate_u64_identity_kernel,
     validate_u64_map_kernel,
     validate_u8_map_kernel,
+    validate_u8_checked_div_rem_kernel,
     PcuBindingRef,
     PcuDispatchAluOp,
     PcuDispatchControlOp,
@@ -35,6 +40,8 @@ pub enum PcuU8MapReferenceError {
     InvalidKernel(fusion_pcu::PcuU8MapValidationError),
     MissingBinding(PcuBindingRef),
     AccessMismatch(PcuBindingRef),
+    /// A checked arithmetic domain fault. Both output buffers are unusable after this error.
+    Fault(PcuExecutionFault),
 }
 
 /// CPU oracle for the bounded typed `u8` indexed arithmetic map.
@@ -53,6 +60,9 @@ unsafe impl PcuSynchronousHostDispatchBackend<u8> for PcuU8MapReference {
     ) -> Result<(), Self::Error> {
         validate_host_scalar_bindings::<u8, ()>(submission, bindings)
             .map_err(|_| PcuU8MapReferenceError::InvalidSubmission)?;
+        if validate_u8_checked_div_rem_kernel(submission.kernel).is_ok() {
+            return run_checked_u8_div_rem(submission, bindings);
+        }
         validate_u8_map_kernel(submission.kernel).map_err(PcuU8MapReferenceError::InvalidKernel)?;
         let (body, extent, grid) = match submission.kernel.ops {
             [PcuDispatchOp::GridStrideLoop { extent, body }, _] => (*body, *extent as usize, true),
@@ -132,6 +142,55 @@ unsafe impl PcuSynchronousHostDispatchBackend<u8> for PcuU8MapReference {
     }
 }
 
+fn run_checked_u8_div_rem(
+    submission: PcuDispatchSubmission<'_>,
+    bindings: &mut [PcuHostScalarBinding<'_, u8>],
+) -> Result<(), PcuU8MapReferenceError> {
+    let extent = match submission.kernel.ops {
+        [PcuDispatchOp::GridStrideLoop { extent, .. }, _] => *extent as usize,
+        _ => submission.shape.invocation_count().get() as usize,
+    };
+    let [input_a, input_b, quotient, remainder] = [
+        submission.kernel.bindings[0].reference(),
+        submission.kernel.bindings[1].reference(),
+        submission.kernel.bindings[2].reference(),
+        submission.kernel.bindings[3].reference(),
+    ];
+    for logical in 0..extent {
+        let read = |target| {
+            bindings
+                .iter()
+                .find(|candidate| candidate.target == target)
+                .and_then(|candidate| match &candidate.slice {
+                    PcuHostScalarSlice::Read(slice) => slice.get(logical).copied(),
+                    PcuHostScalarSlice::ReadWrite(slice) => slice.get(logical).copied(),
+                })
+        };
+        let lhs = read(input_a).ok_or(PcuU8MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read(input_b).ok_or(PcuU8MapReferenceError::MissingBinding(input_b))?;
+        if rhs == 0 {
+            return Err(PcuU8MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
+            }));
+        }
+        for (target, value) in [(quotient, lhs / rhs), (remainder, lhs % rhs)] {
+            let destination = bindings
+                .iter_mut()
+                .find(|candidate| candidate.target == target)
+                .ok_or(PcuU8MapReferenceError::MissingBinding(target))?;
+            let PcuHostScalarSlice::ReadWrite(slice) = &mut destination.slice else {
+                return Err(PcuU8MapReferenceError::AccessMismatch(target));
+            };
+            let Some(output) = slice.get_mut(logical) else {
+                return Err(PcuU8MapReferenceError::InvalidSubmission);
+            };
+            *output = value;
+        }
+    }
+    Ok(())
+}
+
 /// Failure to execute the typed wrapping `u16` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuU16MapReferenceError {
@@ -139,6 +198,8 @@ pub enum PcuU16MapReferenceError {
     InvalidKernel(fusion_pcu::PcuU16MapValidationError),
     MissingBinding(PcuBindingRef),
     AccessMismatch(PcuBindingRef),
+    /// A checked arithmetic domain fault. Both output buffers are unusable after this error.
+    Fault(PcuExecutionFault),
 }
 
 /// CPU oracle for the bounded typed `u16` indexed arithmetic map.
@@ -157,6 +218,9 @@ unsafe impl PcuSynchronousHostDispatchBackend<u16> for PcuU16MapReference {
     ) -> Result<(), Self::Error> {
         validate_host_scalar_bindings::<u16, ()>(submission, bindings)
             .map_err(|_| PcuU16MapReferenceError::InvalidSubmission)?;
+        if validate_u16_checked_div_rem_kernel(submission.kernel).is_ok() {
+            return run_checked_u16_div_rem(submission, bindings);
+        }
         validate_u16_map_kernel(submission.kernel)
             .map_err(PcuU16MapReferenceError::InvalidKernel)?;
         let (body, extent, grid) = match submission.kernel.ops {
@@ -235,6 +299,55 @@ unsafe impl PcuSynchronousHostDispatchBackend<u16> for PcuU16MapReference {
         }
         Ok(())
     }
+}
+
+fn run_checked_u16_div_rem(
+    submission: PcuDispatchSubmission<'_>,
+    bindings: &mut [PcuHostScalarBinding<'_, u16>],
+) -> Result<(), PcuU16MapReferenceError> {
+    let extent = match submission.kernel.ops {
+        [PcuDispatchOp::GridStrideLoop { extent, .. }, _] => *extent as usize,
+        _ => submission.shape.invocation_count().get() as usize,
+    };
+    let [input_a, input_b, quotient, remainder] = [
+        submission.kernel.bindings[0].reference(),
+        submission.kernel.bindings[1].reference(),
+        submission.kernel.bindings[2].reference(),
+        submission.kernel.bindings[3].reference(),
+    ];
+    for logical in 0..extent {
+        let read = |target| {
+            bindings
+                .iter()
+                .find(|candidate| candidate.target == target)
+                .and_then(|candidate| match &candidate.slice {
+                    PcuHostScalarSlice::Read(slice) => slice.get(logical).copied(),
+                    PcuHostScalarSlice::ReadWrite(slice) => slice.get(logical).copied(),
+                })
+        };
+        let lhs = read(input_a).ok_or(PcuU16MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read(input_b).ok_or(PcuU16MapReferenceError::MissingBinding(input_b))?;
+        if rhs == 0 {
+            return Err(PcuU16MapReferenceError::Fault(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::DivideByZero,
+                invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
+            }));
+        }
+        for (target, value) in [(quotient, lhs / rhs), (remainder, lhs % rhs)] {
+            let destination = bindings
+                .iter_mut()
+                .find(|candidate| candidate.target == target)
+                .ok_or(PcuU16MapReferenceError::MissingBinding(target))?;
+            let PcuHostScalarSlice::ReadWrite(slice) = &mut destination.slice else {
+                return Err(PcuU16MapReferenceError::AccessMismatch(target));
+            };
+            let Some(output) = slice.get_mut(logical) else {
+                return Err(PcuU16MapReferenceError::InvalidSubmission);
+            };
+            *output = value;
+        }
+    }
+    Ok(())
 }
 
 /// Failure to execute the typed wrapping `u32` map reference.
@@ -584,6 +697,8 @@ pub enum PcuI64MapReferenceError {
     InvalidKernel(fusion_pcu::PcuI64MapValidationError),
     MissingBinding(PcuBindingRef),
     AccessMismatch(PcuBindingRef),
+    /// A checked arithmetic domain fault. Both output buffers are unusable after this error.
+    Fault(PcuExecutionFault),
 }
 
 /// CPU oracle for the bounded typed `i64` indexed arithmetic map.
@@ -602,6 +717,9 @@ unsafe impl PcuSynchronousHostDispatchBackend<i64> for PcuI64MapReference {
     ) -> Result<(), Self::Error> {
         validate_host_scalar_bindings::<i64, ()>(submission, bindings)
             .map_err(|_| PcuI64MapReferenceError::InvalidSubmission)?;
+        if validate_i64_checked_div_rem_kernel(submission.kernel).is_ok() {
+            return run_checked_i64_div_rem(submission, bindings);
+        }
         validate_i64_map_kernel(submission.kernel)
             .map_err(PcuI64MapReferenceError::InvalidKernel)?;
         let (body, extent, grid) = match submission.kernel.ops {
@@ -856,6 +974,77 @@ fn read_i32_binding(
         })
 }
 
+fn run_checked_i64_div_rem(
+    submission: PcuDispatchSubmission<'_>,
+    bindings: &mut [PcuHostScalarBinding<'_, i64>],
+) -> Result<(), PcuI64MapReferenceError> {
+    let extent = match submission.kernel.ops {
+        [PcuDispatchOp::GridStrideLoop { extent, .. }, _] => *extent as usize,
+        _ => submission.shape.invocation_count().get() as usize,
+    };
+    let [input_a, input_b, quotient, remainder] = [
+        submission.kernel.bindings[0].reference(),
+        submission.kernel.bindings[1].reference(),
+        submission.kernel.bindings[2].reference(),
+        submission.kernel.bindings[3].reference(),
+    ];
+    // Report the first logical fault, independent of grid-stride execution order, and leave
+    // both destinations untouched when any element is outside the checked domain.
+    for logical in 0..extent {
+        let lhs = read_i64_binding(bindings, input_a, logical)
+            .ok_or(PcuI64MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read_i64_binding(bindings, input_b, logical)
+            .ok_or(PcuI64MapReferenceError::MissingBinding(input_b))?;
+        let kind = if rhs == 0 {
+            Some(PcuExecutionFaultKind::DivideByZero)
+        } else if lhs == i64::MIN && rhs == -1 {
+            Some(PcuExecutionFaultKind::SignedDivisionOverflow)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Err(PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                kind,
+                invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
+            }));
+        }
+    }
+    for logical in 0..extent {
+        let lhs = read_i64_binding(bindings, input_a, logical)
+            .ok_or(PcuI64MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read_i64_binding(bindings, input_b, logical)
+            .ok_or(PcuI64MapReferenceError::MissingBinding(input_b))?;
+        for (target, value) in [(quotient, lhs / rhs), (remainder, lhs % rhs)] {
+            let destination = bindings
+                .iter_mut()
+                .find(|candidate| candidate.target == target)
+                .ok_or(PcuI64MapReferenceError::MissingBinding(target))?;
+            let PcuHostScalarSlice::ReadWrite(slice) = &mut destination.slice else {
+                return Err(PcuI64MapReferenceError::AccessMismatch(target));
+            };
+            let Some(output) = slice.get_mut(logical) else {
+                return Err(PcuI64MapReferenceError::InvalidSubmission);
+            };
+            *output = value;
+        }
+    }
+    Ok(())
+}
+
+fn read_i64_binding(
+    bindings: &[PcuHostScalarBinding<'_, i64>],
+    target: PcuBindingRef,
+    logical: usize,
+) -> Option<i64> {
+    bindings
+        .iter()
+        .find(|candidate| candidate.target == target)
+        .and_then(|candidate| match &candidate.slice {
+            PcuHostScalarSlice::Read(slice) => slice.get(logical).copied(),
+            PcuHostScalarSlice::ReadWrite(slice) => slice.get(logical).copied(),
+        })
+}
+
 /// Failure to execute the typed wrapping `i8` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuI8MapReferenceError {
@@ -863,6 +1052,8 @@ pub enum PcuI8MapReferenceError {
     InvalidKernel(fusion_pcu::PcuI8MapValidationError),
     MissingBinding(PcuBindingRef),
     AccessMismatch(PcuBindingRef),
+    /// A checked arithmetic domain fault. Both output buffers are unusable after this error.
+    Fault(PcuExecutionFault),
 }
 
 /// CPU oracle for the bounded typed `i8` indexed arithmetic map.
@@ -881,6 +1072,9 @@ unsafe impl PcuSynchronousHostDispatchBackend<i8> for PcuI8MapReference {
     ) -> Result<(), Self::Error> {
         validate_host_scalar_bindings::<i8, ()>(submission, bindings)
             .map_err(|_| PcuI8MapReferenceError::InvalidSubmission)?;
+        if validate_i8_checked_div_rem_kernel(submission.kernel).is_ok() {
+            return run_checked_i8_div_rem(submission, bindings);
+        }
         validate_i8_map_kernel(submission.kernel).map_err(PcuI8MapReferenceError::InvalidKernel)?;
         let (body, extent, grid) = match submission.kernel.ops {
             [PcuDispatchOp::GridStrideLoop { extent, body }, _] => (*body, *extent as usize, true),
@@ -957,6 +1151,76 @@ unsafe impl PcuSynchronousHostDispatchBackend<i8> for PcuI8MapReference {
     }
 }
 
+fn run_checked_i8_div_rem(
+    submission: PcuDispatchSubmission<'_>,
+    bindings: &mut [PcuHostScalarBinding<'_, i8>],
+) -> Result<(), PcuI8MapReferenceError> {
+    let extent = match submission.kernel.ops {
+        [PcuDispatchOp::GridStrideLoop { extent, .. }, _] => *extent as usize,
+        _ => submission.shape.invocation_count().get() as usize,
+    };
+    let [input_a, input_b, quotient, remainder] = [
+        submission.kernel.bindings[0].reference(),
+        submission.kernel.bindings[1].reference(),
+        submission.kernel.bindings[2].reference(),
+        submission.kernel.bindings[3].reference(),
+    ];
+    // Scan the entire logical range before writing, so faults are deterministic and outputs
+    // remain untouched when any invocation faults.
+    for logical in 0..extent {
+        let lhs = read_i8_binding(bindings, input_a, logical)
+            .ok_or(PcuI8MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read_i8_binding(bindings, input_b, logical)
+            .ok_or(PcuI8MapReferenceError::MissingBinding(input_b))?;
+        let kind = if rhs == 0 {
+            Some(PcuExecutionFaultKind::DivideByZero)
+        } else if lhs == i8::MIN && rhs == -1 {
+            Some(PcuExecutionFaultKind::SignedDivisionOverflow)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Err(PcuI8MapReferenceError::Fault(PcuExecutionFault {
+                kind,
+                invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
+            }));
+        }
+    }
+    for logical in 0..extent {
+        let lhs = read_i8_binding(bindings, input_a, logical)
+            .ok_or(PcuI8MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read_i8_binding(bindings, input_b, logical)
+            .ok_or(PcuI8MapReferenceError::MissingBinding(input_b))?;
+        for (target, value) in [(quotient, lhs / rhs), (remainder, lhs % rhs)] {
+            let destination = bindings
+                .iter_mut()
+                .find(|candidate| candidate.target == target)
+                .ok_or(PcuI8MapReferenceError::MissingBinding(target))?;
+            let PcuHostScalarSlice::ReadWrite(slice) = &mut destination.slice else {
+                return Err(PcuI8MapReferenceError::AccessMismatch(target));
+            };
+            *slice
+                .get_mut(logical)
+                .ok_or(PcuI8MapReferenceError::InvalidSubmission)? = value;
+        }
+    }
+    Ok(())
+}
+
+fn read_i8_binding(
+    bindings: &[PcuHostScalarBinding<'_, i8>],
+    target: PcuBindingRef,
+    logical: usize,
+) -> Option<i8> {
+    bindings
+        .iter()
+        .find(|candidate| candidate.target == target)
+        .and_then(|candidate| match &candidate.slice {
+            PcuHostScalarSlice::Read(slice) => slice.get(logical).copied(),
+            PcuHostScalarSlice::ReadWrite(slice) => slice.get(logical).copied(),
+        })
+}
+
 /// Failure to execute the typed wrapping `i16` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuI16MapReferenceError {
@@ -964,6 +1228,8 @@ pub enum PcuI16MapReferenceError {
     InvalidKernel(fusion_pcu::PcuI16MapValidationError),
     MissingBinding(PcuBindingRef),
     AccessMismatch(PcuBindingRef),
+    /// A checked arithmetic domain fault. Both output buffers are unusable after this error.
+    Fault(PcuExecutionFault),
 }
 
 /// CPU oracle for the bounded typed `i16` indexed arithmetic map.
@@ -982,6 +1248,9 @@ unsafe impl PcuSynchronousHostDispatchBackend<i16> for PcuI16MapReference {
     ) -> Result<(), Self::Error> {
         validate_host_scalar_bindings::<i16, ()>(submission, bindings)
             .map_err(|_| PcuI16MapReferenceError::InvalidSubmission)?;
+        if validate_i16_checked_div_rem_kernel(submission.kernel).is_ok() {
+            return run_checked_i16_div_rem(submission, bindings);
+        }
         validate_i16_map_kernel(submission.kernel)
             .map_err(PcuI16MapReferenceError::InvalidKernel)?;
         let (body, extent, grid) = match submission.kernel.ops {
@@ -1057,4 +1326,73 @@ unsafe impl PcuSynchronousHostDispatchBackend<i16> for PcuI16MapReference {
         }
         Ok(())
     }
+}
+
+fn run_checked_i16_div_rem(
+    submission: PcuDispatchSubmission<'_>,
+    bindings: &mut [PcuHostScalarBinding<'_, i16>],
+) -> Result<(), PcuI16MapReferenceError> {
+    let extent = match submission.kernel.ops {
+        [PcuDispatchOp::GridStrideLoop { extent, .. }, _] => *extent as usize,
+        _ => submission.shape.invocation_count().get() as usize,
+    };
+    let [input_a, input_b, quotient, remainder] = [
+        submission.kernel.bindings[0].reference(),
+        submission.kernel.bindings[1].reference(),
+        submission.kernel.bindings[2].reference(),
+        submission.kernel.bindings[3].reference(),
+    ];
+    // Validate the full logical range first so errors are deterministic and outputs stay intact.
+    for logical in 0..extent {
+        let lhs = read_i16_binding(bindings, input_a, logical)
+            .ok_or(PcuI16MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read_i16_binding(bindings, input_b, logical)
+            .ok_or(PcuI16MapReferenceError::MissingBinding(input_b))?;
+        let kind = if rhs == 0 {
+            Some(PcuExecutionFaultKind::DivideByZero)
+        } else if lhs == i16::MIN && rhs == -1 {
+            Some(PcuExecutionFaultKind::SignedDivisionOverflow)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Err(PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                kind,
+                invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
+            }));
+        }
+    }
+    for logical in 0..extent {
+        let lhs = read_i16_binding(bindings, input_a, logical)
+            .ok_or(PcuI16MapReferenceError::MissingBinding(input_a))?;
+        let rhs = read_i16_binding(bindings, input_b, logical)
+            .ok_or(PcuI16MapReferenceError::MissingBinding(input_b))?;
+        for (target, value) in [(quotient, lhs / rhs), (remainder, lhs % rhs)] {
+            let destination = bindings
+                .iter_mut()
+                .find(|candidate| candidate.target == target)
+                .ok_or(PcuI16MapReferenceError::MissingBinding(target))?;
+            let PcuHostScalarSlice::ReadWrite(slice) = &mut destination.slice else {
+                return Err(PcuI16MapReferenceError::AccessMismatch(target));
+            };
+            *slice
+                .get_mut(logical)
+                .ok_or(PcuI16MapReferenceError::InvalidSubmission)? = value;
+        }
+    }
+    Ok(())
+}
+
+fn read_i16_binding(
+    bindings: &[PcuHostScalarBinding<'_, i16>],
+    target: PcuBindingRef,
+    logical: usize,
+) -> Option<i16> {
+    bindings
+        .iter()
+        .find(|candidate| candidate.target == target)
+        .and_then(|candidate| match &candidate.slice {
+            PcuHostScalarSlice::Read(slice) => slice.get(logical).copied(),
+            PcuHostScalarSlice::ReadWrite(slice) => slice.get(logical).copied(),
+        })
 }

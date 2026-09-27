@@ -21,7 +21,9 @@ use criterion::{
 use fusion_pcu::{
     model::dispatch::{
         PcuDispatchDataOp,
+        PcuDispatchControlOp,
         PcuDispatchEntryPoint,
+        PcuDispatchFeatureCaps,
         PcuDispatchIndex,
         PcuDispatchKernelIr,
         PcuDispatchOp,
@@ -193,6 +195,22 @@ fn run_case<const N: usize>(
     ];
     run_pcu(backend, &prepared, &bindings_owned)?;
     verify_pair("PCU", &pcu_q, &pcu_r, &expected_q, &expected_r)?;
+    if N == 65 && !grid_stride {
+        verify_unchecked_predecessor_batch(backend, &prepared, &bindings_owned)?;
+    }
+    let mut checked_batch = prepared.checked_batch();
+    checked_batch.submit_checked_last(&prepared, &bindings_owned)?;
+    let mut batch_completion = checked_batch.finish()?;
+    if batch_completion.wait()? != fusion_pcu::PcuCompletionOutcome::Succeeded {
+        return Err("checked-last batch unexpectedly faulted on valid i32 inputs".into());
+    }
+    verify_pair(
+        "checked-last batch",
+        &pcu_q,
+        &pcu_r,
+        &expected_q,
+        &expected_r,
+    )?;
     run_native(runtime, &function, &stream, &native_args, grid)?;
     verify_pair("handwritten HIP", &hip_q, &hip_r, &expected_q, &expected_r)?;
     run_native(runtime, &lowered_function, &stream, &native_args, grid)?;
@@ -299,6 +317,99 @@ fn run_case<const N: usize>(
             fusion_pcu::PcuExecutionFaultKind::SignedDivisionOverflow,
         )?;
     }
+    Ok(())
+}
+
+fn verify_unchecked_predecessor_batch(
+    backend: &RocmOwnedDispatchBackend,
+    checked: &fusion_pcu_rocm::RocmPreparedDispatch,
+    checked_bindings: &[PcuOwnedBinding<fusion_pcu_rocm::DeviceBuffer>],
+) -> Result<(), Box<dyn Error>> {
+    let source = (0..65_u32).map(|x| x ^ 0xa5a5_5a5a).collect::<Vec<_>>();
+    let bytes = source
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    let mut input = backend.allocate(bytes.len())?;
+    let output = backend.allocate(bytes.len())?;
+    input.copy_from(&bytes)?;
+    let bindings = [
+        PcuBinding::value(
+            Some("copy_input"),
+            0,
+            0,
+            PcuBindingStorageClass::Storage,
+            PcuBindingAccess::ReadOnly,
+            PcuValueType::u32(),
+        ),
+        PcuBinding::value(
+            Some("copy_output"),
+            0,
+            1,
+            PcuBindingStorageClass::Storage,
+            PcuBindingAccess::ReadWrite,
+            PcuValueType::u32(),
+        ),
+    ];
+    let operations = [
+        PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(1),
+            binding: PcuBindingRef::new(0, 0),
+            index: PcuDispatchIndex::InvocationId,
+        }),
+        PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+            binding: PcuBindingRef::new(0, 1),
+            index: PcuDispatchIndex::InvocationId,
+            value: PcuDispatchValueId(1),
+        }),
+        PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+    ];
+    let kernel = PcuDispatchKernelIr {
+        id: PcuKernelId(0xD1_0010),
+        entry: PcuDispatchEntryPoint {
+            name: "batch_predecessor_copy",
+            logical_shape: [65, 1, 1],
+        },
+        bindings: &bindings,
+        ports: &[],
+        parameters: &[],
+        ops: &operations,
+        type_caps: PcuValueTypeCaps::UINT32 | PcuValueTypeCaps::SCALAR_VALUES,
+        feature_caps: PcuDispatchFeatureCaps::READ_ONLY_RESOURCES
+            .union(PcuDispatchFeatureCaps::MUTABLE_RESOURCES),
+    };
+    let prepared_copy = backend.prepare_dispatch_on_stream(
+        kernel,
+        PcuInvocationShape::invocations(NonZeroU32::new(65).expect("nonzero")),
+        &checked.stream_handle(),
+    )?;
+    let copy_bindings = [
+        backend.binding(
+            PcuBindingRef::new(0, 0),
+            PcuBindingAccess::ReadOnly,
+            PcuBindingType::Value(PcuValueType::u32()),
+            input,
+        )?,
+        backend.binding(
+            PcuBindingRef::new(0, 1),
+            PcuBindingAccess::ReadWrite,
+            PcuBindingType::Value(PcuValueType::u32()),
+            output.clone(),
+        )?,
+    ];
+    let mut batch = checked.checked_batch();
+    batch.submit_unchecked(&prepared_copy, &copy_bindings)?;
+    batch.submit_checked_last(checked, checked_bindings)?;
+    let mut completion = batch.finish()?;
+    if completion.wait()? != fusion_pcu::PcuCompletionOutcome::Succeeded {
+        return Err("checked-tail batch with an unchecked predecessor faulted".into());
+    }
+    let mut actual = vec![0_u8; bytes.len()];
+    output.copy_to(&mut actual)?;
+    if actual != bytes {
+        return Err("unchecked predecessor copy output mismatch".into());
+    }
+    println!("ordered unchecked copy -> checked i32 DivRem batch verified");
     Ok(())
 }
 
@@ -854,6 +965,26 @@ fn verify_fault(
             )
             .into());
         }
+    }
+
+    let mut checked_batch = prepared.checked_batch();
+    checked_batch.submit_checked_last(prepared, &fault_bindings)?;
+    if !matches!(
+        checked_batch.submit_unchecked(prepared, &fault_bindings),
+        Err(fusion_pcu_rocm::RocmOwnedDispatchError::CheckedDivisionBatchClosed)
+    ) {
+        return Err("checked-last batch admitted a subsequent launch".into());
+    }
+    let mut batch_completion = checked_batch.finish()?;
+    let expected_fault = fusion_pcu::PcuExecutionFault {
+        kind: fault_kind,
+        invocation_id: expected_id,
+    };
+    if batch_completion.wait()? != fusion_pcu::PcuCompletionOutcome::Fault(expected_fault) {
+        return Err(format!(
+            "checked-last batch did not report {fault_kind:?} at ID {expected_id}"
+        )
+        .into());
     }
 
     let mut lhs = runtime.allocate(n * 4)?;

@@ -386,6 +386,10 @@ pub struct Sample {
 }
 
 pub fn print_samples(label: &str, samples: &[Sample]) {
+    if samples.is_empty() {
+        // Criterion skips a benchmark closure when its name is filtered out.
+        return;
+    }
     if samples.iter().all(|sample| sample.bind.is_some()) {
         print_metric(label, "binding construction", samples, |sample| {
             sample.bind.unwrap_or_default()
@@ -464,6 +468,9 @@ fn print_metric(
 }
 
 pub fn print_duration_samples(label: &str, samples: &[Duration]) {
+    if samples.is_empty() {
+        return;
+    }
     let mut values = samples.to_vec();
     values.sort_unstable();
     println!(

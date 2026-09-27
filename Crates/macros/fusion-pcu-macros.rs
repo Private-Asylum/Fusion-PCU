@@ -120,6 +120,7 @@ enum ScalarKind {
     I16,
     I32,
     I64,
+    Generic,
 }
 
 impl ScalarKind {
@@ -135,6 +136,7 @@ impl ScalarKind {
             Self::I16 => quote! { i16 },
             Self::I32 => quote! { i32 },
             Self::I64 => quote! { i64 },
+            Self::Generic => unreachable!("generic scalar has no concrete Rust type token"),
         }
     }
 }
@@ -144,6 +146,13 @@ struct BindingSpec {
     access: BindingAccess,
     binding: u32,
     scalar: ScalarKind,
+    generic_scalar: Option<Ident>,
+}
+
+struct PcuHelper {
+    ident: Ident,
+    parameters: Vec<Ident>,
+    body: Expr,
 }
 
 struct ExprEmitter<'a> {
@@ -151,6 +160,9 @@ struct ExprEmitter<'a> {
     invocation_ident: &'a Ident,
     crate_path: &'a Path,
     grid_stride: bool,
+    helpers: &'a [PcuHelper],
+    helper_stack: Vec<Ident>,
+    values: Vec<(Ident, u16, ScalarKind)>,
     next_value: u16,
     ops: Vec<TokenStream2>,
 }
@@ -161,12 +173,16 @@ impl<'a> ExprEmitter<'a> {
         invocation_ident: &'a Ident,
         crate_path: &'a Path,
         grid_stride: bool,
+        helpers: &'a [PcuHelper],
     ) -> Self {
         Self {
             bindings,
             invocation_ident,
             crate_path,
             grid_stride,
+            helpers,
+            helper_stack: Vec::new(),
+            values: Vec::new(),
             next_value: 1,
             ops: Vec::new(),
         }
@@ -179,11 +195,93 @@ impl<'a> ExprEmitter<'a> {
             Expr::Lit(lit) => self.emit_lit(lit),
             Expr::Paren(paren) => self.emit_expr(&paren.expr),
             Expr::MethodCall(call) => self.emit_wrapping_method(call),
+            Expr::Call(call) => self.emit_helper_call(call),
+            Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+                let ident = &path.path.segments[0].ident;
+                self.values
+                    .iter()
+                    .rev()
+                    .find(|(name, _, _)| name == ident)
+                    .map(|(_, value, scalar)| (*value, *scalar))
+                    .ok_or_else(|| {
+                        Error::new(
+                            path.span(),
+                            "PCU helper expressions may only reference their scalar parameters",
+                        )
+                    })
+            }
             _ => Err(Error::new(
                 unsupported_expression_span(expr),
                 "unsupported PCU expression; supported subset is binding[index], f32 literals, parentheses, and + - * /",
             )),
         }
+    }
+
+    fn emit_helper_call(&mut self, call: &syn::ExprCall) -> Result<(u16, ScalarKind), Error> {
+        let Expr::Path(path) = call.func.as_ref() else {
+            return Err(Error::new(
+                call.func.span(),
+                "PCU helper calls must name a `#[pcu_fn]` sibling directly",
+            ));
+        };
+        if path.qself.is_some() || path.path.segments.len() != 1 {
+            return Err(Error::new(
+                path.span(),
+                "PCU helper calls must name a `#[pcu_fn]` sibling directly",
+            ));
+        }
+        let helper_ident = &path.path.segments[0].ident;
+        let Some(helper) = self
+            .helpers
+            .iter()
+            .find(|helper| helper.ident == *helper_ident)
+        else {
+            return Err(Error::new(
+                helper_ident.span(),
+                "PCU helper calls require `#[pcu_module]` and a sibling `#[pcu_fn]` definition",
+            ));
+        };
+        if helper.parameters.len() != call.args.len() {
+            return Err(Error::new(
+                call.span(),
+                "PCU helper argument count does not match its definition",
+            ));
+        }
+        if self.helper_stack.iter().any(|name| name == helper_ident) {
+            return Err(Error::new(
+                call.span(),
+                "recursive PCU helper calls are not supported",
+            ));
+        }
+
+        let mut arguments = Vec::with_capacity(call.args.len());
+        for argument in &call.args {
+            arguments.push(self.emit_expr(argument)?);
+        }
+        if arguments
+            .iter()
+            .any(|(_, scalar)| *scalar != ScalarKind::F32)
+        {
+            return Err(Error::new(
+                call.span(),
+                "this PCU helper profile currently accepts only f32 arguments",
+            ));
+        }
+
+        let values_len = self.values.len();
+        self.helper_stack.push(helper_ident.clone());
+        self.values.extend(
+            helper
+                .parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().map(|(value, scalar)| (*value, *scalar)))
+                .map(|(ident, (value, scalar))| (ident, value, scalar)),
+        );
+        let result = self.emit_expr(&helper.body);
+        self.values.truncate(values_len);
+        self.helper_stack.pop();
+        result
     }
 
     fn emit_binary(&mut self, binary: &ExprBinary) -> Result<(u16, ScalarKind), Error> {
@@ -259,6 +357,7 @@ impl<'a> ExprEmitter<'a> {
                     | ScalarKind::I16
                     | ScalarKind::I32
                     | ScalarKind::I64
+                    | ScalarKind::Generic
             )
         {
             return Err(Error::new(
@@ -277,7 +376,17 @@ impl<'a> ExprEmitter<'a> {
             ScalarKind::I16 => quote! { #pcu::PcuValueType::i16() },
             ScalarKind::I32 => quote! { #pcu::PcuValueType::i32() },
             ScalarKind::I64 => quote! { #pcu::PcuValueType::i64() },
-            ScalarKind::F32 | ScalarKind::F64 => unreachable!("integer operand checked"),
+            ScalarKind::Generic => {
+                let generic = self
+                    .bindings
+                    .iter()
+                    .find_map(|binding| binding.generic_scalar.as_ref())
+                    .expect("generic arithmetic has a generic binding");
+                quote! { #pcu::PcuValueType::Scalar(<#generic as #pcu::PcuScalar>::TYPE) }
+            }
+            ScalarKind::F32 | ScalarKind::F64 => {
+                unreachable!("integer operand checked")
+            }
         };
         self.ops.push(quote! {
             #pcu::PcuDispatchDataOp::Alu {
@@ -393,6 +502,47 @@ pub fn pcu(attr: TokenStream, item: TokenStream) -> TokenStream {
     pcu_dispatch(attr, item)
 }
 
+/// Mark a pure, expression-bodied scalar helper owned by an enclosing `#[pcu_module]`.
+#[proc_macro_attribute]
+pub fn pcu_fn(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[pcu_fn]` takes no arguments",
+        )
+        .into_compile_error()
+        .into();
+    }
+    let function = parse_macro_input!(item as ItemFn);
+    Error::new(
+        function.sig.ident.span(),
+        "`#[pcu_fn]` helpers must be declared inside an inline `#[pcu_module]`",
+    )
+    .into_compile_error()
+    .into()
+}
+
+/// Owns a module of bounded PCU kernels and explicitly marked pure scalar helpers.
+///
+/// The first helper profile accepts only `f32` scalar arguments and return values, with a pure
+/// arithmetic expression body. Helpers are inlined into the kernel's dispatch IR.
+#[proc_macro_attribute]
+pub fn pcu_module(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return Error::new(
+            proc_macro2::Span::call_site(),
+            "`#[pcu_module]` takes no arguments",
+        )
+        .into_compile_error()
+        .into();
+    }
+    let mut module = parse_macro_input!(item as syn::ItemMod);
+    match expand_pcu_module(&mut module) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
+
 fn build_body_operations(
     data_ops: &[TokenStream2],
     loop_extent: Option<&Expr>,
@@ -430,11 +580,29 @@ fn build_body_operations(
 }
 
 fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<TokenStream2, Error> {
+    expand_pcu_dispatch_with_helpers(args, function, &[])
+}
+
+// Keep the shared lowering path together: generic identities and concrete kernels must pass the
+// same structural/body validation before they diverge into their respective typed builders.
+#[allow(clippy::too_many_lines)]
+fn expand_pcu_dispatch_with_helpers(
+    args: PcuDispatchArgs,
+    function: &ItemFn,
+    helpers: &[PcuHelper],
+) -> Result<TokenStream2, Error> {
     let vis = function.vis.clone();
     let function_ident = function.sig.ident.clone();
     let bindings_ident = format_ident!("{}_bindings", function_ident);
     let crate_path = args.crate_path;
     let const_generics = validate_const_generics(function)?;
+    let generic_scalar = generic_scalar_type(function)?;
+    if generic_scalar.is_some() && !helpers.is_empty() {
+        return Err(Error::new(
+            function.sig.generics.span(),
+            "generic PCU kernels currently do not support helper functions",
+        ));
+    }
     let invocation_expr = lower_invocation_expr(&args.invocations, &const_generics)?;
     let generated_generics = if function.sig.generics.params.is_empty() {
         quote! { <'a> }
@@ -442,7 +610,7 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
         let params = &function.sig.generics.params;
         quote! { <'a, #params> }
     };
-    let binding_specs = parse_bindings(&function.sig.inputs)?;
+    let binding_specs = parse_bindings(&function.sig.inputs, generic_scalar.as_ref())?;
     let (loop_extent, data_ops) = if let Some((extent, data_ops)) =
         checked_div_rem::lower(function, &binding_specs, &crate_path)?
     {
@@ -461,35 +629,113 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
             } => (invocation, *assignment, Some(*extent)),
         };
         let output_binding = validate_assignment_target(assignment, &binding_specs, invocation)?;
-        let mut emitter =
-            ExprEmitter::new(&binding_specs, invocation, &crate_path, extent.is_some());
-        let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
-        if result_type != output_binding.scalar {
-            return Err(Error::new(
-                assignment.right.span(),
-                "PCU store value type must match the output binding element type",
-            ));
-        }
-        let pcu = &crate_path;
-        let output_slot = output_binding.binding;
-        let store_index = if extent.is_some() {
-            quote! { GridStrideId }
-        } else {
-            quote! { InvocationId }
-        };
-        emitter.ops.push(quote! {
-            #pcu::PcuDispatchDataOp::BindingStore {
-                binding: #pcu::PcuBindingRef::new(0, #output_slot),
-                index: #pcu::PcuDispatchIndex::#store_index,
-                value: #pcu::PcuDispatchValueId(#result_value),
+        if let Some(scalar_type) = &generic_scalar {
+            if generic_scalar_wrapping(function) {
+                validate_generic_wrapping_map(assignment, &binding_specs, invocation, scalar_type)?;
+                let mut emitter = ExprEmitter::new(
+                    &binding_specs,
+                    invocation,
+                    &crate_path,
+                    extent.is_some(),
+                    helpers,
+                );
+                let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
+                if result_type != ScalarKind::Generic {
+                    return Err(Error::new(
+                        assignment.right.span(),
+                        "generic wrapping result type mismatch",
+                    ));
+                }
+                let output_slot = output_binding.binding;
+                let store_index = if extent.is_some() {
+                    quote! { GridStrideId }
+                } else {
+                    quote! { InvocationId }
+                };
+                emitter.ops.push(quote! {
+                    #crate_path::PcuDispatchDataOp::BindingStore {
+                        binding: #crate_path::PcuBindingRef::new(0, #output_slot),
+                        index: #crate_path::PcuDispatchIndex::#store_index,
+                        value: #crate_path::PcuDispatchValueId(#result_value),
+                    }
+                });
+                (extent, emitter.ops)
+            } else {
+                validate_generic_identity(assignment, &binding_specs, invocation, scalar_type)?;
+                let data_ops = lower_generic_identity(
+                    &binding_specs,
+                    output_binding,
+                    &crate_path,
+                    extent.is_some(),
+                );
+                (extent, data_ops)
             }
-        });
-        (extent, emitter.ops)
+        } else {
+            let mut emitter = ExprEmitter::new(
+                &binding_specs,
+                invocation,
+                &crate_path,
+                extent.is_some(),
+                helpers,
+            );
+            let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
+            if result_type != output_binding.scalar {
+                return Err(Error::new(
+                    assignment.right.span(),
+                    "PCU store value type must match the output binding element type",
+                ));
+            }
+            let pcu = &crate_path;
+            let output_slot = output_binding.binding;
+            let store_index = if extent.is_some() {
+                quote! { GridStrideId }
+            } else {
+                quote! { InvocationId }
+            };
+            emitter.ops.push(quote! {
+                #pcu::PcuDispatchDataOp::BindingStore {
+                    binding: #pcu::PcuBindingRef::new(0, #output_slot),
+                    index: #pcu::PcuDispatchIndex::#store_index,
+                    value: #pcu::PcuDispatchValueId(#result_value),
+                }
+            });
+            (extent, emitter.ops)
+        }
     };
     let pcu = &crate_path;
 
-    let (operations, op_count) =
-        build_body_operations(&data_ops, loop_extent, &const_generics, &crate_path)?;
+    let generic_wrapping = generic_scalar.is_some() && generic_scalar_wrapping(function);
+    let wrapping_body_ident = format_ident!("__{}_PcuWrappingBody", function_ident);
+    let (operations, mut op_count, wrapping_body_item) = if generic_wrapping
+        && let Some(extent) = loop_extent
+    {
+        let lowered_extent = lower_invocation_expr(extent, &const_generics)?;
+        let body_len = data_ops.len();
+        let body_ops = data_ops
+            .iter()
+            .map(|op| quote! { #crate_path::PcuDispatchOp::Data(#op) });
+        let scalar_ident = generic_scalar
+            .as_ref()
+            .expect("generic wrapping has a type parameter");
+        let body_type = quote! {
+            #[allow(non_camel_case_types)]
+            struct #wrapping_body_ident<T: #crate_path::PcuWrappingInteger>(::core::marker::PhantomData<T>);
+            impl<T: #crate_path::PcuWrappingInteger> #wrapping_body_ident<T> {
+                const BODY: [#crate_path::PcuDispatchOp<'static>; #body_len] = [#(#body_ops),*];
+            }
+        };
+        let operation = quote! {
+            let builder = builder.with_op(#crate_path::PcuDispatchOp::GridStrideLoop {
+                extent: const { let extent: usize = #lowered_extent; assert!(extent != 0, "PCU grid-stride extent must be nonzero"); assert!(extent <= u32::MAX as usize, "PCU grid-stride extent exceeds u32"); extent as u32 },
+                body: &#wrapping_body_ident::<#scalar_ident>::BODY,
+            })?;
+        };
+        (operation, 2, body_type)
+    } else {
+        let (operations, count) =
+            build_body_operations(&data_ops, loop_extent, &const_generics, &crate_path)?;
+        (operations, count, quote! {})
+    };
 
     let binding_items = binding_specs
         .iter()
@@ -497,33 +743,489 @@ fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<Token
         .collect::<Vec<_>>();
     let binding_count = binding_items.len();
     let kernel_id = args.kernel_id;
+    let binding_generic = generic_scalar.as_ref().map(|ident| {
+        if generic_scalar_wrapping(function) {
+            quote! { <#ident: #pcu::PcuWrappingInteger> }
+        } else {
+            quote! { <#ident: #pcu::PcuScalar> }
+        }
+    });
+    let binding_lifetime = quote! { 'static };
+    let generic_identity = generic_scalar.is_some() && !generic_scalar_wrapping(function);
+    if generic_identity && loop_extent.is_some() {
+        // The typed builder has a fixed three-op capacity: loop region plus terminal return.
+        op_count = 3;
+    }
+    let normal_builder = quote! {
+        let builder = #pcu::model::PcuDispatchKernelBuilder::<#op_count>::new(
+            #kernel_id,
+            "main",
+            [invocations, 1, 1],
+        )
+        .with_bindings(bindings);
+        #operations
+        builder.with_control_op(#pcu::PcuDispatchControlOp::Return)
+    };
+    let builder_body = if let Some(scalar_ident) = &generic_scalar
+        && generic_identity
+    {
+        if let Some(extent) = loop_extent {
+            let extent = lower_invocation_expr(extent, &const_generics)?;
+            quote! {
+                #pcu::model::PcuScalarIdentityBuilder::<#scalar_ident>::build_grid_stride(
+                    #kernel_id,
+                    invocations,
+                    const {
+                        let extent: usize = #extent;
+                        assert!(extent != 0, "PCU grid-stride extent must be nonzero");
+                        assert!(extent <= u32::MAX as usize, "PCU grid-stride extent exceeds u32");
+                        extent as u32
+                    },
+                    bindings,
+                )
+            }
+        } else {
+            quote! {
+                #pcu::model::PcuScalarIdentityBuilder::<#scalar_ident>::build(
+                    #kernel_id,
+                    invocations,
+                    bindings,
+                )
+            }
+        }
+    } else {
+        normal_builder
+    };
+    let builder_result = if generic_identity {
+        quote! { #pcu::model::PcuScalarIdentityBuildError }
+    } else {
+        quote! { #pcu::PcuError }
+    };
     Ok(quote! {
-        #vis const fn #bindings_ident() -> [#pcu::PcuBinding<'static>; #binding_count] {
+        #wrapping_body_item
+        #vis const fn #bindings_ident #binding_generic() -> [#pcu::PcuBinding<#binding_lifetime>; #binding_count] {
             [#(#binding_items),*]
         }
 
         #vis fn #function_ident #generated_generics(
             bindings: &'a [#pcu::PcuBinding<'a>],
-        ) -> ::core::result::Result<
-            #pcu::model::PcuDispatchKernelBuilder<'a, #op_count>,
-            #pcu::PcuError,
-        > {
+        ) -> ::core::result::Result<#pcu::model::PcuDispatchKernelBuilder<'a, #op_count>, #builder_result> {
             let invocations: u32 = const {
                 let count: usize = #invocation_expr;
                 assert!(count != 0, "PCU invocation count must be nonzero");
                 assert!(count <= u32::MAX as usize, "PCU invocation count exceeds u32");
                 count as u32
             };
-            let builder = #pcu::model::PcuDispatchKernelBuilder::<#op_count>::new(
-                #kernel_id,
-                "main",
-                [invocations, 1, 1],
-            )
-            .with_bindings(bindings);
-            #operations
-            builder.with_control_op(#pcu::PcuDispatchControlOp::Return)
+            #builder_body
         }
     })
+}
+
+fn lower_generic_identity(
+    bindings: &[BindingSpec],
+    output: &BindingSpec,
+    crate_path: &Path,
+    grid_stride: bool,
+) -> Vec<TokenStream2> {
+    let input = bindings
+        .iter()
+        .find(|binding| binding.access == BindingAccess::ReadOnly)
+        .expect("validated generic identity signature");
+    let output_slot = output.binding;
+    let input_slot = input.binding;
+    let index = if grid_stride {
+        quote! { #crate_path::PcuDispatchIndex::GridStrideId }
+    } else {
+        quote! { #crate_path::PcuDispatchIndex::InvocationId }
+    };
+    vec![
+        quote! {
+            #crate_path::PcuDispatchDataOp::BindingLoad {
+                result: #crate_path::PcuDispatchValueId(1),
+                binding: #crate_path::PcuBindingRef::new(0, #input_slot),
+                index: #index,
+            }
+        },
+        quote! {
+            #crate_path::PcuDispatchDataOp::BindingStore {
+                binding: #crate_path::PcuBindingRef::new(0, #output_slot),
+                index: #index,
+                value: #crate_path::PcuDispatchValueId(1),
+            }
+        },
+    ]
+}
+
+fn expand_pcu_module(module: &mut syn::ItemMod) -> Result<TokenStream2, Error> {
+    let Some((_, items)) = module.content.take() else {
+        return Err(Error::new_spanned(
+            module,
+            "`#[pcu_module]` requires an inline module so its helpers are visible to the frontend",
+        ));
+    };
+
+    let helpers = items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) if has_attribute(&function.attrs, "pcu_fn") => {
+                Some(parse_pcu_helper(function))
+            }
+            _ => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_pcu_helpers(&helpers)?;
+
+    let mut expanded = Vec::with_capacity(items.len());
+    let mut kernel_count = 0_usize;
+    for item in items {
+        match item {
+            syn::Item::Fn(function) if has_attribute(&function.attrs, "pcu_fn") => {}
+            syn::Item::Fn(mut function) => {
+                let pcu_attributes = function
+                    .attrs
+                    .iter()
+                    .filter(|attribute| {
+                        attribute_ends_with(attribute, "pcu")
+                            || attribute_ends_with(attribute, "pcu_dispatch")
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if pcu_attributes.is_empty() {
+                    expanded.push(quote! { #function });
+                    continue;
+                }
+                if pcu_attributes.len() != 1 {
+                    return Err(Error::new_spanned(
+                        &function.sig.ident,
+                        "a PCU module function must have exactly one `#[pcu(...)]` or `#[pcu_dispatch(...)]` attribute",
+                    ));
+                }
+                if helpers
+                    .iter()
+                    .any(|helper| helper.ident == function.sig.ident)
+                {
+                    return Err(Error::new_spanned(
+                        &function.sig.ident,
+                        "a PCU kernel and a `#[pcu_fn]` helper cannot share a name",
+                    ));
+                }
+                let attribute = &pcu_attributes[0];
+                let args = attribute.parse_args::<PcuDispatchArgs>()?;
+                function.attrs.retain(|candidate| {
+                    !attribute_ends_with(candidate, "pcu")
+                        && !attribute_ends_with(candidate, "pcu_dispatch")
+                });
+                if let Some(attribute) = function.attrs.first() {
+                    return Err(Error::new_spanned(
+                        attribute,
+                        "`#[pcu_module]` kernels currently accept only their PCU attribute",
+                    ));
+                }
+                kernel_count += 1;
+                expanded.push(expand_pcu_dispatch_with_helpers(args, &function, &helpers)?);
+            }
+            other => {
+                if let Some(attribute) = item_attribute(&other, "pcu_fn") {
+                    return Err(Error::new_spanned(
+                        attribute,
+                        "`#[pcu_fn]` may only mark a free function inside `#[pcu_module]`",
+                    ));
+                }
+                expanded.push(quote! { #other });
+            }
+        }
+    }
+    if kernel_count == 0 {
+        return Err(Error::new_spanned(
+            &module.ident,
+            "`#[pcu_module]` requires at least one `#[pcu(...)]` or `#[pcu_dispatch(...)]` kernel",
+        ));
+    }
+
+    let attrs = &module.attrs;
+    let vis = &module.vis;
+    let unsafety = &module.unsafety;
+    let ident = &module.ident;
+    Ok(quote! {
+        #(#attrs)*
+        #vis #unsafety mod #ident {
+            #(#expanded)*
+        }
+    })
+}
+
+fn item_attribute<'a>(item: &'a syn::Item, name: &str) -> Option<&'a syn::Attribute> {
+    let attrs = match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => return None,
+    };
+    attrs
+        .iter()
+        .find(|attribute| attribute_ends_with(attribute, name))
+}
+
+fn has_attribute(attrs: &[syn::Attribute], name: &str) -> bool {
+    attrs
+        .iter()
+        .any(|attribute| attribute_ends_with(attribute, name))
+}
+
+fn attribute_ends_with(attribute: &syn::Attribute, name: &str) -> bool {
+    attribute
+        .path()
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == name)
+}
+
+fn parse_pcu_helper(function: &ItemFn) -> Result<PcuHelper, Error> {
+    let marker_count = function
+        .attrs
+        .iter()
+        .filter(|attribute| attribute_ends_with(attribute, "pcu_fn"))
+        .count();
+    if marker_count != 1 {
+        return Err(Error::new_spanned(
+            &function.sig.ident,
+            "a PCU helper must have exactly one `#[pcu_fn]` marker",
+        ));
+    }
+    if let Some(marker) = function
+        .attrs
+        .iter()
+        .find(|attribute| attribute_ends_with(attribute, "pcu_fn"))
+        && !matches!(marker.meta, syn::Meta::Path(_))
+    {
+        return Err(Error::new_spanned(marker, "`#[pcu_fn]` takes no arguments"));
+    }
+    if let Some(attribute) = function
+        .attrs
+        .iter()
+        .find(|attribute| !attribute_ends_with(attribute, "pcu_fn"))
+    {
+        return Err(Error::new_spanned(
+            attribute,
+            "`#[pcu_module]` helpers currently accept only the `#[pcu_fn]` marker",
+        ));
+    }
+    if function.sig.asyncness.is_some()
+        || function.sig.constness.is_some()
+        || function.sig.unsafety.is_some()
+        || function.sig.abi.is_some()
+        || !function.sig.generics.params.is_empty()
+        || function.sig.generics.where_clause.is_some()
+        || function.sig.variadic.is_some()
+    {
+        return Err(Error::new_spanned(
+            &function.sig,
+            "PCU helpers must be plain, non-generic, safe Rust functions",
+        ));
+    }
+    let ReturnType::Type(_, return_type) = &function.sig.output else {
+        return Err(Error::new_spanned(
+            &function.sig.output,
+            "PCU helpers must declare an explicit `-> f32` return type",
+        ));
+    };
+    if !matches!(return_type.as_ref(), Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32"))
+    {
+        return Err(Error::new_spanned(
+            return_type,
+            "this PCU helper profile supports only the `f32` scalar type",
+        ));
+    }
+    let mut parameters = Vec::with_capacity(function.sig.inputs.len());
+    for input in &function.sig.inputs {
+        let FnArg::Typed(argument) = input else {
+            return Err(Error::new_spanned(
+                input,
+                "PCU helpers cannot have a receiver",
+            ));
+        };
+        let Pat::Ident(pattern) = argument.pat.as_ref() else {
+            return Err(Error::new_spanned(
+                &argument.pat,
+                "PCU helper parameters must be simple identifiers",
+            ));
+        };
+        if !matches!(argument.ty.as_ref(), Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32"))
+        {
+            return Err(Error::new_spanned(
+                &argument.ty,
+                "this PCU helper profile supports only `f32` scalar parameters",
+            ));
+        }
+        if parameters
+            .iter()
+            .any(|parameter: &Ident| parameter == &pattern.ident)
+        {
+            return Err(Error::new_spanned(
+                &pattern.ident,
+                "PCU helper parameter names must be unique",
+            ));
+        }
+        parameters.push(pattern.ident.clone());
+    }
+    let [Stmt::Expr(body, None)] = function.block.stmts.as_slice() else {
+        return Err(Error::new_spanned(
+            &function.block,
+            "PCU helper bodies must be one pure scalar expression without statements or control flow",
+        ));
+    };
+    Ok(PcuHelper {
+        ident: function.sig.ident.clone(),
+        parameters,
+        body: body.clone(),
+    })
+}
+
+fn validate_pcu_helpers(helpers: &[PcuHelper]) -> Result<(), Error> {
+    for (index, helper) in helpers.iter().enumerate() {
+        if helpers[..index]
+            .iter()
+            .any(|prior| prior.ident == helper.ident)
+        {
+            return Err(Error::new(
+                helper.ident.span(),
+                "duplicate PCU helper name in this module",
+            ));
+        }
+    }
+    let mut call_graph = Vec::with_capacity(helpers.len());
+    for helper in helpers {
+        let mut calls = Vec::new();
+        validate_helper_expression(&helper.body, &helper.parameters, helpers, &mut calls)?;
+        call_graph.push(calls);
+    }
+    let mut state = vec![0_u8; helpers.len()];
+    for index in 0..helpers.len() {
+        validate_helper_acyclic(index, helpers, &call_graph, &mut state)?;
+    }
+    Ok(())
+}
+
+fn validate_helper_expression(
+    expression: &Expr,
+    parameters: &[Ident],
+    helpers: &[PcuHelper],
+    calls: &mut Vec<usize>,
+) -> Result<(), Error> {
+    match expression {
+        Expr::Binary(binary) => {
+            if !matches!(
+                binary.op,
+                BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
+            ) {
+                return Err(Error::new(
+                    binary.op.span(),
+                    "PCU helper arithmetic supports only `+`, `-`, `*`, and `/`",
+                ));
+            }
+            validate_helper_expression(&binary.left, parameters, helpers, calls)?;
+            validate_helper_expression(&binary.right, parameters, helpers, calls)
+        }
+        Expr::Call(call) => {
+            let Expr::Path(path) = call.func.as_ref() else {
+                return Err(Error::new(
+                    call.func.span(),
+                    "PCU helpers may call only direct sibling `#[pcu_fn]` helpers",
+                ));
+            };
+            if path.qself.is_some() || path.path.segments.len() != 1 {
+                return Err(Error::new(
+                    path.span(),
+                    "PCU helpers may call only direct sibling `#[pcu_fn]` helpers",
+                ));
+            }
+            let name = &path.path.segments[0].ident;
+            let Some((helper_index, target)) = helpers
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| candidate.ident == *name)
+            else {
+                return Err(Error::new(
+                    name.span(),
+                    "PCU helper calls must resolve to a sibling `#[pcu_fn]` helper",
+                ));
+            };
+            if target.parameters.len() != call.args.len() {
+                return Err(Error::new(
+                    call.span(),
+                    "PCU helper argument count does not match its definition",
+                ));
+            }
+            calls.push(helper_index);
+            for argument in &call.args {
+                validate_helper_expression(argument, parameters, helpers, calls)?;
+            }
+            Ok(())
+        }
+        Expr::Lit(literal) => match &literal.lit {
+            Lit::Float(value) if matches!(value.suffix(), "" | "f32") => Ok(()),
+            Lit::Float(value) => Err(Error::new(
+                value.span(),
+                "PCU helper constants must be unsuffixed or explicitly suffixed `f32`",
+            )),
+            _ => Err(Error::new(
+                literal.span(),
+                "PCU helper constants must be floating point literals",
+            )),
+        },
+        Expr::Paren(paren) => validate_helper_expression(&paren.expr, parameters, helpers, calls),
+        Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+            let name = &path.path.segments[0].ident;
+            if parameters.iter().any(|parameter| parameter == name) {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    name.span(),
+                    "PCU helper expressions may reference only their scalar parameters",
+                ))
+            }
+        }
+        _ => Err(Error::new(
+            expression.span(),
+            "PCU helper bodies support only scalar parameters, f32 literals, parentheses, arithmetic, and sibling helper calls",
+        )),
+    }
+}
+
+fn validate_helper_acyclic(
+    index: usize,
+    helpers: &[PcuHelper],
+    call_graph: &[Vec<usize>],
+    state: &mut [u8],
+) -> Result<(), Error> {
+    match state[index] {
+        1 => {
+            return Err(Error::new(
+                helpers[index].ident.span(),
+                "recursive PCU helper calls are not supported",
+            ));
+        }
+        2 => return Ok(()),
+        _ => {}
+    }
+    state[index] = 1;
+    for &called in &call_graph[index] {
+        validate_helper_acyclic(called, helpers, call_graph, state)?;
+    }
+    state[index] = 2;
+    Ok(())
 }
 
 fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
@@ -542,10 +1244,7 @@ fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
     let mut names = Vec::new();
     for parameter in &function.sig.generics.params {
         let GenericParam::Const(parameter) = parameter else {
-            return Err(Error::new(
-                parameter.span(),
-                "PCU dispatch does not yet support type generics: binding metadata and expression typing require concrete supported element types, so a `T: PcuScalar` bound alone would not make lowered operations type-safe; use `const NAME: usize` generics for invocation shapes",
-            ));
+            continue;
         };
         let Type::Path(ty) = &parameter.ty else {
             return Err(Error::new(
@@ -562,6 +1261,218 @@ fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
         names.push(parameter.ident.clone());
     }
     Ok(names)
+}
+
+fn generic_scalar_type(function: &ItemFn) -> Result<Option<Ident>, Error> {
+    let types = function
+        .sig
+        .generics
+        .params
+        .iter()
+        .filter_map(|parameter| match parameter {
+            GenericParam::Type(parameter) => Some(parameter),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if types.is_empty() {
+        return Ok(None);
+    }
+    if types.len() != 1 {
+        return Err(Error::new(
+            function.sig.generics.span(),
+            "generic PCU kernels support exactly one sealed scalar type parameter",
+        ));
+    }
+    let parameter = types[0];
+    let has_supported_bound = parameter.bounds.len() == 1
+        && parameter.bounds.iter().any(|bound| match bound {
+            syn::TypeParamBound::Trait(bound) => {
+                bound.path.segments.last().is_some_and(|segment| {
+                    segment.ident == "PcuScalar" || segment.ident == "PcuWrappingInteger"
+                })
+            }
+            _ => false,
+        });
+    if !has_supported_bound || parameter.default.is_some() || !parameter.attrs.is_empty() {
+        return Err(Error::new(
+            parameter.span(),
+            "generic PCU kernels require exactly `T: PcuScalar` or `T: PcuWrappingInteger`; both traits are sealed",
+        ));
+    }
+    Ok(Some(parameter.ident.clone()))
+}
+
+fn generic_scalar_wrapping(function: &ItemFn) -> bool {
+    function
+        .sig
+        .generics
+        .params
+        .iter()
+        .find_map(|parameter| match parameter {
+            GenericParam::Type(parameter) => {
+                parameter.bounds.iter().find_map(|bound| match bound {
+                    syn::TypeParamBound::Trait(bound) => bound
+                        .path
+                        .segments
+                        .last()
+                        .map(|segment| segment.ident == "PcuWrappingInteger"),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+fn validate_generic_wrapping_map(
+    assignment: &ExprAssign,
+    bindings: &[BindingSpec],
+    invocation: &Ident,
+    scalar_type: &Ident,
+) -> Result<(), Error> {
+    if bindings.len() != 3
+        || bindings.iter().any(|binding| {
+            binding.scalar != ScalarKind::Generic
+                || binding.generic_scalar.as_ref() != Some(scalar_type)
+        })
+    {
+        return Err(Error::new(
+            assignment.span(),
+            "generic `T: PcuWrappingInteger` maps require exactly two `&[T]` inputs and one `&mut [T]` output",
+        ));
+    }
+    let Expr::MethodCall(call) = assignment.right.as_ref() else {
+        return Err(Error::new(
+            assignment.right.span(),
+            "generic wrapping maps currently support only `output[id] = left[id].wrapping_add/sub/mul(right[id])`",
+        ));
+    };
+    if !matches!(
+        call.method.to_string().as_str(),
+        "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+    ) || call.args.len() != 1
+        || call.turbofish.is_some()
+    {
+        return Err(Error::new(
+            call.span(),
+            "generic wrapping maps support only one-argument wrapping_add, wrapping_sub, or wrapping_mul",
+        ));
+    }
+    let mut input_names = Vec::with_capacity(2);
+    for operand in [
+        call.receiver.as_ref(),
+        call.args.first().expect("argument count checked"),
+    ] {
+        let Expr::Index(index) = operand else {
+            return Err(Error::new(
+                operand.span(),
+                "generic wrapping operands must be indexed bindings",
+            ));
+        };
+        validate_invocation_index(&index.index, invocation)?;
+        let Some(name) = expr_ident(&index.expr) else {
+            return Err(Error::new(
+                index.expr.span(),
+                "generic wrapping operands must name input bindings",
+            ));
+        };
+        if bindings
+            .iter()
+            .find(|binding| binding.ident == *name)
+            .is_none_or(|binding| binding.access != BindingAccess::ReadOnly)
+        {
+            return Err(Error::new(
+                index.expr.span(),
+                "generic wrapping operands must use read-only inputs",
+            ));
+        }
+        input_names.push(name.clone());
+    }
+    let Expr::Index(output) = assignment.left.as_ref() else {
+        return Err(Error::new(
+            assignment.left.span(),
+            "generic wrapping destination must be indexed",
+        ));
+    };
+    validate_invocation_index(&output.index, invocation)?;
+    let Some(name) = expr_ident(&output.expr) else {
+        return Err(Error::new(
+            output.expr.span(),
+            "generic wrapping destination must name the output binding",
+        ));
+    };
+    if bindings
+        .iter()
+        .find(|binding| binding.ident == *name)
+        .is_none_or(|binding| binding.access != BindingAccess::ReadWrite)
+    {
+        return Err(Error::new(
+            output.expr.span(),
+            "generic wrapping destination must use the writable output",
+        ));
+    }
+    if input_names[0] == input_names[1] || input_names.iter().any(|input| input == name) {
+        return Err(Error::new(
+            assignment.span(),
+            "generic wrapping maps require two distinct read-only inputs and a distinct writable output",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generic_identity(
+    assignment: &ExprAssign,
+    bindings: &[BindingSpec],
+    invocation: &Ident,
+    scalar_type: &Ident,
+) -> Result<(), Error> {
+    if bindings.len() != 2
+        || bindings.iter().any(|binding| {
+            binding.scalar != ScalarKind::Generic
+                || binding.generic_scalar.as_ref() != Some(scalar_type)
+        })
+    {
+        return Err(Error::new(
+            assignment.span(),
+            "generic `T: PcuScalar` kernels require exactly `input: &[T]` and `output: &mut [T]`",
+        ));
+    }
+    let Expr::Index(source_index) = assignment.right.as_ref() else {
+        return Err(Error::new(
+            assignment.right.span(),
+            "generic `T: PcuScalar` kernels currently support only `output[id] = input[id]`",
+        ));
+    };
+    let Some(source) = expr_ident(&source_index.expr) else {
+        return Err(Error::new(
+            source_index.expr.span(),
+            "identity source must be a binding",
+        ));
+    };
+    validate_invocation_index(&source_index.index, invocation)?;
+    let Expr::Index(target_index) = assignment.left.as_ref() else {
+        unreachable!("validated generic output binding is indexed")
+    };
+    let Some(target) = expr_ident(&target_index.expr) else {
+        unreachable!("validated generic output binding is named")
+    };
+    validate_invocation_index(&target_index.index, invocation)?;
+    if source == target
+        || bindings
+            .iter()
+            .find(|binding| binding.ident == *source)
+            .is_none_or(|binding| binding.access != BindingAccess::ReadOnly)
+        || bindings
+            .iter()
+            .find(|binding| binding.ident == *target)
+            .is_none_or(|binding| binding.access != BindingAccess::ReadWrite)
+    {
+        return Err(Error::new(
+            assignment.span(),
+            "generic identity copy requires a distinct read-only input and writable output",
+        ));
+    }
+    Ok(())
 }
 
 fn lower_invocation_expr(expr: &Expr, const_generics: &[Ident]) -> Result<TokenStream2, Error> {
@@ -627,6 +1538,7 @@ fn lower_invocation_expr(expr: &Expr, const_generics: &[Ident]) -> Result<TokenS
 
 fn parse_bindings(
     inputs: &syn::punctuated::Punctuated<FnArg, Token![,]>,
+    generic_scalar: Option<&Ident>,
 ) -> Result<Vec<BindingSpec>, Error> {
     let mut bindings = Vec::new();
     for input in inputs {
@@ -642,7 +1554,7 @@ fn parse_bindings(
                 "PCU kernel bindings must be identifiers",
             ));
         };
-        let (access, scalar) = parse_binding_type(&input.ty)?;
+        let (access, scalar, binding_generic) = parse_binding_type(&input.ty, generic_scalar)?;
         let binding = u32::try_from(bindings.len())
             .map_err(|_| Error::new(input.span(), "too many PCU bindings for this macro"))?;
         bindings.push(BindingSpec {
@@ -650,12 +1562,16 @@ fn parse_bindings(
             access,
             binding,
             scalar,
+            generic_scalar: binding_generic,
         });
     }
     Ok(bindings)
 }
 
-fn parse_binding_type(ty: &Type) -> Result<(BindingAccess, ScalarKind), Error> {
+fn parse_binding_type(
+    ty: &Type,
+    generic_scalar: Option<&Ident>,
+) -> Result<(BindingAccess, ScalarKind, Option<Ident>), Error> {
     let Type::Reference(reference) = ty else {
         return Err(Error::new(
             ty.span(),
@@ -680,6 +1596,19 @@ fn parse_binding_type(ty: &Type) -> Result<(BindingAccess, ScalarKind), Error> {
             "this PCU dispatch macro currently supports only f32, f64, u8, u16, u32, u64, i8, i16, i32, and i64 elements",
         ));
     };
+    if let Some(generic) = generic_scalar
+        && element.path.is_ident(generic)
+    {
+        return Ok((
+            if reference.mutability.is_some() {
+                BindingAccess::ReadWrite
+            } else {
+                BindingAccess::ReadOnly
+            },
+            ScalarKind::Generic,
+            Some(generic.clone()),
+        ));
+    }
     let scalar = if element.path.is_ident("f32") {
         ScalarKind::F32
     } else if element.path.is_ident("f64") {
@@ -713,6 +1642,7 @@ fn parse_binding_type(ty: &Type) -> Result<(BindingAccess, ScalarKind), Error> {
             BindingAccess::ReadOnly
         },
         scalar,
+        None,
     ))
 }
 
@@ -1038,6 +1968,17 @@ fn binding_tokens(binding: &BindingSpec, pcu: &Path) -> TokenStream2 {
         BindingAccess::ReadOnly => quote! { #pcu::PcuBindingAccess::ReadOnly },
         BindingAccess::ReadWrite => quote! { #pcu::PcuBindingAccess::ReadWrite },
     };
+    if let Some(generic) = &binding.generic_scalar {
+        return quote! {
+            #pcu::PcuBinding::scalar::<#generic>(
+                ::core::option::Option::Some(#name),
+                0,
+                #slot,
+                #pcu::PcuBindingStorageClass::Storage,
+                #access,
+            )
+        };
+    }
     let scalar = binding.scalar.rust_type();
     quote! {
         #pcu::PcuBinding::scalar::<#scalar>(
@@ -1543,18 +2484,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_type_generic_sources_until_element_semantics_exist() {
+    fn rejects_generic_scalar_arithmetic_outside_identity_profile() {
         let function = syn::parse_str::<ItemFn>(
-            "fn kernel<T: PcuScalar>(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation]; }",
+            "fn kernel<T: PcuScalar>(input: &[T], output: &mut [T]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] + input[invocation]; }",
         )
         .expect("test function parses");
         let args = syn::parse_str::<PcuDispatchArgs>("invocations = 8").expect("attribute parses");
-        let error = expand_pcu_dispatch(args, &function).expect_err("type generic is unsupported");
+        let error =
+            expand_pcu_dispatch(args, &function).expect_err("generic arithmetic is unsupported");
         let message = error.to_string();
-        assert!(message.contains("does not yet support type generics"));
-        assert!(message.contains("expression typing require concrete supported element types"));
-        assert!(message.contains("T: PcuScalar"));
-        assert!(message.contains("const NAME: usize"));
+        assert!(message.contains("currently support only `output[id] = input[id]`"));
+    }
+
+    #[test]
+    fn lowers_generic_scalar_grid_stride_through_typed_builder() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel<T: PcuScalar, const N: usize>(input: &[T], output: &mut [T]) { let mut id = context.global_invocation_id; let stride = context.invocation_count; while id < N { output[id] = input[id]; id += stride; } }",
+        )
+        .expect("function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 4").expect("attribute parses");
+        let tokens = expand_pcu_dispatch(args, &function)
+            .expect("the typed identity builder supports bounded grid stride");
+        assert!(tokens.to_string().contains("build_grid_stride"));
     }
 
     #[test]

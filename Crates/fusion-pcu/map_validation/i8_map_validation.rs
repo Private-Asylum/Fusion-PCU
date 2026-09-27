@@ -8,6 +8,7 @@ use crate::{
     PcuValueTypeCaps,
 };
 use crate::map_validation::integer_map_validation::{
+    validate_integer_checked_div_rem_kernel,
     validate_integer_map_kernel,
     IntegerMapValidationError,
 };
@@ -68,11 +69,27 @@ pub fn validate_i8_map_kernel(
         .map_err(map_error)
 }
 
+/// Validates the exact checked `i8` quotient/remainder profile.
+///
+/// Direct invocation indexing or one canonical grid-stride loop is supported. Zero divisors
+/// and `i8::MIN / -1` are execution faults; both output buffers are unusable after a fault.
+///
+/// # Errors
+///
+/// Returns the first structural violation of the checked `DivRem` profile.
+pub fn validate_i8_checked_div_rem_kernel(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Result<(), PcuI8MapValidationError> {
+    validate_integer_checked_div_rem_kernel(kernel, PcuValueType::i8(), PcuValueTypeCaps::INT8)
+        .map_err(map_error)
+}
+
 #[cfg(test)]
 mod tests {
     use std::boxed::Box;
     use super::{
         validate_i8_map_kernel,
+        validate_i8_checked_div_rem_kernel,
         PcuI8MapValidationError,
     };
     use crate::{
@@ -249,5 +266,116 @@ mod tests {
     fn admits_chained_wrapping_alu_direct_and_grid_stride() {
         assert_eq!(validate_i8_map_kernel(&chained_kernel(None)), Ok(()));
         assert_eq!(validate_i8_map_kernel(&chained_kernel(Some(100))), Ok(()));
+    }
+
+    fn checked_div_rem_kernel(extent: Option<u32>) -> PcuDispatchKernelIr<'static> {
+        let bindings = Box::leak(Box::new([
+            PcuBinding::scalar::<i8>(
+                Some("a"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i8>(
+                Some("b"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<i8>(
+                Some("q"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+            PcuBinding::scalar::<i8>(
+                Some("r"),
+                0,
+                3,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ]));
+        let index = if extent.is_some() {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = Box::leak(Box::new([
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                value_type: crate::PcuValueType::i8(),
+                flags: crate::model::PcuIntegerDivFlags::CHECKED,
+                quotient: PcuDispatchValueId(3),
+                remainder: PcuDispatchValueId(4),
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 3),
+                index,
+                value: PcuDispatchValueId(4),
+            }),
+        ]));
+        let ops = match extent {
+            Some(extent) => Box::leak(Box::new([
+                PcuDispatchOp::GridStrideLoop { extent, body },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])) as &'static [PcuDispatchOp<'static>],
+            None => Box::leak(Box::new([
+                body[0],
+                body[1],
+                body[2],
+                body[3],
+                body[4],
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ])),
+        };
+        PcuDispatchKernelIr {
+            id: PcuKernelId(1),
+            entry: PcuDispatchEntryPoint {
+                name: "divrem_i8",
+                logical_shape: [1, 1, 1],
+            },
+            bindings,
+            ports: &[],
+            parameters: &[],
+            ops,
+            type_caps: PcuValueTypeCaps::for_scalar(PcuScalarType::I8),
+            feature_caps: crate::PcuDispatchFeatureCaps::default(),
+        }
+    }
+
+    #[test]
+    fn admits_checked_i8_divrem_direct_and_grid_stride_only() {
+        assert_eq!(
+            validate_i8_checked_div_rem_kernel(&checked_div_rem_kernel(None)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_i8_checked_div_rem_kernel(&checked_div_rem_kernel(Some(19))),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_i8_checked_div_rem_kernel(&checked_div_rem_kernel(Some(0))),
+            Err(PcuI8MapValidationError::UnsupportedOperation(0))
+        ));
     }
 }

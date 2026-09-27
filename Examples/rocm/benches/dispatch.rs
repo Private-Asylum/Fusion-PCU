@@ -21,15 +21,14 @@ use criterion::{
 };
 
 use fusion_pcu::{
-    F32MapBuilder,
     PcuBinding,
     PcuBindingAccess,
-    PcuBindingRef,
     PcuBindingStorageClass,
     PcuDispatchSubmission,
     PcuInvocationShape,
     PcuValueType,
 };
+use fusion_pcu_macros::pcu_module;
 use fusion_pcu_rocm::{
     HipKernelArgument,
     RocmDiscovery,
@@ -47,6 +46,20 @@ use dispatch_support::{
     timed_copy,
     verify_output,
 };
+
+#[pcu_module]
+mod kernels {
+    #[pcu_fn]
+    fn plus_one(value: f32) -> f32 {
+        value + 1.0
+    }
+
+    #[pcu(invocations = N)]
+    pub fn add<const N: usize>(input: &[f32], output: &mut [f32]) {
+        let id = pcu::context::global_invocation_id();
+        output[id] = plus_one(input[id]);
+    }
+}
 
 fn dispatch_benchmarks(criterion: &mut Criterion) {
     if let Err(error) = run_benchmarks(criterion) {
@@ -134,12 +147,11 @@ fn run_case(
             PcuValueType::f32(),
         ),
     ];
-    let (builder, value) =
-        F32MapBuilder::<8>::new(1, "dispatch_benchmark", [invocations, 1, 1], &declarations)
-            .load_f32(PcuBindingRef::new(0, 0))?;
-    let (builder, one) = builder.constant(1.0)?;
-    let (builder, result) = builder.add(value, one)?;
-    let builder = builder.store_f32(PcuBindingRef::new(0, 1), result)?;
+    let builder = match elements {
+        65 => kernels::add::<65>(&declarations)?,
+        1_048_576 => kernels::add::<1_048_576>(&declarations)?,
+        _ => return Err("dispatch benchmark shape has no kernel specialization".into()),
+    };
     let kernel = builder.ir();
     let submission = PcuDispatchSubmission {
         kernel: &kernel,
