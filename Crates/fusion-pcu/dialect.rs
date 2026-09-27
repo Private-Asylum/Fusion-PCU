@@ -88,6 +88,22 @@ pub struct PcuDialectFragment<'a> {
     pub operations: &'a [PcuDialectOperation<'a>],
 }
 
+impl PcuDialectFragment<'_> {
+    /// Returns the union of effects declared by every operation in this fragment.
+    ///
+    /// This is the fragment's minimum externally visible effect contract. Consumers can carry it
+    /// into assessment or composition without reinterpreting operation names. It does not include
+    /// resource requirements, which remain explicit in the resource binding contracts.
+    #[must_use]
+    pub fn required_effects(&self) -> PcuDialectEffects {
+        self.operations
+            .iter()
+            .fold(PcuDialectEffects::PURE, |effects, operation| {
+                effects.union(operation.effects)
+            })
+    }
+}
+
 /// Consumer declaration for one dialect it understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcuDialectSupport<'a> {
@@ -201,6 +217,210 @@ pub struct PcuDialectProgram<'a> {
     pub output_ports: &'a [PcuDialectPort<'a>],
     /// Exactly one entry per operation, identified by its explicit zero-based index.
     pub operation_attributes: &'a [PcuDialectOperationAttributes<'a>],
+}
+
+/// Permissions required by a dialect program at a named resource port.
+///
+/// This contract is deliberately independent of operation effects: an effect does not identify
+/// which resource it accesses or how large/aligned that resource must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuDialectResourceAccess(u8);
+
+impl PcuDialectResourceAccess {
+    pub const NONE: Self = Self(0);
+    pub const READ: Self = Self(1);
+    pub const WRITE: Self = Self(2);
+    pub const READ_WRITE: Self = Self(3);
+
+    #[must_use]
+    pub const fn contains(self, access: Self) -> bool {
+        self.0 & access.0 == access.0
+    }
+}
+
+/// Minimum backing-resource contract for one named program port.
+///
+/// `minimum_bytes` and `minimum_alignment` are expressed in bytes. Alignment must be a nonzero
+/// power of two. For output ports this is the producer's guaranteed minimum; for input ports it
+/// is the consumer's requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuDialectResourceRequirement<'a> {
+    pub port_name: &'a str,
+    pub minimum_bytes: u64,
+    pub minimum_alignment: u64,
+    pub access: PcuDialectResourceAccess,
+}
+
+/// Additive resource sidecar for a program, preserving `PcuDialectProgram` literals and ABI.
+///
+/// This initial opt-in contract treats every named value port as resource-backed. Programs with
+/// scalar-only ports should not use it until value and resource port kinds are distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcuDialectProgramResources<'a> {
+    pub inputs: &'a [PcuDialectResourceRequirement<'a>],
+    pub outputs: &'a [PcuDialectResourceRequirement<'a>],
+}
+
+/// Failure while checking explicit program resource contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcuDialectResourceError {
+    EmptyPortName,
+    UnknownPort,
+    DuplicatePort,
+    MissingPort,
+    InvalidSize,
+    InvalidAlignment,
+    InsufficientBytes,
+    InsufficientAlignment,
+    InsufficientAccess,
+    OutputStorageTooSmall,
+}
+
+/// Validate that an explicit resource sidecar exactly covers the program's named value ports.
+///
+/// # Errors
+///
+/// Returns the first missing, duplicate, unknown, or malformed resource requirement.
+pub fn validate_dialect_program_resources(
+    program: &PcuDialectProgram<'_>,
+    resources: &PcuDialectProgramResources<'_>,
+) -> Result<(), PcuDialectResourceError> {
+    validate_resource_ports(program.input_ports, resources.inputs)?;
+    validate_resource_ports(program.output_ports, resources.outputs)
+}
+
+/// Check resource laws for each explicit pipeline binding and propagate the public boundary
+/// requirements (first inputs and second outputs) into caller-owned storage.
+///
+/// A first-program output is a producer guarantee and a second-program input is a consumer
+/// requirement. The producer must guarantee sufficient size, alignment, and permissions. The
+/// returned sidecar contains exactly the first program's public input contracts and second
+/// program's public output contracts; internal bindings are checked and then disappear.
+///
+/// # Errors
+///
+/// Returns an error for invalid sidecars, unresolved binding names, incompatible internal
+/// requirements, or insufficient output storage. Output storage is unchanged on failure.
+pub fn compose_dialect_program_resources<'out, 'data>(
+    first: &PcuDialectProgram<'_>,
+    first_resources: &PcuDialectProgramResources<'data>,
+    second: &PcuDialectProgram<'_>,
+    second_resources: &PcuDialectProgramResources<'data>,
+    bindings: &[PcuDialectProgramBinding<'_>],
+    input_storage: &'out mut [PcuDialectResourceRequirement<'data>],
+    output_storage: &'out mut [PcuDialectResourceRequirement<'data>],
+) -> Result<PcuDialectProgramResources<'out>, PcuDialectResourceError>
+where
+    'data: 'out,
+{
+    validate_dialect_program_resources(first, first_resources)?;
+    validate_dialect_program_resources(second, second_resources)?;
+    if input_storage.len() < first_resources.inputs.len() {
+        return Err(PcuDialectResourceError::OutputStorageTooSmall);
+    }
+    if output_storage.len() < second_resources.outputs.len() {
+        return Err(PcuDialectResourceError::OutputStorageTooSmall);
+    }
+    for (index, binding) in bindings.iter().enumerate() {
+        if bindings[..index]
+            .iter()
+            .any(|prior| prior.second_input == binding.second_input)
+        {
+            return Err(PcuDialectResourceError::DuplicatePort);
+        }
+    }
+    if bindings.len() != second_resources.inputs.len()
+        || second_resources.inputs.iter().any(|input| {
+            !bindings
+                .iter()
+                .any(|binding| binding.second_input == input.port_name)
+        })
+    {
+        return Err(PcuDialectResourceError::MissingPort);
+    }
+    for binding in bindings {
+        let source = first_resources
+            .outputs
+            .iter()
+            .find(|item| item.port_name == binding.first_output)
+            .ok_or(PcuDialectResourceError::UnknownPort)?;
+        let target = second_resources
+            .inputs
+            .iter()
+            .find(|item| item.port_name == binding.second_input)
+            .ok_or(PcuDialectResourceError::UnknownPort)?;
+        if source.minimum_bytes < target.minimum_bytes {
+            return Err(PcuDialectResourceError::InsufficientBytes);
+        }
+        if source.minimum_alignment < target.minimum_alignment
+            || !source
+                .minimum_alignment
+                .is_multiple_of(target.minimum_alignment)
+        {
+            return Err(PcuDialectResourceError::InsufficientAlignment);
+        }
+        if !source.access.contains(target.access) {
+            return Err(PcuDialectResourceError::InsufficientAccess);
+        }
+    }
+    input_storage[..first_resources.inputs.len()].copy_from_slice(first_resources.inputs);
+    output_storage[..second_resources.outputs.len()].copy_from_slice(second_resources.outputs);
+    Ok(PcuDialectProgramResources {
+        inputs: &input_storage[..first_resources.inputs.len()],
+        outputs: &output_storage[..second_resources.outputs.len()],
+    })
+}
+
+fn validate_resource_ports(
+    ports: &[PcuDialectPort<'_>],
+    requirements: &[PcuDialectResourceRequirement<'_>],
+) -> Result<(), PcuDialectResourceError> {
+    for (index, port) in ports.iter().enumerate() {
+        if port.name.is_empty() {
+            return Err(PcuDialectResourceError::EmptyPortName);
+        }
+        if ports[..index].iter().any(|prior| prior.name == port.name) {
+            return Err(PcuDialectResourceError::DuplicatePort);
+        }
+    }
+    for (index, requirement) in requirements.iter().enumerate() {
+        if requirement.port_name.is_empty() {
+            return Err(PcuDialectResourceError::EmptyPortName);
+        }
+        if !ports.iter().any(|port| port.name == requirement.port_name) {
+            return Err(PcuDialectResourceError::UnknownPort);
+        }
+        if requirements[..index]
+            .iter()
+            .any(|prior| prior.port_name == requirement.port_name)
+        {
+            return Err(PcuDialectResourceError::DuplicatePort);
+        }
+        if requirement.minimum_bytes == 0 {
+            return Err(PcuDialectResourceError::InvalidSize);
+        }
+        if requirement.minimum_alignment == 0 || !requirement.minimum_alignment.is_power_of_two() {
+            return Err(PcuDialectResourceError::InvalidAlignment);
+        }
+    }
+    if ports
+        .iter()
+        .any(|port| !requirements.iter().any(|item| item.port_name == port.name))
+    {
+        return Err(PcuDialectResourceError::MissingPort);
+    }
+    Ok(())
+}
+
+impl PcuDialectProgram<'_> {
+    /// Returns the union of effects declared by the program's operations.
+    ///
+    /// Port and immediate metadata do not add effects; their operation contracts do. The result
+    /// is useful when propagating a validated program's effect requirements into a larger plan.
+    #[must_use]
+    pub fn required_effects(&self) -> PcuDialectEffects {
+        self.fragment.required_effects()
+    }
 }
 
 /// Consumer-owned immediate requirement for one operation attribute.
@@ -1228,6 +1448,52 @@ mod tests {
     }
 
     #[test]
+    fn fragment_effect_requirements_union_across_all_operations() {
+        let operations = [
+            PcuDialectOperation {
+                name: "test.read",
+                inputs: no_inputs(),
+                input_count: 0,
+                result: None,
+                effects: PcuDialectEffects::READ_MEMORY,
+            },
+            PcuDialectOperation {
+                name: "test.sync_write",
+                inputs: no_inputs(),
+                input_count: 0,
+                result: None,
+                effects: PcuDialectEffects::SYNCHRONIZE.union(PcuDialectEffects::WRITE_MEMORY),
+            },
+        ];
+        let fragment = PcuDialectFragment {
+            dialect: PcuDialectId("org.example.effect-summary"),
+            version: PcuDialectVersion { major: 1, minor: 0 },
+            operations: &operations,
+        };
+        assert_eq!(
+            fragment.required_effects(),
+            PcuDialectEffects::READ_MEMORY
+                .union(PcuDialectEffects::SYNCHRONIZE)
+                .union(PcuDialectEffects::WRITE_MEMORY)
+        );
+        assert_eq!(
+            PcuDialectFragment {
+                operations: &[],
+                ..fragment
+            }
+            .required_effects(),
+            PcuDialectEffects::PURE
+        );
+        let program = PcuDialectProgram {
+            fragment,
+            input_ports: &[],
+            output_ports: &[],
+            operation_attributes: &[],
+        };
+        assert_eq!(program.required_effects(), fragment.required_effects());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // End-to-end fragment composition and rejection vector.
     fn vm_consumer_admits_typed_versioned_instructions_and_composes_without_capture() {
         let dialect = PcuDialectId("org.example.stack-vm");
@@ -2166,5 +2432,155 @@ mod tests {
         assert_eq!(unchanged_inputs, original_inputs);
         assert_eq!(unchanged_outputs, original_outputs);
         assert_eq!(unchanged_attributes, original_attributes);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn resource_sidecar_validates_and_composes_explicit_contracts() {
+        let input = PcuDialectPort {
+            name: "input",
+            value: PcuDialectOperand {
+                id: PcuDialectValueId(0),
+                value_type: PcuValueType::u32(),
+            },
+        };
+        let wire = PcuDialectPort {
+            name: "wire",
+            value: PcuDialectOperand {
+                id: PcuDialectValueId(0),
+                value_type: PcuValueType::u32(),
+            },
+        };
+        let received = PcuDialectPort {
+            name: "received",
+            value: PcuDialectOperand {
+                id: PcuDialectValueId(0),
+                value_type: PcuValueType::u32(),
+            },
+        };
+        let output = PcuDialectPort {
+            name: "output",
+            value: PcuDialectOperand {
+                id: PcuDialectValueId(0),
+                value_type: PcuValueType::u32(),
+            },
+        };
+        let empty_ops = [];
+        let first_inputs = [input];
+        let first_outputs = [wire];
+        let second_inputs = [received];
+        let second_outputs = [output];
+        let fragment = PcuDialectFragment {
+            dialect: PcuDialectId("example"),
+            version: PcuDialectVersion { major: 1, minor: 0 },
+            operations: &empty_ops,
+        };
+        let first = PcuDialectProgram {
+            fragment,
+            input_ports: &first_inputs,
+            output_ports: &first_outputs,
+            operation_attributes: &[],
+        };
+        let second = PcuDialectProgram {
+            fragment,
+            input_ports: &second_inputs,
+            output_ports: &second_outputs,
+            operation_attributes: &[],
+        };
+        let first_in_req = [PcuDialectResourceRequirement {
+            port_name: "input",
+            minimum_bytes: 4,
+            minimum_alignment: 4,
+            access: PcuDialectResourceAccess::READ,
+        }];
+        let first_out_req = [PcuDialectResourceRequirement {
+            port_name: "wire",
+            minimum_bytes: 64,
+            minimum_alignment: 64,
+            access: PcuDialectResourceAccess::READ_WRITE,
+        }];
+        let second_in_req = [PcuDialectResourceRequirement {
+            port_name: "received",
+            minimum_bytes: 32,
+            minimum_alignment: 16,
+            access: PcuDialectResourceAccess::READ,
+        }];
+        let second_out_req = [PcuDialectResourceRequirement {
+            port_name: "output",
+            minimum_bytes: 8,
+            minimum_alignment: 8,
+            access: PcuDialectResourceAccess::WRITE,
+        }];
+        let first_resources = PcuDialectProgramResources {
+            inputs: &first_in_req,
+            outputs: &first_out_req,
+        };
+        let second_resources = PcuDialectProgramResources {
+            inputs: &second_in_req,
+            outputs: &second_out_req,
+        };
+        assert_eq!(
+            validate_dialect_program_resources(&first, &first_resources),
+            Ok(())
+        );
+        let binding = [PcuDialectProgramBinding {
+            first_output: "wire",
+            second_input: "received",
+        }];
+        let mut composed_inputs = [first_in_req[0]];
+        let mut composed_outputs = [second_out_req[0]];
+        let composed = compose_dialect_program_resources(
+            &first,
+            &first_resources,
+            &second,
+            &second_resources,
+            &binding,
+            &mut composed_inputs,
+            &mut composed_outputs,
+        )
+        .unwrap();
+        assert_eq!(composed.inputs, first_in_req);
+        assert_eq!(composed.outputs, second_out_req);
+        let too_large = [PcuDialectResourceRequirement {
+            minimum_bytes: 128,
+            ..second_in_req[0]
+        }];
+        let incompatible = PcuDialectProgramResources {
+            inputs: &too_large,
+            outputs: &second_out_req,
+        };
+        composed_inputs[0].minimum_bytes = 777;
+        composed_outputs[0].minimum_bytes = 888;
+        assert_eq!(
+            compose_dialect_program_resources(
+                &first,
+                &first_resources,
+                &second,
+                &incompatible,
+                &binding,
+                &mut composed_inputs,
+                &mut composed_outputs
+            ),
+            Err(PcuDialectResourceError::InsufficientBytes)
+        );
+        assert_eq!(composed_inputs[0].minimum_bytes, 777);
+        assert_eq!(composed_outputs[0].minimum_bytes, 888);
+        let omitted = PcuDialectProgramResources {
+            inputs: &[],
+            outputs: &first_out_req,
+        };
+        assert_eq!(
+            validate_dialect_program_resources(&first, &omitted),
+            Err(PcuDialectResourceError::MissingPort)
+        );
+        let duplicate_inputs = [input, input];
+        let duplicated = PcuDialectProgram {
+            input_ports: &duplicate_inputs,
+            ..first
+        };
+        assert_eq!(
+            validate_dialect_program_resources(&duplicated, &first_resources),
+            Err(PcuDialectResourceError::DuplicatePort)
+        );
     }
 }

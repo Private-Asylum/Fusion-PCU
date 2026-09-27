@@ -301,14 +301,14 @@ fn graph_uniform_cpu_evaluation_materializes_dense_values_and_checks_shape() {
     assert_eq!(execution.value(scalar).unwrap().data(), &[4.0]);
 }
 
-struct TestMemory(PcuMemoryOverlap);
+struct TestMemory(PcuMemoryOverlap, u64);
 
 impl PcuMemoryResource for TestMemory {
     fn pool(&self) -> PcuMemoryPoolId {
         PcuMemoryPoolId(0)
     }
     fn size_bytes(&self) -> u64 {
-        64
+        self.1
     }
     fn alignment_bytes(&self) -> u64 {
         1
@@ -333,6 +333,60 @@ impl PcuMemoryResource for TestMemory {
             _ => PcuMemoryOverlap::Disjoint,
         }
     }
+}
+
+struct AccessMemory(PcuMemoryAccess);
+
+impl PcuMemoryResource for AccessMemory {
+    fn pool(&self) -> PcuMemoryPoolId {
+        PcuMemoryPoolId(0)
+    }
+    fn size_bytes(&self) -> u64 {
+        64
+    }
+    fn alignment_bytes(&self) -> u64 {
+        1
+    }
+    fn access(&self) -> PcuMemoryAccess {
+        self.0
+    }
+    fn is_device_local(&self) -> Option<bool> {
+        None
+    }
+    fn origin(&self) -> PcuMemoryResourceOrigin {
+        PcuMemoryResourceOrigin::ProviderManaged
+    }
+}
+
+#[test]
+fn execution_plan_storage_requirements_include_capacity_and_access() {
+    let mut graph = Graph::default();
+    let input = graph.input([4]).unwrap();
+    let output = graph.relu(input).unwrap();
+    let plan = graph.execution_plan_for_outputs(&[output]).unwrap();
+    let requirements = plan.value_storage_requirements().unwrap();
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].value, input);
+    assert_eq!(requirements[0].access, PcuMemoryAccess::ReadOnly);
+    assert_eq!(requirements[1].value, output);
+    assert_eq!(requirements[1].access, PcuMemoryAccess::ReadWrite);
+    assert_eq!(requirements[0].output_bytes, 16);
+    assert_eq!(
+        requirements[0].validate(&AccessMemory(PcuMemoryAccess::ReadOnly)),
+        Ok(())
+    );
+    assert_eq!(
+        requirements[1].validate(&AccessMemory(PcuMemoryAccess::ReadWrite)),
+        Ok(())
+    );
+    assert_eq!(
+        requirements[1].validate(&AccessMemory(PcuMemoryAccess::ReadOnly)),
+        Err(TensorStorageValidationError::InsufficientAccess {
+            value: output,
+            required: PcuMemoryAccess::ReadWrite,
+            available: PcuMemoryAccess::ReadOnly,
+        })
+    );
 }
 
 #[test]
@@ -369,15 +423,15 @@ fn storage_constraints_follow_liveness_and_reject_unknown_overlap() {
         .iter()
         .find(|c| c.left == left && c.right == sum)
         .unwrap();
-    let a = TestMemory(PcuMemoryOverlap::Disjoint);
-    let b = TestMemory(PcuMemoryOverlap::Unknown);
+    let a = TestMemory(PcuMemoryOverlap::Disjoint, 64);
+    let b = TestMemory(PcuMemoryOverlap::Unknown, 64);
     assert_eq!(constraint.validate(&[(left, &a), (sum, &a)]), Ok(()));
     assert_eq!(constraint.validate_resources(&a, &a), Ok(()));
     assert_eq!(
         constraint.validate(&[(left, &a), (sum, &b)]),
         Err(TensorStorageValidationError::UnknownOverlap { left, right: sum })
     );
-    let overlapping = TestMemory(PcuMemoryOverlap::Overlapping);
+    let overlapping = TestMemory(PcuMemoryOverlap::Overlapping, 64);
     assert!(matches!(
         constraint.validate_resources(&a, &overlapping),
         Err(TensorStorageValidationError::Overlapping { .. })
@@ -386,6 +440,16 @@ fn storage_constraints_follow_liveness_and_reject_unknown_overlap() {
         constraint.validate(&[(left, &a), (sum, &overlapping)]),
         Err(TensorStorageValidationError::Overlapping { .. })
     ));
+
+    let undersized = TestMemory(PcuMemoryOverlap::Disjoint, constraint.right_bytes - 1);
+    assert_eq!(
+        constraint.validate_resources(&a, &undersized),
+        Err(TensorStorageValidationError::ResourceTooSmall {
+            value: sum,
+            required_bytes: constraint.right_bytes,
+            available_bytes: constraint.right_bytes - 1,
+        })
+    );
 }
 
 fn assert_gradient_graph_matches_reference(

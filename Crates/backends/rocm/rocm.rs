@@ -5,7 +5,10 @@
 //! here; unsupported PCU operations are rejected by the lowerer.
 
 use std::{
-    cell::Cell,
+    cell::{
+        Cell,
+        RefCell,
+    },
     ffi::{
         CStr,
         c_char,
@@ -39,6 +42,7 @@ mod tensor;
 pub use blas::{
     Rocblas,
     RocblasError,
+    RocblasSgemmHostTiming,
 };
 pub use codegen::compiler::{
     HipCompileError,
@@ -79,12 +83,14 @@ pub use tensor::{
     RocmAdmittedTensorFeedbackResources,
     RocmPreparedTensorGraph,
     RocmTensorAssessor,
+    RocmTensorElementwiseHostTiming,
     RocmTensorError,
     RocmTensorExecutionError,
     RocmTensorFeedbackPrepareError,
     RocmTensorFeedbackReleaseError,
     RocmTensorFeedbackResources,
     RocmTensorInput,
+    RocmTensorNodeTiming,
     RocmTensorOutputBank,
     RocmTensorPrewarmReport,
     RocmTensorScratch,
@@ -1483,6 +1489,19 @@ pub struct HipCompletionBatch {
     launch_events: Vec<HipEventHandle>,
     resources: Vec<LaunchResources>,
     failed: bool,
+    timing: Option<HipBatchTiming>,
+}
+
+struct HipBatchTiming {
+    start: Option<HipTimingEventHandle>,
+    end: Option<HipTimingEventHandle>,
+    segments_ms: Rc<RefCell<Vec<f32>>>,
+}
+
+struct HipBatchTimingSegment {
+    start: HipTimingEventHandle,
+    end: HipTimingEventHandle,
+    segments_ms: Rc<RefCell<Vec<f32>>>,
 }
 
 impl HipCompletionBatch {
@@ -1494,7 +1513,33 @@ impl HipCompletionBatch {
             launch_events: Vec::new(),
             resources: Vec::new(),
             failed: false,
+            timing: None,
         }
+    }
+
+    /// Start collecting completions and device elapsed-time measurements for each segment.
+    /// Timing events are only created when a launch is submitted.
+    #[must_use]
+    pub fn new_timed(stream: &HipStreamHandle) -> Self {
+        Self {
+            stream: stream.clone(),
+            launch_events: Vec::new(),
+            resources: Vec::new(),
+            failed: false,
+            timing: Some(HipBatchTiming {
+                start: None,
+                end: None,
+                segments_ms: Rc::new(RefCell::new(Vec::new())),
+            }),
+        }
+    }
+
+    /// Return device elapsed times for segments whose completion tokens have been waited.
+    #[must_use]
+    pub fn timings_ms(&self) -> Vec<f32> {
+        self.timing
+            .as_ref()
+            .map_or_else(Vec::new, |timing| timing.segments_ms.borrow().clone())
     }
 
     #[must_use]
@@ -1539,6 +1584,36 @@ impl HipCompletionBatch {
     /// Returns the event or stream synchronization error.
     pub fn finish(&mut self) -> Result<HipBatchCompletion, HipError> {
         ensure_batch_open(self.failed)?;
+        if self
+            .timing
+            .as_ref()
+            .is_some_and(|timing| timing.start.is_some())
+        {
+            let end = match self.stream.inner.runtime.create_timing_event() {
+                Ok(event) => event,
+                Err(error) => {
+                    self.release_after_stream_sync();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.stream.record_timing(&end) {
+                if self.stream.synchronize().is_err() {
+                    self.failed = true;
+                    self.quarantine_and_forget();
+                    std::mem::forget(end);
+                } else {
+                    self.resources.clear();
+                    self.launch_events.clear();
+                    if let Some(timing) = &mut self.timing {
+                        timing.start.take();
+                    }
+                }
+                return Err(error);
+            }
+            if let Some(timing) = &mut self.timing {
+                timing.end = Some(end);
+            }
+        }
         let event = match self.stream.inner.runtime.create_event() {
             Ok(event) => event,
             Err(error) => {
@@ -1555,13 +1630,25 @@ impl HipCompletionBatch {
                 // Stream quiescence is proven; the failed event is not needed to release owners.
                 self.resources.clear();
                 self.launch_events.clear();
+                if let Some(timing) = &mut self.timing {
+                    timing.start.take();
+                    timing.end.take();
+                }
             }
             return Err(error);
         }
+        let timing_events = self.timing.as_mut().and_then(|timing| {
+            Some(HipBatchTimingSegment {
+                start: timing.start.take()?,
+                end: timing.end.take()?,
+                segments_ms: Rc::clone(&timing.segments_ms),
+            })
+        });
         Ok(HipBatchCompletion {
             final_event: Some(event),
             launch_events: std::mem::take(&mut self.launch_events),
             resources: std::mem::take(&mut self.resources),
+            timing_events,
         })
     }
 
@@ -1572,6 +1659,10 @@ impl HipCompletionBatch {
         } else {
             self.resources.clear();
             self.launch_events.clear();
+            if let Some(timing) = &mut self.timing {
+                timing.start.take();
+                timing.end.take();
+            }
         }
     }
 
@@ -1584,6 +1675,14 @@ impl HipCompletionBatch {
         }
         for event in self.launch_events.drain(..) {
             std::mem::forget(event);
+        }
+        if let Some(timing) = &mut self.timing {
+            if let Some(event) = timing.start.take() {
+                std::mem::forget(event);
+            }
+            if let Some(event) = timing.end.take() {
+                std::mem::forget(event);
+            }
         }
     }
 }
@@ -1604,6 +1703,7 @@ pub struct HipBatchCompletion {
     final_event: Option<HipEventHandle>,
     launch_events: Vec<HipEventHandle>,
     resources: Vec<LaunchResources>,
+    timing_events: Option<HipBatchTimingSegment>,
 }
 
 impl HipBatchCompletion {
@@ -1616,9 +1716,18 @@ impl HipBatchCompletion {
         if let Some(event) = &self.final_event {
             event.synchronize()?;
         }
+        if let Some(timing) = &self.timing_events {
+            let milliseconds = timing
+                .start
+                .inner
+                .runtime
+                .elapsed_time_ms(&timing.start, &timing.end)?;
+            timing.segments_ms.borrow_mut().push(milliseconds);
+        }
         self.resources.clear();
         self.launch_events.clear();
         self.final_event.take();
+        self.timing_events.take();
         Ok(())
     }
 }
@@ -1636,6 +1745,7 @@ impl Drop for HipBatchCompletion {
             self.resources.clear();
             self.launch_events.clear();
             self.final_event.take();
+            self.timing_events.take();
         } else {
             for resources in &self.resources {
                 resources.quarantine();
@@ -1648,6 +1758,10 @@ impl Drop for HipBatchCompletion {
             }
             if let Some(event) = self.final_event.take() {
                 std::mem::forget(event);
+            }
+            if let Some(timing) = self.timing_events.take() {
+                std::mem::forget(timing.start);
+                std::mem::forget(timing.end);
             }
         }
     }
@@ -1838,6 +1952,31 @@ impl HipKernel {
         } else {
             Some(self.module.runtime.create_event()?)
         };
+        if let Some(batch) = batch.as_deref_mut()
+            && let Some(timing) = &mut batch.timing
+            && timing.start.is_none()
+        {
+            let start = match self.module.runtime.create_timing_event() {
+                Ok(event) => event,
+                Err(error) => {
+                    batch.failed = true;
+                    batch.release_after_stream_sync();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = stream.record_timing(&start) {
+                batch.failed = true;
+                if stream.synchronize().is_err() {
+                    batch.quarantine_and_forget();
+                    std::mem::forget(start);
+                } else {
+                    batch.resources.clear();
+                    batch.launch_events.clear();
+                }
+                return Err(error);
+            }
+            timing.start = Some(start);
+        }
         let launch_result =
             self.module
                 .runtime

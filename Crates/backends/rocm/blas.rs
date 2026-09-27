@@ -14,6 +14,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::Arc,
+    time::Instant,
 };
 
 use libloading::Library;
@@ -95,6 +96,66 @@ pub enum RocblasError {
         required: usize,
     },
     InvalidVector(&'static str),
+}
+
+/// Host-side phase durations for one explicitly profiled SGEMM call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RocblasSgemmHostTiming {
+    /// Validation, leases, device selection, and symbol lookup.
+    pub preflight: std::time::Duration,
+    /// Time spent in the `rocblas_sgemm` C function.
+    pub rocblas_call: std::time::Duration,
+    /// Time spent in `hipDeviceSynchronize`.
+    pub device_synchronize: std::time::Duration,
+    /// Lease release or quarantine disposition after synchronization.
+    pub cleanup: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+enum SgemmPhase {
+    Preflight,
+    RocblasCall,
+    DeviceSynchronize,
+    Cleanup,
+}
+
+trait SgemmTimingSink {
+    type Mark;
+
+    fn begin(&mut self, phase: SgemmPhase) -> Self::Mark;
+    fn finish(&mut self, phase: SgemmPhase, mark: Self::Mark);
+}
+
+struct NoopSgemmTiming;
+
+impl SgemmTimingSink for NoopSgemmTiming {
+    type Mark = ();
+
+    #[inline(always)]
+    fn begin(&mut self, _: SgemmPhase) {}
+
+    #[inline(always)]
+    fn finish(&mut self, _: SgemmPhase, (): Self::Mark) {}
+}
+
+struct CollectSgemmTiming<'a>(&'a mut RocblasSgemmHostTiming);
+
+impl SgemmTimingSink for CollectSgemmTiming<'_> {
+    type Mark = Instant;
+
+    fn begin(&mut self, _: SgemmPhase) -> Self::Mark {
+        Instant::now()
+    }
+
+    fn finish(&mut self, phase: SgemmPhase, mark: Self::Mark) {
+        let elapsed = mark.elapsed();
+        match phase {
+            SgemmPhase::Preflight => self.0.preflight = elapsed,
+            SgemmPhase::RocblasCall => self.0.rocblas_call = elapsed,
+            SgemmPhase::DeviceSynchronize => self.0.device_synchronize = elapsed,
+            SgemmPhase::Cleanup => self.0.cleanup = elapsed,
+        }
+    }
 }
 
 impl fmt::Display for RocblasError {
@@ -256,7 +317,7 @@ impl Rocblas {
     ///
     /// Returns an identity, missing-symbol, or rocBLAS status error.
     #[cfg(feature = "tensor")]
-    pub(crate) fn bind_stream(&mut self, stream: &HipStreamHandle) -> Result<(), RocblasError> {
+    pub fn bind_stream(&mut self, stream: &HipStreamHandle) -> Result<(), RocblasError> {
         if self.bound_stream.is_some() {
             return Err(RocblasError::Busy);
         }
@@ -310,49 +371,145 @@ impl Rocblas {
         c: &DeviceBuffer,
         ldc: usize,
     ) -> Result<(), RocblasError> {
-        if self.poisoned.get() {
-            return Err(RocblasError::CompletionUnknown);
-        }
-        let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
-        let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
-        matrix_bytes("A", a_rows, a_cols, lda, a.len())?;
-        matrix_bytes("B", b_rows, b_cols, ldb, b.len())?;
-        matrix_bytes("C", m, n, ldc, c.len())?;
-        self.runtime
-            .ensure_same_runtime(&a.allocation.runtime)
-            .map_err(|_| RocblasError::DifferentRuntime)?;
-        self.runtime
-            .ensure_same_runtime(&b.allocation.runtime)
-            .map_err(|_| RocblasError::DifferentRuntime)?;
-        self.runtime
-            .ensure_same_runtime(&c.allocation.runtime)
-            .map_err(|_| RocblasError::DifferentRuntime)?;
-        if Rc::ptr_eq(&a.allocation, &b.allocation)
-            || Rc::ptr_eq(&a.allocation, &c.allocation)
-            || Rc::ptr_eq(&b.allocation, &c.allocation)
-        {
-            return Err(RocblasError::AliasedBuffers);
-        }
-        let a_lease = a.acquire_access().map_err(|_| RocblasError::Busy)?;
-        let b_lease = b.acquire_access().map_err(|_| RocblasError::Busy)?;
-        let c_lease = c.acquire_access().map_err(|_| RocblasError::Busy)?;
-        let (m, n, k, lda, ldb, ldc) = (
-            c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
-            c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
-            c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
-            c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
-            c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
-            c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
-        );
-        self.runtime.hip_set_device(self.runtime.0.device)?;
-        // SAFETY: signature follows rocblas_sgemm in rocblas.h; buffers are validated allocations
-        // from this runtime/device and the scalar pointers remain live through the call.
-        let sgemm = unsafe { self.library.get::<Sgemm>(b"rocblas_sgemm\0") }.map_err(|e| {
-            RocblasError::MissingSymbol {
-                symbol: "rocblas_sgemm",
-                detail: e.to_string(),
+        self.sgemm_impl(
+            transpose_a,
+            transpose_b,
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            lda,
+            b,
+            ldb,
+            beta,
+            c,
+            ldc,
+            &mut NoopSgemmTiming,
+        )
+    }
+
+    /// Like [`Self::sgemm`], with opt-in host timings for its setup, C call, synchronization,
+    /// and final lease disposition. Timings are reset before the call and remain available when
+    /// the operation returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, runtime, concurrency, rocBLAS, or HIP errors as [`Self::sgemm`].
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::too_many_arguments
+    )]
+    pub fn sgemm_profiled(
+        &self,
+        transpose_a: bool,
+        transpose_b: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &DeviceBuffer,
+        lda: usize,
+        b: &DeviceBuffer,
+        ldb: usize,
+        beta: f32,
+        c: &DeviceBuffer,
+        ldc: usize,
+        timing: &mut RocblasSgemmHostTiming,
+    ) -> Result<(), RocblasError> {
+        *timing = RocblasSgemmHostTiming::default();
+        self.sgemm_impl(
+            transpose_a,
+            transpose_b,
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            lda,
+            b,
+            ldb,
+            beta,
+            c,
+            ldc,
+            &mut CollectSgemmTiming(timing),
+        )
+    }
+
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::too_many_arguments,
+        clippy::too_many_lines // Keep lease acquisition, synchronization, and quarantine visible together.
+    )]
+    fn sgemm_impl<T: SgemmTimingSink>(
+        &self,
+        transpose_a: bool,
+        transpose_b: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &DeviceBuffer,
+        lda: usize,
+        b: &DeviceBuffer,
+        ldb: usize,
+        beta: f32,
+        c: &DeviceBuffer,
+        ldc: usize,
+        timing: &mut T,
+    ) -> Result<(), RocblasError> {
+        let preflight_mark = timing.begin(SgemmPhase::Preflight);
+        let preflight = (|| {
+            if self.poisoned.get() {
+                return Err(RocblasError::CompletionUnknown);
             }
-        })?;
+            let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
+            let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+            matrix_bytes("A", a_rows, a_cols, lda, a.len())?;
+            matrix_bytes("B", b_rows, b_cols, ldb, b.len())?;
+            matrix_bytes("C", m, n, ldc, c.len())?;
+            self.runtime
+                .ensure_same_runtime(&a.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            self.runtime
+                .ensure_same_runtime(&b.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            self.runtime
+                .ensure_same_runtime(&c.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            if Rc::ptr_eq(&a.allocation, &b.allocation)
+                || Rc::ptr_eq(&a.allocation, &c.allocation)
+                || Rc::ptr_eq(&b.allocation, &c.allocation)
+            {
+                return Err(RocblasError::AliasedBuffers);
+            }
+            let a_lease = a.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let b_lease = b.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let c_lease = c.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let (m, n, k, lda, ldb, ldc) = (
+                c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
+            );
+            self.runtime.hip_set_device(self.runtime.0.device)?;
+            // SAFETY: signature follows rocblas_sgemm in rocblas.h; buffers are validated allocations
+            // from this runtime/device and the scalar pointers remain live through the call.
+            let sgemm = unsafe { self.library.get::<Sgemm>(b"rocblas_sgemm\0") }.map_err(|e| {
+                RocblasError::MissingSymbol {
+                    symbol: "rocblas_sgemm",
+                    detail: e.to_string(),
+                }
+            })?;
+            Ok((a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, *sgemm))
+        })();
+        timing.finish(SgemmPhase::Preflight, preflight_mark);
+        let (a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, sgemm) = preflight?;
+        let call_mark = timing.begin(SgemmPhase::RocblasCall);
         let status = unsafe {
             sgemm(
                 self.handle,
@@ -379,13 +536,17 @@ impl Rocblas {
                 ldc,
             )
         };
+        timing.finish(SgemmPhase::RocblasCall, call_mark);
         // rocBLAS enqueues on its default stream. Device synchronization makes this API explicitly
         // synchronous and ensures all borrowed buffer owners remain valid until completion. Even a
         // rocBLAS error is followed by synchronization because the call may have partially queued.
+        let sync_mark = timing.begin(SgemmPhase::DeviceSynchronize);
         let sync = self.runtime.call(
             "hipDeviceSynchronize",
             |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
         );
+        timing.finish(SgemmPhase::DeviceSynchronize, sync_mark);
+        let cleanup_mark = timing.begin(SgemmPhase::Cleanup);
         if let Err(error) = sync {
             // Completion is now unknown. Retain every allocation and the library/handle forever;
             // freeing any of them could race device work that HIP failed to confirm had stopped.
@@ -393,8 +554,13 @@ impl Rocblas {
             std::mem::forget(a_lease);
             std::mem::forget(b_lease);
             std::mem::forget(c_lease);
+            timing.finish(SgemmPhase::Cleanup, cleanup_mark);
             return Err(error.into());
         }
+        drop(a_lease);
+        drop(b_lease);
+        drop(c_lease);
+        timing.finish(SgemmPhase::Cleanup, cleanup_mark);
         if status != ROCBLAS_SUCCESS {
             return Err(RocblasError::Status {
                 operation: "rocblas_sgemm",

@@ -60,6 +60,10 @@ const PROVIDER: PcuProviderId = PcuProviderId(0x524f_434d);
 const TARGET_ID: u32 = 0;
 
 const fn f32_alu_caps() -> PcuDispatchOpCaps {
+    f64_alu_caps().union(PcuDispatchOpCaps::ALU_MAX)
+}
+
+const fn f64_alu_caps() -> PcuDispatchOpCaps {
     PcuDispatchOpCaps::ALU_ADD
         .union(PcuDispatchOpCaps::ALU_SUB)
         .union(PcuDispatchOpCaps::ALU_MUL)
@@ -494,6 +498,7 @@ impl RocmDiscovery {
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
             .union(PcuDispatchOpCaps::CONTROL_LOOP)
@@ -508,7 +513,7 @@ impl RocmDiscovery {
             scalar_alu: PcuFeatureSupport::new(
                 fusion_pcu::PcuDispatchScalarAluSupport::empty()
                     .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
+                    .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
                     .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
                     .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
                     .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
@@ -595,6 +600,7 @@ const ROCM_EXECUTOR: PcuExecutorDescriptor = PcuExecutorDescriptor {
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
             .union(PcuDispatchOpCaps::CONTROL_LOOP)
@@ -603,7 +609,7 @@ const ROCM_EXECUTOR: PcuExecutorDescriptor = PcuExecutorDescriptor {
             .union(PcuDispatchOpCaps::BINDING_STORE),
         dispatch_scalar_alu: fusion_pcu::PcuDispatchScalarAluSupport::empty()
             .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
             .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
             .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
@@ -662,6 +668,98 @@ mod tests {
                 .dispatch_scalar_alu
                 .for_scalar(fusion_pcu::PcuScalarType::F64)
                 .contains(PcuDispatchOpCaps::ALU_ADD)
+        );
+    }
+
+    #[test]
+    fn discovery_advertises_lowered_f32_max() {
+        let support = sample().support(true);
+        assert!(
+            support
+                .dispatch_support
+                .scalar_alu
+                .direct
+                .for_scalar(fusion_pcu::PcuScalarType::F32)
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            support
+                .dispatch_support
+                .instructions
+                .direct
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            ROCM_EXECUTOR
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::F32)
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            ROCM_EXECUTOR
+                .support
+                .dispatch_instructions
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            !ROCM_EXECUTOR
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::F64)
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            !ROCM_EXECUTOR
+                .support
+                .dispatch_instructions
+                .contains(PcuDispatchOpCaps::ALU_MIN)
+        );
+        let max = [fusion_pcu::PcuDispatchOp::Data(
+            fusion_pcu::PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f32(),
+                result: fusion_pcu::PcuDispatchValueId(3),
+                op: fusion_pcu::PcuDispatchAluOp::Max,
+                lhs: fusion_pcu::PcuDispatchValueId(1),
+                rhs: fusion_pcu::PcuDispatchValueId(2),
+            },
+        )];
+        let kernel = fusion_pcu::PcuDispatchKernelIr {
+            id: fusion_pcu::PcuKernelId(1),
+            entry: fusion_pcu::PcuDispatchEntryPoint {
+                name: "f32-max-capability",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &max,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        assert!(
+            ROCM_EXECUTOR
+                .support
+                .supports_kernel_direct(fusion_pcu::PcuKernel::Dispatch(kernel))
+        );
+        let f64_max = [fusion_pcu::PcuDispatchOp::Data(
+            fusion_pcu::PcuDispatchDataOp::Alu {
+                value_type: fusion_pcu::PcuValueType::f64(),
+                result: fusion_pcu::PcuDispatchValueId(3),
+                op: fusion_pcu::PcuDispatchAluOp::Max,
+                lhs: fusion_pcu::PcuDispatchValueId(1),
+                rhs: fusion_pcu::PcuDispatchValueId(2),
+            },
+        )];
+        assert!(
+            !ROCM_EXECUTOR
+                .support
+                .supports_kernel_direct(fusion_pcu::PcuKernel::Dispatch(
+                    fusion_pcu::PcuDispatchKernelIr {
+                        ops: &f64_max,
+                        ..kernel
+                    }
+                ))
         );
     }
 

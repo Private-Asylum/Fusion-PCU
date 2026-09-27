@@ -1178,6 +1178,7 @@ const fn owned_dispatch_support() -> PcuSupport {
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
             .union(PcuDispatchOpCaps::CONTROL_LOOP)
@@ -1189,7 +1190,7 @@ const fn owned_dispatch_support() -> PcuSupport {
     dispatch.scalar_alu = PcuFeatureSupport::new(
         fusion_pcu::PcuDispatchScalarAluSupport::empty()
             .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
             .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
             .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
@@ -1215,6 +1216,7 @@ const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_
     .union(PcuDispatchOpCaps::ALU_SUB)
     .union(PcuDispatchOpCaps::ALU_MUL)
     .union(PcuDispatchOpCaps::ALU_DIV)
+    .union(PcuDispatchOpCaps::ALU_MAX)
     .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
     .union(PcuDispatchOpCaps::CONTROL_RETURN)
     .union(PcuDispatchOpCaps::CONTROL_LOOP)
@@ -1223,6 +1225,10 @@ const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_
     .union(PcuDispatchOpCaps::BINDING_STORE);
 
 const fn f32_alu_caps() -> PcuDispatchOpCaps {
+    f64_alu_caps().union(PcuDispatchOpCaps::ALU_MAX)
+}
+
+const fn f64_alu_caps() -> PcuDispatchOpCaps {
     PcuDispatchOpCaps::ALU_ADD
         .union(PcuDispatchOpCaps::ALU_SUB)
         .union(PcuDispatchOpCaps::ALU_MUL)
@@ -1288,7 +1294,7 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
         dispatch_instructions: OWNED_DISPATCH_INSTRUCTIONS,
         dispatch_scalar_alu: fusion_pcu::PcuDispatchScalarAluSupport::empty()
             .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::F64, f32_alu_caps())
+            .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
             .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
             .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
@@ -1342,6 +1348,12 @@ mod tests {
         PcuDispatchValueId,
         PcuExecutionFault,
         PcuExecutionFaultKind,
+        PcuExecutionGraphError,
+        PcuExecutionNode,
+        PcuExecutionResourceId,
+        PcuExecutionResourceUse,
+        validate_execution_fault_gates,
+        validate_execution_graph,
     };
     use fusion_pcu::model::PcuIntegerDivFlags;
 
@@ -1374,6 +1386,36 @@ mod tests {
             validate_batch_fault_semantics(true),
             Err(RocmOwnedDispatchError::CheckedDivisionBatchUnsupported)
         ));
+
+        let result = PcuExecutionResourceUse {
+            resource: PcuExecutionResourceId(0),
+            access: PcuMemoryAccess::WriteOnly,
+        };
+        let consumed = PcuExecutionResourceUse {
+            access: PcuMemoryAccess::ReadOnly,
+            ..result
+        };
+        // An in-order HIP stream establishes ordering, but a later launch must not read a
+        // checked kernel's output before its terminal fault word has been observed.
+        let nodes = [
+            PcuExecutionNode {
+                dependencies: &[],
+                resources: &[result],
+            },
+            PcuExecutionNode {
+                dependencies: &[0],
+                resources: &[consumed],
+            },
+        ];
+        assert!(validate_execution_graph(&nodes, 1, &mut [false; 2]).is_ok());
+        assert_eq!(
+            validate_execution_fault_gates(&nodes, &[true, false], &[], &mut [false; 2]),
+            Err(PcuExecutionGraphError::FaultOutputNotSuccessGated {
+                producer: 0,
+                consumer: 1,
+                resource: PcuExecutionResourceId(0),
+            })
+        );
     }
 
     #[test]
@@ -1489,6 +1531,46 @@ mod tests {
                 .direct
                 .for_scalar(fusion_pcu::PcuScalarType::F64)
                 .contains(PcuDispatchOpCaps::ALU_ADD)
+        );
+    }
+
+    #[test]
+    fn owned_dispatch_advertises_lowered_f32_max() {
+        let support = owned_dispatch_support();
+        assert!(
+            support
+                .dispatch_support
+                .scalar_alu
+                .direct
+                .for_scalar(fusion_pcu::PcuScalarType::F32)
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            support
+                .dispatch_support
+                .instructions
+                .direct
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            OWNED_EXECUTORS[0]
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::F32)
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            !OWNED_EXECUTORS[0]
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::F64)
+                .contains(PcuDispatchOpCaps::ALU_MAX)
+        );
+        assert!(
+            !OWNED_EXECUTORS[0]
+                .support
+                .dispatch_instructions
+                .contains(PcuDispatchOpCaps::ALU_MIN)
         );
     }
 

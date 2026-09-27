@@ -40,11 +40,13 @@ pub use runtime::{
     activation,
     assessment,
     discovery,
+    execution,
     registry,
 };
 pub use runtime::activation::*;
 pub use runtime::assessment::*;
 pub use runtime::discovery::*;
+pub use runtime::execution::*;
 pub use runtime::registry::*;
 pub use resource::{
     borrowed,

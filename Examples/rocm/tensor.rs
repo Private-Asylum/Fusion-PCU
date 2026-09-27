@@ -1073,15 +1073,22 @@ fn verify_relu_backward(
     ];
     let expected = graph.evaluate(&inputs)?.value(output)?.clone();
     let actual = assessor.execute_graph(&graph, &inputs, output, pool, memory)?;
-    if actual
-        .data()
-        .iter()
-        .map(|v| v.to_bits())
-        .eq(expected.data().iter().map(|v| v.to_bits()))
-    {
+    let prepared = assessor.prepare_graph(&graph, output)?;
+    let batched = assessor.execute_prepared_batched(&prepared, &inputs, pool, memory)?;
+    let matches_expected = |value: &Tensor| {
+        value
+            .data()
+            .iter()
+            .map(|entry| entry.to_bits())
+            .eq(expected.data().iter().map(|entry| entry.to_bits()))
+    };
+    if matches_expected(&actual) && matches_expected(&batched) {
         Ok(())
     } else {
-        Err(format!("ROCm ReLU backward output {actual:?}, expected {expected:?}").into())
+        Err(format!(
+            "ROCm ReLU backward outputs direct={actual:?}, batched={batched:?}, expected={expected:?}"
+        )
+        .into())
     }
 }
 

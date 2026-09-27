@@ -21,6 +21,7 @@ pub use storage::{
     TensorStorageValidationError,
     TensorValueLiveness,
     TensorValueRequirement,
+    TensorValueStorageRequirement,
 };
 use storage::node_output_bytes;
 
@@ -1094,6 +1095,38 @@ impl<'a> TensorExecutionPlan<'a> {
             self.graph.nodes[value.index].op,
             Op::Input | Op::Constant(_) | Op::Uniform(_)
         )
+    }
+
+    /// Returns dense-layout resource extents and required access for selected values.
+    ///
+    /// Inputs and constants are read-only; computed values may be produced and consumed by
+    /// selected operations, so their resources must support both reads and writes. The byte
+    /// extents are logical dense extents. A backend using compact uniforms, views, or another
+    /// physical layout must physicalize these requirements before validating actual resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeOverflow` if a selected value's byte extent cannot be represented.
+    pub fn value_storage_requirements(
+        &self,
+    ) -> Result<Vec<TensorValueStorageRequirement>, TensorError> {
+        self.value_liveness
+            .iter()
+            .map(|life| {
+                Ok(TensorValueStorageRequirement {
+                    value: life.value,
+                    output_bytes: u64::try_from(
+                        life.output_bytes.ok_or(TensorError::ShapeOverflow)?,
+                    )
+                    .map_err(|_| TensorError::ShapeOverflow)?,
+                    access: if self.is_writable_value(life.value) {
+                        fusion_pcu::PcuMemoryAccess::ReadWrite
+                    } else {
+                        fusion_pcu::PcuMemoryAccess::ReadOnly
+                    },
+                })
+            })
+            .collect()
     }
 
     #[must_use]

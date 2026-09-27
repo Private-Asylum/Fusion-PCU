@@ -6,9 +6,11 @@
 pub mod activation;
 pub mod assessment;
 pub mod discovery;
+pub mod execution;
 pub mod registry;
 
 pub use activation::*;
 pub use assessment::*;
 pub use discovery::*;
+pub use execution::*;
 pub use registry::*;

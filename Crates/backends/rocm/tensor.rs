@@ -53,6 +53,7 @@ use fusion_pcu::{
     PcuMemoryAllocationRequest,
     PcuMemoryHostAccess,
     PcuMemoryMemberRequirement,
+    PcuMemoryResourceCapability,
     PcuMemoryResource,
     PcuMemoryProvider,
     PcuMemoryProviderError,
@@ -100,13 +101,16 @@ use crate::{
     HipTimingEventHandle,
     Rocblas,
     RocblasError,
+    RocblasSgemmHostTiming,
     RocmMemoryResource,
     RocmOwnedDispatchBackend,
     RocmPreparedDispatch,
 };
 
 const ADD_DISPATCH_CACHE_CAPACITY: usize = 32;
-const TENSOR_EXECUTION_INLINE_NODES: usize = 8;
+// Covers the common small training graph without heap-spilling per-step resource/use slots.
+// Larger graphs still spill rather than imposing their full working set on every stack frame.
+const TENSOR_EXECUTION_INLINE_NODES: usize = 12;
 
 type TensorExecutionResources =
     SmallVec<[Option<RocmMemoryResource>; TENSOR_EXECUTION_INLINE_NODES]>;
@@ -1766,6 +1770,11 @@ impl<'session> RocmTensorAssessor<'session> {
             {
                 return Err(RocmTensorExecutionError::ScratchMismatch);
             }
+            if let Some(resource) = &resource {
+                physical_value_storage_requirement(prepared, node.value, node.op)?
+                    .validate(resource)
+                    .map_err(RocmTensorExecutionError::StorageConstraint)?;
+            }
             resources.push(resource);
         }
         let mse_squared = if max_mse_count == 0 {
@@ -1856,6 +1865,7 @@ impl<'session> RocmTensorAssessor<'session> {
             session: self.session,
             pool,
             outputs,
+            requirements,
             poisoned: false,
         })
     }
@@ -1899,6 +1909,53 @@ impl<'session> RocmTensorAssessor<'session> {
             output_bank.poisoned = true;
         }
         result.map(drop)
+    }
+
+    /// Diagnostic variant of [`Self::execute_prepared_outputs_into_bank`] that returns
+    /// synchronous wall time for each prepared node in execution order.
+    ///
+    /// Timing collection is deliberately isolated to this entry point because reading the clock
+    /// and retaining one record per node perturb short kernels.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, memory-provider, operation, or completion errors as the
+    /// unprofiled output-bank path.
+    pub fn execute_prepared_outputs_into_bank_profiled<P>(
+        &self,
+        prepared: &RocmPreparedTensorGraph<'_>,
+        inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        scratch: &mut RocmTensorScratch<'_, '_, 'session>,
+        output_bank: &mut RocmTensorOutputBank<'_, '_, 'session>,
+        memory: &mut P,
+    ) -> Result<Vec<RocmTensorNodeTiming>, RocmTensorExecutionError>
+    where
+        P: PcuMemoryProvider<Resource = RocmMemoryResource>,
+    {
+        if output_bank.poisoned
+            || !std::ptr::eq(output_bank.prepared, prepared)
+            || !std::ptr::eq(output_bank.session, self.session)
+            || output_bank.pool != scratch.pool
+        {
+            return Err(RocmTensorExecutionError::OutputResourceMismatch);
+        }
+        let mut timings = CollectNodeTimings::default();
+        let result = self.execute_prepared_outputs_with_input_sources_and_scratch(
+            prepared,
+            &[],
+            inputs,
+            output_bank.pool,
+            memory,
+            Some(&mut *scratch),
+            Some(output_bank),
+            &mut timings,
+            None,
+        );
+        if result.is_err() {
+            scratch.poisoned = true;
+            output_bank.poisoned = true;
+        }
+        result.map(|_| timings.0)
     }
 
     /// Execute into a reusable output bank with HIP dispatch batching enabled.
@@ -1947,6 +2004,112 @@ impl<'session> RocmTensorAssessor<'session> {
             output_bank.poisoned = true;
         }
         result.map(drop)
+    }
+
+    /// Diagnostic variant of [`Self::execute_prepared_outputs_into_bank_batched`] that returns
+    /// per-node host wall time spent while executing prepared nodes in order.
+    ///
+    /// Timing collection is deliberately isolated to this entry point because reading the clock
+    /// and retaining one record per node perturb short kernels. Pointwise nodes may only enqueue
+    /// work; their deferred completion wait is charged to the later batch flush or `MatMul`, or
+    /// occurs after the node loop when the final batch is dropped. Batch completion is dropped
+    /// before reusable storage is poisoned on error, so queued work is synchronized or
+    /// quarantined before this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, memory-provider, operation, or completion errors as the
+    /// batched output-bank path.
+    pub fn execute_prepared_outputs_into_bank_batched_profiled<P>(
+        &self,
+        prepared: &RocmPreparedTensorGraph<'_>,
+        inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        scratch: &mut RocmTensorScratch<'_, '_, 'session>,
+        output_bank: &mut RocmTensorOutputBank<'_, '_, 'session>,
+        memory: &mut P,
+    ) -> Result<Vec<RocmTensorNodeTiming>, RocmTensorExecutionError>
+    where
+        P: PcuMemoryProvider<Resource = RocmMemoryResource>,
+    {
+        if output_bank.poisoned
+            || !std::ptr::eq(output_bank.prepared, prepared)
+            || !std::ptr::eq(output_bank.session, self.session)
+            || output_bank.pool != scratch.pool
+        {
+            return Err(RocmTensorExecutionError::OutputResourceMismatch);
+        }
+        let mut timings = CollectNodeTimings::default();
+        let mut batch = HipCompletionBatch::new(&self.stream);
+        let result = self.execute_prepared_outputs_with_input_sources_and_scratch(
+            prepared,
+            &[],
+            inputs,
+            output_bank.pool,
+            memory,
+            Some(&mut *scratch),
+            Some(output_bank),
+            &mut timings,
+            Some(&mut batch),
+        );
+        drop(batch);
+        if result.is_err() {
+            scratch.poisoned = true;
+            output_bank.poisoned = true;
+        }
+        result.map(|_| timings.0)
+    }
+
+    /// Execute a prepared output-bank graph with opt-in per-batch HIP device timing.
+    ///
+    /// Returned durations are HIP stream-event intervals in milliseconds, in submission order.
+    /// Each begins immediately before a batch's first launch and ends when the batch flushes.
+    /// The interval excludes rocBLAS work but may include stream-idle time between launches or
+    /// between the last launch and the flush marker. It is not a GPU-busy kernel-duration sum.
+    /// The normal batched path creates no timing events.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, memory, launch, or completion errors as batched execution,
+    /// plus timing-event failures. An execution failure poisons the reusable storage.
+    pub fn execute_prepared_outputs_into_bank_batched_device_timed<P>(
+        &self,
+        prepared: &RocmPreparedTensorGraph<'_>,
+        inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        scratch: &mut RocmTensorScratch<'_, '_, 'session>,
+        output_bank: &mut RocmTensorOutputBank<'_, '_, 'session>,
+        memory: &mut P,
+    ) -> Result<Vec<f32>, RocmTensorExecutionError>
+    where
+        P: PcuMemoryProvider<Resource = RocmMemoryResource>,
+    {
+        if output_bank.poisoned
+            || !std::ptr::eq(output_bank.prepared, prepared)
+            || !std::ptr::eq(output_bank.session, self.session)
+            || output_bank.pool != scratch.pool
+        {
+            return Err(RocmTensorExecutionError::OutputResourceMismatch);
+        }
+        let mut batch = HipCompletionBatch::new_timed(&self.stream);
+        let result = self.execute_prepared_outputs_with_input_sources_and_scratch(
+            prepared,
+            &[],
+            inputs,
+            output_bank.pool,
+            memory,
+            Some(&mut *scratch),
+            Some(output_bank),
+            &mut NoopNodeTiming,
+            Some(&mut batch),
+        );
+        match result {
+            Ok(_) => Ok(batch.timings_ms()),
+            Err(error) => {
+                drop(batch);
+                scratch.poisoned = true;
+                output_bank.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     /// Execute a prepared graph with caller-owned reusable constants and intermediate storage.
@@ -2371,10 +2534,8 @@ impl<'session> RocmTensorAssessor<'session> {
         }
         if let Some(bank) = output_bank {
             validate_output_bank(bank, prepared, self.session, pool, resource_inputs, scratch)?;
-            if let Some(scratch) = scratch {
-                validate_prepared_storage_constraints(prepared, resource_inputs, scratch, bank)?;
-            }
         }
+        validate_prepared_storage_constraints(prepared, resource_inputs, scratch, output_bank)?;
         if prepared.nodes.iter().any(|node| {
             matches!(
                 node.op,
@@ -2434,6 +2595,8 @@ impl<'session> RocmTensorAssessor<'session> {
                 continue;
             }
             let timing_mark = timings.begin();
+            let mut sgemm_host = None;
+            let mut elementwise_host = None;
             match node.op {
                 OpDescriptor::Input => {
                     if let Some(output) = output_bank.and_then(|bank| bank.output(node.value)) {
@@ -2562,19 +2725,25 @@ impl<'session> RocmTensorAssessor<'session> {
                         &mut scratch,
                         output_bank,
                     )?;
-                    self.execute_matmul_row_major_flags(
-                        resources[left_index]
-                            .as_ref()
-                            .ok_or(RocmTensorExecutionError::MissingResource(left))?,
-                        resources[right_index]
-                            .as_ref()
-                            .ok_or(RocmTensorExecutionError::MissingResource(right))?,
-                        &result,
-                        left_shape,
-                        right_shape,
-                        transpose_left,
-                        transpose_right,
-                    )?;
+                    let left_resource = resources[left_index]
+                        .as_ref()
+                        .ok_or(RocmTensorExecutionError::MissingResource(left))?;
+                    let right_resource = resources[right_index]
+                        .as_ref()
+                        .ok_or(RocmTensorExecutionError::MissingResource(right))?;
+                    sgemm_host = timings.with_sgemm_timing(|sgemm_timing| {
+                        self.execute_matmul_row_major_flags(
+                            left_resource,
+                            right_resource,
+                            &result,
+                            left_shape,
+                            right_shape,
+                            transpose_left,
+                            transpose_right,
+                            sgemm_timing,
+                        )
+                        .map_err(Into::into)
+                    })?;
                     resources[index] = Some(result);
                     release_after_read(&mut resources, &mut remaining_uses, left_index)?;
                     release_after_read(&mut resources, &mut remaining_uses, right_index)?;
@@ -2698,6 +2867,7 @@ impl<'session> RocmTensorAssessor<'session> {
                             &mut scratch,
                             output_bank,
                         )?;
+                        let mut elementwise_timing = timings.begin_elementwise();
                         self.execute_elementwise(
                             kind,
                             ElementwiseOperands {
@@ -2715,7 +2885,9 @@ impl<'session> RocmTensorAssessor<'session> {
                                     | (u8::from(right_is_scalar) << 1),
                             },
                             batch.as_deref_mut(),
+                            &mut elementwise_timing,
                         )?;
+                        elementwise_host = timings.finish_elementwise(elementwise_timing);
                         resources[index] = Some(output);
                         release_after_read(&mut resources, &mut remaining_uses, left_index)?;
                         release_after_read(&mut resources, &mut remaining_uses, right_index)?;
@@ -2791,6 +2963,7 @@ impl<'session> RocmTensorAssessor<'session> {
                                     | (u8::from(right_is_scalar) << 1),
                             },
                             batch.as_deref_mut(),
+                            &mut NoopElementwiseTiming,
                         )?;
                         resources[index] = Some(output);
                         release_after_read(&mut resources, &mut remaining_uses, left_index)?;
@@ -2935,6 +3108,7 @@ impl<'session> RocmTensorAssessor<'session> {
                             scalar_mask: 0,
                         },
                         batch.as_deref_mut(),
+                        &mut NoopElementwiseTiming,
                     )?;
                     if let Some(batch) = batch.as_deref_mut() {
                         flush_hip_batch(batch)?;
@@ -2970,6 +3144,13 @@ impl<'session> RocmTensorAssessor<'session> {
                 );
             } else if plan.fused_add_by_relu.contains_key(&node.value) {
                 timings.finish_fused_add_relu(timing_mark, node);
+            } else if matches!(node.op, OpDescriptor::MatMul { .. }) {
+                timings.finish_matmul(timing_mark, node, sgemm_host);
+            } else if matches!(
+                node.op,
+                OpDescriptor::Add { .. } | OpDescriptor::Sub { .. } | OpDescriptor::Mul { .. }
+            ) {
+                timings.finish_fixed_elementwise(timing_mark, node, elementwise_host);
             } else {
                 timings.finish(timing_mark, node);
             }
@@ -3048,6 +3229,7 @@ impl<'session> RocmTensorAssessor<'session> {
                 scalar_mask: 0,
             },
             batch,
+            &mut NoopElementwiseTiming,
         )
     }
 
@@ -3093,17 +3275,22 @@ impl<'session> RocmTensorAssessor<'session> {
             HipKernelArgument::Buffer(output.device_buffer()),
             HipKernelArgument::Bytes(&count_bytes),
         ];
-        // SAFETY: The compiled kernel takes three f32 buffers and a u32 count. Assessed shapes
-        // and allocation sizes cover all guarded indices; the completion retains resources.
-        #[allow(unsafe_code)]
-        let mut completion =
-            unsafe { kernel.launch(stream, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args) }
-                .map_err(RocmTensorExecutionError::Completion)?;
         if let Some(batch) = batch {
-            batch
-                .push(completion)
-                .map_err(RocmTensorExecutionError::Completion)
+            // SAFETY: the compiled kernel takes three f32 buffers and a u32 count. Assessed
+            // shapes and resource sizes cover all guarded indices; the batch retains owners
+            // before enqueue and waits for its final event before reuse.
+            #[allow(unsafe_code)]
+            unsafe {
+                kernel.launch_into_batch(batch, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
+            }
+            .map_err(RocmTensorExecutionError::Completion)
         } else {
+            // SAFETY: the same assessed ABI and resource contract applies to direct submission.
+            #[allow(unsafe_code)]
+            let mut completion = unsafe {
+                kernel.launch(stream, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
+            }
+            .map_err(RocmTensorExecutionError::Completion)?;
             completion
                 .wait()
                 .map_err(RocmTensorExecutionError::Completion)
@@ -3168,17 +3355,22 @@ impl<'session> RocmTensorAssessor<'session> {
             HipKernelArgument::Bytes(&learning_rate_bytes),
             HipKernelArgument::Bytes(&count_bytes),
         ];
-        // SAFETY: assessed equal nonempty f32 shapes fit u32, and execution resources cover all
-        // indices. The completion retains the buffers until the one launch has finished.
-        #[allow(unsafe_code)]
-        let mut completion =
-            unsafe { kernel.launch(stream, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args) }
-                .map_err(RocmTensorExecutionError::Completion)?;
         if let Some(batch) = batch {
-            batch
-                .push(completion)
-                .map_err(RocmTensorExecutionError::Completion)
+            // SAFETY: the assessed shapes and live resources cover every guarded index. The
+            // batch retains the launch owners before enqueue and its final event proves
+            // quiescence before dependent work or storage reuse.
+            #[allow(unsafe_code)]
+            unsafe {
+                kernel.launch_into_batch(batch, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
+            }
+            .map_err(RocmTensorExecutionError::Completion)
         } else {
+            // SAFETY: the same assessed shape and resource contract applies to the direct path.
+            #[allow(unsafe_code)]
+            let mut completion = unsafe {
+                kernel.launch(stream, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
+            }
+            .map_err(RocmTensorExecutionError::Completion)?;
             completion
                 .wait()
                 .map_err(RocmTensorExecutionError::Completion)
@@ -3375,11 +3567,12 @@ impl<'session> RocmTensorAssessor<'session> {
     }
 
     #[allow(clippy::too_many_lines)] // Keeps the cache, owned bindings, and completion lifetime explicit.
-    fn execute_elementwise(
+    fn execute_elementwise<T: ElementwiseTimingSink>(
         &self,
         kind: TensorDispatchKind,
         operands: ElementwiseOperands<'_>,
         batch: Option<&mut HipCompletionBatch>,
+        timing: &mut T,
     ) -> Result<(), RocmTensorExecutionError> {
         let ElementwiseOperands {
             shape,
@@ -3398,6 +3591,7 @@ impl<'session> RocmTensorAssessor<'session> {
             .ok_or(RocmTensorExecutionError::SizeOverflow)?;
         let logical_count = invocations.get();
         let cache_key = TensorDispatchCacheKey::Fixed(kind, logical_count, scalar_mask);
+        let setup_mark = timing.begin(ElementwisePhase::CacheAndBind);
         self.ensure_dispatch_cached(
             cache_key.clone(),
             kind.kernel(logical_count, scalar_mask),
@@ -3460,6 +3654,8 @@ impl<'session> RocmTensorAssessor<'session> {
             )
             .map_err(RocmTensorExecutionError::Backend)?;
         bindings.push(output_binding);
+        timing.finish(ElementwisePhase::CacheAndBind, setup_mark);
+        let submit_mark = timing.begin(ElementwisePhase::Submit);
         let dispatch_result = {
             let cache = self.add_dispatches.borrow();
             let prepared = cache
@@ -3480,11 +3676,14 @@ impl<'session> RocmTensorAssessor<'session> {
                 )
             }
         };
+        timing.finish(ElementwisePhase::Submit, submit_mark);
         if let Some(mut completion) = dispatch_result {
-            match completion
+            let wait_mark = timing.begin(ElementwisePhase::Wait);
+            let outcome = completion
                 .wait()
-                .map_err(RocmTensorExecutionError::Completion)?
-            {
+                .map_err(RocmTensorExecutionError::Completion)?;
+            timing.finish(ElementwisePhase::Wait, wait_mark);
+            match outcome {
                 PcuCompletionOutcome::Succeeded => Ok(()),
                 PcuCompletionOutcome::Failed => Err(RocmTensorExecutionError::FailedCompletion),
                 PcuCompletionOutcome::Fault(fault) => {
@@ -3506,7 +3705,16 @@ impl<'session> RocmTensorAssessor<'session> {
         inner: usize,
         columns: usize,
     ) -> Result<(), RocmTensorError> {
-        self.execute_matmul_row_major_flags(a, b, c, [rows, inner], [inner, columns], false, false)
+        self.execute_matmul_row_major_flags(
+            a,
+            b,
+            c,
+            [rows, inner],
+            [inner, columns],
+            false,
+            false,
+            None,
+        )
     }
 
     /// Interpret row-major operands with optional logical transposition; rocBLAS consumes the
@@ -3521,6 +3729,7 @@ impl<'session> RocmTensorAssessor<'session> {
         b_shape: [usize; 2],
         transpose_a: bool,
         transpose_b: bool,
+        sgemm_timing: Option<&mut RocblasSgemmHostTiming>,
     ) -> Result<(), RocmTensorError> {
         let rows = a_shape[usize::from(transpose_a)];
         let inner = a_shape[usize::from(!transpose_a)];
@@ -3555,7 +3764,7 @@ impl<'session> RocmTensorAssessor<'session> {
             return Err(RocmTensorError::InvalidMemoryAccess);
         }
         let (m, n) = (columns, rows);
-        self.rocblas.sgemm(
+        let args = (
             transpose_b,
             transpose_a,
             m,
@@ -3569,7 +3778,18 @@ impl<'session> RocmTensorAssessor<'session> {
             0.0,
             c.device_buffer(),
             m,
-        )?;
+        );
+        if let Some(timing) = sgemm_timing {
+            self.rocblas.sgemm_profiled(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, timing,
+            )?;
+        } else {
+            self.rocblas.sgemm(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12,
+            )?;
+        }
         Ok(())
     }
 }
@@ -3616,22 +3836,121 @@ pub struct RocmPreparedTensorGraph<'graph> {
     physical_layouts: HashMap<ValueId, RocmPhysicalLayout>,
 }
 
-/// Synchronous wall time spent executing one prepared graph node in diagnostic mode.
+/// Host wall time attributed to one prepared graph node in diagnostic mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RocmTensorNodeTiming {
     /// Graph value produced by this node.
     pub value: ValueId,
     /// Operation kind, such as `MatMul`, `ReluBackward`, or `Input`.
     pub operation: &'static str,
-    /// Elapsed wall time, including synchronous device completion.
+    /// Elapsed wall time while scheduling or executing this node. Synchronous execution includes
+    /// device completion waits; batched pointwise execution may measure enqueue time only, with a
+    /// deferred wait charged to a later flush or `MatMul`, or occurring after the node loop.
     pub elapsed: Duration,
+    /// SGEMM host phase durations for `MatMul` nodes, populated by profiled execution only.
+    pub sgemm_host: Option<RocblasSgemmHostTiming>,
+    /// Fixed elementwise host phases for profiled `Add`, `Sub`, or `Mul` nodes.
+    pub elementwise_host: Option<RocmTensorElementwiseHostTiming>,
+}
+
+/// Host durations for the fixed elementwise dispatch lifecycle.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RocmTensorElementwiseHostTiming {
+    /// Dispatch cache admission and binding construction.
+    pub cache_and_bind: Duration,
+    /// Prepared dispatch submission.
+    pub submit: Duration,
+    /// Synchronous completion wait; zero when completion is deferred to an enclosing batch.
+    pub wait: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum ElementwisePhase {
+    CacheAndBind,
+    Submit,
+    Wait,
+}
+
+trait ElementwiseTimingSink {
+    type Mark;
+
+    fn begin(&mut self, phase: ElementwisePhase) -> Self::Mark;
+    fn finish(&mut self, phase: ElementwisePhase, mark: Self::Mark);
+}
+
+struct NoopElementwiseTiming;
+
+impl ElementwiseTimingSink for NoopElementwiseTiming {
+    type Mark = ();
+
+    #[inline(always)]
+    fn begin(&mut self, _: ElementwisePhase) {}
+
+    #[inline(always)]
+    fn finish(&mut self, _: ElementwisePhase, (): Self::Mark) {}
+}
+
+#[derive(Default)]
+struct CollectElementwiseTiming(RocmTensorElementwiseHostTiming);
+
+impl ElementwiseTimingSink for CollectElementwiseTiming {
+    type Mark = Instant;
+
+    fn begin(&mut self, _: ElementwisePhase) -> Self::Mark {
+        Instant::now()
+    }
+
+    fn finish(&mut self, phase: ElementwisePhase, mark: Self::Mark) {
+        let elapsed = mark.elapsed();
+        match phase {
+            ElementwisePhase::CacheAndBind => self.0.cache_and_bind = elapsed,
+            ElementwisePhase::Submit => self.0.submit = elapsed,
+            ElementwisePhase::Wait => self.0.wait = elapsed,
+        }
+    }
 }
 
 trait NodeTimingSink {
     type Mark;
+    type ElementwiseTiming: ElementwiseTimingSink;
 
     fn begin(&mut self) -> Self::Mark;
     fn finish(&mut self, mark: Self::Mark, node: &NodeDescriptor<'_>);
+
+    fn begin_elementwise(&mut self) -> Self::ElementwiseTiming;
+    fn finish_elementwise(
+        &mut self,
+        timing: Self::ElementwiseTiming,
+    ) -> Option<RocmTensorElementwiseHostTiming>;
+
+    fn finish_fixed_elementwise(
+        &mut self,
+        mark: Self::Mark,
+        node: &NodeDescriptor<'_>,
+        _timing: Option<RocmTensorElementwiseHostTiming>,
+    ) {
+        self.finish(mark, node);
+    }
+
+    fn with_sgemm_timing<F>(
+        &mut self,
+        operation: F,
+    ) -> Result<Option<RocblasSgemmHostTiming>, RocmTensorExecutionError>
+    where
+        F: FnOnce(Option<&mut RocblasSgemmHostTiming>) -> Result<(), RocmTensorExecutionError>,
+    {
+        operation(None)?;
+        Ok(None)
+    }
+
+    fn finish_matmul(
+        &mut self,
+        mark: Self::Mark,
+        node: &NodeDescriptor<'_>,
+        _sgemm_host: Option<RocblasSgemmHostTiming>,
+    ) {
+        self.finish(mark, node);
+    }
 
     fn finish_fused_add_relu(&mut self, mark: Self::Mark, node: &NodeDescriptor<'_>) {
         self.finish(mark, node);
@@ -3651,12 +3970,24 @@ struct NoopNodeTiming;
 
 impl NodeTimingSink for NoopNodeTiming {
     type Mark = ();
+    type ElementwiseTiming = NoopElementwiseTiming;
 
     #[inline(always)]
     fn begin(&mut self) {}
 
     #[inline(always)]
     fn finish(&mut self, (): Self::Mark, _: &NodeDescriptor<'_>) {}
+
+    fn begin_elementwise(&mut self) -> Self::ElementwiseTiming {
+        NoopElementwiseTiming
+    }
+
+    fn finish_elementwise(
+        &mut self,
+        _: Self::ElementwiseTiming,
+    ) -> Option<RocmTensorElementwiseHostTiming> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -3670,29 +4001,55 @@ struct SgdUpdateMode {
 
 impl NodeTimingSink for CollectNodeTimings {
     type Mark = Instant;
+    type ElementwiseTiming = CollectElementwiseTiming;
 
     fn begin(&mut self) -> Self::Mark {
         Instant::now()
     }
 
     fn finish(&mut self, mark: Self::Mark, node: &NodeDescriptor<'_>) {
-        self.0.push(RocmTensorNodeTiming {
-            value: node.value,
-            operation: match node.op {
-                OpDescriptor::Input => "Input",
-                OpDescriptor::Constant(_) => "Constant",
-                OpDescriptor::Uniform { .. } => "Uniform",
-                OpDescriptor::MatMul { .. } => "MatMul",
-                OpDescriptor::Add { .. } => "Add",
-                OpDescriptor::Sub { .. } => "Sub",
-                OpDescriptor::Mul { .. } => "Mul",
-                OpDescriptor::Relu { .. } => "Relu",
-                OpDescriptor::ReluBackward { .. } => "ReluBackward",
-                OpDescriptor::SgdUpdate { .. } => "SgdUpdate",
-                OpDescriptor::MeanSquaredError { .. } => "MeanSquaredError",
-            },
-            elapsed: mark.elapsed(),
-        });
+        self.push(mark, node, None, None);
+    }
+
+    fn begin_elementwise(&mut self) -> Self::ElementwiseTiming {
+        CollectElementwiseTiming::default()
+    }
+
+    fn finish_elementwise(
+        &mut self,
+        timing: Self::ElementwiseTiming,
+    ) -> Option<RocmTensorElementwiseHostTiming> {
+        Some(timing.0)
+    }
+
+    fn finish_fixed_elementwise(
+        &mut self,
+        mark: Self::Mark,
+        node: &NodeDescriptor<'_>,
+        elementwise_host: Option<RocmTensorElementwiseHostTiming>,
+    ) {
+        self.push(mark, node, None, elementwise_host);
+    }
+
+    fn with_sgemm_timing<F>(
+        &mut self,
+        operation: F,
+    ) -> Result<Option<RocblasSgemmHostTiming>, RocmTensorExecutionError>
+    where
+        F: FnOnce(Option<&mut RocblasSgemmHostTiming>) -> Result<(), RocmTensorExecutionError>,
+    {
+        let mut timing = RocblasSgemmHostTiming::default();
+        operation(Some(&mut timing))?;
+        Ok(Some(timing))
+    }
+
+    fn finish_matmul(
+        &mut self,
+        mark: Self::Mark,
+        node: &NodeDescriptor<'_>,
+        sgemm_host: Option<RocblasSgemmHostTiming>,
+    ) {
+        self.push(mark, node, sgemm_host, None);
     }
 
     fn finish_fused_add_relu(&mut self, mark: Self::Mark, node: &NodeDescriptor<'_>) {
@@ -3700,6 +4057,8 @@ impl NodeTimingSink for CollectNodeTimings {
             value: node.value,
             operation: "FusedAddRelu",
             elapsed: mark.elapsed(),
+            sgemm_host: None,
+            elementwise_host: None,
         });
     }
 
@@ -3716,6 +4075,38 @@ impl NodeTimingSink for CollectNodeTimings {
                 TensorPointwiseEpilogue::Relu => "FusedAddSubRelu",
             },
             elapsed: mark.elapsed(),
+            sgemm_host: None,
+            elementwise_host: None,
+        });
+    }
+}
+
+impl CollectNodeTimings {
+    fn push(
+        &mut self,
+        mark: Instant,
+        node: &NodeDescriptor<'_>,
+        sgemm_host: Option<RocblasSgemmHostTiming>,
+        elementwise_host: Option<RocmTensorElementwiseHostTiming>,
+    ) {
+        self.0.push(RocmTensorNodeTiming {
+            value: node.value,
+            operation: match node.op {
+                OpDescriptor::Input => "Input",
+                OpDescriptor::Constant(_) => "Constant",
+                OpDescriptor::Uniform { .. } => "Uniform",
+                OpDescriptor::MatMul { .. } => "MatMul",
+                OpDescriptor::Add { .. } => "Add",
+                OpDescriptor::Sub { .. } => "Sub",
+                OpDescriptor::Mul { .. } => "Mul",
+                OpDescriptor::Relu { .. } => "Relu",
+                OpDescriptor::ReluBackward { .. } => "ReluBackward",
+                OpDescriptor::SgdUpdate { .. } => "SgdUpdate",
+                OpDescriptor::MeanSquaredError { .. } => "MeanSquaredError",
+            },
+            elapsed: mark.elapsed(),
+            sgemm_host,
+            elementwise_host,
         });
     }
 }
@@ -3738,6 +4129,7 @@ pub struct RocmTensorOutputBank<'plan, 'graph, 'session> {
     session: &'session RocmOwnedDispatchBackend,
     pool: PcuMemoryPoolId,
     outputs: Vec<RocmTensorInput<'session>>,
+    requirements: Vec<PcuMemoryMemberRequirement>,
     poisoned: bool,
 }
 
@@ -3773,7 +4165,6 @@ fn validate_output_bank(
     {
         return Err(RocmTensorExecutionError::OutputResourceMismatch);
     }
-    let mut requirements = Vec::with_capacity(bank.outputs.len());
     for (&value, output) in prepared.outputs.iter().zip(&bank.outputs) {
         let expected_shape = prepared.graph.shape(value)?;
         if !std::ptr::eq(output.session, session)
@@ -3781,19 +4172,13 @@ fn validate_output_bank(
             || output.resource.pool() != pool
             || !output.resource.belongs_to_runtime(session.tensor_runtime())
             || output.resource.device_buffer().len() < byte_len(expected_shape)?
-            || !matches!(
-                output.resource.access(),
-                PcuMemoryAccess::WriteOnly | PcuMemoryAccess::ReadWrite
-            )
+            || output.resource.access() != PcuMemoryAccess::ReadWrite
+            || !output
+                .resource
+                .supports(PcuMemoryResourceCapability::ReusableStorage)
         {
             return Err(RocmTensorExecutionError::OutputResourceMismatch);
         }
-        requirements.push(PcuMemoryMemberRequirement {
-            pool,
-            minimum_size_bytes: byte_len(expected_shape)? as u64,
-            access: PcuMemoryAccess::ReadWrite,
-            require_device_local: false,
-        });
         if inputs
             .iter()
             .any(|(_, input)| input.resource.may_overlap(&output.resource))
@@ -3812,7 +4197,7 @@ fn validate_output_bank(
             return Err(RocmTensorExecutionError::OutputResourceMismatch);
         }
     }
-    validate_reusable_memory_bank_members_by(&bank.outputs, &requirements, |output| {
+    validate_reusable_memory_bank_members_by(&bank.outputs, &bank.requirements, |output| {
         &output.resource
     })
     .map_err(|_| RocmTensorExecutionError::OutputResourceMismatch)?;
@@ -3822,11 +4207,11 @@ fn validate_output_bank(
 fn validate_prepared_storage_constraints(
     prepared: &RocmPreparedTensorGraph<'_>,
     inputs: &[(ValueId, &RocmTensorInput<'_>)],
-    scratch: &RocmTensorScratch<'_, '_, '_>,
-    bank: &RocmTensorOutputBank<'_, '_, '_>,
+    scratch: Option<&RocmTensorScratch<'_, '_, '_>>,
+    bank: Option<&RocmTensorOutputBank<'_, '_, '_>>,
 ) -> Result<(), RocmTensorExecutionError> {
     let resource_for = |value| {
-        bank.output(value)
+        bank.and_then(|bank| bank.output(value))
             .map(|output| &output.resource)
             .or_else(|| {
                 inputs
@@ -3835,26 +4220,61 @@ fn validate_prepared_storage_constraints(
                     .map(|(_, input)| &input.resource)
             })
             .or_else(|| {
-                prepared
-                    .index_of(value)
-                    .and_then(|index| scratch.resources.get(index))
-                    .and_then(Option::as_ref)
+                scratch.and_then(|scratch| {
+                    prepared
+                        .index_of(value)
+                        .and_then(|index| scratch.resources.get(index))
+                        .and_then(Option::as_ref)
+                })
             })
     };
-    for constraint in &prepared.storage_constraints {
-        let left =
-            resource_for(constraint.left).ok_or(RocmTensorExecutionError::StorageConstraint(
-                TensorStorageValidationError::MissingResource(constraint.left),
-            ))?;
-        let right =
-            resource_for(constraint.right).ok_or(RocmTensorExecutionError::StorageConstraint(
-                TensorStorageValidationError::MissingResource(constraint.right),
-            ))?;
-        constraint
-            .validate_resources(left, right)
-            .map_err(RocmTensorExecutionError::StorageConstraint)?;
+    validate_available_storage_constraints(&prepared.storage_constraints, resource_for)
+}
+
+fn validate_available_storage_constraints<'resource, R: PcuMemoryResource + 'resource>(
+    constraints: &[TensorStorageConstraint],
+    mut resource_for: impl FnMut(ValueId) -> Option<&'resource R>,
+) -> Result<(), RocmTensorExecutionError> {
+    for constraint in constraints {
+        if let (Some(left), Some(right)) = (
+            resource_for(constraint.left),
+            resource_for(constraint.right),
+        ) {
+            constraint
+                .validate_resources(left, right)
+                .map_err(RocmTensorExecutionError::StorageConstraint)?;
+        }
     }
     Ok(())
+}
+
+fn input_storage_requirement(
+    value: ValueId,
+    shape: &[usize],
+) -> Result<fusion_pcu_tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
+    Ok(fusion_pcu_tensor::TensorValueStorageRequirement {
+        value,
+        output_bytes: u64::try_from(byte_len(shape)?)
+            .map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
+        access: PcuMemoryAccess::ReadOnly,
+    })
+}
+
+fn physical_value_storage_requirement(
+    prepared: &RocmPreparedTensorGraph<'_>,
+    value: ValueId,
+    op: OpDescriptor<'_>,
+) -> Result<fusion_pcu_tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
+    Ok(fusion_pcu_tensor::TensorValueStorageRequirement {
+        value,
+        output_bytes: prepared.physical_layout(value)?.physical_bytes,
+        access: match op {
+            OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. } => {
+                PcuMemoryAccess::ReadOnly
+            }
+            _ => PcuMemoryAccess::ReadWrite,
+        },
+    })
 }
 
 impl RocmTensorScratch<'_, '_, '_> {
@@ -4593,6 +5013,10 @@ fn validate_graph_input_sources(
             }
             .into());
         }
+        // This path only accepts Input nodes; compact uniforms are materialized by the executor.
+        input_storage_requirement(*id, node.shape)?
+            .validate(&input.resource)
+            .map_err(RocmTensorExecutionError::StorageConstraint)?;
         input.validate_session(session)?;
         if input.resource.pool() != pool {
             return Err(RocmTensorExecutionError::InputPoolMismatch);
@@ -5038,6 +5462,8 @@ fn matmul_shape_supported(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use fusion_pcu::{
         PcuDispatchEntryPoint,
         PcuDispatchFeatureCaps,
@@ -5056,6 +5482,7 @@ mod tests {
         TensorOperationAssessor,
         TensorOperationSupport,
         TensorPointwiseEpilogue,
+        TensorStorageConstraint,
     };
 
     use super::{
@@ -5069,6 +5496,8 @@ mod tests {
         bounded_mul_topology,
         collect_dispatch_requests,
         execution_resource_slots,
+        input_storage_requirement,
+        validate_available_storage_constraints,
         retained_requested_key_count,
         mse_kernel,
         mse_scratch_length_fits,
@@ -5083,6 +5512,9 @@ mod tests {
         scratch_stores_node,
         validate_graph_inputs,
         CollectNodeTimings,
+        CollectElementwiseTiming,
+        ElementwisePhase,
+        ElementwiseTimingSink,
         NodeTimingSink,
         RocmTensorExecutionError,
         RocmPhysicalLayout,
@@ -5117,6 +5549,27 @@ mod tests {
         assert_eq!(spilled_use_counts.len(), node_count);
         assert!(spilled_resources.spilled());
         assert!(spilled_use_counts.spilled());
+    }
+
+    #[test]
+    fn fixed_elementwise_timing_keeps_phase_values_independent() {
+        let mut sink = CollectElementwiseTiming::default();
+        let mark = sink.begin(ElementwisePhase::CacheAndBind);
+        sink.finish(ElementwisePhase::CacheAndBind, mark);
+        let cache_and_bind = sink.0.cache_and_bind;
+        assert_eq!(sink.0.submit, Duration::ZERO);
+        assert_eq!(sink.0.wait, Duration::ZERO);
+
+        let mark = sink.begin(ElementwisePhase::Submit);
+        sink.finish(ElementwisePhase::Submit, mark);
+        let submit = sink.0.submit;
+        assert_eq!(sink.0.cache_and_bind, cache_and_bind);
+        assert_eq!(sink.0.wait, Duration::ZERO);
+
+        let mark = sink.begin(ElementwisePhase::Wait);
+        sink.finish(ElementwisePhase::Wait, mark);
+        assert_eq!(sink.0.cache_and_bind, cache_and_bind);
+        assert_eq!(sink.0.submit, submit);
     }
 
     #[test]
@@ -5639,6 +6092,95 @@ mod tests {
             (constraint.left == uniform && constraint.left_bytes == 16)
                 || (constraint.right == uniform && constraint.right_bytes == 16)
         }));
+    }
+
+    #[test]
+    fn resource_input_requirement_covers_dense_input_extent() {
+        let mut graph = Graph::default();
+        let value = graph.input([16]).unwrap();
+        let requirement = input_storage_requirement(value, &[16]).unwrap();
+        assert_eq!(requirement.output_bytes, 64);
+        assert_eq!(requirement.access, fusion_pcu::PcuMemoryAccess::ReadOnly);
+        assert_eq!(graph.shape(value).unwrap(), &[16]);
+    }
+
+    #[test]
+    fn storage_constraints_check_available_pairs_and_defer_missing_values() {
+        struct TestResource(u8);
+        impl fusion_pcu::PcuMemoryResource for TestResource {
+            fn pool(&self) -> fusion_pcu::PcuMemoryPoolId {
+                fusion_pcu::PcuMemoryPoolId(0)
+            }
+            fn size_bytes(&self) -> u64 {
+                4
+            }
+            fn alignment_bytes(&self) -> u64 {
+                4
+            }
+            fn access(&self) -> fusion_pcu::PcuMemoryAccess {
+                fusion_pcu::PcuMemoryAccess::ReadWrite
+            }
+            fn is_device_local(&self) -> Option<bool> {
+                Some(true)
+            }
+            fn origin(&self) -> fusion_pcu::PcuMemoryResourceOrigin {
+                fusion_pcu::PcuMemoryResourceOrigin::ProviderManaged
+            }
+            fn overlap(
+                &self,
+                other: &Self,
+                _left: fusion_pcu::PcuMemoryRange,
+                _right: fusion_pcu::PcuMemoryRange,
+            ) -> fusion_pcu::PcuMemoryOverlap {
+                if self.0 == other.0 {
+                    fusion_pcu::PcuMemoryOverlap::Overlapping
+                } else {
+                    fusion_pcu::PcuMemoryOverlap::Disjoint
+                }
+            }
+        }
+
+        let mut graph = Graph::default();
+        let left = graph.input([]).unwrap();
+        let right = graph.input([]).unwrap();
+        let constraints = [TensorStorageConstraint {
+            left,
+            right,
+            left_bytes: 4,
+            right_bytes: 4,
+        }];
+        let input_resources = [(left, TestResource(1)), (right, TestResource(2))];
+        validate_available_storage_constraints(&constraints, |value| {
+            input_resources
+                .iter()
+                .find(|(id, _)| *id == value)
+                .map(|(_, resource)| resource)
+        })
+        .unwrap();
+        let scratch_resources = [(left, TestResource(3)), (right, TestResource(4))];
+        validate_available_storage_constraints(&constraints, |value| {
+            scratch_resources
+                .iter()
+                .find(|(id, _)| *id == value)
+                .map(|(_, resource)| resource)
+        })
+        .unwrap();
+        validate_available_storage_constraints(&constraints, |value| {
+            (value == left).then_some(&input_resources[0].1)
+        })
+        .unwrap();
+        let aliased = [(left, TestResource(1)), (right, TestResource(1))];
+        assert!(matches!(
+            validate_available_storage_constraints(&constraints, |value| {
+                aliased
+                    .iter()
+                    .find(|(id, _)| *id == value)
+                    .map(|(_, resource)| resource)
+            }),
+            Err(RocmTensorExecutionError::StorageConstraint(
+                fusion_pcu_tensor::TensorStorageValidationError::Overlapping { .. }
+            ))
+        ));
     }
 
     #[test]

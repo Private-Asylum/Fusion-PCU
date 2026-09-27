@@ -1,6 +1,7 @@
 //! Backend-neutral tensor storage requirements and overlap validation.
 
 use fusion_pcu::{
+    PcuMemoryAccess,
     PcuMemoryOverlap,
     PcuMemoryRange,
     PcuMemoryResource,
@@ -44,8 +45,24 @@ pub struct TensorStorageConstraint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorStorageValidationError {
     MissingResource(ValueId),
-    Overlapping { left: ValueId, right: ValueId },
-    UnknownOverlap { left: ValueId, right: ValueId },
+    ResourceTooSmall {
+        value: ValueId,
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    InsufficientAccess {
+        value: ValueId,
+        required: PcuMemoryAccess,
+        available: PcuMemoryAccess,
+    },
+    Overlapping {
+        left: ValueId,
+        right: ValueId,
+    },
+    UnknownOverlap {
+        left: ValueId,
+        right: ValueId,
+    },
 }
 
 impl TensorStorageConstraint {
@@ -83,6 +100,18 @@ impl TensorStorageConstraint {
         left: &R,
         right: &R,
     ) -> Result<(), TensorStorageValidationError> {
+        for (value, required_bytes, available_bytes) in [
+            (self.left, self.left_bytes, left.size_bytes()),
+            (self.right, self.right_bytes, right.size_bytes()),
+        ] {
+            if available_bytes < required_bytes {
+                return Err(TensorStorageValidationError::ResourceTooSmall {
+                    value,
+                    required_bytes,
+                    available_bytes,
+                });
+            }
+        }
         let overlap = left.overlap(
             right,
             PcuMemoryRange {
@@ -113,6 +142,62 @@ pub struct TensorValueRequirement<'a> {
     pub value: ValueId,
     pub shape: &'a [usize],
     pub output_bytes: Option<usize>,
+}
+
+/// Access and dense-layout extent for one value's backing resource in a selected execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TensorValueStorageRequirement {
+    pub value: ValueId,
+    pub output_bytes: u64,
+    pub access: PcuMemoryAccess,
+}
+
+impl TensorValueStorageRequirement {
+    /// Checks a resource for dense storage capacity and the required access.
+    ///
+    /// Backends with compact physical layouts must adapt the extent before calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resource's insufficient extent or access permission.
+    pub fn validate<R: PcuMemoryResource>(
+        &self,
+        resource: &R,
+    ) -> Result<(), TensorStorageValidationError> {
+        let available_bytes = resource.size_bytes();
+        if available_bytes < self.output_bytes {
+            return Err(TensorStorageValidationError::ResourceTooSmall {
+                value: self.value,
+                required_bytes: self.output_bytes,
+                available_bytes,
+            });
+        }
+        let actual = resource.access();
+        let permitted = match self.access {
+            PcuMemoryAccess::ReadOnly => {
+                matches!(
+                    actual,
+                    PcuMemoryAccess::ReadOnly | PcuMemoryAccess::ReadWrite
+                )
+            }
+            PcuMemoryAccess::WriteOnly => {
+                matches!(
+                    actual,
+                    PcuMemoryAccess::WriteOnly | PcuMemoryAccess::ReadWrite
+                )
+            }
+            PcuMemoryAccess::ReadWrite => actual == PcuMemoryAccess::ReadWrite,
+        };
+        if permitted {
+            Ok(())
+        } else {
+            Err(TensorStorageValidationError::InsufficientAccess {
+                value: self.value,
+                required: self.access,
+                available: actual,
+            })
+        }
+    }
 }
 
 pub fn node_output_bytes(shape: &[usize]) -> Option<usize> {
