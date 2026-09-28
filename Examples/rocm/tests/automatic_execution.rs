@@ -3,12 +3,14 @@
 //! Run explicitly on a `ROCm` host with:
 //! `cargo test -p fusion-pcu-example-rocm --test automatic_execution -- --ignored --nocapture`
 
+#[rustfmt::skip]
 use std::{
     cell::Cell,
     num::NonZeroUsize,
     rc::Rc,
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryAllocationRequest,
     PcuMemoryDisposition,
@@ -23,6 +25,7 @@ use fusion_pcu::{
     PcuMemoryResource,
     PcuOwnedDispatchMemorySession,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmMemoryResource,
@@ -30,6 +33,7 @@ use fusion_pcu_rocm::{
     RocmTensorAssessor,
     RocmTensorExecutionError,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,

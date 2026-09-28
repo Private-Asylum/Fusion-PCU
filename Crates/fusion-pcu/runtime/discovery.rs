@@ -3,6 +3,7 @@
 //! Discovery is deliberately separate from backend preference and selection. Implementations
 //! describe what is present; callers provide bounded storage and decide what to use.
 
+#[rustfmt::skip]
 use crate::{
     PcuExecutorDescriptor,
     PcuSupport,

@@ -6,6 +6,7 @@
 
 use core::num::NonZeroU32;
 
+#[rustfmt::skip]
 use super::{
     PcuBindingRef,
     PcuKernel,

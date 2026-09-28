@@ -1,5 +1,6 @@
 //! Bounded implementation of the abstract PCU memory contract for one selected HIP device.
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryAccess,
     PcuMemoryAllocationRequest,
@@ -22,6 +23,7 @@ use fusion_pcu::{
     PcuMemoryResourceOrigin,
 };
 
+#[rustfmt::skip]
 use crate::{
     DeviceBuffer,
     HipError,

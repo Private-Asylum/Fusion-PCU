@@ -1,5 +1,6 @@
 use fusion_pcu_cpu::PcuF32Reference;
 use fusion_pcu_macros::pcu;
+#[rustfmt::skip]
 use pcu_alias::{
     PcuBindingAccess,
     PcuBindingRef,

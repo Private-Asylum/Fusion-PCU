@@ -1621,6 +1621,7 @@ mod tests {
 
     #[test]
     fn serialized_concurrent_admissions_cannot_spend_the_same_headroom() {
+        #[rustfmt::skip]
         use std::sync::{
             Arc,
             Mutex,

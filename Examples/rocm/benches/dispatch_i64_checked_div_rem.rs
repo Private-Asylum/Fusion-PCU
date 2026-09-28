@@ -6,11 +6,13 @@ mod dispatch_support;
 #[allow(dead_code)] // Selection support exposes utilities shared by the other example benches.
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     num::NonZeroU32,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -18,6 +20,7 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     model::dispatch::{
         PcuDispatchDataOp,
@@ -42,6 +45,7 @@ use fusion_pcu::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     compile_hip_source,
     HipKernelArgument,
@@ -50,6 +54,7 @@ use fusion_pcu_rocm::{
     RocmOwnedDispatchBackend,
 };
 
+#[rustfmt::skip]
 use dispatch_support::{
     AllocationCapture,
     run_direct,
@@ -751,8 +756,10 @@ fn verify_pair(
     remainder.copy_to(&mut r)?;
     let decode = |bytes: &[u8]| {
         bytes
-            .chunks_exact(8)
-            .map(|x| i64::from_le_bytes(x.try_into().expect("eight bytes")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|x| i64::from_le_bytes(*x))
             .collect::<Vec<_>>()
     };
     let actual_q = decode(&q);

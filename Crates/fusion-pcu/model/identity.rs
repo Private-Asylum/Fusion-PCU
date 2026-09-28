@@ -1,5 +1,6 @@
 //! Typed construction for scalar identity copies.
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuBindingAccess,
@@ -201,10 +202,12 @@ impl<T: PcuScalar> PcuScalarIdentityBuilder<T> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuScalarIdentityBuildError as Error,
         PcuScalarIdentityBuilder,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

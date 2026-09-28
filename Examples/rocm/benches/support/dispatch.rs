@@ -2,11 +2,13 @@
 
 #[path = "alloc.rs"]
 mod alloc;
+#[rustfmt::skip]
 pub use alloc::{
     AllocationCapture,
     AllocationCounts,
 };
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     time::{
@@ -15,6 +17,7 @@ use std::{
     },
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -23,6 +26,7 @@ use fusion_pcu::{
     PcuOwnedCompletion,
     PcuValueType,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     HipCompletion,
     HipKernel,
@@ -360,7 +364,7 @@ pub fn print_duration_samples(label: &str, samples: &[Duration]) {
     );
 }
 
-fn percentile(samples: &[Duration], percentile: usize) -> Duration {
+const fn percentile(samples: &[Duration], percentile: usize) -> Duration {
     samples[percentile_index(samples.len(), percentile)]
 }
 
@@ -388,8 +392,13 @@ pub fn verify_u32_copy(label: &str, bytes: &[u8], input: &[u32]) -> Result<(), B
     if bytes.len() != std::mem::size_of_val(input) {
         return Err(format!("{label} output length differs from input").into());
     }
-    for (index, chunk) in bytes.chunks_exact(size_of::<u32>()).enumerate() {
-        let actual = u32::from_ne_bytes(chunk.try_into()?);
+    for (index, chunk) in bytes
+        .as_chunks::<{ size_of::<u32>() }>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let actual = u32::from_ne_bytes(*chunk);
         if actual != input[index] {
             return Err(format!(
                 "{label} output[{index}]={actual}; expected {}",
@@ -402,8 +411,13 @@ pub fn verify_u32_copy(label: &str, bytes: &[u8], input: &[u32]) -> Result<(), B
 }
 
 pub fn verify_output(label: &str, bytes: &[u8], input: &[f32]) -> Result<(), Box<dyn Error>> {
-    for (index, chunk) in bytes.chunks_exact(size_of::<f32>()).enumerate() {
-        let actual = f32::from_ne_bytes(chunk.try_into()?);
+    for (index, chunk) in bytes
+        .as_chunks::<{ size_of::<f32>() }>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let actual = f32::from_ne_bytes(*chunk);
         let expected = input[index] + 1.0;
         if (actual - expected).abs() > f32::EPSILON {
             return Err(format!("{label} output[{index}]={actual}; expected {expected}").into());

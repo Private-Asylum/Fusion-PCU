@@ -4,6 +4,7 @@ mod support;
 #[path = "support/typed_kernel.rs"]
 mod typed_kernel_support;
 
+#[rustfmt::skip]
 use criterion::{
     Criterion,
     criterion_group,

@@ -1,5 +1,6 @@
 //! Backend-neutral unsupported generic PCU implementation.
 
+#[rustfmt::skip]
 use super::{
     PcuBaseContract,
     PcuExecutorDescriptor,

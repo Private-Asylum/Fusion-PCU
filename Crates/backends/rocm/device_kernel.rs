@@ -1,11 +1,13 @@
 //! Synchronous typed device-resident kernel execution and transfer helpers.
 
+#[rustfmt::skip]
 use core::{
     fmt,
     num::NonZeroU32,
 };
 use std::error::Error;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -31,6 +33,7 @@ use fusion_pcu::{
     PcuValueType,
 };
 
+#[rustfmt::skip]
 use crate::{
     RocmMemoryResource,
     RocmOwnedDispatchBackend,

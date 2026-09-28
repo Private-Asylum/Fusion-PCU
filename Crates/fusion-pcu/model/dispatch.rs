@@ -1,5 +1,6 @@
 //! Dispatch-model vocabulary and backend-neutral kernel builder.
 
+#[rustfmt::skip]
 use core::ops::{
     BitAnd,
     BitAndAssign,
@@ -7,6 +8,7 @@ use core::ops::{
     BitOrAssign,
 };
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuBindingAccess,
@@ -28,6 +30,7 @@ use crate::{
     PcuIrKind,
 };
 
+#[rustfmt::skip]
 pub use crate::ir::{
     PcuAluOp as PcuDispatchAluOp,
     PcuBindingOp as PcuDispatchResourceOp,
@@ -925,6 +928,7 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuDispatchAluOp,
         PcuDispatchCoordinateOp,
@@ -935,6 +939,7 @@ mod tests {
         PcuTraceRayOp,
         PcuIntegerDivFlags,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuAccelerationStructureBindingType,
         PcuAccelerationStructureLevel,

@@ -2,10 +2,12 @@
 
 use std::num::NonZeroUsize;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryPoolId,
     PcuMemoryProvider,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Tensor,
     TensorFeedbackPlan,
@@ -14,6 +16,7 @@ use fusion_pcu_tensor::{
 use smallvec::SmallVec;
 
 use super::validate_initial_bindings;
+#[rustfmt::skip]
 use super::super::{
     RocmMemoryResource,
     RocmPreparedTensorGraph,

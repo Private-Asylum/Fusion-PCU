@@ -4,6 +4,7 @@
 //! It requires buffers allocated by this adapter's HIP runtime and retains exclusive buffer
 //! leases until the HIP event proves that the kernel has stopped accessing them.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     fmt,
@@ -51,6 +52,7 @@ const fn decode_fault_word(word: u64) -> Result<Option<PcuExecutionFault>, HipEr
     }))
 }
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBaseContract,
     PcuBindingAccess,
@@ -94,6 +96,7 @@ use fusion_pcu::{
     PcuOwnedBindingRequirement,
 };
 
+#[rustfmt::skip]
 use crate::{
     DeviceBuffer,
     HipCompletion,
@@ -1439,6 +1442,7 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         decode_fault_word,
         validate_batch_fault_semantics,
@@ -1453,6 +1457,7 @@ mod tests {
         memory_access_supports_binding,
         launch_grid,
     };
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuBindingAccess,
         PcuBindingRef,
@@ -1825,11 +1830,13 @@ mod tests {
 
     #[test]
     fn memory_access_must_cover_dispatch_binding_access() {
+        #[rustfmt::skip]
         use PcuBindingAccess::{
             ReadOnly,
             ReadWrite,
             WriteOnly,
         };
+        #[rustfmt::skip]
         use PcuMemoryAccess::{
             ReadOnly as MemoryReadOnly,
             ReadWrite as MemoryReadWrite,
@@ -1848,6 +1855,7 @@ mod tests {
 }
 
 mod execution;
+#[rustfmt::skip]
 pub use execution::{
     RocmExecutionStep,
     RocmOwnedExecution,

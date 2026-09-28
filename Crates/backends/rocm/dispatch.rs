@@ -1,16 +1,19 @@
 //! Synchronous, bounded PCU Dispatch execution on one `ROCm` device.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     fmt,
     mem::size_of,
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingRef,
     PcuDispatchKernelIr,
 };
 
+#[rustfmt::skip]
 use crate::{
     DeviceBuffer,
     HipCompileError,
@@ -176,10 +179,12 @@ fn launch_grid(invocations: u32, block_size: u32) -> Result<u32, RocmDispatchErr
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         RocmDispatchError,
         launch_grid,
     };
+    #[rustfmt::skip]
     use fusion_pcu::{
         F32MapBuilder,
         PcuBinding,

@@ -6,6 +6,7 @@
 //! - model-local IR payloads from `fusion-pcu::model`
 //! - backend-neutral validation results from `fusion-pcu::validation`
 
+#[rustfmt::skip]
 pub use crate::core::{
     PcuAccelerationStructureBindingType,
     PcuAccelerationStructureLevel,
@@ -45,6 +46,7 @@ pub use crate::core::{
     PcuValueTypeCaps,
     PcuValueType,
 };
+#[rustfmt::skip]
 pub use crate::ir::{
     PcuCoordinateOp,
     PcuDispatchInstruction,
@@ -54,6 +56,7 @@ pub use crate::ir::{
     PcuSampleOp,
     PcuTraceRayOp,
 };
+#[rustfmt::skip]
 pub use crate::model::{
     PcuCommandEffectKind,
     PcuCommandKernelIr,
@@ -95,6 +98,7 @@ pub use crate::model::{
     PcuTransactionKernelIr,
     PcuTransactionOrdering,
 };
+#[rustfmt::skip]
 pub use crate::validation::{
     PcuSampleValidationError,
     PcuStreamSimpleTransformValidationError,
@@ -103,6 +107,7 @@ pub use crate::validation::{
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuCommandEffectKind,
         PcuCommandKernelIr,

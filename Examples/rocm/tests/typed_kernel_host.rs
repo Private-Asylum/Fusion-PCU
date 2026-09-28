@@ -1,12 +1,14 @@
 //! Synchronous typed host-call regressions. Run explicitly on a selected `ROCm` device with:
 //! `cargo test -p fusion-pcu-example-rocm --test typed_kernel_host -- --ignored --nocapture`
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryPoolId,
     PcuDeviceBuffer,
     PcuScalar,
 };
 use fusion_pcu_macros::pcu;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDeviceKernelError,
     RocmDiscovery,
@@ -139,6 +141,7 @@ fn typed_host_calls_reuse_fresh_borrows_and_preserve_unwritten_elements() {
 #[test]
 #[ignore = "requires a visible ROCm device; run explicitly on ROCm hardware"]
 fn generic_typed_identity_supports_wide_and_half_transport() {
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuBf16Bits,
         PcuF16Bits,

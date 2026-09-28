@@ -1,5 +1,6 @@
 //! Structural admission for the bounded scalar `i8` arithmetic map profile.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingRef,
     PcuDispatchKernelIr,
@@ -7,6 +8,7 @@ use crate::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use crate::map_validation::integer_map_validation::{
     validate_integer_checked_div_rem_kernel,
     validate_integer_map_kernel,
@@ -87,11 +89,13 @@ pub fn validate_i8_checked_div_rem_kernel(
 #[cfg(test)]
 mod tests {
     use std::boxed::Box;
+    #[rustfmt::skip]
     use super::{
         validate_i8_map_kernel,
         validate_i8_checked_div_rem_kernel,
         PcuI8MapValidationError,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

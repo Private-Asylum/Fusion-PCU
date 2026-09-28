@@ -8,6 +8,7 @@
 //! - invocation semantics
 //! - kernel identity and signatures
 
+#[rustfmt::skip]
 use core::ops::{
     BitAnd,
     BitAndAssign,
@@ -1196,6 +1197,7 @@ pub trait PcuKernelIrContract {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuAccelerationStructureBindingType,
         PcuAccelerationStructureLevel,

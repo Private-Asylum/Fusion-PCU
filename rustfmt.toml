@@ -8,5 +8,5 @@
 # Keep ordering manual because rustfmt cannot distinguish third-party crates from adjacent owned
 # crates honestly.
 reorder_imports = false
-imports_granularity = "Item"
-imports_layout = "Vertical"
+
+# Grouped imports carry #[rustfmt::skip] to preserve vertical layout on stable.

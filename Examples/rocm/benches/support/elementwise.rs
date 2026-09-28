@@ -1,16 +1,19 @@
 //! Shared end-to-end Criterion runner for unary and binary f32 tensor maps.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     ffi::CStr,
     hint::black_box,
 };
 
+#[rustfmt::skip]
 use criterion::{
     Criterion,
     Throughput,
 };
 use fusion_pcu::PcuOwnedDispatchMemorySession;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipKernel,
@@ -22,6 +25,7 @@ use fusion_pcu_rocm::{
     RocmTensorAssessor,
     compile_hip_source_for_device,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,
@@ -29,6 +33,7 @@ use fusion_pcu_tensor::{
     ValueId,
 };
 
+#[rustfmt::skip]
 use crate::support::{
     self,
     selection,

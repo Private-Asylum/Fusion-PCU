@@ -3,6 +3,7 @@
 //! This deliberately small stream interpreter owns its operation meanings. PCU validates the
 //! names, types, effects, and SSA flow without learning any of these operations itself.
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuDialectComposeError,
     PcuDialectBuilder,

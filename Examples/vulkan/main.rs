@@ -2,11 +2,13 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
+#[rustfmt::skip]
 use fusion_pcu_runner::{
     PcuDispatchReport,
     PcuRunnerError,
     PcuRuntime,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingRef,
     PcuDispatchSubmission,
@@ -21,11 +23,13 @@ use fusion_pcu_macros::pcu_dispatch;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
+#[rustfmt::skip]
 use winit::event_loop::{
     ActiveEventLoop,
     ControlFlow,
     EventLoop,
 };
+#[rustfmt::skip]
 use winit::window::{
     Window,
     WindowId,
@@ -81,10 +85,7 @@ impl ExampleApp {
             "fusion-vulkan-example: dispatched {} PCU invocations over {ELEMENT_COUNT} elements through {} on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
             report.dispatch.execution.invocations,
             report.dispatch.runner_id,
-            report
-                .device_name
-                .as_deref()
-                .map_or("unknown device", core::convert::identity),
+            report.device_name.as_deref().unwrap_or("unknown device"),
             report.dispatch.execution.resource_model,
             report.dispatch.execution.dispatch_groups,
             report.dispatch.spirv_words,

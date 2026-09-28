@@ -6,6 +6,7 @@
 
 mod feedback_runtime;
 pub use feedback_runtime::RocmTensorExecution;
+#[rustfmt::skip]
 pub use feedback_runtime::{
     RocmAdmittedTensorFeedbackResources,
     RocmTensorFeedbackPrepareError,
@@ -13,6 +14,7 @@ pub use feedback_runtime::{
     RocmTensorFeedbackResources,
 };
 
+#[rustfmt::skip]
 use std::{
     cell::RefCell,
     collections::{
@@ -33,6 +35,7 @@ use std::{
 };
 use smallvec::SmallVec;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBinding,
     PcuBindingAccess,
@@ -67,6 +70,7 @@ use fusion_pcu::{
     validate_reusable_memory_bank_members_by,
 };
 use std::num::NonZeroU32;
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     NodeDescriptor,
@@ -94,6 +98,7 @@ use fusion_pcu_tensor::{
     ValueId,
 };
 
+#[rustfmt::skip]
 use crate::{
     HipCompletionBatch,
     HipKernel,
@@ -6330,6 +6335,7 @@ fn matmul_shape_supported(
 mod tests {
     use std::time::Duration;
 
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuDispatchEntryPoint,
         PcuDispatchFeatureCaps,
@@ -6339,6 +6345,7 @@ mod tests {
         PcuDispatchAluOp,
         PcuValueTypeCaps,
     };
+    #[rustfmt::skip]
     use fusion_pcu_tensor::{
         Graph,
         NodeDescriptor,
@@ -6351,6 +6358,7 @@ mod tests {
         TensorStorageConstraint,
     };
 
+    #[rustfmt::skip]
     use super::{
         add_kernel,
         add_relu_kernel,

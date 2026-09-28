@@ -1,5 +1,6 @@
 //! Structural admission for bit-preserving f16/bf16 identity copies.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,

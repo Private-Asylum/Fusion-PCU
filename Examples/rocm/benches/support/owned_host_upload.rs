@@ -4,17 +4,20 @@
 //! reference-counted host payload. This isolates scheduler-route costs; it is not a native HIP
 //! parity benchmark.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     num::NonZeroU32,
     sync::Arc,
 };
 
+#[rustfmt::skip]
 use criterion::{
     BenchmarkId,
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     model::dispatch::{
         PcuDispatchDataOp,
@@ -38,6 +41,7 @@ use fusion_pcu::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     RocmOwnedDispatchBackend,

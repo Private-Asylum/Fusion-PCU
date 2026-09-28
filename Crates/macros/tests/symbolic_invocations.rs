@@ -1,13 +1,16 @@
+#[rustfmt::skip]
 use fusion_pcu_macros::{
     pcu,
     pcu_dispatch,
 };
 use core::num::NonZeroU32;
+#[rustfmt::skip]
 use fusion_pcu_cpu::{
     PcuF32Reference,
     PcuF32ReferenceError,
 };
 use pcu_alias::PcuBindingAccess;
+#[rustfmt::skip]
 use pcu_alias::{
     PcuBindingRef,
     PcuDispatchDataOp,

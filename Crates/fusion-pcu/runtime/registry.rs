@@ -3,11 +3,13 @@
 //! The registry erases provider types only at a monomorphized function-pointer boundary. It
 //! allocates nothing and does not define a loadable plugin ABI.
 
+#[rustfmt::skip]
 use core::fmt::{
     self,
     Write,
 };
 
+#[rustfmt::skip]
 use crate::{
     PcuCapabilitySnapshot,
     PcuContextDescriptor,
@@ -373,6 +375,7 @@ const unsafe fn cast<'a, D: 'a>(x: *const ()) -> &'a D {
 }
 
 const fn empty_provider<'a>() -> PcuProviderDescriptor<'a> {
+    #[rustfmt::skip]
     use crate::{
         PcuProviderReadiness,
         PcuProviderStatus,
@@ -487,6 +490,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     use crate::{
         PcuContextDescriptor,
         PcuDeviceDescriptor,
@@ -609,7 +613,7 @@ mod tests {
         assert_eq!(r.providers(&mut p).unwrap(), 2);
         assert_eq!(p[0].id, PcuProviderId(1));
         let mut empty = [];
-        assert!(r.targets(PcuProviderId(1), 1, &mut empty).unwrap() == 1);
+        assert_eq!(r.targets(PcuProviderId(1), 1, &mut empty).unwrap(), 1);
         let err = r.targets(PcuProviderId(2), 1, &mut empty).unwrap_err();
         assert_eq!(err.provider, Some(PcuProviderId(2)));
         assert_eq!(err.operation, PcuDiscoveryOperation::Targets);

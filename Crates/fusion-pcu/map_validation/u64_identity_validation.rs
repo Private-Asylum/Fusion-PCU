@@ -1,5 +1,6 @@
 //! Structural admission for the narrow scalar `u64` invocation-index identity copy profile.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -185,10 +186,12 @@ fn validate_binding(
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuU64IdentityValidationError as Error,
         validate_u64_identity_kernel,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

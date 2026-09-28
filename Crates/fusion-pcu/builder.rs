@@ -7,6 +7,7 @@
 
 use core::marker::PhantomData;
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuBindingAccess,
@@ -231,6 +232,7 @@ impl<'a, const MAX_OPS: usize> F32MapBuilder<'a, MAX_OPS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     use crate::{
         PcuBindingStorageClass,
         PcuDispatchDataOp,

@@ -1,5 +1,6 @@
 //! Host-side HIP source compilation for a selected AMD GPU architecture.
 
+#[rustfmt::skip]
 use std::{
     fmt,
     fs,

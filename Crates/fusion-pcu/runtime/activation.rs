@@ -5,6 +5,7 @@
 //! backend's typed [`crate::PcuDeviceActivation::Session`] in a consumer-owned enum or value.
 //! This keeps heterogeneous session ownership explicit without allocation or a core-wide enum.
 
+#[rustfmt::skip]
 use crate::{
     PcuObjectKind,
     PcuObjectRef,

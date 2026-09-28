@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuStreamKernelIr,
     PcuStreamPattern,

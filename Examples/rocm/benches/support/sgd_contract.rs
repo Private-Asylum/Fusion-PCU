@@ -2,6 +2,7 @@
 
 use std::error::Error;
 
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipKernel,

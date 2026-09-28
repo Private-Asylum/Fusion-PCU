@@ -2,6 +2,7 @@
 
 use std::error::Error;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuCaps,
     PcuContextDescriptor,

@@ -9,6 +9,7 @@
 extern crate std;
 
 #[cfg(test)]
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuExecutionFault,
     PcuExecutionFaultKind,
@@ -27,6 +28,7 @@ mod validation;
 
 const VALUE_SLOTS: usize = 256;
 
+#[rustfmt::skip]
 pub use floats::{
     PcuF16IdentityReference,
     PcuBf16IdentityReference,
@@ -36,6 +38,7 @@ pub use floats::{
     PcuF64Reference,
     PcuF64ReferenceError,
 };
+#[rustfmt::skip]
 pub use integer::{
     PcuI8MapReference,
     PcuI8MapReferenceError,
@@ -54,10 +57,12 @@ pub use integer::{
     PcuU64MapReference,
     PcuU64MapReferenceError,
 };
+#[rustfmt::skip]
 pub use stream::{
     PcuU32StreamReference,
     PcuU32StreamReferenceError,
 };
+#[rustfmt::skip]
 pub use typed_conversion::{
     PcuCpuTypedBinding,
     PcuCpuTypedSlice,
@@ -71,6 +76,7 @@ mod tests {
     use std::boxed::Box;
     use std::vec;
 
+    #[rustfmt::skip]
     use super::{
         PcuF32Reference,
         PcuF32ReferenceError,
@@ -2577,6 +2583,7 @@ mod tests {
             .expect("chain executes");
         assert_eq!(output, [2, 28]);
     }
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuBinding,
         PcuBindingAccess,

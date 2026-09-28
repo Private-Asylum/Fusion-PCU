@@ -3,6 +3,7 @@
 //! This contract describes supported Rust values, not a promise that a particular backend can
 //! execute every operation on them or map host memory directly into a device address space.
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuBindingAccess,
@@ -450,11 +451,13 @@ impl<'a> PcuBinding<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuBf16Bits,
         PcuF16Bits,
         PcuScalar,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

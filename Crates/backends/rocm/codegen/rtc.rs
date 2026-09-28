@@ -1,5 +1,6 @@
 //! HIP runtime compilation for the device selected by an existing [`HipRuntime`].
 
+#[rustfmt::skip]
 use std::{
     ffi::{
         CStr,
@@ -13,6 +14,7 @@ use std::{
 
 use libloading::Library;
 
+#[rustfmt::skip]
 use crate::{
     HipError,
     HipRuntime,

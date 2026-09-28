@@ -1,5 +1,6 @@
 //! Inspect `ROCm` through PCU's consumer-facing discovery registry.
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuDeviceClass,
     PcuDeviceDescriptor,

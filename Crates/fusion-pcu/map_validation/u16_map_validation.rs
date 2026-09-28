@@ -1,5 +1,6 @@
 //! Structural admission for the bounded scalar `u16` arithmetic map profile.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingRef,
     PcuDispatchKernelIr,
@@ -7,6 +8,7 @@ use crate::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use crate::map_validation::integer_map_validation::{
     validate_integer_map_kernel,
     IntegerMapValidationError,
@@ -90,10 +92,12 @@ pub fn validate_u16_checked_div_rem_kernel(
 #[cfg(test)]
 mod tests {
     use std::boxed::Box;
+    #[rustfmt::skip]
     use super::{
         validate_u16_map_kernel,
         PcuU16MapValidationError,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

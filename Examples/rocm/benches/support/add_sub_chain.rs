@@ -3,6 +3,7 @@
 use std::error::Error;
 
 use fusion_pcu::PcuObjectRef;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipKernel,

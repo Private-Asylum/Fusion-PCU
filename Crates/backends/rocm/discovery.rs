@@ -1,5 +1,6 @@
 //! Runtime-backed discovery for the `ROCm` provider.
 
+#[rustfmt::skip]
 use std::{
     process::Command,
     sync::atomic::{
@@ -8,6 +9,7 @@ use std::{
     },
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuCapabilitySnapshot,
     PcuCaps,
@@ -45,6 +47,7 @@ use fusion_pcu::{
     PcuDispatchKernelIr,
 };
 
+#[rustfmt::skip]
 use crate::{
     HipDeviceInfo,
     HipError,
@@ -775,13 +778,13 @@ mod tests {
             fusion_pcu::PcuScalarType::F16,
             fusion_pcu::PcuScalarType::BF16,
         ] {
-            assert!(
+            assert_eq!(
                 ROCM_EXECUTOR
                     .support
                     .dispatch_scalar_alu
                     .for_scalar(scalar)
-                    .bits()
-                    == 0
+                    .bits(),
+                0
             );
         }
     }

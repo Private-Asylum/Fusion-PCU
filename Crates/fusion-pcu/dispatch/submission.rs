@@ -1,5 +1,6 @@
 //! Submission descriptors and execution handles.
 
+#[rustfmt::skip]
 use crate::contract::{
     PcuCommandKernelIr,
     PcuDispatchKernelIr,

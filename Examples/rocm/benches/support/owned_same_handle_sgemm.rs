@@ -3,17 +3,20 @@
 //! The manual route queues the same two rocBLAS SGEMMs into one HIP batch on the same stream.
 //! It controls for scheduler cost; it does not compare independent SGEMM implementations.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     time::Instant,
 };
 
+#[rustfmt::skip]
 use criterion::{
     BenchmarkId,
     Criterion,
     Throughput,
 };
 use fusion_pcu::PcuExecutionNodeState;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipCompletionBatch,

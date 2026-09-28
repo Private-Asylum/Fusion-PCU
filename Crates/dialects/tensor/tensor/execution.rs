@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 
+#[rustfmt::skip]
 use super::{
     Tensor,
     ValueId,

@@ -5,6 +5,7 @@
 
 use std::error::Error;
 
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     HipKernelArgument,
     HipRuntime,
@@ -62,8 +63,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut bytes = [0_u8; 12];
     output_buffer.copy_to(&mut bytes)?;
     let results = bytes
-        .chunks_exact(4)
-        .map(|word| f32::from_ne_bytes(word.try_into().expect("four-byte result")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_ne_bytes(*word))
         .collect::<Vec<_>>();
     let [default_expression, strict_separate, explicit_fma] = results.as_slice() else {
         return Err("kernel returned an unexpected output count".into());

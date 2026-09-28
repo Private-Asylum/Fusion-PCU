@@ -5,6 +5,7 @@
 
 #[cfg(all(feature = "insights", target_os = "linux", target_arch = "x86_64"))]
 mod linux_x86_64 {
+    #[rustfmt::skip]
     use std::{
         io,
         mem::size_of,
@@ -253,6 +254,7 @@ pub const fn unsupported_reason() -> Option<&'static str> {
 }
 
 #[cfg(all(feature = "insights", target_os = "linux", target_arch = "x86_64"))]
+#[rustfmt::skip]
 pub use linux_x86_64::{
     CpuCounterSample,
     CpuCounters,

@@ -1,11 +1,13 @@
 //! Synchronous typed host-call adapter over `ROCm`'s owned Dispatch path.
 
+#[rustfmt::skip]
 use core::{
     fmt,
     num::NonZeroU32,
 };
 use std::error::Error;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -31,6 +33,7 @@ use fusion_pcu::{
     PcuValueType,
 };
 
+#[rustfmt::skip]
 use crate::{
     DeviceBuffer,
     RocmMemoryProvider,
@@ -408,6 +411,7 @@ const fn is_certain_prelaunch_error(error: &RocmOwnedDispatchError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuBindingAccess,
         PcuBindingRef,
@@ -418,6 +422,7 @@ mod tests {
         PcuValueType,
     };
 
+    #[rustfmt::skip]
     use super::{
         validate_host_arguments,
         RocmHostKernelError,

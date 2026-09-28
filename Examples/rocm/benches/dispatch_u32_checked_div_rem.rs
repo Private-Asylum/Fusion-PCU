@@ -6,11 +6,13 @@ mod dispatch_support;
 #[allow(dead_code)] // Selection support exposes utilities shared by the other example benches.
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     num::NonZeroU32,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -18,6 +20,7 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     model::dispatch::{
         PcuDispatchKernelIr,
@@ -32,10 +35,12 @@ use fusion_pcu::{
     PcuSubmissionWaitError,
     PcuValueType,
 };
+#[rustfmt::skip]
 use fusion_pcu_macros::{
     pcu,
     pcu_dispatch,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     compile_hip_source,
     HipKernelArgument,
@@ -44,6 +49,7 @@ use fusion_pcu_rocm::{
     RocmOwnedDispatchBackend,
 };
 
+#[rustfmt::skip]
 use dispatch_support::{
     AllocationCapture,
     encode_u32,
@@ -638,8 +644,10 @@ fn verify_pair(
     remainder.copy_to(&mut r)?;
     let decode = |bytes: &[u8]| {
         bytes
-            .chunks_exact(4)
-            .map(|x| u32::from_le_bytes(x.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| u32::from_le_bytes(*x))
             .collect::<Vec<_>>()
     };
     if decode(&q) != expected_q || decode(&r) != expected_r {

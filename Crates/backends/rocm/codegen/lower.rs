@@ -2,11 +2,13 @@
 //!
 //! The current subset is deliberately one-dimensional: f32 indexed maps and bounded integer maps.
 
+#[rustfmt::skip]
 use std::fmt::{
     self,
     Write as _,
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -1148,6 +1150,7 @@ fn exact_integer_widening_profile(
     input: PcuValueType,
     output: PcuValueType,
 ) -> Option<MixedWideningProfile> {
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuDispatchConversion as C,
         PcuScalarType as S,
@@ -1651,6 +1654,7 @@ fn emit_i64_checked_div_rem(
 }
 
 mod validation;
+#[rustfmt::skip]
 use validation::{
     kernel_uses_checked_div_rem,
     validate_kernel,
@@ -1658,11 +1662,13 @@ use validation::{
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         RocmLowerError,
         lower_dispatch_to_hip_rtc_source,
         lower_dispatch_to_hip_source,
     };
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuBinding,
         PcuBindingAccess,
@@ -1832,6 +1838,7 @@ mod tests {
     );
 
     const fn widening_cases() -> [WideningCase; 6] {
+        #[rustfmt::skip]
         use fusion_pcu::{
             PcuDispatchConversion as C,
             PcuScalarType as S,

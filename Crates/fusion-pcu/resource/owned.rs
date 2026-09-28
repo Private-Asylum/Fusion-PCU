@@ -5,6 +5,7 @@
 //! a binding owns its backend resource, and a completion implementation keeps those bindings alive
 //! until it can prove that device access has stopped.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -22,6 +23,7 @@ use crate::{
     PcuMemoryPoolId,
     PcuMemoryProvider,
 };
+#[rustfmt::skip]
 use crate::dispatch::{
     PcuDispatchSubmission,
     validate_dispatch_submission,
@@ -882,6 +884,7 @@ const fn status_from_outcome(outcome: PcuCompletionOutcome) -> PcuQueueCompletio
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuCompletionOutcome,
         PcuCompletionState,
@@ -896,6 +899,7 @@ mod tests {
         PcuPreparedOwnedDispatch,
         validate_owned_dispatch_bindings,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBaseContract,
         PcuBinding,
@@ -922,6 +926,7 @@ mod tests {
     };
     use crate::model::PcuDispatchKernelBuilder;
     use crate::PcuScalarType;
+    #[rustfmt::skip]
     use std::{
         boxed::Box,
         cell::Cell,
@@ -1192,6 +1197,7 @@ mod tests {
 
     #[test]
     fn owned_schema_copies_binding_element_zero_and_invocation_extents() {
+        #[rustfmt::skip]
         use crate::{
             PcuDispatchDataOp,
             PcuDispatchIndex,

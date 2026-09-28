@@ -6,6 +6,7 @@
 
 use core::marker::PhantomData;
 
+#[rustfmt::skip]
 use crate::{
     PcuDialectEffects,
     PcuDialectFragment,
@@ -280,6 +281,7 @@ impl<'a> PcuDialectBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     use crate::{
         compose_dialect_fragments,
         PcuDialectOperationSpec,

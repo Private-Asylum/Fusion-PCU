@@ -1,6 +1,7 @@
 //! Backend contracts for the PCU execution families.
 
 use crate::contract::PcuKernelIrContract;
+#[rustfmt::skip]
 use crate::contract::{
     PcuBaseContract,
     PcuError,
@@ -10,6 +11,7 @@ use crate::contract::{
     PcuKernel,
 };
 use crate::validation::validate_command_kernel;
+#[rustfmt::skip]
 use super::{
     validate_direct_kernel_support,
     validate_dispatch_submission,

@@ -7,6 +7,7 @@
 //! possible backend property. Backends should expose additional constraints as structured
 //! diagnostics through their own error type.
 
+#[rustfmt::skip]
 use crate::{
     PcuDispatchFeatureCaps,
     PcuDispatchOpCaps,
@@ -23,6 +24,7 @@ use crate::{
     PcuBaseContract,
     PcuDeviceIdentity,
 };
+#[rustfmt::skip]
 use crate::dispatch::{
     validate_dispatch_submission,
     validate_parameters,
@@ -353,6 +355,7 @@ const fn check_limit(
 mod tests {
     use super::*;
     use core::num::NonZeroU32;
+    #[rustfmt::skip]
     use crate::{
         PcuExecutorClass,
         PcuExecutorOrigin,

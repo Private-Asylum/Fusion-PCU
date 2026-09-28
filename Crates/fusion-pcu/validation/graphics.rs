@@ -1,6 +1,7 @@
 //! Validation for graphics sampling and ray tracing operations.
 
 use super::find_binding;
+#[rustfmt::skip]
 use crate::{
     PcuAccelerationStructureLevel,
     PcuBinding,

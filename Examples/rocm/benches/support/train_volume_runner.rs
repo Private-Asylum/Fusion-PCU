@@ -1,11 +1,13 @@
 //! Volume comparison for unique-input strict PCU and fully-batched native training jobs.
 
+#[rustfmt::skip]
 use super::{
     native,
     support,
     train_volume,
 };
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
@@ -20,6 +22,7 @@ use std::{
     },
 };
 
+#[rustfmt::skip]
 use criterion::{
     BenchmarkGroup,
     BenchmarkId,
@@ -29,16 +32,19 @@ use criterion::{
     measurement::WallTime,
 };
 use fusion_pcu::PcuOwnedDispatchMemorySession;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,
     ValueId,
 };
+#[rustfmt::skip]
 use train_volume::{
     JobInputs,
     FEATURES,

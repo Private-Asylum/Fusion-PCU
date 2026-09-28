@@ -1,5 +1,6 @@
 //! Common structural admission for the bounded scalar `f32` indexed-map profile.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -392,10 +393,12 @@ const fn result_id(op: PcuDispatchOp<'_>) -> Option<PcuDispatchValueId> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuF32MapValidationError,
         validate_f32_map_kernel,
     };
+    #[rustfmt::skip]
     use crate::{
         F32MapBuilder,
         PcuBinding,

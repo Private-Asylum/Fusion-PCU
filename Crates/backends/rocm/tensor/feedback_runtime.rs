@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     allocate_with_resource_policy,
     PcuMemoryAccess,
@@ -15,6 +16,7 @@ use fusion_pcu::{
     PcuMemoryReservationSet,
     PcuMemoryResourcePolicy,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     TensorError,
     TensorFeedbackInput,
@@ -27,6 +29,7 @@ use smallvec::SmallVec;
 pub(super) mod execution;
 pub use execution::RocmTensorExecution;
 
+#[rustfmt::skip]
 use super::{
     RocmMemoryResource,
     RocmPreparedTensorGraph,

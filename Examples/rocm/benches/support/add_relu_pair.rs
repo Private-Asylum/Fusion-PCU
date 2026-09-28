@@ -1,5 +1,6 @@
 //! Alternating, paired Add -> `ReLU` timing and Rust heap diagnostics.
 
+#[rustfmt::skip]
 use std::{
     alloc::{
         GlobalAlloc,
@@ -215,7 +216,7 @@ fn print_samples(label: &str, samples: &[Sample]) {
     );
 }
 
-fn percentile(values: &[f64], percentile: usize) -> f64 {
+const fn percentile(values: &[f64], percentile: usize) -> f64 {
     values[percentile_index(values.len(), percentile)]
 }
 

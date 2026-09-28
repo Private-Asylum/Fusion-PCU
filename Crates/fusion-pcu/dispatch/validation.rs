@@ -2,6 +2,7 @@
 
 use crate::contract::PcuKernelIrContract;
 use super::submission::PcuDispatchSubmission;
+#[rustfmt::skip]
 use crate::contract::{
     PcuBinding,
     PcuBindingRef,
@@ -180,6 +181,7 @@ fn port_exists(ports: &[PcuPort<'_>], name: &str) -> bool {
 mod tests {
     use core::num::NonZeroU32;
 
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

@@ -4,17 +4,20 @@
 //! streams, buffers, and rocBLAS handle. It is a scheduler-overhead control, not independent
 //! handwritten kernel codegen.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     num::NonZeroU32,
     time::Instant,
 };
 
+#[rustfmt::skip]
 use criterion::{
     BenchmarkId,
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     model::dispatch::{
         PcuDispatchDataOp,
@@ -38,6 +41,7 @@ use fusion_pcu::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipCompletion,

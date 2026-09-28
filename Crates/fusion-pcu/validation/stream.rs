@@ -1,5 +1,6 @@
 //! Validation for stream kernel transforms.
 
+#[rustfmt::skip]
 use crate::{
     PcuParameterSlot,
     PcuPortDirection,

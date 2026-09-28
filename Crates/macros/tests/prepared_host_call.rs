@@ -1,5 +1,6 @@
 use core::cell::Cell;
 use fusion_pcu_macros::pcu;
+#[rustfmt::skip]
 use pcu_alias::{
     PcuHostArgument,
     PcuHostKernelBackend,

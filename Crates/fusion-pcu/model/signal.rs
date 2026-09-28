@@ -1,5 +1,6 @@
 //! Signal-model vocabulary and backend-neutral kernel builder.
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuDispatchPolicyCaps,
@@ -15,6 +16,7 @@ use crate::{
     PcuSignalOpCaps,
 };
 
+#[rustfmt::skip]
 pub use crate::model::command::{
     PcuOperand,
     PcuTarget,
@@ -229,12 +231,14 @@ impl<'a, const MAX_OPS: usize> PcuSignalKernelBuilder<'a, MAX_OPS> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuSignalKernelBuilder,
         PcuSignalOp,
         PcuSignalTriggerKind,
         PcuTarget,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuIrKind,
         PcuKernel,

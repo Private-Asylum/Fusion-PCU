@@ -1,5 +1,6 @@
 //! Stream-model vocabulary and backend-neutral kernel builder.
 
+#[rustfmt::skip]
 use core::ops::{
     BitAnd,
     BitAndAssign,
@@ -7,6 +8,7 @@ use core::ops::{
     BitOrAssign,
 };
 
+#[rustfmt::skip]
 use crate::contract::{
     PcuDispatchPolicyCaps,
     PcuError,
@@ -20,9 +22,11 @@ use crate::contract::{
     PcuParameter,
     PcuPort,
 };
+#[rustfmt::skip]
 use crate::validation::{
     validate_stream_simple_transform,
 };
+#[rustfmt::skip]
 use crate::{
     PcuParameterSlot,
     PcuScalarType,
@@ -577,11 +581,13 @@ const fn required_capabilities(pattern: PcuStreamPattern) -> PcuStreamCapabiliti
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuStreamCapabilities,
         PcuStreamKernelBuilder,
         PcuStreamValueType,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuIrKind,
         PcuKernel,

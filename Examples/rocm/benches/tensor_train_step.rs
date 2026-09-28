@@ -4,12 +4,14 @@
 pub mod alloc;
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
     time::Instant,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -17,16 +19,19 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use alloc::{
     AllocationCapture,
     AllocationCounts,
 };
 use fusion_pcu::PcuOwnedDispatchMemorySession;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,
@@ -37,6 +42,7 @@ mod memory_profile;
 use memory_profile::ProfiledMemory;
 #[path = "support/train_step_reference.rs"]
 mod train_step_reference;
+#[rustfmt::skip]
 use train_step_reference::{
     cpu_strict_two_steps,
     cpu_two_steps,
@@ -1917,7 +1923,7 @@ fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
     if values.len().is_multiple_of(2) {
-        (values[middle - 1] + values[middle]) * 0.5
+        f64::midpoint(values[middle - 1], values[middle])
     } else {
         values[middle]
     }

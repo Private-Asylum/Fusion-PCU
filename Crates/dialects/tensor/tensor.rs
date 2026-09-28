@@ -8,6 +8,7 @@
 //! adapters provide device execution separately.
 
 use std::fmt;
+#[rustfmt::skip]
 use std::sync::atomic::{
     AtomicU64,
     Ordering,
@@ -15,6 +16,7 @@ use std::sync::atomic::{
 
 #[path = "tensor/storage.rs"]
 mod storage;
+#[rustfmt::skip]
 pub use storage::{
     TensorGraphRequirements,
     TensorStorageConstraint,
@@ -27,6 +29,7 @@ use storage::node_output_bytes;
 
 #[path = "tensor/feedback.rs"]
 mod feedback;
+#[rustfmt::skip]
 pub use feedback::{
     TensorFeedbackBinding,
     TensorFeedbackInput,

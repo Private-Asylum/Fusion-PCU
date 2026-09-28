@@ -1,5 +1,6 @@
 use fusion_pcu_cpu::PcuU8MapReference;
 use fusion_pcu_macros::pcu;
+#[rustfmt::skip]
 use pcu_alias::{
     PcuBindingRef,
     PcuDispatchSubmission,

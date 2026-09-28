@@ -1,5 +1,6 @@
 //! Shared structural admission for exact-width signed and unsigned integer map profiles.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,

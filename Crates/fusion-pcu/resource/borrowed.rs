@@ -3,6 +3,7 @@
 //! The primary asynchronous route owns device resources. This route borrows host slices and
 //! returns only after the implementation has established that no device access remains.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,

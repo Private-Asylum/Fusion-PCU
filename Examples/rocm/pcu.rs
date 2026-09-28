@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 use std::num::NonZeroU32;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuContextDescriptor,
     PcuContextKind,
@@ -40,6 +41,7 @@ use fusion_pcu::{
     PcuValueType,
     allocate_with_policy,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmOwnedDispatchBackend,
@@ -182,8 +184,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     memory_provider
         .transfer_from(gpu_output.resource(), 0, &mut output_bytes)
         .map_err(|error| format!("PCU output transfer: {error:?}"))?;
-    for (index, chunk) in output_bytes.chunks_exact(4).enumerate() {
-        let actual = f32::from_ne_bytes(chunk.try_into()?);
+    for (index, chunk) in output_bytes.as_chunks::<4>().0.iter().enumerate() {
+        let actual = f32::from_ne_bytes(*chunk);
         let expected = input[index] + 1.5;
         if actual.to_bits() != expected.to_bits() {
             return Err(format!("output[{index}] = {actual}, expected {expected}").into());

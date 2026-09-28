@@ -5,16 +5,19 @@ mod prepared;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
+#[rustfmt::skip]
 use quote::{
     format_ident,
     quote,
     ToTokens,
 };
+#[rustfmt::skip]
 use syn::parse::{
     Parse,
     ParseStream,
 };
 use syn::spanned::Spanned;
+#[rustfmt::skip]
 use syn::{
     BinOp,
     Error,
@@ -97,7 +100,7 @@ impl Parse for PcuDispatchArgs {
             )
         })?;
         Ok(Self {
-            kernel_id: kernel_id.map_or(1, core::convert::identity),
+            kernel_id: kernel_id.unwrap_or(1),
             invocations,
             crate_path: crate_path.unwrap_or_else(|| syn::parse_quote!(::fusion_pcu)),
         })
@@ -2064,6 +2067,7 @@ fn binding_tokens(binding: &BindingSpec, pcu: &Path) -> TokenStream2 {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuDispatchArgs,
         expand_pcu_dispatch,

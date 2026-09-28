@@ -1,5 +1,6 @@
 //! Command-model vocabulary and backend-neutral kernel builder.
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuCommandOpCaps,
@@ -341,11 +342,13 @@ impl<'a, const MAX_STEPS: usize> PcuCommandKernelBuilder<'a, MAX_STEPS> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuCommandKernelBuilder,
         PcuCommandOp,
         PcuTarget,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuIrKind,
         PcuKernel,

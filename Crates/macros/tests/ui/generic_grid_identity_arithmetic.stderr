@@ -2,4 +2,4 @@ error: generic `T: PcuScalar` kernels currently support only `output[id] = input
  --> tests/ui/generic_grid_identity_arithmetic.rs:9:22
   |
 9 |         output[id] = input[id] + input[id];
-  |                      ^^^^^^^^^^^^^^^^^^^^^
+  |                      ^^^^^

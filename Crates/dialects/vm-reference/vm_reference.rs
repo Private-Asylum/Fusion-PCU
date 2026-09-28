@@ -8,6 +8,7 @@
 
 #![no_std]
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuDialectEffects,
     PcuDialectFragment,
@@ -389,6 +390,7 @@ pub fn execute_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuDialectImmediate,
         PcuDialectOperationAttributes,

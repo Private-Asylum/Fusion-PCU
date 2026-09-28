@@ -15,6 +15,7 @@ mod validation;
 pub use backend::*;
 pub use context::*;
 pub use submission::*;
+#[rustfmt::skip]
 pub use validation::{
     validate_dispatch_submission,
     validate_invocation_bindings,
@@ -58,6 +59,7 @@ mod tests {
         assert!(super::PcuDispatchContext::new(2, count).is_none());
     }
 
+    #[rustfmt::skip]
     use super::{
         PcuCommandSubmission,
         PcuCommandBackend,
@@ -80,6 +82,7 @@ mod tests {
         PcuStreamInstallation,
         PcuTransactionBackend,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBaseContract,
         PcuCaps,

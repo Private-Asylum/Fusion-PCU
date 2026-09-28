@@ -3,6 +3,7 @@
 //! The manual HIP control uses the same prepared PCU copy kernel and geometry, streams, resident
 //! buffers, and Arc payload. It is a scheduler control, not independent kernel code generation.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     num::NonZeroU32,
@@ -13,11 +14,13 @@ use std::{
     },
 };
 
+#[rustfmt::skip]
 use criterion::{
     BenchmarkId,
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     model::dispatch::{
         PcuDispatchDataOp,
@@ -41,6 +44,7 @@ use fusion_pcu::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipBatchCompletion,

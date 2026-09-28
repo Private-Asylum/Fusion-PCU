@@ -1,4 +1,3 @@
 [toolchain]
-# Preserve the nightly formatter and compiler used for the extracted PCU history.
-channel = "nightly-2025-06-30"
+channel = "stable"
 components = ["rust-src", "rustfmt", "clippy"]

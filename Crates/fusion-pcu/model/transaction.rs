@@ -1,5 +1,6 @@
 //! Transaction-model vocabulary and backend-neutral kernel builder.
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuDispatchPolicyCaps,
@@ -219,10 +220,12 @@ impl<'a> PcuTransactionKernelBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuTransactionKernelBuilder,
         PcuTransactionOrdering,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuDispatchPolicyCaps,
         PcuIrKind,

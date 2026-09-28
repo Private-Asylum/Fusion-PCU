@@ -1,5 +1,6 @@
 //! Process-lifetime dynamic loader state for the HIP runtime.
 
+#[rustfmt::skip]
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -43,6 +44,7 @@ pub(super) fn load_library(candidate: &std::ffi::OsStr) -> Result<Arc<Library>, 
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    #[rustfmt::skip]
     use std::{
         ffi::OsStr,
         sync::Arc,

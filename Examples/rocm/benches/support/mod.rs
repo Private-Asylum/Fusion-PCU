@@ -1,5 +1,6 @@
 //! Shared bench configuration, device policy, and untimed setup instrumentation.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     time::{

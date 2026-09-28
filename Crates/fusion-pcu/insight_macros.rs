@@ -80,6 +80,7 @@ mod tests {
 
 #[cfg(all(test, feature = "insights"))]
 mod enabled_tests {
+    #[rustfmt::skip]
     use crate::insights::{
         InsightClock,
         InsightScopes,

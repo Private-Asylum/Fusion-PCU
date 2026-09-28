@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuF32MapValidationError,
     PcuBindingRef,
@@ -26,6 +27,7 @@ use fusion_pcu::{
     validate_f32_map_kernel,
 };
 
+#[rustfmt::skip]
 use super::{
     PcuSpirvCapability,
     PcuSpirvError,
@@ -682,11 +684,13 @@ const fn dataflow_result(op: PcuDispatchOp<'_>) -> Option<PcuDispatchValueId> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         lower_dispatch_to_spirv,
         validate_invocation_index,
         validate_dispatch_for_spirv,
     };
+    #[rustfmt::skip]
     use super::super::{
         PcuSpirvCapability,
         PcuSpirvCapabilityCaps,
@@ -695,6 +699,7 @@ mod tests {
         PcuSpirvLoweringOptions,
         SPIRV_MAGIC,
     };
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuAccelerationStructureBindingType,
         PcuAccelerationStructureLevel,

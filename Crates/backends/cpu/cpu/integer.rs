@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 use fusion_pcu::{
     validate_host_scalar_bindings,
     validate_i16_map_kernel,

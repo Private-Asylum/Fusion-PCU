@@ -2,6 +2,7 @@
 //!
 //! This uses rocBLAS' public `rocblas_sgemm` ABI directly and does not require hipBLASLt.
 
+#[rustfmt::skip]
 use std::{
     any::Any,
     cell::Cell,
@@ -20,6 +21,7 @@ use std::{
 
 use libloading::Library;
 
+#[rustfmt::skip]
 use super::{
     DeviceBuffer,
     HipCompletionBatch,
@@ -1520,8 +1522,10 @@ mod tests {
         let mut actual = [0_u8; 16];
         c.copy_to(&mut actual).expect("read SGEMM output");
         let actual = actual
-            .chunks_exact(size_of::<f32>())
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32-sized chunk")))
+            .as_chunks::<{ size_of::<f32>() }>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_ne_bytes(*chunk))
             .collect::<Vec<_>>();
         assert_eq!(actual, a_values);
     }

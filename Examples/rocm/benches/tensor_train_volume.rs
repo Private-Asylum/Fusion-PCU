@@ -9,6 +9,7 @@ mod support;
 #[path = "support/train_volume.rs"]
 mod train_volume;
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,

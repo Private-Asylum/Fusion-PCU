@@ -1,5 +1,6 @@
 //! One explicitly selected `ROCm` linear-regression gradient and SGD update graph.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     process::ExitCode,
@@ -9,11 +10,13 @@ use std::{
 mod selection;
 
 use fusion_pcu::PcuOwnedDispatchMemorySession;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,

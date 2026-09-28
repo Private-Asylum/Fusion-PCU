@@ -1,5 +1,6 @@
 //! Public SPIR-V lowering options and descriptor types.
 
+#[rustfmt::skip]
 use core::ops::{
     BitAnd,
     BitAndAssign,

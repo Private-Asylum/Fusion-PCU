@@ -7,6 +7,7 @@
 //! - binding/port/sync ops
 //! - sample ops over binding truth
 
+#[rustfmt::skip]
 use core::ops::{
     BitAnd,
     BitAndAssign,
@@ -14,16 +15,19 @@ use core::ops::{
     BitOrAssign,
 };
 
+#[rustfmt::skip]
 use crate::{
     PcuBinding,
     PcuBindingRef,
     PcuDispatchOpCaps,
     PcuValueType,
 };
+#[rustfmt::skip]
 use crate::validation::{
     validate_sample_op,
     validate_trace_ray_op,
 };
+#[rustfmt::skip]
 pub use crate::validation::{
     PcuSampleValidationError,
     PcuTraceRayValidationError,

@@ -1,5 +1,6 @@
 //! Structural admission for the bounded HIP Dispatch lowering profiles.
 
+#[rustfmt::skip]
 use super::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -339,15 +340,7 @@ fn validate_grid_stride_body(
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
                 result,
                 binding,
-                index: PcuDispatchIndex::GridStrideId,
-            }) => {
-                require_binding(kernel, binding, false)?;
-                define(&mut definitions, result)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result,
-                binding,
-                index: PcuDispatchIndex::BindingElementZero,
+                index: PcuDispatchIndex::GridStrideId | PcuDispatchIndex::BindingElementZero,
             }) => {
                 require_binding(kernel, binding, false)?;
                 define(&mut definitions, result)?;
@@ -403,7 +396,7 @@ fn validate_grid_stride_body(
     }
 }
 
-fn map_common_validation_error(
+const fn map_common_validation_error(
     error: PcuF32MapValidationError,
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> RocmLowerError {

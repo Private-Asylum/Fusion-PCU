@@ -14,6 +14,7 @@ use std::string::String;
 
 use ash::vk;
 
+#[rustfmt::skip]
 use crate::{
     PcuComputeRunner,
     PcuLoweredSpirvDispatch,
@@ -23,6 +24,7 @@ use crate::{
     PcuRunnerExecutionReport,
     PcuRunnerHandle,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuDispatchSubmission,
     PcuDispatchOp,
@@ -1499,6 +1501,7 @@ fn find_memory_type(
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         fixed_descriptor_geometry,
         PcuVulkanError,

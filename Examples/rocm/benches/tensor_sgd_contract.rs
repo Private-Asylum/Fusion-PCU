@@ -2,12 +2,14 @@
 
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
     time::Instant,
 };
 
+#[rustfmt::skip]
 use criterion::{
     BenchmarkId,
     Criterion,
@@ -16,11 +18,13 @@ use criterion::{
     criterion_main,
 };
 use fusion_pcu::PcuOwnedDispatchMemorySession;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,

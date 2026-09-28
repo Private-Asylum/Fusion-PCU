@@ -6,6 +6,7 @@ mod dispatch_support;
 #[allow(dead_code)]
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
@@ -13,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -20,6 +22,7 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBf16Bits,
     PcuBinding,
@@ -45,6 +48,7 @@ use fusion_pcu::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     compile_hip_source,
     DeviceBuffer,
@@ -130,34 +134,42 @@ impl Conversion {
     fn expected(self, input: &[u8]) -> Vec<u8> {
         match self {
             Self::F32ToF16 => input
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|chunk| {
-                    let bits = u32::from_ne_bytes(chunk.try_into().expect("four bytes"));
+                    let bits = u32::from_ne_bytes(*chunk);
                     PcuF16Bits::from_f32(f32::from_bits(bits))
                         .to_bits()
                         .to_ne_bytes()
                 })
                 .collect(),
             Self::F16ToF32 => input
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .flat_map(|chunk| {
-                    let bits = u16::from_ne_bytes(chunk.try_into().expect("two bytes"));
+                    let bits = u16::from_ne_bytes(*chunk);
                     PcuF16Bits::from_bits(bits).to_f32().to_bits().to_ne_bytes()
                 })
                 .collect(),
             Self::F32ToBf16 => input
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|chunk| {
-                    let bits = u32::from_ne_bytes(chunk.try_into().expect("four bytes"));
+                    let bits = u32::from_ne_bytes(*chunk);
                     PcuBf16Bits::from_f32(f32::from_bits(bits))
                         .to_bits()
                         .to_ne_bytes()
                 })
                 .collect(),
             Self::Bf16ToF32 => input
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .flat_map(|chunk| {
-                    let bits = u16::from_ne_bytes(chunk.try_into().expect("two bytes"));
+                    let bits = u16::from_ne_bytes(*chunk);
                     PcuBf16Bits::from_bits(bits)
                         .to_f32()
                         .to_bits()

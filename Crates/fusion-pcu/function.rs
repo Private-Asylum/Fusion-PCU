@@ -4,6 +4,7 @@
 //! allocation-free, pure constant/ALU inliner; this does not lower Rust source or promise that
 //! any backend can execute an out-of-line function call.
 
+#[rustfmt::skip]
 use crate::{
     PcuDispatchDataOp,
     PcuDispatchValueId,
@@ -441,6 +442,7 @@ pub fn validate_function_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     use crate::{
         PcuDispatchAluOp,
         PcuValueType,

@@ -1,5 +1,6 @@
 //! Benchmark-thread Rust allocation instrumentation.
 
+#[rustfmt::skip]
 use std::{
     alloc::{
         GlobalAlloc,

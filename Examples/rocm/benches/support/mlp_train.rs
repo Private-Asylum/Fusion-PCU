@@ -1,12 +1,14 @@
 //! Direct HIP and rocBLAS peer for two-step training of a 1024-2048-2048-1024 MLP.
 
 use std::error::Error;
+#[rustfmt::skip]
 use std::time::{
     Duration,
     Instant,
 };
 
 use fusion_pcu::PcuObjectRef;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipCompletionBatch,

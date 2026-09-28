@@ -4,6 +4,7 @@
 //! and submits them through module launches. Runtime resources and completion ownership are kept
 //! here; unsupported PCU operations are rejected by the lowerer.
 
+#[rustfmt::skip]
 use std::{
     any::Any,
     cell::{
@@ -24,6 +25,7 @@ use std::{
 use std::fs;
 
 use libloading::Library;
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryPoolId,
     PcuMemoryPoolSnapshot,
@@ -43,41 +45,49 @@ mod runtime;
 #[cfg(feature = "tensor")]
 mod tensor;
 
+#[rustfmt::skip]
 pub use blas::{
     Rocblas,
     RocblasError,
     RocblasSgemmHostTiming,
 };
+#[rustfmt::skip]
 pub use codegen::compiler::{
     HipCompileError,
     compile_hip_source,
 };
+#[rustfmt::skip]
 pub use dispatch::{
     RocmDispatchBinding,
     RocmDispatchError,
     execute_pcu_dispatch,
 };
 pub use discovery::RocmDiscovery;
+#[rustfmt::skip]
 pub use device_kernel::{
     RocmDeviceKernelError,
     RocmPreparedDeviceKernel,
 };
 pub use error::*;
+#[rustfmt::skip]
 pub use host_kernel::{
     RocmHostKernelError,
     RocmPreparedHostKernel,
 };
+#[rustfmt::skip]
 pub use codegen::lower::{
     RocmLowerError,
     lower_dispatch_to_hip_rtc_source,
     lower_dispatch_to_hip_source,
 };
+#[rustfmt::skip]
 pub use memory::{
     RocmImportDescriptor,
     RocmMemoryMapping,
     RocmMemoryProvider,
     RocmMemoryResource,
 };
+#[rustfmt::skip]
 pub use owned_dispatch::{
     RocmCheckedBatchCompletion,
     RocmCheckedDispatchBatch,
@@ -93,11 +103,13 @@ pub use owned_dispatch::{
     RocmPreparedDispatch,
     RocmTwoSlotExecutionStep,
 };
+#[rustfmt::skip]
 pub use codegen::rtc::{
     HipRtcError,
     compile_hip_source_for_device,
 };
 #[cfg(feature = "tensor")]
+#[rustfmt::skip]
 pub use tensor::{
     RocmAdmittedTensorFeedbackResources,
     RocmPreparedTensorGraph,
@@ -117,6 +129,7 @@ pub use tensor::{
 };
 
 #[cfg(all(feature = "tensor", feature = "insights"))]
+#[rustfmt::skip]
 pub use tensor::{
     RocmTensorBatchedExecutionTiming,
     RocmTensorInsightRecord,

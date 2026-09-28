@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 use fusion_pcu_macros::{
     pcu,
     pcu_dispatch,

@@ -1,5 +1,6 @@
 //! Bounded type checking for scalar dispatch data-flow regions.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingRef,
     PcuBindingType,
@@ -196,10 +197,12 @@ fn check_type(
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         validate_typed_dispatch_value_flow,
         PcuTypedDispatchValidationError as Error,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

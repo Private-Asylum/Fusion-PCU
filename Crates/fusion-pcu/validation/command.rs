@@ -1,12 +1,14 @@
 //! Validation for ordered command kernels.
 
 use super::find_binding;
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,
     PcuPortDirection,
     PcuValueType,
 };
+#[rustfmt::skip]
 use crate::model::{
     PcuCommandEffectKind,
     PcuCommandKernelIr,
@@ -193,6 +195,7 @@ mod command_result_tests {
     use super::*;
     #[cfg(test)]
     use crate::PcuBinding;
+    #[rustfmt::skip]
     use crate::model::{
         PcuCommandResult,
         PcuCommandStep,

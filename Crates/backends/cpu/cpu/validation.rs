@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -14,6 +15,7 @@ use fusion_pcu::{
     PcuParameterValue,
 };
 
+#[rustfmt::skip]
 use crate::{
     PcuF32ReferenceError,
     VALUE_SLOTS,

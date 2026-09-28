@@ -7,6 +7,7 @@ pub mod signal;
 pub mod stream;
 pub mod transaction;
 
+#[rustfmt::skip]
 use crate::{
     PcuDispatchPolicyCaps,
     PcuPrimitiveCaps,

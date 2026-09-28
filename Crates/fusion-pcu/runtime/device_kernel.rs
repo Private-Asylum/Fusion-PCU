@@ -2,6 +2,7 @@
 
 use core::marker::PhantomData;
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,

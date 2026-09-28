@@ -1,4 +1,5 @@
 //! Paired raw-tick diagnostics; reporting and verification remain outside measured calls.
+#[rustfmt::skip]
 use super::{
     native,
     support,
@@ -7,6 +8,7 @@ use super::{
     cpu_counters,
     insights,
 };
+#[rustfmt::skip]
 use std::{
     error::Error,
     num::NonZeroUsize,
@@ -15,20 +17,24 @@ use std::{
         Instant,
     },
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuOwnedDispatchMemorySession,
     insights::InsightClock,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,
     ValueId,
 };
+#[rustfmt::skip]
 use train_volume::{
     FEATURES,
     LEARNING_RATE,

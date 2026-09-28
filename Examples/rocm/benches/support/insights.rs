@@ -5,6 +5,7 @@
 //! returned as an opaque context so consumers can reject samples that crossed contexts.
 
 #[cfg(feature = "insights")]
+#[rustfmt::skip]
 use fusion_pcu::insights::{
     InsightClock,
     InsightStamp,

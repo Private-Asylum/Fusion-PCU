@@ -2,10 +2,12 @@
 
 use core::fmt;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuDispatchOpCaps,
     PcuValueType,
 };
+#[rustfmt::skip]
 use super::types::{
     PcuSpirvCapability,
     PcuSpirvVersion,

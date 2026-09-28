@@ -6,17 +6,20 @@ use std::error::Error;
 
 use std::hint::black_box;
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
     BenchmarkId,
     Criterion,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryPoolId,
     PcuMemoryProvider,
     PcuOwnedDispatchMemorySession,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     HipRuntime,
     Rocblas,
@@ -24,6 +27,7 @@ use fusion_pcu_rocm::{
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,
@@ -461,12 +465,14 @@ fn verify_resident(
     native.copy_to(&mut native_data)?;
     let expected = f32::from(u16::try_from(size * 6).expect("benchmark output fits u16"));
     for (index, (pcu_bytes, native_bytes)) in pcu_data
-        .chunks_exact(4)
-        .zip(native_data.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(native_data.as_chunks::<4>().0.iter())
         .enumerate()
     {
-        let pcu_value = f32::from_ne_bytes(pcu_bytes.try_into()?);
-        let native_value = f32::from_ne_bytes(native_bytes.try_into()?);
+        let pcu_value = f32::from_ne_bytes(*pcu_bytes);
+        let native_value = f32::from_ne_bytes(*native_bytes);
         if pcu_value.to_bits() != expected.to_bits() || native_value.to_bits() != expected.to_bits()
         {
             return Err(format!("resident output[{index}] mismatch: PCU {pcu_value}, native {native_value}, expected {expected}").into());

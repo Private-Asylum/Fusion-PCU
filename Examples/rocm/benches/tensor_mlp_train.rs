@@ -2,6 +2,7 @@
 
 mod support;
 
+#[rustfmt::skip]
 use std::{
     cell::RefCell,
     error::Error,
@@ -9,6 +10,7 @@ use std::{
     time::Instant,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -16,16 +18,19 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryProvider,
     PcuMemoryUsage,
     PcuOwnedDispatchMemorySession,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,
@@ -703,13 +708,22 @@ fn run_on(
         "PCU batch {batch} warm two-step provider delta: {} allocations ({} bytes, {:?}); {} uploads ({} bytes, {:?}); {} downloads ({} bytes, {:?})",
         profile.allocations - prepared_profile.allocations,
         profile.allocated_bytes - prepared_profile.allocated_bytes,
-        profile.allocation_time - prepared_profile.allocation_time,
+        profile
+            .allocation_time
+            .checked_sub(prepared_profile.allocation_time)
+            .expect("cumulative provider timing must not decrease"),
         profile.uploads - prepared_profile.uploads,
         profile.uploaded_bytes - prepared_profile.uploaded_bytes,
-        profile.upload_time - prepared_profile.upload_time,
+        profile
+            .upload_time
+            .checked_sub(prepared_profile.upload_time)
+            .expect("cumulative provider timing must not decrease"),
         profile.downloads - prepared_profile.downloads,
         profile.downloaded_bytes - prepared_profile.downloaded_bytes,
-        profile.download_time - prepared_profile.download_time,
+        profile
+            .download_time
+            .checked_sub(prepared_profile.download_time)
+            .expect("cumulative provider timing must not decrease"),
     );
     println!(
         "PCU batch {batch} pool: process used start {}, peak observed {}, end {}; peak telemetry is sampled at setup/end-of-step boundaries; cumulative allocated bytes are a separate upper bound",
@@ -791,13 +805,22 @@ fn run_on(
         "PCU batch {batch} output-bank warm two-step provider delta: {} allocations ({} bytes, {:?}); {} uploads ({} bytes, {:?}); {} downloads ({} bytes, {:?}); setup allocated {} bytes",
         bank_profile.allocations - bank_setup_profile.allocations,
         bank_profile.allocated_bytes - bank_setup_profile.allocated_bytes,
-        bank_profile.allocation_time - bank_setup_profile.allocation_time,
+        bank_profile
+            .allocation_time
+            .checked_sub(bank_setup_profile.allocation_time)
+            .expect("cumulative provider timing must not decrease"),
         bank_profile.uploads - bank_setup_profile.uploads,
         bank_profile.uploaded_bytes - bank_setup_profile.uploaded_bytes,
-        bank_profile.upload_time - bank_setup_profile.upload_time,
+        bank_profile
+            .upload_time
+            .checked_sub(bank_setup_profile.upload_time)
+            .expect("cumulative provider timing must not decrease"),
         bank_profile.downloads - bank_setup_profile.downloads,
         bank_profile.downloaded_bytes - bank_setup_profile.downloaded_bytes,
-        bank_profile.download_time - bank_setup_profile.download_time,
+        bank_profile
+            .download_time
+            .checked_sub(bank_setup_profile.download_time)
+            .expect("cumulative provider timing must not decrease"),
         bank_setup_profile.allocated_bytes,
     );
 
@@ -837,7 +860,7 @@ fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
     if values.len().is_multiple_of(2) {
-        (values[middle - 1] + values[middle]) * 0.5
+        f64::midpoint(values[middle - 1], values[middle])
     } else {
         values[middle]
     }

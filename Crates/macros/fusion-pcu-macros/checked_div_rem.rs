@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 use super::{
     BindingAccess,
     BindingSpec,
@@ -12,6 +13,7 @@ use super::{
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::spanned::Spanned;
+#[rustfmt::skip]
 use syn::{
     BinOp,
     Error,

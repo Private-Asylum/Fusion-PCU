@@ -4,6 +4,7 @@
 #[allow(dead_code)] // The shared allocator helper also exposes phased counters for other benches.
 mod alloc;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
@@ -13,11 +14,13 @@ use std::{
     },
 };
 
+#[rustfmt::skip]
 use criterion::{
     BenchmarkId,
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingRef,
     PcuDeviceBuffer,
@@ -25,6 +28,7 @@ use fusion_pcu::{
     PcuMemoryPoolId,
 };
 use fusion_pcu_macros::pcu;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipKernel,

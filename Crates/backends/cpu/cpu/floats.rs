@@ -1,3 +1,4 @@
+#[rustfmt::skip]
 use fusion_pcu::{
     validate_f16_identity_kernel,
     validate_bf16_identity_kernel,
@@ -21,6 +22,7 @@ use fusion_pcu::{
     PcuBf16Bits,
 };
 
+#[rustfmt::skip]
 use crate::{
     validation,
     VALUE_SLOTS,
@@ -259,6 +261,7 @@ impl_half_identity!(
 mod half_identity_tests {
     use core::num::NonZeroU32;
     use std::boxed::Box;
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuBinding,
         PcuBindingAccess,
@@ -280,6 +283,7 @@ mod half_identity_tests {
         PcuValueType,
         PcuValueTypeCaps,
     };
+    #[rustfmt::skip]
     use super::{
         PcuBf16IdentityReference,
         PcuF16IdentityReference,

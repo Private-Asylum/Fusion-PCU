@@ -1,5 +1,6 @@
 //! Common structural admission for the bounded scalar `f64` indexed-map profile.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -373,10 +374,12 @@ const fn result_id(op: PcuDispatchOp<'_>) -> Option<PcuDispatchValueId> {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuF64MapValidationError,
         validate_f64_map_kernel,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,

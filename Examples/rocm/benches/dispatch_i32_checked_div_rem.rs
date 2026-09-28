@@ -14,12 +14,14 @@ mod owned_sgemm;
 #[allow(dead_code)] // Selection support exposes utilities shared by the other example benches.
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     num::NonZeroU32,
     sync::Arc,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -27,6 +29,7 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     model::dispatch::{
         PcuDispatchDataOp,
@@ -55,6 +58,7 @@ use fusion_pcu::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     compile_hip_source,
     HipKernelArgument,
@@ -70,6 +74,7 @@ use fusion_pcu_rocm::{
     RocmTwoSlotExecutionStep,
 };
 
+#[rustfmt::skip]
 use dispatch_support::{
     AllocationCapture,
     run_direct,
@@ -2491,8 +2496,10 @@ fn decode_u32(bytes: &[u8]) -> Result<Vec<u32>, Box<dyn Error>> {
         return Err("u32 readback had a partial element".into());
     }
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<u32>())
-        .map(|chunk| u32::from_ne_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<{ std::mem::size_of::<u32>() }>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_ne_bytes(*chunk))
         .collect())
 }
 
@@ -2501,8 +2508,10 @@ fn decode_i32(bytes: &[u8]) -> Result<Vec<i32>, Box<dyn Error>> {
         return Err("i32 readback had a partial element".into());
     }
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<i32>())
-        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<{ std::mem::size_of::<i32>() }>()
+        .0
+        .iter()
+        .map(|chunk| i32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -2519,8 +2528,10 @@ fn verify_pair(
     remainder.copy_to(&mut r)?;
     let decode = |bytes: &[u8]| {
         bytes
-            .chunks_exact(4)
-            .map(|x| i32::from_le_bytes(x.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| i32::from_le_bytes(*x))
             .collect::<Vec<_>>()
     };
     let actual_q = decode(&q);

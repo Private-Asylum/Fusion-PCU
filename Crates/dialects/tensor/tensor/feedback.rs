@@ -1,5 +1,6 @@
 //! Backend-neutral feedback bindings and reusable iteration schedule.
 
+#[rustfmt::skip]
 use super::{
     TensorError,
     TensorExecutionPlan,

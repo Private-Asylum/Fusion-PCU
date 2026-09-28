@@ -5,6 +5,7 @@
 mod dispatch_support;
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
@@ -12,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -20,6 +22,7 @@ use criterion::{
     Throughput,
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
     PcuDispatchSubmission,
@@ -27,12 +30,14 @@ use fusion_pcu::{
     PcuValueType,
 };
 use fusion_pcu_macros::pcu;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     HipKernelArgument,
     RocmDiscovery,
     RocmOwnedDispatchBackend,
     compile_hip_source,
 };
+#[rustfmt::skip]
 use dispatch_support::{
     BLOCK_SIZE,
     READBACK_SAMPLES,

@@ -1,5 +1,6 @@
 //! Reference execution for bounded heterogeneous scalar conversion profiles.
 
+#[rustfmt::skip]
 use fusion_pcu::{
     validate_dispatch_submission,
     validate_typed_dispatch_value_flow,
@@ -450,7 +451,7 @@ fn execute_invocation(
     Ok(())
 }
 
-fn load_slice_value(slice: &PcuCpuTypedSlice<'_>, element: usize) -> Value {
+const fn load_slice_value(slice: &PcuCpuTypedSlice<'_>, element: usize) -> Value {
     match slice {
         PcuCpuTypedSlice::ReadI8(slice) => Value::I8(slice[element]),
         PcuCpuTypedSlice::ReadU8(slice) => Value::U8(slice[element]),
@@ -508,7 +509,7 @@ fn convert_value(
     }
 }
 
-fn store_slice_value(
+const fn store_slice_value(
     slice: &mut PcuCpuTypedSlice<'_>,
     index: usize,
     value: Value,
@@ -537,6 +538,7 @@ mod tests {
     use core::num::NonZeroU32;
     use std::boxed::Box;
 
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuBinding,
         PcuBindingAccess,
@@ -560,6 +562,7 @@ mod tests {
         PcuValueTypeCaps,
     };
 
+    #[rustfmt::skip]
     use super::{
         PcuCpuTypedBinding,
         PcuCpuTypedSlice,

@@ -1,5 +1,6 @@
 //! Optional dynamically loaded ROCTX range markers for profiler correlation.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     ffi::CStr,

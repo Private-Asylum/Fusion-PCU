@@ -5,6 +5,7 @@
 mod dispatch_support;
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
@@ -12,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -19,12 +21,14 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuDispatchSubmission,
     PcuInvocationShape,
     PcuWrappingInteger,
 };
 use fusion_pcu_macros::pcu;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     compile_hip_source,
     HipKernelArgument,
@@ -32,6 +36,7 @@ use fusion_pcu_rocm::{
     RocmOwnedDispatchBackend,
 };
 
+#[rustfmt::skip]
 use dispatch_support::{
     encode_u32,
     print_samples,

@@ -1,5 +1,6 @@
 //! Shared generic PCU execution-substrate identifiers and descriptor vocabulary.
 
+#[rustfmt::skip]
 use super::caps::{
     PcuCommandOpCaps,
     PcuDispatchOpCaps,
@@ -9,6 +10,7 @@ use super::caps::{
     PcuSignalOpCaps,
     PcuTransactionFeatureCaps,
 };
+#[rustfmt::skip]
 use crate::{
     PcuDispatchFeatureCaps,
     PcuKernel,
@@ -169,6 +171,7 @@ impl PcuExecutorSupport {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuExecutorSupport,
         PcuExecutorDescriptor,
@@ -176,6 +179,7 @@ mod tests {
         PcuExecutorId,
         PcuExecutorOrigin,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuCommandKernelIr,
         PcuCommandOp,

@@ -5,6 +5,7 @@
 //! dialect only when its consumer-specific support table recognizes that exact operation and
 //! version.
 
+#[rustfmt::skip]
 use crate::{
     PcuScalarType,
     PcuValueType,

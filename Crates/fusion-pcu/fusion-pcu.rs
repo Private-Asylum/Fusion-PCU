@@ -39,6 +39,7 @@ pub mod scalar_wrapping;
 pub mod validation;
 
 pub use contract::*;
+#[rustfmt::skip]
 pub use runtime::{
     activation,
     assessment,
@@ -54,6 +55,7 @@ pub use runtime::execution::*;
 pub use runtime::host_kernel::*;
 pub use runtime::kernel::*;
 pub use runtime::registry::*;
+#[rustfmt::skip]
 pub use resource::{
     borrowed,
     memory,

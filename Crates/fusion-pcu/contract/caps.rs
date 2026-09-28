@@ -1,5 +1,6 @@
 //! Capability and support vocabulary for generic PCU backends.
 
+#[rustfmt::skip]
 use core::ops::{
     BitAnd,
     BitAndAssign,
@@ -7,6 +8,7 @@ use core::ops::{
     BitOrAssign,
 };
 
+#[rustfmt::skip]
 use crate::{
     PcuDispatchFeatureCaps,
     PcuKernel,
@@ -978,6 +980,7 @@ impl PcuSupport {
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuCommandOpCaps,
         PcuCommandSupport,
@@ -990,6 +993,7 @@ mod tests {
         PcuPrimitiveSupport,
         PcuSupport,
     };
+    #[rustfmt::skip]
     use crate::{
         PcuAccelerationStructureBindingType,
         PcuAccelerationStructureLevel,

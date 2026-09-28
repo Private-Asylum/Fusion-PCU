@@ -1,11 +1,13 @@
 //! Direct HIP and rocBLAS peer for the linear-regression training graph.
 
 use std::error::Error;
+#[rustfmt::skip]
 use std::time::{
     Duration,
     Instant,
 };
 
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipKernel,
@@ -20,6 +22,7 @@ use fusion_pcu_rocm::{
 };
 use fusion_pcu::PcuObjectRef;
 #[cfg(feature = "insights")]
+#[rustfmt::skip]
 use fusion_pcu::insights::{
     InsightClock,
     InsightLedger,

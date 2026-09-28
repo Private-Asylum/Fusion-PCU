@@ -6,6 +6,7 @@ mod dispatch_support;
 #[allow(dead_code)]
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
@@ -13,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -20,6 +22,7 @@ use criterion::{
     Criterion,
     Throughput,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     f32_bits_to_f64_bits,
     PcuBinding,
@@ -44,6 +47,7 @@ use fusion_pcu::{
     PcuValueType,
     PcuValueTypeCaps,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     compile_hip_source,
     DeviceBuffer,

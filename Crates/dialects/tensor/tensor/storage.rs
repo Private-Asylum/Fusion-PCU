@@ -1,5 +1,6 @@
 //! Backend-neutral tensor storage requirements and overlap validation.
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryAccess,
     PcuMemoryOverlap,

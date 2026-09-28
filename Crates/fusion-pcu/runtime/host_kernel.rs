@@ -3,6 +3,7 @@
 //! This describes a host boundary, not device selection or implicit CPU fallback. Native host
 //! byte order is explicit: implementations must convert it or reject an unsupported host order.
 
+#[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
     PcuBindingRef,
@@ -135,6 +136,7 @@ pub trait PcuPreparedHostKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     use crate::{
         PcuBf16Bits,
         PcuF16Bits,

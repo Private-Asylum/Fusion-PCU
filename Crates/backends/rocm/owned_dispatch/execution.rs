@@ -1,5 +1,6 @@
 //! Bounded execution of validated, fault-gated graphs of owned `ROCm` operations.
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     fmt,
@@ -7,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuCompletionOutcome,
     PcuBindingAccess,
@@ -33,6 +35,7 @@ use crate::HipRuntime;
 use crate::HipStreamHandle;
 use crate::Rocblas;
 
+#[rustfmt::skip]
 use super::{
     RocmOwnedCompletion,
     RocmOwnedDispatchError,
@@ -1859,6 +1862,7 @@ fn next_pending_slot(pending: [bool; 2], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[rustfmt::skip]
     use fusion_pcu::{
         PcuExecutionFault,
         PcuExecutionFaultKind,

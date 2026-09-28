@@ -4,11 +4,13 @@
 mod elementwise;
 mod support;
 
+#[rustfmt::skip]
 use criterion::{
     Criterion,
     criterion_group,
     criterion_main,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     TensorError,

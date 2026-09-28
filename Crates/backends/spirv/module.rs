@@ -1,5 +1,6 @@
 //! Minimal SPIR-V module emission helpers.
 
+#[rustfmt::skip]
 use super::{
     PcuSpirvCapabilityCaps,
     PcuSpirvError,
@@ -7,6 +8,7 @@ use super::{
     PcuSpirvModuleInfo,
     PcuSpirvSink,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,

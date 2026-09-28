@@ -1,10 +1,12 @@
 //! Measure provider operations without changing their resource or transfer behavior.
 
+#[rustfmt::skip]
 use std::time::{
     Duration,
     Instant,
 };
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryAllocationRequest,
     PcuMemoryPoolId,

@@ -1,4 +1,5 @@
 use super::*;
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryAccess,
     PcuMemoryOverlap,

@@ -5,6 +5,7 @@ use std::process::ExitCode;
 #[path = "selection.rs"]
 mod selection;
 
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryAllocateWithPolicyError,
     PcuMemoryProviderFailure,
@@ -14,6 +15,7 @@ use fusion_pcu::{
     PcuOwnedDispatchMemorySession,
     PcuMemoryResourcePolicy,
 };
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmMemoryResource,
@@ -21,6 +23,7 @@ use fusion_pcu_rocm::{
     RocmTensorAssessor,
     RocmTensorExecutionError,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,

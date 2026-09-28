@@ -1,9 +1,11 @@
 use proc_macro2::TokenStream;
+#[rustfmt::skip]
 use quote::{
     format_ident,
     quote,
     ToTokens,
 };
+#[rustfmt::skip]
 use syn::{
     GenericParam,
     Generics,

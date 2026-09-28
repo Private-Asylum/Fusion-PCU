@@ -4,6 +4,7 @@ use std::error::Error;
 
 use fusion_pcu_tensor::Tensor;
 
+#[rustfmt::skip]
 use super::{
     Program,
     StrictProgram,

@@ -2,11 +2,13 @@
 
 mod support;
 
+#[rustfmt::skip]
 use std::{
     error::Error,
     hint::black_box,
 };
 
+#[rustfmt::skip]
 use criterion::{
     criterion_group,
     criterion_main,
@@ -15,6 +17,7 @@ use criterion::{
     Throughput,
 };
 use fusion_pcu::PcuOwnedDispatchMemorySession;
+#[rustfmt::skip]
 use fusion_pcu_rocm::{
     DeviceBuffer,
     HipRuntime,
@@ -23,6 +26,7 @@ use fusion_pcu_rocm::{
     RocmOwnedDispatchBackend,
     RocmTensorAssessor,
 };
+#[rustfmt::skip]
 use fusion_pcu_tensor::{
     Graph,
     Tensor,

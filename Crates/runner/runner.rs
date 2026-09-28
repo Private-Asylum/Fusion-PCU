@@ -6,11 +6,13 @@ use std::error::Error;
 use std::string::String;
 use std::vec::Vec;
 
+#[rustfmt::skip]
 use fusion_pcu::dispatch::{
     validate_dispatch_submission,
     validate_invocation_bindings,
     validate_parameters,
 };
+#[rustfmt::skip]
 use fusion_pcu::{
     PcuDispatchSubmission,
     PcuError,
@@ -19,6 +21,7 @@ use fusion_pcu::{
     PcuInvocationParameters,
     PcuKernelIrContract,
 };
+#[rustfmt::skip]
 use fusion_pcu_spirv::{
     lower_dispatch_to_spirv,
     PcuSpirvError,
@@ -449,6 +452,7 @@ impl Error for PcuRunnerError {}
 
 #[cfg(test)]
 mod tests {
+    #[rustfmt::skip]
     use super::{
         PcuComputeRunner,
         PcuDispatchSubmission,
