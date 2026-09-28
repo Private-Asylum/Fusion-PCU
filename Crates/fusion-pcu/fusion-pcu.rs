@@ -15,6 +15,8 @@
 
 #[cfg(test)]
 extern crate std;
+#[cfg(feature = "tensor")]
+extern crate alloc;
 
 pub mod builder;
 #[path = "contract/contract.rs"]

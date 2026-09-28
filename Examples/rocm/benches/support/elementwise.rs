@@ -26,7 +26,7 @@ use fusion_pcu_rocm::{
     compile_hip_source_for_device,
 };
 #[rustfmt::skip]
-use fusion_pcu_tensor::{
+use fusion_pcu::dialect::tensor::{
     Graph,
     Tensor,
     TensorError,

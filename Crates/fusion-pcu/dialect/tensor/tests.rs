@@ -1,6 +1,6 @@
 use super::*;
 #[rustfmt::skip]
-use fusion_pcu::{
+use crate::{
     PcuMemoryAccess,
     PcuMemoryOverlap,
     PcuMemoryRange,

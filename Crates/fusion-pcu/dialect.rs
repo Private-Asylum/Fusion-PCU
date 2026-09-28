@@ -12,6 +12,12 @@ use crate::{
 };
 
 pub mod builder;
+/// Tensor graph semantics and reference evaluation (requires an allocator, never std).
+#[cfg(feature = "tensor")]
+pub mod tensor;
+/// Allocation-free reference VM for the typed stream dialect.
+#[cfg(feature = "vm-reference")]
+pub mod vm_reference;
 
 pub use builder::*;
 

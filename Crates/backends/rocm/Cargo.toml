@@ -19,11 +19,10 @@ path = "rocm.rs"
 [features]
 default = []
 insights = ["fusion-pcu/insights"]
-tensor = ["dep:fusion-pcu-tensor"]
+tensor = ["fusion-pcu/tensor"]
 
 [dependencies]
 fusion-pcu.workspace = true
-fusion-pcu-tensor = { workspace = true, optional = true }
 libloading.workspace = true
 smallvec.workspace = true
 

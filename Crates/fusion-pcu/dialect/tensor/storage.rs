@@ -1,7 +1,8 @@
 //! Backend-neutral tensor storage requirements and overlap validation.
 
+use alloc::vec::Vec;
 #[rustfmt::skip]
-use fusion_pcu::{
+use crate::{
     PcuMemoryAccess,
     PcuMemoryOverlap,
     PcuMemoryRange,
@@ -204,7 +205,7 @@ impl TensorValueStorageRequirement {
 pub fn node_output_bytes(shape: &[usize]) -> Option<usize> {
     shape
         .iter()
-        .try_fold(std::mem::size_of::<f32>(), |bytes, &dimension| {
+        .try_fold(core::mem::size_of::<f32>(), |bytes, &dimension| {
             bytes.checked_mul(dimension)
         })
 }

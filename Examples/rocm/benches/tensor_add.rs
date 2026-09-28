@@ -11,7 +11,7 @@ use criterion::{
     criterion_main,
 };
 #[rustfmt::skip]
-use fusion_pcu_tensor::{
+use fusion_pcu::dialect::tensor::{
     Graph,
     TensorError,
     ValueId,

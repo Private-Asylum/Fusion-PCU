@@ -1,4 +1,4 @@
-//! A small executable consumer of public [`fusion_pcu`] dialect programs and fragments.
+//! A small executable consumer of public [`crate`] dialect programs and fragments.
 //!
 //! This `no_std` reference VM implements a typed, versioned `u32` stream dialect: `input.u32`
 //! reads the next caller input, `add.u32` performs wrapping addition, and `emit.u32` appends to
@@ -6,10 +6,8 @@
 //! `value` immediate plus wrapping addition. Both paths use caller-provided storage and validate
 //! before execution.
 
-#![no_std]
-
 #[rustfmt::skip]
-use fusion_pcu::{
+use crate::{
     PcuDialectEffects,
     PcuDialectFragment,
     PcuDialectId,
@@ -391,7 +389,7 @@ pub fn execute_program(
 mod tests {
     use super::*;
     #[rustfmt::skip]
-    use fusion_pcu::{
+    use crate::{
         PcuDialectImmediate,
         PcuDialectOperationAttributes,
         PcuDialectOperand,
@@ -406,7 +404,7 @@ mod tests {
     fn fragment<'a>(operations: &'a [PcuDialectOperation<'a>]) -> PcuDialectFragment<'a> {
         PcuDialectFragment {
             dialect: DIALECT,
-            version: fusion_pcu::PcuDialectVersion {
+            version: crate::PcuDialectVersion {
                 major: DIALECT_MAJOR,
                 minor: DIALECT_MINOR,
             },

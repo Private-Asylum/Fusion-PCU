@@ -8,7 +8,7 @@ use fusion_pcu::{
     PcuMemoryProvider,
 };
 #[rustfmt::skip]
-use fusion_pcu_tensor::{
+use fusion_pcu::dialect::tensor::{
     Tensor,
     TensorFeedbackPlan,
     ValueId,
@@ -419,7 +419,7 @@ where
     }
 }
 
-impl<P> fusion_pcu_tensor::TensorExecution for RocmTensorExecution<'_, '_, '_, P>
+impl<P> fusion_pcu::dialect::tensor::TensorExecution for RocmTensorExecution<'_, '_, '_, P>
 where
     P: PcuMemoryProvider<Resource = RocmMemoryResource>,
 {

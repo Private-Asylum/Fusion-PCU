@@ -29,7 +29,7 @@ use fusion_pcu_rocm::{
     RocmTensorAssessor,
 };
 #[rustfmt::skip]
-use fusion_pcu_tensor::{
+use fusion_pcu::dialect::tensor::{
     Graph,
     Tensor,
     ValueId,

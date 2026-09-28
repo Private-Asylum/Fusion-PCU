@@ -1,12 +1,17 @@
 //! Backend-neutral feedback bindings and reusable iteration schedule.
 
 #[rustfmt::skip]
+use alloc::{
+    vec,
+    vec::Vec,
+};
+#[rustfmt::skip]
 use super::{
     TensorError,
     TensorExecutionPlan,
     ValueId,
 };
-use std::num::NonZeroUsize;
+use core::num::NonZeroUsize;
 
 /// One loop-carried value, mapping a selected output into a selected graph input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,13 +233,17 @@ impl<'g> TensorExecutionPlan<'g> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Graph;
+    #[rustfmt::skip]
+    use super::super::{
+        Graph,
+        Tensor,
+    };
 
     #[test]
     fn feedback_validates_selected_values_and_schedules_two_banks() {
         let mut graph = Graph::default();
         let state = graph.input(vec![2]).unwrap();
-        let increment = graph.constant(crate::Tensor::new(vec![2], vec![1.0, 1.0]).unwrap());
+        let increment = graph.constant(Tensor::new(vec![2], vec![1.0, 1.0]).unwrap());
         let next = graph.add(state, increment).unwrap();
         let plan = graph.execution_plan_for_outputs(&[next]).unwrap();
         let feedback = plan.feedback_plan(&[(next, state)]).unwrap();
@@ -275,11 +284,11 @@ mod tests {
         let mut graph = Graph::default();
         let state = graph.input(vec![2]).unwrap();
         let other_state = graph.input(vec![3]).unwrap();
-        let increment = graph.constant(crate::Tensor::new(vec![2], vec![0.0; 2]).unwrap());
+        let increment = graph.constant(Tensor::new(vec![2], vec![0.0; 2]).unwrap());
         let next = graph.add(state, increment).unwrap();
-        let other_increment = graph.constant(crate::Tensor::new(vec![3], vec![0.0; 3]).unwrap());
+        let other_increment = graph.constant(Tensor::new(vec![3], vec![0.0; 3]).unwrap());
         let other_output = graph.add(other_state, other_increment).unwrap();
-        let unselected = graph.constant(crate::Tensor::scalar(1.0));
+        let unselected = graph.constant(Tensor::scalar(1.0));
         let plan = graph
             .execution_plan_for_outputs(&[next, other_output])
             .unwrap();
@@ -312,7 +321,7 @@ mod tests {
     fn feedback_supports_n_bank_rotation_and_rejects_one_bank() {
         let mut graph = Graph::default();
         let state = graph.input(vec![1]).unwrap();
-        let increment = graph.constant(crate::Tensor::new(vec![1], vec![1.0]).unwrap());
+        let increment = graph.constant(Tensor::new(vec![1], vec![1.0]).unwrap());
         let next = graph.add(state, increment).unwrap();
         let plan = graph.execution_plan_for_outputs(&[next]).unwrap();
         let one = NonZeroUsize::new(1).unwrap();

@@ -1,6 +1,6 @@
 //! Backend-neutral behavior of a prepared, bound tensor execution.
 
-use std::num::NonZeroUsize;
+use core::num::NonZeroUsize;
 
 #[rustfmt::skip]
 use super::{

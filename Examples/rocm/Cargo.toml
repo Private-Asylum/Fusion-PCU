@@ -228,10 +228,9 @@ default = []
 insights = ["fusion-pcu/insights", "fusion-pcu-rocm/insights"]
 
 [dependencies]
-fusion-pcu.workspace = true
+fusion-pcu = { workspace = true, features = ["tensor"] }
 fusion-pcu-rocm = { workspace = true, features = ["tensor"] }
 fusion-pcu-macros.workspace = true
-fusion-pcu-tensor.workspace = true
 
 [dev-dependencies]
 libloading.workspace = true

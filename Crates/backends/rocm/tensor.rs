@@ -71,7 +71,7 @@ use fusion_pcu::{
 };
 use std::num::NonZeroU32;
 #[rustfmt::skip]
-use fusion_pcu_tensor::{
+use fusion_pcu::dialect::tensor::{
     Graph,
     NodeDescriptor,
     OpDescriptor,
@@ -5047,8 +5047,8 @@ fn resource_may_overlap_any<R: PcuMemoryResource>(
 fn input_storage_requirement(
     value: ValueId,
     shape: &[usize],
-) -> Result<fusion_pcu_tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
-    Ok(fusion_pcu_tensor::TensorValueStorageRequirement {
+) -> Result<fusion_pcu::dialect::tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
+    Ok(fusion_pcu::dialect::tensor::TensorValueStorageRequirement {
         value,
         output_bytes: u64::try_from(byte_len(shape)?)
             .map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
@@ -5060,8 +5060,8 @@ fn physical_value_storage_requirement(
     prepared: &RocmPreparedTensorGraph<'_>,
     value: ValueId,
     op: OpDescriptor<'_>,
-) -> Result<fusion_pcu_tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
-    Ok(fusion_pcu_tensor::TensorValueStorageRequirement {
+) -> Result<fusion_pcu::dialect::tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
+    Ok(fusion_pcu::dialect::tensor::TensorValueStorageRequirement {
         value,
         output_bytes: prepared.physical_layout(value)?.physical_bytes,
         access: match op {
@@ -5697,7 +5697,7 @@ fn compact_uniform_candidates<A: TensorOperationAssessor>(
 
 fn pointwise_step_uses_leaf(
     group: &TensorBoundedPointwiseFusionGroup,
-    step: &fusion_pcu_tensor::TensorPointwiseStep,
+    step: &fusion_pcu::dialect::tensor::TensorPointwiseStep,
     value: ValueId,
 ) -> bool {
     let is_leaf = |operand| matches!(operand, TensorPointwiseOperand::Leaf(index) if group.leaves.get(index) == Some(&value));
@@ -6346,7 +6346,7 @@ mod tests {
         PcuValueTypeCaps,
     };
     #[rustfmt::skip]
-    use fusion_pcu_tensor::{
+    use fusion_pcu::dialect::tensor::{
         Graph,
         NodeDescriptor,
         OpDescriptor,
@@ -6600,8 +6600,8 @@ mod tests {
         let output = graph.relu(difference).unwrap();
         let plan = graph.execution_plan_for_outputs(&[output]).unwrap();
         let selected = plan.select_lowering_with_grouping(
-            fusion_pcu_tensor::TensorArithmeticRewritePolicy::Disabled,
-            fusion_pcu_tensor::TensorArithmeticCapability::Strict,
+            fusion_pcu::dialect::tensor::TensorArithmeticRewritePolicy::Disabled,
+            fusion_pcu::dialect::tensor::TensorArithmeticCapability::Strict,
             TensorPointwiseGroupingPolicy::BoundedAddSubRelu,
         );
         let group = selected
@@ -6688,7 +6688,7 @@ mod tests {
         assert!(!source.contains("fmaxf"));
         assert!(matches!(
             selected.operations().last(),
-            Some(fusion_pcu_tensor::TensorSelectedOperation::FusedAddSub { group: selected })
+            Some(fusion_pcu::dialect::tensor::TensorSelectedOperation::FusedAddSub { group: selected })
                 if selected.output == output
                     && selected.epilogue == TensorPointwiseEpilogue::Identity
         ));
@@ -6764,7 +6764,7 @@ mod tests {
                 .contains("float v4 = v3 * v1;")
         );
         assert!(matches!(prepared.lowering_plan().operations().last(),
-            Some(fusion_pcu_tensor::TensorSelectedOperation::FusedMul { group }) if group.output == output));
+            Some(fusion_pcu::dialect::tensor::TensorSelectedOperation::FusedMul { group }) if group.output == output));
     }
 
     #[test]
@@ -7139,7 +7139,7 @@ mod tests {
                 aliased.get(index).map(|(_, resource)| resource)
             }),
             Err(RocmTensorExecutionError::StorageConstraint(
-                fusion_pcu_tensor::TensorStorageValidationError::Overlapping { .. }
+                fusion_pcu::dialect::tensor::TensorStorageValidationError::Overlapping { .. }
             ))
         ));
         let unknown = [(left, TestResource(u8::MAX)), (right, TestResource(2))];
@@ -7148,7 +7148,7 @@ mod tests {
                 unknown.get(index).map(|(_, resource)| resource)
             }),
             Err(RocmTensorExecutionError::StorageConstraint(
-                fusion_pcu_tensor::TensorStorageValidationError::UnknownOverlap { .. }
+                fusion_pcu::dialect::tensor::TensorStorageValidationError::UnknownOverlap { .. }
             ))
         ));
         assert!(resource_may_overlap_any(
@@ -7477,7 +7477,7 @@ mod tests {
         let plan = prepare_graph(&graph, updated, &PureRocmAssessor).unwrap();
         let node = plan.nodes.last().unwrap();
         assert!(
-            matches!(node.op, fusion_pcu_tensor::OpDescriptor::SgdUpdate {
+            matches!(node.op, fusion_pcu::dialect::tensor::OpDescriptor::SgdUpdate {
             weights: value_weights, gradient: value_gradient, learning_rate
         } if value_weights == weights
             && value_gradient == gradient

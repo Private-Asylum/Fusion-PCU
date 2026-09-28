@@ -1,15 +1,21 @@
-//! Small standalone tensor dialect with a deterministic CPU reference evaluator.
+//! Feature-gated tensor dialect with a deterministic CPU reference evaluator.
 //!
-//! This crate is intentionally outside `fusion-pcu`: tensor semantics belong to a dialect, not
-//! to the generic coprocessor IR. The current graph supports f32 inputs/constants, elementwise
+//! Tensor semantics remain isolated from generic coprocessor contracts. This module uses
+//! `core` and `alloc`, never `std`. The current graph supports f32 inputs/constants, elementwise
 //! add/subtract/multiply, SGD updates, matrix multiplication, `ReLU`, and mean-squared error. It can append
 //! a backward graph for the supported MSE-rooted subset. It does not implement broadcasting,
 //! batching, convolution, views, mixed precision, optimizers, or serialization; selected backend
 //! adapters provide device execution separately.
 
-use std::fmt;
 #[rustfmt::skip]
-use std::sync::atomic::{
+use alloc::{
+    string::String,
+    vec,
+    vec::Vec,
+};
+use core::fmt;
+#[rustfmt::skip]
+use core::sync::atomic::{
     AtomicU64,
     Ordering,
 };
@@ -161,7 +167,7 @@ impl fmt::Display for TensorError {
         write!(f, "{self:?}")
     }
 }
-impl std::error::Error for TensorError {}
+impl core::error::Error for TensorError {}
 
 fn element_count(shape: &[usize]) -> Result<usize, TensorError> {
     shape.iter().try_fold(1usize, |n, &d| {
@@ -1127,9 +1133,9 @@ impl<'a> TensorExecutionPlan<'a> {
                     )
                     .map_err(|_| TensorError::ShapeOverflow)?,
                     access: if self.is_writable_value(life.value) {
-                        fusion_pcu::PcuMemoryAccess::ReadWrite
+                        crate::PcuMemoryAccess::ReadWrite
                     } else {
-                        fusion_pcu::PcuMemoryAccess::ReadOnly
+                        crate::PcuMemoryAccess::ReadOnly
                     },
                 })
             })

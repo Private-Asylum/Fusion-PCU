@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use fusion_pcu_tensor::Tensor;
+use fusion_pcu::dialect::tensor::Tensor;
 
 #[rustfmt::skip]
 use super::{

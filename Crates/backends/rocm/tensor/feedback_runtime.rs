@@ -17,7 +17,8 @@ use fusion_pcu::{
     PcuMemoryResourcePolicy,
 };
 #[rustfmt::skip]
-use fusion_pcu_tensor::{
+use fusion_pcu::dialect::tensor::{
+    Tensor,
     TensorError,
     TensorFeedbackInput,
     TensorFeedbackPlan,
@@ -311,10 +312,7 @@ impl<'session> RocmTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
     {
         let mut reservations = Vec::new();
-        let mut allocate = |memory: &mut P,
-                            pool,
-                            shape: &[usize],
-                            upload: Option<&fusion_pcu_tensor::Tensor>| {
+        let mut allocate = |memory: &mut P, pool, shape: &[usize], upload: Option<&Tensor>| {
             let size_bytes = u64::try_from(super::byte_len(shape)?)
                 .map_err(|_| RocmTensorExecutionError::SizeOverflow)?;
             let request = policy.apply(PcuMemoryAllocationRequest {

@@ -21,6 +21,8 @@ default = []
 insights = []
 std = []
 hosted = ["std"]
+tensor = []
+vm-reference = []
 
 [lints]
 workspace = true
