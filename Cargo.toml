@@ -30,7 +30,6 @@ license = "Apache-2.0"
 repository = "https://github.com/Private-Asylum/Fusion-PCU"
 homepage = "https://github.com/Private-Asylum/Fusion-PCU"
 readme = "README.md"
-license-file = "LICENSE"
 keywords = ["compute", "gpu", "ir", "coprocessor", "heterogeneous"]
 categories = ["hardware-support", "science", "development-tools"]
 publish = ["crates-io"]
