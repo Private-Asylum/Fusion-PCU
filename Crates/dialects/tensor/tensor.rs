@@ -33,6 +33,10 @@ pub use feedback::{
     TensorFeedbackPlan,
 };
 
+#[path = "tensor/execution.rs"]
+mod execution;
+pub use execution::TensorExecution;
+
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_graph_id() -> u64 {

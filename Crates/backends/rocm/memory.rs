@@ -152,6 +152,16 @@ impl PcuMemoryResource for RocmMemoryResource {
 }
 
 impl RocmMemoryResource {
+    /// Whether two provider resources refer to the same allocation with identical metadata.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn same_binding(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.buffer.allocation, &other.buffer.allocation)
+            && self.pool == other.pool
+            && self.alignment == other.alignment
+            && self.access == other.access
+            && self.size_bytes() == other.size_bytes()
+    }
+
     /// Conservatively checks whether two complete resources can refer to the same bytes.
     #[cfg(feature = "tensor")]
     pub(crate) fn may_overlap(&self, other: &Self) -> bool {

@@ -114,6 +114,7 @@ use crate::HipCompletionBatch;
 #[derive(Debug)]
 pub enum RocmOwnedDispatchError {
     Hip(HipError),
+    Rocblas(crate::RocblasError),
     Lower(RocmLowerError),
     Compile(crate::HipCompileError),
     HipRtc(crate::HipRtcError),
@@ -143,12 +144,16 @@ pub enum RocmOwnedDispatchError {
     CheckedDivisionRequired,
     CheckedBatchUnavailable,
     CheckedBatchFaultWordUnavailable,
+    CheckedFaultWordSize {
+        actual: usize,
+    },
 }
 
 impl fmt::Display for RocmOwnedDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hip(error) => error.fmt(f),
+            Self::Rocblas(error) => error.fmt(f),
             Self::Lower(error) => write!(f, "PCU Dispatch cannot lower to ROCm: {error}"),
             Self::Compile(error) => write!(f, "ROCm code object compilation failed: {error}"),
             Self::HipRtc(error) => write!(f, "ROCm runtime compilation failed: {error}"),
@@ -200,6 +205,11 @@ impl fmt::Display for RocmOwnedDispatchError {
             Self::CheckedBatchFaultWordUnavailable => {
                 f.write_str("the checked ROCm completion has no retained fault word")
             }
+            Self::CheckedFaultWordSize { actual } => write!(
+                f,
+                "checked dispatch fault word requires {} bytes, received {actual}",
+                core::mem::size_of::<u64>()
+            ),
         }
     }
 }
@@ -209,6 +219,12 @@ impl Error for RocmOwnedDispatchError {}
 impl From<HipError> for RocmOwnedDispatchError {
     fn from(error: HipError) -> Self {
         Self::Hip(error)
+    }
+}
+
+impl From<crate::RocblasError> for RocmOwnedDispatchError {
+    fn from(error: crate::RocblasError) -> Self {
+        Self::Rocblas(error)
     }
 }
 
@@ -234,6 +250,25 @@ pub struct RocmOwnedDispatchBackend {
 }
 
 impl RocmOwnedDispatchBackend {
+    /// Create an ordered HIP stream on this selected backend runtime and device.
+    ///
+    /// # Errors
+    ///
+    /// Returns a HIP stream creation error.
+    pub fn create_stream(&self) -> Result<crate::HipStreamHandle, RocmOwnedDispatchError> {
+        self.runtime.create_stream().map_err(Into::into)
+    }
+
+    /// Create a rocBLAS handle for this backend's selected runtime and device.
+    ///
+    /// # Errors
+    ///
+    /// Returns a rocBLAS or HIP initialization error.
+    #[cfg(feature = "tensor")]
+    pub fn create_rocblas(&self) -> Result<crate::Rocblas, crate::RocblasError> {
+        crate::Rocblas::new(&self.runtime)
+    }
+
     #[cfg(feature = "tensor")]
     pub(crate) const fn tensor_runtime(&self) -> &HipRuntime {
         &self.runtime
@@ -541,10 +576,29 @@ pub struct RocmPreparedDispatch {
 }
 
 impl RocmPreparedDispatch {
+    pub(crate) const fn requires_checked_fault_word(&self) -> bool {
+        self.checked_division
+    }
+
     /// Clone the stream captured by this executable for preparing related ordered work.
     #[must_use]
     pub fn stream_handle(&self) -> crate::HipStreamHandle {
         self.stream.clone()
+    }
+
+    /// Clone this prepared executable's compiled HIP kernel for low-level manual orchestration.
+    ///
+    /// The returned kernel keeps its module loaded. Direct launches remain unsafe because callers
+    /// must supply the exact ABI and buffer access pattern documented by [`crate::HipKernel`].
+    #[must_use]
+    pub fn hip_kernel(&self) -> crate::HipKernel {
+        self.function.clone()
+    }
+
+    /// Return this executable's exact three-dimensional grid and block geometry.
+    #[must_use]
+    pub const fn launch_geometry(&self) -> ([u32; 3], [u32; 3]) {
+        ([self.grid_x, 1, 1], [self.block_size, 1, 1])
     }
 
     /// Start a checked-terminal batch on this executable's captured stream.
@@ -568,6 +622,48 @@ impl RocmPreparedDispatch {
         &self,
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
+        self.validate_bindings(bindings)?;
+        let fault_word = if self.checked_division {
+            Some(self.runtime.allocate(core::mem::size_of::<u64>())?)
+        } else {
+            None
+        };
+        self.submit_validated(bindings, fault_word)
+    }
+
+    /// Submits a checked kernel with caller-owned status storage.
+    ///
+    /// This crate-private path is for synchronous typed wrappers that wait for each completion
+    /// before reusing the supplied storage. HIP allocation access gates reject an overlapping
+    /// launch through another clone. The completion retains its own allocation lease, so uncertain
+    /// waits keep the storage alive alongside the caller's owner.
+    /// Public `submit` remains independently safe for overlapping submissions by allocating one
+    /// status word per completion.
+    #[allow(clippy::needless_pass_by_ref_mut)] // Typed wrappers hold exclusive status ownership and wait before reuse.
+    pub(crate) fn submit_with_fault_word(
+        &self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+        fault_word: &mut DeviceBuffer,
+    ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
+        if !self.checked_division {
+            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+        }
+        self.validate_bindings(bindings)?;
+        if fault_word.len() != core::mem::size_of::<u64>() {
+            return Err(RocmOwnedDispatchError::CheckedFaultWordSize {
+                actual: fault_word.len(),
+            });
+        }
+        self.runtime
+            .ensure_same_runtime(&fault_word.allocation.runtime)
+            .map_err(|_| HipError::DifferentRuntime)?;
+        self.submit_validated(bindings, Some(fault_word.clone()))
+    }
+
+    fn validate_bindings(
+        &self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+    ) -> Result<(), RocmOwnedDispatchError> {
         validate_owned_binding_requirements(&self.binding_requirements, self.device, bindings)
             .map_err(RocmOwnedDispatchError::Binding)?;
         for binding in bindings {
@@ -583,16 +679,23 @@ impl RocmPreparedDispatch {
                 .ensure_same_runtime(&binding.resource.allocation.runtime)
                 .map_err(|_| RocmOwnedDispatchError::DifferentRuntime(binding.target))?;
         }
+        Ok(())
+    }
+
+    fn submit_validated(
+        &self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+        mut fault_word: Option<DeviceBuffer>,
+    ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
         // Kernel arguments are borrowed only during `launch`; HIP copies their pointer values
         // into owned aligned storage before returning. Keep common small interfaces on the stack
         // without constraining larger kernels to an arbitrary binding-count limit.
-        let mut fault_word = if self.checked_division {
-            let mut buffer = self.runtime.allocate(core::mem::size_of::<u64>())?;
+        if self.checked_division {
+            let buffer = fault_word
+                .as_mut()
+                .ok_or(RocmOwnedDispatchError::CheckedBatchFaultWordUnavailable)?;
             buffer.copy_from(&FAULT_WORD_SENTINEL.to_le_bytes())?;
-            Some(buffer)
-        } else {
-            None
-        };
+        }
         let argument_count = self.binding_targets.len() + usize::from(fault_word.is_some());
         let mut inline_arguments: [HipKernelArgument<'_>; INLINE_ARGUMENTS] =
             std::array::from_fn(|_| HipKernelArgument::Bytes(&[]));
@@ -1082,6 +1185,28 @@ pub struct RocmOwnedCompletion {
     hip: Option<HipCompletion>,
     fault_word: Option<DeviceBuffer>,
     terminal: Option<PcuCompletionOutcome>,
+}
+
+impl RocmOwnedCompletion {
+    pub(crate) fn can_handoff_to_batch(
+        &self,
+        batch: &crate::HipCompletionBatch,
+    ) -> Result<bool, HipError> {
+        if self.fault_word.is_some() || self.terminal.is_some() {
+            return Ok(false);
+        }
+        self.hip
+            .as_ref()
+            .map_or(Ok(false), |completion| batch.can_wait_for(completion))
+    }
+
+    pub(crate) const fn take_hip_for_handoff(&mut self) -> Option<HipCompletion> {
+        if self.fault_word.is_none() && self.terminal.is_none() {
+            self.hip.take()
+        } else {
+            None
+        }
+    }
 }
 
 impl PcuOwnedCompletion for RocmOwnedCompletion {
@@ -1721,3 +1846,14 @@ mod tests {
         assert!(memory_access_supports_binding(MemoryReadWrite, ReadWrite));
     }
 }
+
+mod execution;
+pub use execution::{
+    RocmExecutionStep,
+    RocmOwnedExecution,
+    RocmOwnedExecutionError,
+    RocmOwnedExecutionNode,
+    RocmOwnedExecutionOperation,
+    RocmOwnedExecutionTwoSlot,
+    RocmTwoSlotExecutionStep,
+};

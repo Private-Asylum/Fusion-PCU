@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fusion-pcu = { version = "0.1.0", path = "../../fusion-pcu", default-features = false }
+fusion-pcu = { version = "0.0.1", path = "../../fusion-pcu", default-features = false }
 
 [lib]
 crate-type = ["rlib"]

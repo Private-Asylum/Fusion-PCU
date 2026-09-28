@@ -50,6 +50,38 @@ pub enum PcuScalarIdentityBuildError {
     Builder(PcuError),
 }
 
+impl core::fmt::Display for PcuScalarIdentityBuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BindingCount => f.write_str("PCU identity requires two resource bindings"),
+            Self::BindingLocation => {
+                f.write_str("PCU identity bindings must occupy set zero, slots zero and one")
+            }
+            Self::BindingType => {
+                f.write_str("PCU identity binding scalar types must match the specialization")
+            }
+            Self::StorageClass => f.write_str("PCU identity bindings require storage memory"),
+            Self::Access => {
+                f.write_str("PCU identity requires a readable source and writable destination")
+            }
+            Self::EmptyShape => f.write_str("PCU identity invocation count must be nonzero"),
+            Self::InvalidScalarLayout => {
+                f.write_str("PCU scalar host and transfer layouts are inconsistent")
+            }
+            Self::Builder(error) => write!(f, "PCU identity construction failed: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for PcuScalarIdentityBuildError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Builder(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// Constructs one typed scalar load/store per invocation.
 ///
 /// This profile describes memory transport only. It does not grant any backend a promise that

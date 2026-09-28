@@ -1,5 +1,7 @@
 #[path = "fusion-pcu-macros/checked_div_rem.rs"]
 mod checked_div_rem;
+#[path = "fusion-pcu-macros/prepared.rs"]
+mod prepared;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -495,8 +497,18 @@ pub fn pcu_dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Define a bounded PCU kernel with Rust-style invocation-count syntax.
 ///
-/// `#[pcu(invocations = R * C)]` is the concise spelling of [`pcu_dispatch`]. The attribute
-/// accepts the same arguments and currently lowers the same deliberately bounded source subset.
+/// `#[pcu(invocations = R * C)]` is the concise spelling of [`pcu_dispatch`]. It keeps the
+/// generated builder and bindings APIs, and adds `<name>_prepare` for typed host slices and
+/// `<name>_prepare_device` for typed [`PcuDeviceBuffer`](https://docs.rs/fusion-pcu/latest/fusion_pcu/struct.PcuDeviceBuffer.html)
+/// arguments. Each prepare function builds the IR and calls the selected backend once, returning
+/// a reusable `FnMut` that forwards later calls to the prepared executable and propagates its
+/// `Result`. Host closures accept the source slice types; device closures accept shared or mutable
+/// `PcuDeviceBuffer` references in the same argument order. Their argument lifetimes are independent.
+///
+/// Preparation is limited to the same bounded source subset as the IR builder: indexed and
+/// grid-stride scalar maps, the supported concrete scalar arithmetic profiles, and the existing
+/// generic scalar identity or wrapping profiles. It does not turn arbitrary Rust function bodies
+/// into kernels; helper bodies still require the documented `#[pcu_module]` subset.
 #[proc_macro_attribute]
 pub fn pcu(attr: TokenStream, item: TokenStream) -> TokenStream {
     pcu_dispatch(attr, item)
@@ -801,6 +813,63 @@ fn expand_pcu_dispatch_with_helpers(
     } else {
         quote! { #pcu::PcuError }
     };
+    let generic_arguments = function
+        .sig
+        .generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Type(param) => Some(param.ident.to_token_stream()),
+            GenericParam::Const(param) => Some(param.ident.to_token_stream()),
+            GenericParam::Lifetime(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let bindings_call = generic_scalar.map_or_else(
+        || quote! { #bindings_ident() },
+        |scalar_ident| quote! { #bindings_ident::<#scalar_ident>() },
+    );
+    let builder_call = if generic_arguments.is_empty() {
+        quote! { #function_ident(&bindings) }
+    } else {
+        quote! { #function_ident::<#(#generic_arguments),*>(&bindings) }
+    };
+    let prepared_arguments = binding_specs
+        .iter()
+        .zip(&function.sig.inputs)
+        .map(|(binding, input)| {
+            let FnArg::Typed(input) = input else {
+                unreachable!("receivers are rejected by parse_bindings")
+            };
+            let scalar = if binding.scalar == ScalarKind::Generic {
+                let generic = binding
+                    .generic_scalar
+                    .as_ref()
+                    .expect("generic binding scalar");
+                quote! { #generic }
+            } else {
+                let scalar = binding.scalar.rust_type();
+                quote! { #scalar }
+            };
+            prepared::Argument {
+                ident: binding.ident.clone(),
+                binding: binding.binding,
+                read_write: binding.access == BindingAccess::ReadWrite,
+                scalar,
+                ty: input.ty.as_ref().clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let generated = prepared::generate(prepared::Input {
+        pcu,
+        function,
+        visibility: &vis,
+        function_ident: &function_ident,
+        arguments: &prepared_arguments,
+        generic_arguments: &generic_arguments,
+        prepare_error: &builder_result,
+        bindings_call,
+        builder_call,
+    });
     Ok(quote! {
         #wrapping_body_item
         #vis const fn #bindings_ident #binding_generic() -> [#pcu::PcuBinding<#binding_lifetime>; #binding_count] {
@@ -818,6 +887,8 @@ fn expand_pcu_dispatch_with_helpers(
             };
             #builder_body
         }
+
+        #generated
     })
 }
 

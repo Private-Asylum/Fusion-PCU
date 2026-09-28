@@ -23,6 +23,10 @@ use fusion_pcu_tensor::{
 };
 use smallvec::SmallVec;
 
+#[path = "execution.rs"]
+pub(super) mod execution;
+pub use execution::RocmTensorExecution;
+
 use super::{
     RocmMemoryResource,
     RocmPreparedTensorGraph,

@@ -1,9 +1,10 @@
 [package]
-name = "fusion-example-hosted-compute-rocm"
-version = "0.1.0"
-edition = "2024"
+name = "fusion-pcu-example-rocm"
+version.workspace = true
+edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 
 [[bin]]
@@ -34,9 +35,18 @@ path = "train_step.rs"
 name = "fusion-rocm-fma-witness"
 path = "fma_witness.rs"
 
+[[bin]]
+name = "fusion-rocm-typed-kernel"
+path = "typed_kernel.rs"
+
 [[bench]]
 name = "dispatch"
 path = "benches/dispatch.rs"
+harness = false
+
+[[bench]]
+name = "typed_kernel"
+path = "benches/typed_kernel.rs"
 harness = false
 
 [[bench]]
@@ -209,6 +219,10 @@ name = "dispatch_half_convert"
 path = "benches/dispatch_half_convert.rs"
 harness = false
 
+[features]
+default = []
+insights = ["fusion-pcu/insights", "fusion-pcu-rocm/insights"]
+
 [dependencies]
 fusion-pcu.workspace = true
 fusion-pcu-rocm = { workspace = true, features = ["tensor"] }
@@ -216,6 +230,8 @@ fusion-pcu-macros.workspace = true
 fusion-pcu-tensor.workspace = true
 
 [dev-dependencies]
+libloading = "0.8"
+libc = "0.2"
 bytemuck = "1.25"
 criterion = "0.7"
 
@@ -230,3 +246,14 @@ unsafe_code = "deny"
 [[bench]]
 name = "dispatch_i8_checked_div_rem"
 harness = false
+
+[[bench]]
+name = "tensor_train_volume"
+path = "benches/tensor_train_volume.rs"
+harness = false
+
+[[bench]]
+name = "tensor_train_insights"
+path = "benches/tensor_train_insights.rs"
+harness = false
+required-features = ["insights"]

@@ -1,5 +1,7 @@
 //! Compare repeated prepared PCU submissions with repeated direct HIP launches.
 
+#[path = "support/canonical_dispatch_correctness.rs"]
+mod canonical_dispatch_correctness;
 #[path = "support/dispatch.rs"]
 #[allow(dead_code)] // Shared dispatch support also contains the u32 benchmark's helpers.
 mod dispatch_support;
@@ -79,6 +81,9 @@ fn run_benchmarks(criterion: &mut Criterion) -> Result<(), Box<dyn Error>> {
     }
     let (prepared_backend, selected) =
         support::selection::open_ranked(&discovery, candidates, BLOCK_SIZE)?;
+    if std::env::var_os("FUSION_ROCM_CANONICAL_DISPATCH_CORRECTNESS").is_some() {
+        canonical_dispatch_correctness::run(&prepared_backend)?;
+    }
     let device = selected.device;
     let architecture = selected
         .architecture
@@ -178,6 +183,24 @@ fn run_case(
         "\nCase {name}: {elements} f32 elements, block={BLOCK_SIZE}, grid={grid}, {} MiB resident input + output per path",
         input_bytes.len() * 2 / (1024 * 1024)
     );
+
+    // Validate both routes before Criterion filtering can omit either benchmark function. These
+    // untimed launches also ensure the resident output buffers contain results before the later
+    // readback diagnostics inspect them.
+    run_prepared(
+        prepared_backend,
+        &prepared,
+        &prepared_input,
+        &prepared_output,
+    )?;
+    run_direct(&direct_function, &direct_stream, &direct_arguments, grid)?;
+    let mut prepared_preflight = vec![0; input_bytes.len()];
+    let mut direct_preflight = vec![0; input_bytes.len()];
+    prepared_output.copy_to(&mut prepared_preflight)?;
+    direct_output.copy_to(&mut direct_preflight)?;
+    verify_output("prepared untimed preflight", &prepared_preflight, &input)?;
+    verify_output("direct untimed preflight", &direct_preflight, &input)?;
+    println!("Untimed correctness preflight passed for both dispatch routes.");
 
     {
         let mut group = criterion.benchmark_group(name);

@@ -44,6 +44,7 @@ use train_step_reference::{
 };
 
 #[path = "support/train_step.rs"]
+#[allow(dead_code)] // Shared native reference also supplies opt-in volume diagnostics.
 mod native;
 
 struct Program {
@@ -658,6 +659,11 @@ fn run_on(
                 .map_err(|error| format!("strict native: {error}"))?;
             verify(&strict_expected, &strict_native.execute_two_batched()?)
                 .map_err(|error| format!("strict native batched: {error}"))?;
+            verify(
+                &strict_expected,
+                &strict_native.execute_two_fully_batched()?,
+            )
+            .map_err(|error| format!("strict native fully batched: {error}"))?;
             let mut pcu_allocations = [AllocationCounts::default(); 16];
             let mut native_allocations = [AllocationCounts::default(); 16];
             for pair in 0_usize..16 {
@@ -736,7 +742,7 @@ fn run_on(
                 }
             }
             println!(
-                "{rows}x{features} strict warm batched alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
+                "{rows}x{features} strict warm pointwise-batched alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
                 median_allocation_field(&pcu_batched_allocations, |counts| counts.alloc_calls),
                 median_allocation_field(&pcu_batched_allocations, |counts| counts.realloc_calls),
                 median_allocation_field(&pcu_batched_allocations, |counts| counts.dealloc_calls),
@@ -745,6 +751,58 @@ fn run_on(
                 median_allocation_field(&native_batched_allocations, |counts| counts.realloc_calls),
                 median_allocation_field(&native_batched_allocations, |counts| counts.dealloc_calls),
                 median_allocation_field(&native_batched_allocations, |counts| counts
+                    .requested_bytes),
+            );
+            let mut pcu_fully_batched_allocations = [AllocationCounts::default(); 16];
+            let mut native_fully_batched_allocations = [AllocationCounts::default(); 16];
+            for pair in 0_usize..16 {
+                if pair.is_multiple_of(2) {
+                    let _capture = AllocationCapture::start();
+                    let output = execute_strict_pcu_banked(true, None)?;
+                    pcu_fully_batched_allocations[pair] = AllocationCapture::finish();
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("strict PCU fully batched allocation diagnostic: {error}")
+                    })?;
+
+                    let _capture = AllocationCapture::start();
+                    let output = strict_native.execute_two_fully_batched()?;
+                    native_fully_batched_allocations[pair] = AllocationCapture::finish();
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("strict native fully batched allocation diagnostic: {error}")
+                    })?;
+                } else {
+                    let _capture = AllocationCapture::start();
+                    let output = strict_native.execute_two_fully_batched()?;
+                    native_fully_batched_allocations[pair] = AllocationCapture::finish();
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("strict native fully batched allocation diagnostic: {error}")
+                    })?;
+
+                    let _capture = AllocationCapture::start();
+                    let output = execute_strict_pcu_banked(true, None)?;
+                    pcu_fully_batched_allocations[pair] = AllocationCapture::finish();
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("strict PCU fully batched allocation diagnostic: {error}")
+                    })?;
+                }
+            }
+            println!(
+                "{rows}x{features} strict warm fully-batched alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
+                median_allocation_field(&pcu_fully_batched_allocations, |counts| counts
+                    .alloc_calls),
+                median_allocation_field(&pcu_fully_batched_allocations, |counts| counts
+                    .realloc_calls),
+                median_allocation_field(&pcu_fully_batched_allocations, |counts| counts
+                    .dealloc_calls),
+                median_allocation_field(&pcu_fully_batched_allocations, |counts| counts
+                    .requested_bytes),
+                median_allocation_field(&native_fully_batched_allocations, |counts| counts
+                    .alloc_calls),
+                median_allocation_field(&native_fully_batched_allocations, |counts| counts
+                    .realloc_calls),
+                median_allocation_field(&native_fully_batched_allocations, |counts| counts
+                    .dealloc_calls),
+                median_allocation_field(&native_fully_batched_allocations, |counts| counts
                     .requested_bytes),
             );
             {
@@ -802,6 +860,21 @@ fn run_on(
                         });
                     },
                 );
+                group.bench_function(
+                    BenchmarkId::new(
+                        "native_hip_rocblas_strict_fully_batched",
+                        format!("{rows}x{features}"),
+                    ),
+                    |b| {
+                        b.iter(|| {
+                            black_box(
+                                strict_native
+                                    .execute_two_fully_batched()
+                                    .expect("strict native fully batched training failed"),
+                            )
+                        });
+                    },
+                );
                 group.finish();
             }
             verify(&strict_expected, &execute_strict_pcu_banked(false, None)?)
@@ -812,6 +885,11 @@ fn run_on(
                 .map_err(|error| format!("strict native final: {error}"))?;
             verify(&strict_expected, &strict_native.execute_two_batched()?)
                 .map_err(|error| format!("strict native batched final: {error}"))?;
+            verify(
+                &strict_expected,
+                &strict_native.execute_two_fully_batched()?,
+            )
+            .map_err(|error| format!("strict native fully batched final: {error}"))?;
             let mut strict_pair_pcu = Vec::with_capacity(16);
             let mut strict_pair_native = Vec::with_capacity(16);
             let mut strict_pair_ratio = Vec::with_capacity(16);

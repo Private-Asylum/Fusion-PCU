@@ -9,6 +9,7 @@ use std::time::{
 use fusion_pcu::PcuObjectRef;
 use fusion_pcu_rocm::{
     DeviceBuffer,
+    HipCompletionBatch,
     HipKernel,
     HipKernelArgument,
     HipRuntime,
@@ -156,7 +157,8 @@ impl NativeMlpTrain {
         let squared_difference = module.function(c"squared_difference")?;
         let sgd_update = module.function(c"sgd_update")?;
         let stream = runtime.create_stream()?;
-        let blas = Rocblas::new(&runtime)?;
+        let mut blas = Rocblas::new(&runtime)?;
+        blas.bind_stream(&stream)?;
 
         let mut stats = MemoryStats::default();
         let samples = upload(&runtime, inputs.samples, &mut stats)?;
@@ -270,6 +272,221 @@ impl NativeMlpTrain {
                 download(&self.losses[1], 1)?[0],
             ],
         })
+    }
+
+    /// Runs the same two steps with legal same-stream operations queued in HIP batches.
+    /// The forward, squared-difference, and backward/update batches follow the tensor MSE
+    /// barriers; the synchronous rocBLAS reduction remains between the latter two batches.
+    pub fn execute_two_steps_queued(&mut self) -> Result<MlpWeights, Box<dyn Error>> {
+        self.reset_weights()?;
+        self.execute_step_queued(
+            &self.weights_a1,
+            &self.weights_a2,
+            &self.weights_a3,
+            &self.weights_b1,
+            &self.weights_b2,
+            &self.weights_b3,
+            &self.losses[0],
+        )?;
+        self.execute_step_queued(
+            &self.weights_b1,
+            &self.weights_b2,
+            &self.weights_b3,
+            &self.weights_a1,
+            &self.weights_a2,
+            &self.weights_a3,
+            &self.losses[1],
+        )?;
+        self.download_weights()
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn execute_step_queued(
+        &self,
+        w1: &DeviceBuffer,
+        w2: &DeviceBuffer,
+        w3: &DeviceBuffer,
+        updated_w1: &DeviceBuffer,
+        updated_w2: &DeviceBuffer,
+        updated_w3: &DeviceBuffer,
+        loss: &DeviceBuffer,
+    ) -> Result<(), Box<dyn Error>> {
+        let batch_output = self
+            .batch
+            .checked_mul(OUTPUTS)
+            .ok_or("output extent overflow")?;
+        let batch_hidden = self
+            .batch
+            .checked_mul(HIDDEN)
+            .ok_or("activation extent overflow")?;
+        let output_u32 = u32::try_from(batch_output)?;
+        let hidden_u32 = u32::try_from(batch_hidden)?;
+        #[allow(clippy::cast_precision_loss)]
+        let mse_scale = 2.0_f32 / batch_output as f32;
+
+        let mut batch = HipCompletionBatch::new(&self.stream);
+        matmul_into_batch(
+            &self.blas,
+            &mut batch,
+            &self.samples,
+            w1,
+            &self.z1,
+            self.batch,
+            INPUTS,
+            HIDDEN,
+        )?;
+        launch_relu_into_batch(
+            &self.relu_forward,
+            &mut batch,
+            &self.z1,
+            &self.a1,
+            hidden_u32,
+        )?;
+        matmul_into_batch(
+            &self.blas, &mut batch, &self.a1, w2, &self.z2, self.batch, HIDDEN, HIDDEN,
+        )?;
+        launch_relu_into_batch(
+            &self.relu_forward,
+            &mut batch,
+            &self.z2,
+            &self.a2,
+            hidden_u32,
+        )?;
+        matmul_into_batch(
+            &self.blas,
+            &mut batch,
+            &self.a2,
+            w3,
+            &self.prediction,
+            self.batch,
+            HIDDEN,
+            OUTPUTS,
+        )?;
+        batch.finish()?.wait()?;
+
+        let mut batch = HipCompletionBatch::new(&self.stream);
+        launch_squared_difference_into_batch(
+            &self.squared_difference,
+            &mut batch,
+            &self.prediction,
+            &self.targets,
+            &self.squared_differences,
+            output_u32,
+        )?;
+        batch.finish()?.wait()?;
+        self.blas.sasum_scaled(
+            batch_output,
+            &self.squared_differences,
+            1,
+            mse_scale * 0.5,
+            loss,
+        )?;
+
+        let mut batch = HipCompletionBatch::new(&self.stream);
+        launch_mse_gradient_into_batch(
+            &self.mse_gradient,
+            &mut batch,
+            &self.prediction,
+            &self.targets,
+            &self.prediction_gradient,
+            output_u32,
+            mse_scale,
+        )?;
+        matmul_left_transpose_into_batch(
+            &self.blas,
+            &mut batch,
+            &self.a2,
+            &self.prediction_gradient,
+            &self.gradient_w3,
+            self.batch,
+            HIDDEN,
+            OUTPUTS,
+        )?;
+        matmul_right_transpose_into_batch(
+            &self.blas,
+            &mut batch,
+            &self.prediction_gradient,
+            w3,
+            &self.activation_gradient_2,
+            self.batch,
+            OUTPUTS,
+            HIDDEN,
+        )?;
+        launch_relu_backward_into_batch(
+            &self.relu_backward,
+            &mut batch,
+            &self.z2,
+            &self.activation_gradient_2,
+            &self.preactivation_gradient_2,
+            hidden_u32,
+        )?;
+        matmul_left_transpose_into_batch(
+            &self.blas,
+            &mut batch,
+            &self.a1,
+            &self.preactivation_gradient_2,
+            &self.gradient_w2,
+            self.batch,
+            HIDDEN,
+            HIDDEN,
+        )?;
+        matmul_right_transpose_into_batch(
+            &self.blas,
+            &mut batch,
+            &self.preactivation_gradient_2,
+            w2,
+            &self.activation_gradient_1,
+            self.batch,
+            HIDDEN,
+            HIDDEN,
+        )?;
+        launch_relu_backward_into_batch(
+            &self.relu_backward,
+            &mut batch,
+            &self.z1,
+            &self.activation_gradient_1,
+            &self.preactivation_gradient_1,
+            hidden_u32,
+        )?;
+        matmul_left_transpose_into_batch(
+            &self.blas,
+            &mut batch,
+            &self.samples,
+            &self.preactivation_gradient_1,
+            &self.gradient_w1,
+            self.batch,
+            INPUTS,
+            HIDDEN,
+        )?;
+        launch_sgd_into_batch(
+            &self.sgd_update,
+            &mut batch,
+            w1,
+            &self.gradient_w1,
+            updated_w1,
+            u32::try_from(INPUTS * HIDDEN)?,
+            self.learning_rate,
+        )?;
+        launch_sgd_into_batch(
+            &self.sgd_update,
+            &mut batch,
+            w2,
+            &self.gradient_w2,
+            updated_w2,
+            u32::try_from(HIDDEN * HIDDEN)?,
+            self.learning_rate,
+        )?;
+        launch_sgd_into_batch(
+            &self.sgd_update,
+            &mut batch,
+            w3,
+            &self.gradient_w3,
+            updated_w3,
+            u32::try_from(HIDDEN * OUTPUTS)?,
+            self.learning_rate,
+        )?;
+        batch.finish()?.wait()?;
+        Ok(())
     }
 
     /// Runs a diagnostic pass with host timings around synchronous native stage groups.
@@ -703,6 +920,60 @@ fn matmul_right_transpose(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn matmul_into_batch(
+    blas: &Rocblas,
+    batch: &mut HipCompletionBatch,
+    left: &DeviceBuffer,
+    right: &DeviceBuffer,
+    output: &DeviceBuffer,
+    rows: usize,
+    inner: usize,
+    columns: usize,
+) -> Result<(), Box<dyn Error>> {
+    blas.sgemm_into_batch(
+        batch, false, false, columns, rows, inner, 1.0, right, columns, left, inner, 0.0, output,
+        columns,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_left_transpose_into_batch(
+    blas: &Rocblas,
+    batch: &mut HipCompletionBatch,
+    left: &DeviceBuffer,
+    right: &DeviceBuffer,
+    output: &DeviceBuffer,
+    reduction: usize,
+    rows: usize,
+    columns: usize,
+) -> Result<(), Box<dyn Error>> {
+    blas.sgemm_into_batch(
+        batch, false, true, columns, rows, reduction, 1.0, right, columns, left, rows, 0.0, output,
+        columns,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_right_transpose_into_batch(
+    blas: &Rocblas,
+    batch: &mut HipCompletionBatch,
+    left: &DeviceBuffer,
+    right: &DeviceBuffer,
+    output: &DeviceBuffer,
+    rows: usize,
+    inner: usize,
+    columns: usize,
+) -> Result<(), Box<dyn Error>> {
+    blas.sgemm_into_batch(
+        batch, true, false, columns, rows, inner, 1.0, right, inner, left, inner, 0.0, output,
+        columns,
+    )?;
+    Ok(())
+}
+
 fn launch_relu(
     kernel: &HipKernel,
     stream: &HipStreamHandle,
@@ -810,4 +1081,133 @@ fn launch(
     let mut completion = unsafe { kernel.launch(stream, [blocks, 1, 1], [256, 1, 1], 0, args)? };
     completion.wait()?;
     Ok(())
+}
+
+fn launch_batch(
+    kernel: &HipKernel,
+    batch: &mut HipCompletionBatch,
+    args: &[HipKernelArgument<'_>],
+    count: u32,
+) -> Result<(), Box<dyn Error>> {
+    let blocks = count.div_ceil(256);
+    // SAFETY: Callers provide each kernel's declared ABI and buffers sized for `count`.
+    #[allow(unsafe_code)]
+    unsafe {
+        kernel.launch_into_batch(batch, [blocks, 1, 1], [256, 1, 1], 0, args)?;
+    }
+    Ok(())
+}
+
+fn launch_relu_into_batch(
+    kernel: &HipKernel,
+    batch: &mut HipCompletionBatch,
+    input: &DeviceBuffer,
+    output: &DeviceBuffer,
+    count: u32,
+) -> Result<(), Box<dyn Error>> {
+    let count_bytes = count.to_ne_bytes();
+    launch_batch(
+        kernel,
+        batch,
+        &[
+            HipKernelArgument::Buffer(input),
+            HipKernelArgument::Buffer(output),
+            HipKernelArgument::Bytes(&count_bytes),
+        ],
+        count,
+    )
+}
+
+fn launch_relu_backward_into_batch(
+    kernel: &HipKernel,
+    batch: &mut HipCompletionBatch,
+    input: &DeviceBuffer,
+    upstream: &DeviceBuffer,
+    output: &DeviceBuffer,
+    count: u32,
+) -> Result<(), Box<dyn Error>> {
+    let count_bytes = count.to_ne_bytes();
+    launch_batch(
+        kernel,
+        batch,
+        &[
+            HipKernelArgument::Buffer(input),
+            HipKernelArgument::Buffer(upstream),
+            HipKernelArgument::Buffer(output),
+            HipKernelArgument::Bytes(&count_bytes),
+        ],
+        count,
+    )
+}
+
+fn launch_mse_gradient_into_batch(
+    kernel: &HipKernel,
+    batch: &mut HipCompletionBatch,
+    prediction: &DeviceBuffer,
+    target: &DeviceBuffer,
+    gradient: &DeviceBuffer,
+    count: u32,
+    scale: f32,
+) -> Result<(), Box<dyn Error>> {
+    let count_bytes = count.to_ne_bytes();
+    let scale_bytes = scale.to_ne_bytes();
+    launch_batch(
+        kernel,
+        batch,
+        &[
+            HipKernelArgument::Buffer(prediction),
+            HipKernelArgument::Buffer(target),
+            HipKernelArgument::Buffer(gradient),
+            HipKernelArgument::Bytes(&count_bytes),
+            HipKernelArgument::Bytes(&scale_bytes),
+        ],
+        count,
+    )
+}
+
+fn launch_squared_difference_into_batch(
+    kernel: &HipKernel,
+    batch: &mut HipCompletionBatch,
+    prediction: &DeviceBuffer,
+    target: &DeviceBuffer,
+    squares: &DeviceBuffer,
+    count: u32,
+) -> Result<(), Box<dyn Error>> {
+    let count_bytes = count.to_ne_bytes();
+    launch_batch(
+        kernel,
+        batch,
+        &[
+            HipKernelArgument::Buffer(prediction),
+            HipKernelArgument::Buffer(target),
+            HipKernelArgument::Buffer(squares),
+            HipKernelArgument::Bytes(&count_bytes),
+        ],
+        count,
+    )
+}
+
+fn launch_sgd_into_batch(
+    kernel: &HipKernel,
+    batch: &mut HipCompletionBatch,
+    weights: &DeviceBuffer,
+    gradient: &DeviceBuffer,
+    updated: &DeviceBuffer,
+    count: u32,
+    learning_rate: f32,
+) -> Result<(), Box<dyn Error>> {
+    let count_bytes = count.to_ne_bytes();
+    let rate_bytes = learning_rate.to_ne_bytes();
+    launch_batch(
+        kernel,
+        batch,
+        &[
+            HipKernelArgument::Buffer(weights),
+            HipKernelArgument::Buffer(gradient),
+            HipKernelArgument::Buffer(updated),
+            HipKernelArgument::Bytes(&count_bytes),
+            HipKernelArgument::Bytes(&rate_bytes),
+        ],
+        count,
+    )
 }

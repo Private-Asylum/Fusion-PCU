@@ -245,6 +245,9 @@ impl PcuScalar for PcuBf16Bits {
 /// The trait is sealed until custom scalar representations have an explicit unsafe contract.
 /// Backend admission still decides whether the type, operations, and physical layout are
 /// supported. The host layout constants are not device ABI guarantees.
+/// Every sealed implementation is padding-free and admits all bit patterns. Typed host-borrow
+/// byte views rely on this invariant; types such as bool or enums cannot be added without changing
+/// that byte-view contract first.
 #[allow(private_bounds)] // A private supertrait prevents unchecked downstream implementations.
 pub trait PcuScalar: Copy + sealed::Sealed {
     /// Semantic scalar identity in PCU IR.

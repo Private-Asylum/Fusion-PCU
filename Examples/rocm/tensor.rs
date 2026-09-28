@@ -19,6 +19,7 @@ use fusion_pcu_rocm::{
     RocmMemoryResource,
     RocmPreparedTensorGraph,
     RocmTensorAssessor,
+    RocmTensorExecutionError,
 };
 use fusion_pcu_tensor::{
     Graph,
@@ -99,8 +100,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ));
             continue;
         }
+        let bound_result = (|| -> Result<Tensor, RocmTensorExecutionError> {
+            let prepared = assessor.prepare_graph(&graph, output)?;
+            let memory = PcuOwnedDispatchMemorySession::memory_provider(&session, candidate.pool);
+            let mut execution = assessor.bind_host(&prepared, &inputs, candidate.pool, memory)?;
+            execution.execute()?;
+            execution.read_output(output)
+        })();
         let mut memory = PcuOwnedDispatchMemorySession::memory_provider(&session, candidate.pool);
-        match assessor.execute_graph(&graph, &inputs, output, candidate.pool, &mut memory) {
+        match bound_result {
             Ok(actual) if actual == expected => {
                 let prepared = assessor.prepare_graph(&graph, output)?;
                 let batched = assessor.execute_prepared_batched(

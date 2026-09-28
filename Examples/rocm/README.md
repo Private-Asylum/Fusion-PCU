@@ -1,5 +1,24 @@
 # Fusion ROCm host smoke test
 
+## Typed kernel calls
+
+`cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-typed-kernel` prepares one
+typed `#[pcu]` kernel and calls it repeatedly with ordinary Rust slices on the explicitly selected
+ROCm device. Set `FUSION_ROCM_DEVICE` to choose a runtime device index. Each synchronous host call
+uses the current input contents, transfers the initial contents of mutable slices as needed, waits
+for completion, and returns results through the same mutable borrow. The output suffix beyond the
+kernel extent remains intact, and short buffers return an error.
+
+The `typed_kernel` Criterion target has distinct host-slice and resident-device groups. The host
+group compares prepared PCU calls with native HIP including matched input and mutable-output
+uploads, launch, wait, and result download at 65 and 1,048,576 elements. Preparation and native
+compilation are reported separately. Each measured job uses a new input and checks the full result
+against a CPU oracle. The resident group keeps typed device buffers across invocations to measure
+reusable device-side calls without introducing a host-transfer flag. Run it with
+`cargo bench -p fusion-pcu-example-rocm --bench typed_kernel` on a ROCm host. The ignored
+host-borrow regressions run with
+`cargo test -p fusion-pcu-example-rocm --test typed_kernel_host -- --ignored --nocapture`.
+
 The smoke executable verifies the installed ROCm runtime by launching a small HIP kernel and
 running rocBLAS SGEMM. `fusion-rocm-pcu` explicitly selects the ROCm backend and a device, then
 uses PCU memory admission, transfer, owned binding, prepared Dispatch submission and completion
@@ -18,30 +37,30 @@ workload uses PCU traits and submits twice from one prepared executable. Prepare
 belongs in the Cargo `dispatch` benchmark.
 
 ```sh
-cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-smoke --release
-cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-pcu --release
-cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-discover --release
-cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-tensor --release
-cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-rtc --release
-cargo run -p fusion-example-hosted-compute-rocm --bin fusion-rocm-train-step --release
-cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch
-cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch_u32
-cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch_u32_alu
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_relu
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mse
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_uniform
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add_relu_fusion
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add_sub_chain
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add_sub_identity
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mul_chain
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_sgd_contract
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_resident
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_train_step
-cargo bench -p fusion-example-hosted-compute-rocm --bench half_transport
-cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch_widen
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_mlp_train
+cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-smoke --release
+cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-pcu --release
+cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-discover --release
+cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-tensor --release
+cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-rtc --release
+cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-train-step --release
+cargo bench -p fusion-pcu-example-rocm --bench dispatch
+cargo bench -p fusion-pcu-example-rocm --bench dispatch_u32
+cargo bench -p fusion-pcu-example-rocm --bench dispatch_u32_alu
+cargo bench -p fusion-pcu-example-rocm --bench tensor
+cargo bench -p fusion-pcu-example-rocm --bench tensor_add
+cargo bench -p fusion-pcu-example-rocm --bench tensor_relu
+cargo bench -p fusion-pcu-example-rocm --bench tensor_mse
+cargo bench -p fusion-pcu-example-rocm --bench tensor_uniform
+cargo bench -p fusion-pcu-example-rocm --bench tensor_add_relu_fusion
+cargo bench -p fusion-pcu-example-rocm --bench tensor_add_sub_chain
+cargo bench -p fusion-pcu-example-rocm --bench tensor_add_sub_identity
+cargo bench -p fusion-pcu-example-rocm --bench tensor_mul_chain
+cargo bench -p fusion-pcu-example-rocm --bench tensor_sgd_contract
+cargo bench -p fusion-pcu-example-rocm --bench tensor_resident
+cargo bench -p fusion-pcu-example-rocm --bench tensor_train_step
+cargo bench -p fusion-pcu-example-rocm --bench half_transport
+cargo bench -p fusion-pcu-example-rocm --bench dispatch_widen
+cargo bench -p fusion-pcu-example-rocm --bench tensor_mlp_train
 ```
 
 `dispatch_u32_alu` pairs a macro-authored `wrapping_add` kernel with an independent HIP
@@ -57,6 +76,12 @@ Input, constant, nonempty rank-two f32 MatMul, bounded same-shape f32 Add/Sub/Mu
 ReLU backward, and scalar MSE nodes execute on ROCm; unsupported operations return an error
 without CPU fallback.
 This MLP example remains forward inference.
+
+The tensor execution API binds inputs and a memory provider once. Call `update_input`,
+`execute` (or `execute_steps` for explicit feedback), and `read_output`; PCU prepares storage
+and revalidates changed bindings automatically. Plain execution needs one output bank;
+feedback preserves prior-step values with two. Provider and execution failures remain
+`Result` errors, and a failed multi-step run exposes no partial output.
 
 `fusion-rocm-train-step` builds a bounded linear-regression gradient with `Graph::backward_mse` and
 composes an SGD update graph. It keeps input allocations on the selected ROCm device across two
@@ -194,11 +219,11 @@ For hardware runs, use a release build and record the runtime/device context alo
 
 ```sh
 rocminfo
-cargo bench -p fusion-example-hosted-compute-rocm --bench dispatch
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_add
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_relu
-cargo bench -p fusion-example-hosted-compute-rocm --bench tensor_train_step
+cargo bench -p fusion-pcu-example-rocm --bench dispatch
+cargo bench -p fusion-pcu-example-rocm --bench tensor
+cargo bench -p fusion-pcu-example-rocm --bench tensor_add
+cargo bench -p fusion-pcu-example-rocm --bench tensor_relu
+cargo bench -p fusion-pcu-example-rocm --bench tensor_train_step
 ```
 
 The `tensor_train_step` benchmark compares two prepared PCU graph executions per sample, with

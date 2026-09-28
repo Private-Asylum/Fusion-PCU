@@ -1,0 +1,21 @@
+[package]
+name = "fusion-pcu-cuda"
+description = "CUDA backend scaffold for Fusion PCU"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "cuda.rs"
+
+[features]
+default = []
+
+[dependencies]
+fusion-pcu.workspace = true
+
+[lints]
+workspace = true

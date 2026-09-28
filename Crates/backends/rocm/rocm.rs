@@ -5,6 +5,7 @@
 //! here; unsupported PCU operations are rejected by the lowerer.
 
 use std::{
+    any::Any,
     cell::{
         Cell,
         RefCell,
@@ -31,11 +32,14 @@ use fusion_pcu::{
 
 mod blas;
 mod codegen;
+mod device_kernel;
 mod discovery;
 mod dispatch;
 mod error;
+mod host_kernel;
 mod memory;
 mod owned_dispatch;
+mod runtime;
 #[cfg(feature = "tensor")]
 mod tensor;
 
@@ -54,7 +58,15 @@ pub use dispatch::{
     execute_pcu_dispatch,
 };
 pub use discovery::RocmDiscovery;
+pub use device_kernel::{
+    RocmDeviceKernelError,
+    RocmPreparedDeviceKernel,
+};
 pub use error::*;
+pub use host_kernel::{
+    RocmHostKernelError,
+    RocmPreparedHostKernel,
+};
 pub use codegen::lower::{
     RocmLowerError,
     lower_dispatch_to_hip_rtc_source,
@@ -69,10 +81,17 @@ pub use memory::{
 pub use owned_dispatch::{
     RocmCheckedBatchCompletion,
     RocmCheckedDispatchBatch,
+    RocmExecutionStep,
     RocmOwnedCompletion,
     RocmOwnedDispatchBackend,
     RocmOwnedDispatchError,
+    RocmOwnedExecution,
+    RocmOwnedExecutionError,
+    RocmOwnedExecutionNode,
+    RocmOwnedExecutionOperation,
+    RocmOwnedExecutionTwoSlot,
     RocmPreparedDispatch,
+    RocmTwoSlotExecutionStep,
 };
 pub use codegen::rtc::{
     HipRtcError,
@@ -82,6 +101,7 @@ pub use codegen::rtc::{
 pub use tensor::{
     RocmAdmittedTensorFeedbackResources,
     RocmPreparedTensorGraph,
+    RocmTensorExecution,
     RocmTensorAssessor,
     RocmTensorElementwiseHostTiming,
     RocmTensorError,
@@ -94,6 +114,13 @@ pub use tensor::{
     RocmTensorOutputBank,
     RocmTensorPrewarmReport,
     RocmTensorScratch,
+};
+
+#[cfg(all(feature = "tensor", feature = "insights"))]
+pub use tensor::{
+    RocmTensorBatchedExecutionTiming,
+    RocmTensorInsightRecord,
+    RocmTensorOperationInsight,
 };
 
 type HipResult = c_int;
@@ -119,9 +146,12 @@ type GetErrorString = unsafe extern "C" fn(HipResult) -> *const c_char;
 type Malloc = unsafe extern "C" fn(*mut *mut c_void, usize) -> HipResult;
 type Free = unsafe extern "C" fn(*mut c_void) -> HipResult;
 type Memcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipResult;
+type MemcpyAsync =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, HipStream) -> HipResult;
 type StreamCreate = unsafe extern "C" fn(*mut HipStream) -> HipResult;
 type StreamDestroy = unsafe extern "C" fn(HipStream) -> HipResult;
 type StreamSynchronize = unsafe extern "C" fn(HipStream) -> HipResult;
+type StreamWaitEvent = unsafe extern "C" fn(HipStream, HipEvent, u32) -> HipResult;
 type EventCreate = unsafe extern "C" fn(*mut HipEvent, c_int) -> HipResult;
 type EventDestroy = unsafe extern "C" fn(HipEvent) -> HipResult;
 type EventRecord = unsafe extern "C" fn(HipEvent, HipStream) -> HipResult;
@@ -179,11 +209,10 @@ impl HipRuntime {
         let mut last_error = None;
         for candidate in candidates {
             let path = candidate.to_string_lossy().into_owned();
-            // SAFETY: HIP exports the documented C ABI, and the library stays alive through query.
-            let library = match unsafe { Library::new(&candidate) } {
+            let library = match runtime::load_library(&candidate) {
                 Ok(library) => library,
                 Err(error) => {
-                    last_error = Some(error.to_string());
+                    last_error = Some(error);
                     continue;
                 }
             };
@@ -220,11 +249,10 @@ impl HipRuntime {
         );
         let mut last_error = None;
         for candidate in candidates {
-            // SAFETY: symbols are used while this library remains in scope.
-            let library = match unsafe { Library::new(&candidate) } {
+            let library = match runtime::load_library(&candidate) {
                 Ok(library) => library,
                 Err(error) => {
-                    last_error = Some(error.to_string());
+                    last_error = Some(error);
                     continue;
                 }
             };
@@ -304,12 +332,10 @@ impl HipRuntime {
         );
         let mut last_error = None;
         for candidate in candidates {
-            // SAFETY: HIP runtime exports C ABI symbols; retaining the library in RuntimeInner
-            // keeps all loaded function pointers valid for the lifetime of every resource.
-            let library = match unsafe { Library::new(&candidate) } {
+            let library = match runtime::load_library(&candidate) {
                 Ok(library) => library,
                 Err(error) => {
-                    last_error = Some(error.to_string());
+                    last_error = Some(error);
                     continue;
                 }
             };
@@ -323,7 +349,7 @@ impl HipRuntime {
             let mut count: c_int = 0;
             let status = unsafe { get_count(ptr::from_mut(&mut count)) };
             let runtime = Self(Arc::new(RuntimeInner {
-                library: Arc::new(library),
+                library,
                 device: 0,
                 name: String::new(),
             }));
@@ -830,7 +856,7 @@ enum AllocationAccessState {
     Poisoned,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AllocationAccessKind {
     Exclusive,
     Stream(usize),
@@ -875,6 +901,72 @@ impl AllocationAccess {
             kind: AllocationAccessKind::Stream(identity),
         })
     }
+}
+
+fn reassign_allocation_access_guards(
+    guards: &mut [&mut AllocationAccessGuard],
+    from: usize,
+    to: usize,
+) -> Result<(), ()> {
+    // Preflight the whole set before changing any shared gate. This is all-or-nothing because
+    // these Rc<Cell<_>> gates are accessed on the current host thread and cannot race here.
+    let read_guards = guards.iter().map(|guard| &**guard).collect::<Vec<_>>();
+    if !allocation_access_guards_can_reassign(&read_guards, from, to) {
+        return Err(());
+    }
+    let mut groups: Vec<(Rc<AllocationAccess>, usize)> = Vec::new();
+    for guard in guards.iter() {
+        if let Some((_, count)) = groups
+            .iter_mut()
+            .find(|(access, _)| Rc::ptr_eq(access, &guard.access))
+        {
+            *count += 1;
+        } else {
+            groups.push((Rc::clone(&guard.access), 1));
+        }
+    }
+    for (access, count) in groups {
+        access.state.set(AllocationAccessState::Stream {
+            identity: to,
+            leases: count,
+        });
+    }
+    for guard in guards.iter_mut() {
+        guard.kind = AllocationAccessKind::Stream(to);
+    }
+    Ok(())
+}
+
+fn allocation_access_guards_can_reassign(
+    guards: &[&AllocationAccessGuard],
+    from: usize,
+    to: usize,
+) -> bool {
+    if from == to
+        || guards
+            .iter()
+            .any(|guard| guard.kind != AllocationAccessKind::Stream(from))
+    {
+        return false;
+    }
+    let mut groups: Vec<(&Rc<AllocationAccess>, usize)> = Vec::new();
+    for guard in guards {
+        if let Some((_, count)) = groups
+            .iter_mut()
+            .find(|(access, _)| Rc::ptr_eq(access, &guard.access))
+        {
+            *count += 1;
+        } else {
+            groups.push((&guard.access, 1));
+        }
+    }
+    groups.iter().all(|(access, count)| {
+        access.state.get()
+            == (AllocationAccessState::Stream {
+                identity: from,
+                leases: *count,
+            })
+    })
 }
 
 struct AllocationAccessGuard {
@@ -934,6 +1026,132 @@ struct DeviceAccessLease {
     allocation: Rc<DeviceAllocation>,
     guard: AllocationAccessGuard,
 }
+
+/// Opaque identifier for a host readback owned by one completion batch.
+///
+/// Readback IDs are neither transferable across batches nor usable after their bytes are taken.
+#[derive(Clone)]
+pub struct HipReadbackId {
+    identity: Rc<()>,
+    index: usize,
+}
+
+/// Fixed, privately owned host destinations for asynchronous device-to-host copies.
+struct HipReadbackStorage {
+    identity: Rc<()>,
+    buffers: Vec<Option<HipReadbackBuffer>>,
+}
+
+struct HipReadbackBuffer {
+    bytes: Box<[u8]>,
+    queued: bool,
+}
+
+const fn readback_is_complete(
+    final_event_present: bool,
+    resources_present: bool,
+    dependencies_present: bool,
+) -> bool {
+    !final_event_present && !resources_present && !dependencies_present
+}
+
+impl HipReadbackStorage {
+    fn new() -> Self {
+        Self {
+            identity: Rc::new(()),
+            buffers: Vec::new(),
+        }
+    }
+
+    fn allocate(&mut self, bytes: usize) -> HipReadbackId {
+        let index = self.buffers.len();
+        self.buffers.push(Some(HipReadbackBuffer {
+            bytes: vec![0; bytes].into_boxed_slice(),
+            queued: false,
+        }));
+        HipReadbackId {
+            identity: Rc::clone(&self.identity),
+            index,
+        }
+    }
+
+    fn prepare_destination(
+        &mut self,
+        id: &HipReadbackId,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<*mut u8, HipError> {
+        let buffer = self.buffer(id)?;
+        if buffer.queued {
+            return Err(HipError::ReadbackAlreadyQueued);
+        }
+        validate_buffer_range(buffer.bytes.len(), offset, bytes)?;
+        let buffer = self.buffer_mut(id)?;
+        buffer.queued = true;
+        Ok(buffer.bytes.as_mut_ptr().wrapping_add(offset))
+    }
+
+    fn validate_destination(
+        &self,
+        id: &HipReadbackId,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), HipError> {
+        let buffer = self.buffer(id)?;
+        if buffer.queued {
+            return Err(HipError::ReadbackAlreadyQueued);
+        }
+        validate_buffer_range(buffer.bytes.len(), offset, bytes)
+    }
+
+    fn read(&self, id: &HipReadbackId) -> Result<&[u8], HipError> {
+        let buffer = self.buffer(id)?;
+        if !buffer.queued && !buffer.bytes.is_empty() {
+            return Err(HipError::ReadbackNotQueued);
+        }
+        Ok(&buffer.bytes)
+    }
+
+    fn take(&mut self, id: &HipReadbackId) -> Result<Box<[u8]>, HipError> {
+        let buffer = self.buffer(id)?;
+        if !buffer.queued && !buffer.bytes.is_empty() {
+            return Err(HipError::ReadbackNotQueued);
+        }
+        self.buffers
+            .get_mut(id.index)
+            .filter(|_| Rc::ptr_eq(&self.identity, &id.identity))
+            .and_then(Option::take)
+            .map(|buffer| buffer.bytes)
+            .ok_or(HipError::InvalidReadbackId)
+    }
+
+    fn buffer(&self, id: &HipReadbackId) -> Result<&HipReadbackBuffer, HipError> {
+        self.buffers
+            .get(id.index)
+            .filter(|_| Rc::ptr_eq(&self.identity, &id.identity))
+            .and_then(Option::as_ref)
+            .ok_or(HipError::InvalidReadbackId)
+    }
+
+    fn buffer_mut(&mut self, id: &HipReadbackId) -> Result<&mut HipReadbackBuffer, HipError> {
+        self.buffers
+            .get_mut(id.index)
+            .filter(|_| Rc::ptr_eq(&self.identity, &id.identity))
+            .and_then(Option::as_mut)
+            .ok_or(HipError::InvalidReadbackId)
+    }
+
+    fn quarantine_and_forget(&mut self) {
+        for buffer in self.buffers.drain(..).flatten() {
+            std::mem::forget(buffer);
+        }
+    }
+
+    fn has_live_readbacks(&self) -> bool {
+        self.buffers.iter().any(Option::is_some)
+    }
+}
+
 impl Drop for DeviceAllocation {
     fn drop(&mut self) {
         let _ = self
@@ -1067,17 +1285,7 @@ impl DeviceBuffer {
     }
 
     fn check_range(&self, offset: usize, bytes: usize) -> Result<(), HipError> {
-        if offset
-            .checked_add(bytes)
-            .is_none_or(|end| end > self.allocation.bytes)
-        {
-            Err(HipError::BufferTooSmall {
-                allocation: self.allocation.bytes.saturating_sub(offset),
-                requested: bytes,
-            })
-        } else {
-            Ok(())
-        }
+        validate_buffer_range(self.allocation.bytes, offset, bytes)
     }
 
     fn acquire_access(&self) -> Result<DeviceAccessLease, HipError> {
@@ -1180,7 +1388,7 @@ pub struct HipStreamHandle {
 }
 impl HipStreamHandle {
     /// Return the raw stream pointer for internal backend FFI integration.
-    #[cfg(feature = "tensor")]
+    #[allow(dead_code)] // Used by asynchronous library integrations in sibling modules.
     pub(crate) fn raw_stream(&self) -> *mut c_void {
         self.inner.raw
     }
@@ -1353,6 +1561,44 @@ const fn ensure_batch_open(failed: bool) -> Result<(), HipError> {
     }
 }
 
+fn validate_device_copy(
+    destination_bytes: usize,
+    source_bytes: usize,
+    bytes: usize,
+    same_allocation: bool,
+) -> Result<(), HipError> {
+    for allocation in [destination_bytes, source_bytes] {
+        if bytes > allocation {
+            return Err(HipError::BufferTooSmall {
+                allocation,
+                requested: bytes,
+            });
+        }
+    }
+    if same_allocation && bytes != 0 {
+        return Err(HipError::Busy);
+    }
+    Ok(())
+}
+
+fn validate_buffer_range(
+    allocation_bytes: usize,
+    offset: usize,
+    bytes: usize,
+) -> Result<(), HipError> {
+    if offset
+        .checked_add(bytes)
+        .is_none_or(|end| end > allocation_bytes)
+    {
+        Err(HipError::BufferTooSmall {
+            allocation: allocation_bytes.saturating_sub(offset),
+            requested: bytes,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 struct LaunchAccessLeases {
     inline: [Option<DeviceAccessLease>; INLINE_KERNEL_PARAMETERS],
     overflow: Vec<DeviceAccessLease>,
@@ -1392,6 +1638,16 @@ impl LaunchAccessLeases {
             .chain(self.overflow.iter())
             .for_each(DeviceAccessLease::quarantine);
     }
+
+    fn can_handoff_stream(&self, from: usize, to: usize) -> bool {
+        let guards = self.inline[..self.inline_len]
+            .iter()
+            .flatten()
+            .chain(self.overflow.iter())
+            .map(|lease| &lease.guard)
+            .collect::<Vec<_>>();
+        allocation_access_guards_can_reassign(&guards, from, to)
+    }
 }
 
 fn can_inline_kernel_parameters(arguments: &[HipKernelArgument<'_>]) -> bool {
@@ -1414,7 +1670,8 @@ fn copy_inline_kernel_parameter(destination: &mut AlignedKernelWord, bytes: &[u8
 }
 
 struct LaunchResources {
-    _module: Rc<ModuleInner>,
+    _module: Option<Rc<ModuleInner>>,
+    _external_owner: Option<Rc<dyn Any>>,
     // Each unique lease owns the allocation as well as its busy gate until completion.
     access_leases: LaunchAccessLeases,
     stream: HipStreamHandle,
@@ -1426,6 +1683,58 @@ impl LaunchResources {
 
     fn belongs_to_stream(&self, stream: &HipStreamHandle) -> bool {
         Rc::ptr_eq(&self.stream.inner, &stream.inner)
+    }
+
+    fn handoff_accesses_to_stream(&mut self, stream: &HipStreamHandle) -> Result<(), ()> {
+        let from = Rc::as_ptr(&self.stream.inner) as usize;
+        let to = Rc::as_ptr(&stream.inner) as usize;
+        reassign_launch_resource_accesses(std::slice::from_mut(self), from, to)
+    }
+
+    fn can_handoff_accesses_to_stream(&self, stream: &HipStreamHandle) -> bool {
+        let from = Rc::as_ptr(&self.stream.inner) as usize;
+        let to = Rc::as_ptr(&stream.inner) as usize;
+        self.access_leases.can_handoff_stream(from, to)
+    }
+}
+
+fn reassign_launch_resource_accesses(
+    resources: &mut [LaunchResources],
+    from: usize,
+    to: usize,
+) -> Result<(), ()> {
+    let mut guards = Vec::new();
+    append_launch_resource_access_guards(resources, &mut guards);
+    reassign_allocation_access_guards(&mut guards, from, to)
+}
+
+fn append_launch_resource_access_guards<'a>(
+    resources: &'a mut [LaunchResources],
+    guards: &mut Vec<&'a mut AllocationAccessGuard>,
+) {
+    for resource in resources {
+        guards.extend(
+            resource.access_leases.inline[..resource.access_leases.inline_len]
+                .iter_mut()
+                .flatten()
+                .chain(resource.access_leases.overflow.iter_mut())
+                .map(|lease| &mut lease.guard),
+        );
+    }
+}
+
+fn append_launch_resource_access_guards_readonly<'a>(
+    resources: &'a [LaunchResources],
+    guards: &mut Vec<&'a AllocationAccessGuard>,
+) {
+    for resource in resources {
+        guards.extend(
+            resource.access_leases.inline[..resource.access_leases.inline_len]
+                .iter()
+                .flatten()
+                .chain(resource.access_leases.overflow.iter())
+                .map(|lease| &lease.guard),
+        );
     }
 }
 
@@ -1488,8 +1797,17 @@ pub struct HipCompletionBatch {
     stream: HipStreamHandle,
     launch_events: Vec<HipEventHandle>,
     resources: Vec<LaunchResources>,
+    dependencies: Vec<HipProducerCompletion>,
+    readbacks: HipReadbackStorage,
+    queue_markers: Vec<Rc<dyn Any>>,
     failed: bool,
     timing: Option<HipBatchTiming>,
+}
+
+#[allow(clippy::large_enum_variant)] // Keep launch tokens inline; they are moved infrequently.
+enum HipProducerCompletion {
+    Launch(HipCompletion),
+    Batch(HipBatchCompletion),
 }
 
 struct HipBatchTiming {
@@ -1512,6 +1830,9 @@ impl HipCompletionBatch {
             stream: stream.clone(),
             launch_events: Vec::new(),
             resources: Vec::new(),
+            dependencies: Vec::new(),
+            readbacks: HipReadbackStorage::new(),
+            queue_markers: Vec::new(),
             failed: false,
             timing: None,
         }
@@ -1525,6 +1846,9 @@ impl HipCompletionBatch {
             stream: stream.clone(),
             launch_events: Vec::new(),
             resources: Vec::new(),
+            dependencies: Vec::new(),
+            readbacks: HipReadbackStorage::new(),
+            queue_markers: Vec::new(),
             failed: false,
             timing: Some(HipBatchTiming {
                 start: None,
@@ -1532,6 +1856,65 @@ impl HipCompletionBatch {
                 segments_ms: Rc::new(RefCell::new(Vec::new())),
             }),
         }
+    }
+
+    /// Return the stream used by this batch for internal asynchronous-library integration.
+    pub(crate) const fn stream_handle(&self) -> &HipStreamHandle {
+        &self.stream
+    }
+
+    pub(crate) fn has_queue_marker(&self, marker: &Rc<dyn Any>) -> bool {
+        has_queue_marker(&self.queue_markers, marker)
+    }
+
+    pub(crate) fn register_queue_marker(&mut self, marker: Rc<dyn Any>) -> Result<(), HipError> {
+        ensure_batch_open(self.failed)?;
+        register_queue_marker(&mut self.queue_markers, marker);
+        Ok(())
+    }
+
+    /// Retain an external asynchronous operation's buffers and owner through this batch's final
+    /// event. Call this before enqueueing the operation, and ensure the external library is bound
+    /// to [`Self::stream_handle`]. Repeated buffer references are deduplicated. If the external
+    /// call reports an error after possibly enqueueing work, keep this batch and finish or drop it
+    /// normally so its final event or stream synchronization proves quiescence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime mismatch, busy allocation, or [`HipError::BatchPoisoned`].
+    pub(crate) fn retain_external_operation(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        owner: Rc<dyn Any>,
+    ) -> Result<(), HipError> {
+        ensure_batch_open(self.failed)?;
+        for buffer in buffers {
+            self.stream
+                .inner
+                .runtime
+                .ensure_same_runtime(&buffer.allocation.runtime)?;
+        }
+
+        let mut access_leases = LaunchAccessLeases::new();
+        let mut unique = Vec::<&DeviceBuffer>::with_capacity(buffers.len());
+        for buffer in buffers {
+            if unique
+                .iter()
+                .any(|known| Rc::ptr_eq(&known.allocation, &buffer.allocation))
+            {
+                continue;
+            }
+            // If an acquisition fails, already acquired leases drop here and restore their gates.
+            access_leases.push(buffer.acquire_stream_access(&self.stream)?);
+            unique.push(buffer);
+        }
+        self.resources.push(LaunchResources {
+            _module: None,
+            _external_owner: Some(owner),
+            access_leases,
+            stream: self.stream.clone(),
+        });
+        Ok(())
     }
 
     /// Return device elapsed times for segments whose completion tokens have been waited.
@@ -1542,9 +1925,23 @@ impl HipCompletionBatch {
             .map_or_else(Vec::new, |timing| timing.segments_ms.borrow().clone())
     }
 
+    /// Allocate a fixed, batch-owned host destination for an asynchronous device-to-host copy.
+    ///
+    /// The returned identifier is valid only with this batch and its final completion. The
+    /// storage remains private and cannot be read until the completion's complete dependency
+    /// chain has succeeded. Zero-byte results are valid and require no device operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HipError::BatchPoisoned`] if this batch has already failed.
+    pub fn allocate_readback(&mut self, bytes: usize) -> Result<HipReadbackId, HipError> {
+        ensure_batch_open(self.failed)?;
+        Ok(self.readbacks.allocate(bytes))
+    }
+
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.resources.is_empty()
+        self.resources.is_empty() && self.launch_events.is_empty() && self.dependencies.is_empty()
     }
 
     /// Add one launch completion to this batch.
@@ -1569,6 +1966,398 @@ impl HipCompletionBatch {
         }
         if let Some(resources) = completion.resources.take() {
             self.resources.push(resources);
+        }
+        Ok(())
+    }
+
+    /// Queue a device-to-device copy on this batch's stream.
+    ///
+    /// Both allocations remain leased and owned until the batch's final event completes. If HIP
+    /// reports an enqueue error, the stream is synchronized before releasing the leases; when
+    /// quiescence cannot be established, the allocations and their gates are quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime mismatch, invalid byte count, busy allocation, HIP enqueue error, or
+    /// [`HipError::BatchPoisoned`] if this batch has already failed.
+    pub fn copy_device_to_device(
+        &mut self,
+        destination: &DeviceBuffer,
+        source: &DeviceBuffer,
+        bytes: usize,
+    ) -> Result<(), HipError> {
+        ensure_batch_open(self.failed)?;
+        self.stream
+            .inner
+            .runtime
+            .ensure_same_runtime(&destination.allocation.runtime)?;
+        self.stream
+            .inner
+            .runtime
+            .ensure_same_runtime(&source.allocation.runtime)?;
+        validate_device_copy(
+            destination.allocation.bytes,
+            source.allocation.bytes,
+            bytes,
+            Rc::ptr_eq(&destination.allocation, &source.allocation),
+        )?;
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        let mut access_leases = LaunchAccessLeases::new();
+        access_leases.push(destination.acquire_stream_access(&self.stream)?);
+        access_leases.push(source.acquire_stream_access(&self.stream)?);
+        // Retain both owners before enqueue. HIP can report an error after submitting work, so
+        // the same batch synchronization/quarantine path used by failed launches must own them.
+        self.resources.push(LaunchResources {
+            _module: None,
+            _external_owner: None,
+            access_leases,
+            stream: self.stream.clone(),
+        });
+        let enqueue = self
+            .stream
+            .inner
+            .runtime
+            .call("hipMemcpyAsync", |f: MemcpyAsync| unsafe {
+                f(
+                    destination.allocation.pointer,
+                    source.allocation.pointer,
+                    bytes,
+                    HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    self.stream.inner.raw,
+                )
+            });
+        if let Err(error) = enqueue {
+            self.failed = true;
+            self.release_after_stream_sync();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Queue an asynchronous copy of a device allocation into a batch-owned readback.
+    ///
+    /// Use [`Self::copy_device_to_host_at`] to select source and destination offsets. The
+    /// readback bytes are available from the finished completion only after its final event and
+    /// every recursively retained dependency have all waited successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime mismatch, invalid range or readback ID, busy source allocation, HIP
+    /// enqueue error, or [`HipError::BatchPoisoned`] if this batch has already failed.
+    pub fn copy_device_to_host(
+        &mut self,
+        source: &DeviceBuffer,
+        readback: &HipReadbackId,
+        bytes: usize,
+    ) -> Result<(), HipError> {
+        self.copy_device_to_host_at(source, 0, readback, 0, bytes)
+    }
+
+    /// Queue an asynchronous copy from a checked device range into a checked batch readback range.
+    ///
+    /// The source allocation stays leased through the batch's final event. Host storage has a
+    /// fixed address for the duration of the copy, and is only exposed after a successful full
+    /// wait. Empty ranges are validated no-ops and do not acquire the source allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime mismatch, invalid source/destination range or readback ID, busy source
+    /// allocation, HIP enqueue error, or [`HipError::BatchPoisoned`] if this batch has already
+    /// failed.
+    pub fn copy_device_to_host_at(
+        &mut self,
+        source: &DeviceBuffer,
+        source_offset: usize,
+        readback: &HipReadbackId,
+        destination_offset: usize,
+        bytes: usize,
+    ) -> Result<(), HipError> {
+        ensure_batch_open(self.failed)?;
+        self.stream
+            .inner
+            .runtime
+            .ensure_same_runtime(&source.allocation.runtime)?;
+        source.check_range(source_offset, bytes)?;
+        self.readbacks
+            .validate_destination(readback, destination_offset, bytes)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+
+        let mut access_leases = LaunchAccessLeases::new();
+        access_leases.push(source.acquire_stream_access(&self.stream)?);
+        let destination =
+            self.readbacks
+                .prepare_destination(readback, destination_offset, bytes)?;
+        self.resources.push(LaunchResources {
+            _module: None,
+            _external_owner: None,
+            access_leases,
+            stream: self.stream.clone(),
+        });
+        let enqueue = self
+            .stream
+            .inner
+            .runtime
+            .call("hipMemcpyAsync", |f: MemcpyAsync| unsafe {
+                f(
+                    destination.cast(),
+                    source
+                        .allocation
+                        .pointer
+                        .cast::<u8>()
+                        .wrapping_add(source_offset)
+                        .cast(),
+                    bytes,
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                    self.stream.inner.raw,
+                )
+            });
+        if let Err(error) = enqueue {
+            self.failed = true;
+            self.release_after_stream_sync();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Queue an owned host-to-device copy on this batch's stream.
+    ///
+    /// The immutable host payload and destination allocation remain retained until the batch's
+    /// final event completes. The payload can be shared with graph nodes by cloning its `Arc`;
+    /// the batch keeps its own owner until HIP confirms completion. An empty payload is a
+    /// validated no-op and does not acquire the destination's busy gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime mismatch, invalid destination range, busy destination, HIP enqueue
+    /// error, or [`HipError::BatchPoisoned`] if this batch has already failed.
+    pub fn copy_host_to_device(
+        &mut self,
+        destination: &DeviceBuffer,
+        source: Arc<[u8]>,
+    ) -> Result<(), HipError> {
+        self.copy_host_to_device_at(destination, 0, source)
+    }
+
+    /// Queue an owned host-to-device copy at `offset` on this batch's stream.
+    ///
+    /// The byte range is checked before acquiring the allocation lease or submitting HIP work.
+    /// The host source must be represented by an immutable `Arc<[u8]>`; the batch retains that
+    /// owner through its final event, so callers may release their own handle immediately after
+    /// this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime mismatch, invalid destination range, busy destination, HIP enqueue
+    /// error, or [`HipError::BatchPoisoned`] if this batch has already failed.
+    pub fn copy_host_to_device_at(
+        &mut self,
+        destination: &DeviceBuffer,
+        offset: usize,
+        source: Arc<[u8]>,
+    ) -> Result<(), HipError> {
+        ensure_batch_open(self.failed)?;
+        self.stream
+            .inner
+            .runtime
+            .ensure_same_runtime(&destination.allocation.runtime)?;
+        validate_buffer_range(destination.allocation.bytes, offset, source.len())?;
+        if source.is_empty() {
+            return Ok(());
+        }
+
+        let bytes = source.len();
+        let source_pointer = source.as_ptr().cast::<c_void>();
+        let owner: Rc<dyn Any> = Rc::new(source);
+        self.retain_external_operation(&[destination], owner)?;
+        let enqueue = self
+            .stream
+            .inner
+            .runtime
+            .call("hipMemcpyAsync", |f: MemcpyAsync| unsafe {
+                f(
+                    destination
+                        .allocation
+                        .pointer
+                        .cast::<u8>()
+                        .wrapping_add(offset)
+                        .cast(),
+                    source_pointer,
+                    bytes,
+                    HIP_MEMCPY_HOST_TO_DEVICE,
+                    self.stream.inner.raw,
+                )
+            });
+        if let Err(error) = enqueue {
+            self.failed = true;
+            self.release_after_stream_sync();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Check whether an unconsumed launch completion can be attached as a dependency.
+    ///
+    /// This performs no HIP calls and does not change the completion or access gates. The result
+    /// remains valid until another operation changes one of the allocation gates; these handles
+    /// are thread-local (`Rc<Cell<_>>`), so no other thread can race this check.
+    pub(crate) fn can_wait_for(&self, completion: &HipCompletion) -> Result<bool, HipError> {
+        ensure_batch_open(self.failed)?;
+        let producer_runtime = completion
+            .event
+            .as_ref()
+            .map(|event| &event.inner.runtime)
+            .or_else(|| {
+                completion
+                    .resources
+                    .as_ref()
+                    .map(|resources| &resources.stream.inner.runtime)
+            });
+        if let Some(runtime) = producer_runtime {
+            self.stream.inner.runtime.ensure_same_runtime(runtime)?;
+        }
+        if completion.event.is_none()
+            || completion
+                .resources
+                .as_ref()
+                .is_none_or(|resources| resources.belongs_to_stream(&self.stream))
+        {
+            return Ok(true);
+        }
+        Ok(completion
+            .resources
+            .as_ref()
+            .is_none_or(|resources| resources.can_handoff_accesses_to_stream(&self.stream)))
+    }
+
+    /// Queue this batch after a producer completion from another stream.
+    ///
+    /// The producer token, including its event and access leases, remains owned until this
+    /// consumer batch's final event completes. Its buffer access leases transfer to the consumer
+    /// stream only when each buffer has exactly one active stream lease; otherwise this returns
+    /// [`HipError::Busy`] before queuing a wait. This bounded handoff accepts one launch completion,
+    /// not a [`HipBatchCompletion`]. Each completion event is consumed once and is never
+    /// re-recorded through this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime/device mismatch, [`HipError::Busy`] when a producer buffer has other
+    /// active leases, a HIP wait error, or [`HipError::BatchPoisoned`].
+    pub fn wait_for(&mut self, completion: HipCompletion) -> Result<(), HipError> {
+        if !self.can_wait_for(&completion)? {
+            return Err(HipError::Busy);
+        }
+        self.wait_for_dependency(HipProducerCompletion::Launch(completion))
+    }
+
+    /// Queue this batch after a finished producer batch from another stream.
+    ///
+    /// All producer batch buffer leases transfer atomically, allocation by allocation, only when
+    /// the producer batch owns every active stream lease for those allocations. If another token
+    /// or producer operation also leases any allocation, this returns [`HipError::Busy`] before
+    /// queuing a wait. Producer resources remain retained through this consumer batch's final
+    /// event. Same-stream batches use stream order directly. The producer token is borrowed so a
+    /// preflight rejection leaves it available to the caller; after acceptance it becomes inert.
+    ///
+    /// # Errors
+    ///
+    /// Returns a runtime/device mismatch, [`HipError::Busy`] for shared producer leases or live
+    /// readbacks, a HIP wait error, or [`HipError::BatchPoisoned`].
+    pub fn wait_for_batch(&mut self, completion: &mut HipBatchCompletion) -> Result<(), HipError> {
+        if !self.can_wait_for_batch(completion)? {
+            return Err(HipError::Busy);
+        }
+        let inherited_markers = completion.queue_markers.clone();
+        let completion = completion.take_for_dependency()?;
+        self.wait_for_dependency(HipProducerCompletion::Batch(completion))?;
+        for marker in inherited_markers {
+            self.register_queue_marker(marker)?;
+        }
+        Ok(())
+    }
+
+    /// Check whether an unconsumed producer batch can be attached as a dependency.
+    ///
+    /// This checks runtime/device identity and every direct or transitive buffer lease without
+    /// making HIP calls or changing ownership. The result remains valid until another operation
+    /// changes an allocation gate; `Rc<Cell<_>>` keeps these resources on the current thread.
+    pub(crate) fn can_wait_for_batch(
+        &self,
+        completion: &HipBatchCompletion,
+    ) -> Result<bool, HipError> {
+        ensure_batch_open(self.failed)?;
+        self.stream
+            .inner
+            .runtime
+            .ensure_same_runtime(&completion.stream.inner.runtime)?;
+        if !batch_handoff_is_available(
+            completion.handed_off,
+            completion.wait_error_observed,
+            completion.readbacks.has_live_readbacks(),
+        ) {
+            return Ok(false);
+        }
+        if let Some(event) = &completion.final_event {
+            self.stream
+                .inner
+                .runtime
+                .ensure_same_runtime(&event.inner.runtime)?;
+        }
+        if completion.final_event.is_none()
+            || Rc::ptr_eq(&completion.stream.inner, &self.stream.inner)
+        {
+            return Ok(true);
+        }
+        Ok(completion.can_handoff_accesses_to_stream(&self.stream))
+    }
+
+    fn wait_for_dependency(
+        &mut self,
+        mut completion: HipProducerCompletion,
+    ) -> Result<(), HipError> {
+        ensure_batch_open(self.failed)?;
+        let producer_runtime = completion.runtime();
+        if let Some(runtime) = producer_runtime {
+            self.stream.inner.runtime.ensure_same_runtime(runtime)?;
+        }
+
+        if completion
+            .stream()
+            .is_some_and(|stream| Rc::ptr_eq(&stream.inner, &self.stream.inner))
+        {
+            self.dependencies.push(completion);
+            return Ok(());
+        }
+
+        let Some(raw_event) = completion.event().map(|event| event.inner.raw) else {
+            // A completion with no event has already been waited successfully.
+            return Ok(());
+        };
+        completion
+            .handoff_accesses_to_stream(&self.stream)
+            .map_err(|()| HipError::Busy)?;
+        self.dependencies.push(completion);
+        if let Err(error) = self
+            .stream
+            .inner
+            .runtime
+            .call("hipStreamWaitEvent", |f: StreamWaitEvent| unsafe {
+                f(self.stream.inner.raw, raw_event, 0)
+            })
+        {
+            // Even a failed enqueue may leave the consumer's queue state uncertain. Establish
+            // consumer quiescence before releasing the retained producer token.
+            if self.stream.synchronize().is_err() {
+                self.failed = true;
+                self.quarantine_and_forget();
+            } else {
+                self.release_after_stream_sync();
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -1604,6 +2393,8 @@ impl HipCompletionBatch {
                 } else {
                     self.resources.clear();
                     self.launch_events.clear();
+                    self.dependencies.clear();
+                    self.queue_markers.clear();
                     if let Some(timing) = &mut self.timing {
                         timing.start.take();
                     }
@@ -1630,6 +2421,8 @@ impl HipCompletionBatch {
                 // Stream quiescence is proven; the failed event is not needed to release owners.
                 self.resources.clear();
                 self.launch_events.clear();
+                self.dependencies.clear();
+                self.queue_markers.clear();
                 if let Some(timing) = &mut self.timing {
                     timing.start.take();
                     timing.end.take();
@@ -1645,10 +2438,16 @@ impl HipCompletionBatch {
             })
         });
         Ok(HipBatchCompletion {
+            stream: self.stream.clone(),
             final_event: Some(event),
             launch_events: std::mem::take(&mut self.launch_events),
             resources: std::mem::take(&mut self.resources),
+            dependencies: std::mem::take(&mut self.dependencies),
+            readbacks: std::mem::replace(&mut self.readbacks, HipReadbackStorage::new()),
+            queue_markers: std::mem::take(&mut self.queue_markers),
             timing_events,
+            handed_off: false,
+            wait_error_observed: false,
         })
     }
 
@@ -1659,6 +2458,8 @@ impl HipCompletionBatch {
         } else {
             self.resources.clear();
             self.launch_events.clear();
+            self.dependencies.clear();
+            self.queue_markers.clear();
             if let Some(timing) = &mut self.timing {
                 timing.start.take();
                 timing.end.take();
@@ -1676,6 +2477,10 @@ impl HipCompletionBatch {
         for event in self.launch_events.drain(..) {
             std::mem::forget(event);
         }
+        for mut dependency in self.dependencies.drain(..) {
+            dependency.quarantine_and_forget();
+            std::mem::forget(dependency);
+        }
         if let Some(timing) = &mut self.timing {
             if let Some(event) = timing.start.take() {
                 std::mem::forget(event);
@@ -1684,12 +2489,24 @@ impl HipCompletionBatch {
                 std::mem::forget(event);
             }
         }
+        for marker in self.queue_markers.drain(..) {
+            std::mem::forget(marker);
+        }
+        self.readbacks.quarantine_and_forget();
+        std::mem::forget(self.stream.clone());
     }
 }
 
 impl Drop for HipCompletionBatch {
     fn drop(&mut self) {
-        if self.resources.is_empty() {
+        if self.resources.is_empty()
+            && self.launch_events.is_empty()
+            && self.dependencies.is_empty()
+            && self
+                .timing
+                .as_ref()
+                .is_none_or(|timing| timing.start.is_none() && timing.end.is_none())
+        {
             return;
         }
         if self.stream.synchronize().is_err() {
@@ -1700,10 +2517,16 @@ impl Drop for HipCompletionBatch {
 
 /// Final-event completion token retaining every launch in a [`HipCompletionBatch`].
 pub struct HipBatchCompletion {
+    stream: HipStreamHandle,
     final_event: Option<HipEventHandle>,
     launch_events: Vec<HipEventHandle>,
     resources: Vec<LaunchResources>,
+    dependencies: Vec<HipProducerCompletion>,
+    readbacks: HipReadbackStorage,
+    queue_markers: Vec<Rc<dyn Any>>,
     timing_events: Option<HipBatchTimingSegment>,
+    handed_off: bool,
+    wait_error_observed: bool,
 }
 
 impl HipBatchCompletion {
@@ -1713,6 +2536,11 @@ impl HipBatchCompletion {
     ///
     /// Returns the HIP event synchronization error.
     pub fn wait(&mut self) -> Result<(), HipError> {
+        let result = self.wait_inner();
+        track_wait_error(&mut self.wait_error_observed, result)
+    }
+
+    fn wait_inner(&mut self) -> Result<(), HipError> {
         if let Some(event) = &self.final_event {
             event.synchronize()?;
         }
@@ -1723,18 +2551,168 @@ impl HipBatchCompletion {
                 .runtime
                 .elapsed_time_ms(&timing.start, &timing.end)?;
             timing.segments_ms.borrow_mut().push(milliseconds);
+            self.timing_events.take();
         }
+        wait_completion_dependencies(&mut self.dependencies, HipProducerCompletion::wait)?;
         self.resources.clear();
         self.launch_events.clear();
+        self.queue_markers.clear();
         self.final_event.take();
-        self.timing_events.take();
         Ok(())
     }
+
+    pub(crate) fn has_queue_marker(&self, marker: &Rc<dyn Any>) -> bool {
+        completion_has_queue_marker(&self.queue_markers, self.wait_error_observed, marker)
+    }
+
+    pub(crate) fn uses_stream(&self, stream: &HipStreamHandle) -> bool {
+        !self.wait_error_observed && Rc::ptr_eq(&self.stream.inner, &stream.inner)
+    }
+
+    /// Borrow completed host bytes for one readback ID.
+    ///
+    /// Bytes remain unavailable until this completion's event and every recursively retained
+    /// dependency have all waited successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HipError::BatchNotComplete`] before a full successful wait, or
+    /// [`HipError::InvalidReadbackId`] for an ID from another batch or whose bytes were taken.
+    pub fn readback(&self, id: &HipReadbackId) -> Result<&[u8], HipError> {
+        if !readback_is_complete(
+            self.final_event.is_some(),
+            !self.resources.is_empty(),
+            !self.dependencies.is_empty(),
+        ) {
+            return Err(HipError::BatchNotComplete);
+        }
+        self.readbacks.read(id)
+    }
+
+    /// Move completed host bytes out of this completion without copying.
+    ///
+    /// The readback is single-use. The bytes remain unavailable until this completion's event
+    /// and every recursively retained dependency have all waited successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HipError::BatchNotComplete`] before a full successful wait, or
+    /// [`HipError::InvalidReadbackId`] for an ID from another batch or whose bytes were already
+    /// taken.
+    pub fn take_readback(&mut self, id: &HipReadbackId) -> Result<Box<[u8]>, HipError> {
+        if !readback_is_complete(
+            self.final_event.is_some(),
+            !self.resources.is_empty(),
+            !self.dependencies.is_empty(),
+        ) {
+            return Err(HipError::BatchNotComplete);
+        }
+        self.readbacks.take(id)
+    }
+
+    fn take_for_dependency(&mut self) -> Result<Self, HipError> {
+        if !batch_handoff_is_available(
+            self.handed_off,
+            self.wait_error_observed,
+            self.readbacks.has_live_readbacks(),
+        ) {
+            return Err(HipError::Busy);
+        }
+        let empty_readbacks = HipReadbackStorage::new();
+        self.handed_off = true;
+        Ok(Self {
+            stream: self.stream.clone(),
+            final_event: self.final_event.take(),
+            launch_events: std::mem::take(&mut self.launch_events),
+            resources: std::mem::take(&mut self.resources),
+            dependencies: std::mem::take(&mut self.dependencies),
+            readbacks: std::mem::replace(&mut self.readbacks, empty_readbacks),
+            queue_markers: std::mem::take(&mut self.queue_markers),
+            timing_events: self.timing_events.take(),
+            handed_off: false,
+            wait_error_observed: false,
+        })
+    }
+
+    fn can_handoff_accesses_to_stream(&self, stream: &HipStreamHandle) -> bool {
+        let from = Rc::as_ptr(&self.stream.inner) as usize;
+        let to = Rc::as_ptr(&stream.inner) as usize;
+        let mut guards = Vec::new();
+        append_launch_resource_access_guards_readonly(&self.resources, &mut guards);
+        for dependency in &self.dependencies {
+            dependency.append_access_guards_readonly(&mut guards);
+        }
+        allocation_access_guards_can_reassign(&guards, from, to)
+    }
+
+    fn quarantine_and_forget(&mut self) {
+        for resources in &self.resources {
+            resources.quarantine();
+        }
+        for resources in self.resources.drain(..) {
+            std::mem::forget(resources);
+        }
+        for event in self.launch_events.drain(..) {
+            std::mem::forget(event);
+        }
+        for mut dependency in self.dependencies.drain(..) {
+            dependency.quarantine_and_forget();
+            std::mem::forget(dependency);
+        }
+        if let Some(event) = self.final_event.take() {
+            std::mem::forget(event);
+        }
+        if let Some(timing) = self.timing_events.take() {
+            std::mem::forget(timing.start);
+            std::mem::forget(timing.end);
+        }
+        for marker in self.queue_markers.drain(..) {
+            std::mem::forget(marker);
+        }
+        self.readbacks.quarantine_and_forget();
+        std::mem::forget(self.stream.clone());
+    }
+}
+
+const fn track_wait_error<T, E>(sticky_error: &mut bool, result: Result<T, E>) -> Result<T, E> {
+    *sticky_error = result.is_err();
+    result
+}
+
+fn has_queue_marker(markers: &[Rc<dyn Any>], marker: &Rc<dyn Any>) -> bool {
+    markers.iter().any(|known| Rc::ptr_eq(known, marker))
+}
+
+fn register_queue_marker(markers: &mut Vec<Rc<dyn Any>>, marker: Rc<dyn Any>) {
+    if !has_queue_marker(markers, &marker) {
+        markers.push(marker);
+    }
+}
+
+fn completion_has_queue_marker(
+    markers: &[Rc<dyn Any>],
+    wait_error_observed: bool,
+    marker: &Rc<dyn Any>,
+) -> bool {
+    !wait_error_observed && has_queue_marker(markers, marker)
+}
+
+const fn batch_handoff_is_available(
+    handed_off: bool,
+    wait_error_observed: bool,
+    has_live_readbacks: bool,
+) -> bool {
+    !handed_off && !wait_error_observed && !has_live_readbacks
 }
 
 impl Drop for HipBatchCompletion {
     fn drop(&mut self) {
-        if self.resources.is_empty() {
+        if self.resources.is_empty()
+            && self.launch_events.is_empty()
+            && self.dependencies.is_empty()
+            && self.final_event.is_none()
+            && self.timing_events.is_none()
+        {
             return;
         }
         let completed = self
@@ -1744,27 +2722,129 @@ impl Drop for HipBatchCompletion {
         if completed {
             self.resources.clear();
             self.launch_events.clear();
+            self.dependencies.clear();
             self.final_event.take();
             self.timing_events.take();
         } else {
-            for resources in &self.resources {
-                resources.quarantine();
-            }
-            for resources in self.resources.drain(..) {
-                std::mem::forget(resources);
-            }
-            for event in self.launch_events.drain(..) {
-                std::mem::forget(event);
-            }
-            if let Some(event) = self.final_event.take() {
-                std::mem::forget(event);
-            }
-            if let Some(timing) = self.timing_events.take() {
-                std::mem::forget(timing.start);
-                std::mem::forget(timing.end);
+            self.quarantine_and_forget();
+        }
+    }
+}
+
+impl HipProducerCompletion {
+    fn wait(&mut self) -> Result<(), HipError> {
+        match self {
+            Self::Launch(completion) => completion.wait(),
+            Self::Batch(completion) => completion.wait(),
+        }
+    }
+
+    const fn event(&self) -> Option<&HipEventHandle> {
+        match self {
+            Self::Launch(completion) => completion.event.as_ref(),
+            Self::Batch(completion) => completion.final_event.as_ref(),
+        }
+    }
+
+    fn stream(&self) -> Option<&HipStreamHandle> {
+        match self {
+            Self::Launch(completion) => completion
+                .resources
+                .as_ref()
+                .map(|resources| &resources.stream),
+            Self::Batch(completion) => Some(&completion.stream),
+        }
+    }
+
+    fn runtime(&self) -> Option<&HipRuntime> {
+        self.event()
+            .map(|event| &event.inner.runtime)
+            .or_else(|| self.stream().map(|stream| &stream.inner.runtime))
+    }
+
+    fn handoff_accesses_to_stream(&mut self, stream: &HipStreamHandle) -> Result<(), ()> {
+        match self {
+            Self::Launch(completion) => completion.resources.as_mut().map_or(Ok(()), |resources| {
+                resources.handoff_accesses_to_stream(stream)
+            }),
+            Self::Batch(completion) => {
+                let from = Rc::as_ptr(&completion.stream.inner) as usize;
+                let to = Rc::as_ptr(&stream.inner) as usize;
+                let mut guards = Vec::new();
+                append_launch_resource_access_guards(&mut completion.resources, &mut guards);
+                for dependency in &mut completion.dependencies {
+                    dependency.append_access_guards(&mut guards);
+                }
+                reassign_allocation_access_guards(&mut guards, from, to)
             }
         }
     }
+
+    fn append_access_guards<'a>(&'a mut self, guards: &mut Vec<&'a mut AllocationAccessGuard>) {
+        match self {
+            Self::Launch(completion) => {
+                if let Some(resources) = &mut completion.resources {
+                    append_launch_resource_access_guards(std::slice::from_mut(resources), guards);
+                }
+            }
+            Self::Batch(completion) => {
+                append_launch_resource_access_guards(&mut completion.resources, guards);
+                for dependency in &mut completion.dependencies {
+                    dependency.append_access_guards(guards);
+                }
+            }
+        }
+    }
+
+    fn append_access_guards_readonly<'a>(&'a self, guards: &mut Vec<&'a AllocationAccessGuard>) {
+        match self {
+            Self::Launch(completion) => {
+                if let Some(resources) = &completion.resources {
+                    append_launch_resource_access_guards_readonly(
+                        std::slice::from_ref(resources),
+                        guards,
+                    );
+                }
+            }
+            Self::Batch(completion) => {
+                append_launch_resource_access_guards_readonly(&completion.resources, guards);
+                for dependency in &completion.dependencies {
+                    dependency.append_access_guards_readonly(guards);
+                }
+            }
+        }
+    }
+
+    fn quarantine_and_forget(&mut self) {
+        match self {
+            Self::Launch(completion) => {
+                if let Some(resources) = completion.resources.take() {
+                    resources.quarantine();
+                    std::mem::forget(resources);
+                }
+                if let Some(event) = completion.event.take() {
+                    std::mem::forget(event);
+                }
+            }
+            Self::Batch(completion) => completion.quarantine_and_forget(),
+        }
+    }
+}
+
+fn wait_completion_dependencies<T>(
+    dependencies: &mut Vec<T>,
+    mut wait: impl FnMut(&mut T) -> Result<(), HipError>,
+) -> Result<(), HipError> {
+    let index = 0;
+    while index < dependencies.len() {
+        match wait(&mut dependencies[index]) {
+            Ok(()) => {
+                dependencies.remove(index);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 impl HipKernel {
@@ -1935,7 +3015,8 @@ impl HipKernel {
             kernel_params.as_mut_ptr()
         };
         let mut resources = Some(LaunchResources {
-            _module: self.module.clone(),
+            _module: Some(self.module.clone()),
+            _external_owner: None,
             access_leases,
             stream: stream.clone(),
         });
@@ -2041,6 +3122,157 @@ mod memory_snapshot_tests {
     use super::*;
 
     #[test]
+    fn batch_wait_error_stays_sticky_until_a_full_wait_succeeds() {
+        let mut observed = false;
+        assert_eq!(track_wait_error(&mut observed, Ok::<_, ()>(())), Ok(()));
+        assert!(!observed);
+
+        assert_eq!(
+            track_wait_error(&mut observed, Err::<(), _>("event")),
+            Err("event")
+        );
+        assert!(observed);
+        assert_eq!(
+            track_wait_error(&mut observed, Err::<(), _>("dependency")),
+            Err("dependency")
+        );
+        assert!(observed);
+
+        assert_eq!(track_wait_error(&mut observed, Ok::<_, ()>(())), Ok(()));
+        assert!(!observed);
+    }
+
+    #[test]
+    fn failed_wait_preflight_preserves_the_producer_token_for_retry() {
+        let handed_off = false;
+        let wait_error_observed = true;
+        let has_live_readbacks = false;
+        assert!(!batch_handoff_is_available(
+            handed_off,
+            wait_error_observed,
+            has_live_readbacks,
+        ));
+        assert!(!handed_off);
+        assert!(wait_error_observed);
+        assert!(!has_live_readbacks);
+
+        assert!(batch_handoff_is_available(false, false, false));
+    }
+
+    #[test]
+    fn queue_markers_follow_identity_and_are_hidden_after_a_wait_error() {
+        let marker = Rc::new(()) as Rc<dyn Any>;
+        let marker_clone = Rc::clone(&marker);
+        let unrelated = Rc::new(()) as Rc<dyn Any>;
+        let mut markers = Vec::new();
+        register_queue_marker(&mut markers, Rc::clone(&marker));
+        register_queue_marker(&mut markers, marker_clone);
+
+        assert_eq!(markers.len(), 1);
+        assert!(completion_has_queue_marker(&markers, false, &marker));
+        assert!(!completion_has_queue_marker(&markers, true, &marker));
+        assert!(!completion_has_queue_marker(&markers, false, &unrelated));
+    }
+
+    #[test]
+    fn device_copy_preflight_checks_both_ranges_and_aliasing() {
+        assert_eq!(
+            validate_device_copy(16, 8, 9, false),
+            Err(HipError::BufferTooSmall {
+                allocation: 8,
+                requested: 9,
+            })
+        );
+        assert_eq!(
+            validate_device_copy(8, 16, 9, false),
+            Err(HipError::BufferTooSmall {
+                allocation: 8,
+                requested: 9,
+            })
+        );
+        assert_eq!(validate_device_copy(8, 8, 8, true), Err(HipError::Busy));
+        assert_eq!(validate_device_copy(8, 8, 0, true), Ok(()));
+        assert_eq!(validate_device_copy(8, 16, 8, false), Ok(()));
+    }
+
+    #[test]
+    fn host_upload_preflight_checks_bounds_overflow_and_empty_end_ranges() {
+        assert_eq!(validate_buffer_range(16, 4, 12), Ok(()));
+        assert_eq!(validate_buffer_range(16, 16, 0), Ok(()));
+        assert_eq!(
+            validate_buffer_range(16, 4, 13),
+            Err(HipError::BufferTooSmall {
+                allocation: 12,
+                requested: 13,
+            })
+        );
+        assert_eq!(
+            validate_buffer_range(16, usize::MAX, 1),
+            Err(HipError::BufferTooSmall {
+                allocation: 0,
+                requested: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn readback_storage_checks_batch_identity_ranges_and_single_queue() {
+        let mut storage = HipReadbackStorage::new();
+        let id = storage.allocate(5);
+        assert!(storage.has_live_readbacks());
+        assert_eq!(storage.validate_destination(&id, 2, 3), Ok(()));
+        assert_eq!(
+            storage.validate_destination(&id, 4, 2),
+            Err(HipError::BufferTooSmall {
+                allocation: 1,
+                requested: 2,
+            })
+        );
+
+        let mut foreign_storage = HipReadbackStorage::new();
+        let foreign_id = foreign_storage.allocate(5);
+        assert_eq!(
+            storage.validate_destination(&foreign_id, 0, 1),
+            Err(HipError::InvalidReadbackId)
+        );
+
+        let destination = storage.prepare_destination(&id, 1, 3).unwrap();
+        // SAFETY: the storage allocated five writable bytes and the checked range [1, 4) fits.
+        // The pointer is the only access to those bytes until completion in production.
+        unsafe { ptr::copy_nonoverlapping(b"abc".as_ptr(), destination, 3) };
+        assert_eq!(
+            storage.validate_destination(&id, 0, 1),
+            Err(HipError::ReadbackAlreadyQueued)
+        );
+        assert_eq!(storage.read(&id).unwrap(), &[0, b'a', b'b', b'c', 0]);
+
+        assert_eq!(
+            storage.take(&id).unwrap().as_ref(),
+            &[0, b'a', b'b', b'c', 0]
+        );
+        assert_eq!(storage.take(&id), Err(HipError::InvalidReadbackId));
+        assert!(!storage.has_live_readbacks());
+    }
+
+    #[test]
+    fn empty_readback_has_an_owned_identity_and_no_copy_range() {
+        let mut storage = HipReadbackStorage::new();
+        let empty = storage.allocate(0);
+        assert_eq!(storage.validate_destination(&empty, 0, 0), Ok(()));
+        assert_eq!(storage.read(&empty).unwrap(), &[]);
+        assert_eq!(storage.take(&empty).unwrap().as_ref(), &[]);
+        assert_eq!(storage.read(&empty), Err(HipError::InvalidReadbackId));
+    }
+
+    #[test]
+    fn readback_waits_for_the_final_event_resources_and_recursive_dependencies() {
+        assert!(!readback_is_complete(false, false, true));
+        assert!(!readback_is_complete(true, false, false));
+        assert!(!readback_is_complete(false, true, false));
+        assert!(readback_is_complete(false, false, false));
+    }
+
+    #[test]
     fn timing_events_keep_distinct_flags_from_completion_events() {
         assert_eq!(HIP_EVENT_DEFAULT, 0);
         assert_eq!(HIP_EVENT_DISABLE_TIMING, 2);
@@ -2123,6 +3355,139 @@ mod memory_snapshot_tests {
     }
 
     #[test]
+    fn allocation_gate_handoff_moves_a_sole_lease_to_the_consumer_stream() {
+        let state = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let mut producer_lease = state.acquire_stream(11).unwrap();
+        let eligibility = [&producer_lease];
+        assert!(allocation_access_guards_can_reassign(&eligibility, 11, 12));
+        let mut guards = [&mut producer_lease];
+
+        reassign_allocation_access_guards(&mut guards, 11, 12).unwrap();
+        assert_eq!(
+            state.state.get(),
+            AllocationAccessState::Stream {
+                identity: 12,
+                leases: 1,
+            }
+        );
+        assert!(state.acquire_stream(11).is_err());
+        let consumer_lease = state.acquire_stream(12).unwrap();
+        drop(producer_lease);
+        assert_eq!(
+            state.state.get(),
+            AllocationAccessState::Stream {
+                identity: 12,
+                leases: 1,
+            }
+        );
+        drop(consumer_lease);
+        assert_eq!(state.state.get(), AllocationAccessState::Idle);
+    }
+
+    #[test]
+    fn allocation_gate_handoff_preflights_every_lease_before_mutating_any() {
+        let sole = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let shared = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let mut sole_lease = sole.acquire_stream(11).unwrap();
+        let mut shared_lease = shared.acquire_stream(11).unwrap();
+        let other_shared_lease = shared.acquire_stream(11).unwrap();
+        let sole_guard = [&sole_lease];
+        let shared_guard = [&shared_lease];
+        let whole_batch_guards = [&sole_lease, &shared_lease];
+        assert!(allocation_access_guards_can_reassign(&sole_guard, 11, 12));
+        assert!(!allocation_access_guards_can_reassign(
+            &shared_guard,
+            11,
+            12
+        ));
+        assert!(!allocation_access_guards_can_reassign(
+            &whole_batch_guards,
+            11,
+            12
+        ));
+        let mut guards = [&mut sole_lease, &mut shared_lease];
+
+        assert!(reassign_allocation_access_guards(&mut guards, 11, 12).is_err());
+        assert_eq!(
+            sole.state.get(),
+            AllocationAccessState::Stream {
+                identity: 11,
+                leases: 1,
+            }
+        );
+        assert_eq!(
+            shared.state.get(),
+            AllocationAccessState::Stream {
+                identity: 11,
+                leases: 2,
+            }
+        );
+
+        drop(other_shared_lease);
+        drop(shared_lease);
+        drop(sole_lease);
+        assert_eq!(sole.state.get(), AllocationAccessState::Idle);
+        assert_eq!(shared.state.get(), AllocationAccessState::Idle);
+    }
+
+    #[test]
+    fn allocation_gate_handoff_moves_all_leases_owned_by_one_batch() {
+        let shared = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let mut first_lease = shared.acquire_stream(11).unwrap();
+        let mut second_lease = shared.acquire_stream(11).unwrap();
+        let batch_guards = [&first_lease, &second_lease];
+        assert!(allocation_access_guards_can_reassign(&batch_guards, 11, 12));
+        let mut guards = [&mut first_lease, &mut second_lease];
+
+        reassign_allocation_access_guards(&mut guards, 11, 12).unwrap();
+        assert_eq!(
+            shared.state.get(),
+            AllocationAccessState::Stream {
+                identity: 12,
+                leases: 2,
+            }
+        );
+        assert!(shared.acquire_stream(11).is_err());
+        let third_lease = shared.acquire_stream(12).unwrap();
+        drop(first_lease);
+        drop(second_lease);
+        assert_eq!(
+            shared.state.get(),
+            AllocationAccessState::Stream {
+                identity: 12,
+                leases: 1,
+            }
+        );
+        drop(third_lease);
+        assert_eq!(shared.state.get(), AllocationAccessState::Idle);
+    }
+
+    #[test]
+    fn handed_off_allocation_is_quarantined_under_the_consumer_stream_identity() {
+        let state = Rc::new(AllocationAccess {
+            state: Cell::new(AllocationAccessState::Idle),
+        });
+        let mut producer_lease = state.acquire_stream(11).unwrap();
+        let mut guards = [&mut producer_lease];
+
+        reassign_allocation_access_guards(&mut guards, 11, 12).unwrap();
+        producer_lease.quarantine_stream();
+        drop(producer_lease);
+
+        assert_eq!(state.state.get(), AllocationAccessState::Poisoned);
+        assert!(state.acquire_stream(11).is_err());
+        assert!(state.acquire_stream(12).is_err());
+    }
+
+    #[test]
     fn queued_node_leases_remain_exclusive_until_the_batch_releases_them() {
         let state = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
@@ -2167,6 +3532,69 @@ mod memory_snapshot_tests {
     fn poisoned_batch_rejects_more_work_and_finish() {
         assert_eq!(ensure_batch_open(false), Ok(()));
         assert_eq!(ensure_batch_open(true), Err(HipError::BatchPoisoned));
+    }
+
+    #[test]
+    fn dependency_wait_removes_successes_and_retains_failed_and_unvisited_tokens() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct WaitFixture {
+            id: u8,
+            failures_left: u8,
+            attempts: u8,
+        }
+
+        let mut dependencies = vec![
+            WaitFixture {
+                id: 1,
+                failures_left: 0,
+                attempts: 0,
+            },
+            WaitFixture {
+                id: 2,
+                failures_left: 1,
+                attempts: 0,
+            },
+            WaitFixture {
+                id: 3,
+                failures_left: 0,
+                attempts: 0,
+            },
+        ];
+        let first_wait = wait_completion_dependencies(&mut dependencies, |dependency| {
+            dependency.attempts += 1;
+            if dependency.failures_left > 0 {
+                dependency.failures_left -= 1;
+                Err(HipError::BatchPoisoned)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(first_wait, Err(HipError::BatchPoisoned));
+        assert_eq!(
+            dependencies,
+            vec![
+                WaitFixture {
+                    id: 2,
+                    failures_left: 0,
+                    attempts: 1,
+                },
+                WaitFixture {
+                    id: 3,
+                    failures_left: 0,
+                    attempts: 0,
+                },
+            ]
+        );
+
+        assert_eq!(
+            wait_completion_dependencies(&mut dependencies, |dependency| {
+                dependency.attempts += 1;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert!(dependencies.is_empty());
     }
 
     #[test]
@@ -2224,6 +3652,288 @@ extern "C" __global__ void increment(float* value) {
             .copy_to(&mut actual)
             .expect("read completed device value");
         assert_eq!(f32::from_ne_bytes(actual).to_bits(), 2.0_f32.to_bits());
+    }
+
+    #[test]
+    #[ignore = "requires RX 6900 XT and ROCm device access"]
+    fn rx_6900_xt_cross_stream_completion_handoff_transfers_buffer_lease() {
+        let runtime = HipRuntime::new(0).expect("RX 6900 XT HIP runtime");
+        let info = runtime.device_info().expect("selected HIP device info");
+        assert!(
+            info.name.contains("6900 XT"),
+            "unexpected GPU: {}",
+            info.name
+        );
+
+        let image = crate::compile_hip_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void produce(unsigned int* value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] = 40u;
+}
+extern "C" __global__ void consume(unsigned int* value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] += 2u;
+}
+"#,
+        )
+        .expect("compile cross-stream producer and consumer with HIPRTC");
+        let module = runtime.load_module(&image).expect("load HIP module");
+        let producer = module
+            .function(c"produce")
+            .expect("resolve producer kernel");
+        let consumer = module
+            .function(c"consume")
+            .expect("resolve consumer kernel");
+        let producer_stream = runtime.create_stream().expect("create producer stream");
+        let consumer_stream = runtime.create_stream().expect("create consumer stream");
+        let buffer = runtime
+            .allocate(size_of::<u32>())
+            .expect("allocate shared u32 buffer");
+        let arguments = [HipKernelArgument::Buffer(&buffer)];
+
+        // SAFETY: both HIPRTC kernels take one u32 pointer and access only the allocated word.
+        let producer_completion = unsafe {
+            producer
+                .launch(&producer_stream, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .expect("launch producer kernel")
+        };
+        let mut consumer_batch = HipCompletionBatch::new(&consumer_stream);
+        consumer_batch
+            .wait_for(producer_completion)
+            .expect("enqueue cross-stream dependency and hand off buffer lease");
+        // SAFETY: wait_for orders this consumer after the producer event and transfers the
+        // producer's sole buffer lease to the consumer stream before this launch acquires it.
+        unsafe {
+            consumer
+                .launch_into_batch(&mut consumer_batch, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .expect("launch consumer kernel on dependent stream");
+        }
+        let mut completion = consumer_batch
+            .finish()
+            .expect("record consumer final event");
+        completion.wait().expect("wait for consumer completion");
+
+        let mut actual = [0_u8; size_of::<u32>()];
+        buffer
+            .copy_to(&mut actual)
+            .expect("read completed device value");
+        assert_eq!(u32::from_ne_bytes(actual), 42);
+    }
+
+    #[test]
+    #[ignore = "requires RX 6900 XT and ROCm device access"]
+    fn rx_6900_xt_cross_stream_batch_handoff_transfers_shared_buffer_leases() {
+        let runtime = HipRuntime::new(0).expect("RX 6900 XT HIP runtime");
+        let info = runtime.device_info().expect("selected HIP device info");
+        assert!(
+            info.name.contains("6900 XT"),
+            "unexpected GPU: {}",
+            info.name
+        );
+
+        let image = crate::compile_hip_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void produce(unsigned int* value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] = 20u;
+}
+extern "C" __global__ void accumulate(unsigned int* value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] += 20u;
+}
+extern "C" __global__ void consume(unsigned int* value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] += 2u;
+}
+"#,
+        )
+        .expect("compile batch producer and consumer kernels with HIPRTC");
+        let module = runtime.load_module(&image).expect("load HIP module");
+        let producer = module
+            .function(c"produce")
+            .expect("resolve producer kernel");
+        let accumulate = module
+            .function(c"accumulate")
+            .expect("resolve accumulation kernel");
+        let consumer = module
+            .function(c"consume")
+            .expect("resolve consumer kernel");
+        let producer_stream = runtime.create_stream().expect("create producer stream");
+        let consumer_stream = runtime.create_stream().expect("create consumer stream");
+        let buffer = runtime
+            .allocate(size_of::<u32>())
+            .expect("allocate shared u32 buffer");
+        let arguments = [HipKernelArgument::Buffer(&buffer)];
+
+        let mut producer_batch = HipCompletionBatch::new(&producer_stream);
+        // SAFETY: all kernels take one u32 pointer and access only the allocated word. Both
+        // producer launches are ordered in one batch, whose final event protects the two leases.
+        unsafe {
+            producer
+                .launch_into_batch(&mut producer_batch, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .expect("queue first producer launch");
+            accumulate
+                .launch_into_batch(&mut producer_batch, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .expect("queue second producer launch");
+        }
+        let mut producer_completion = producer_batch
+            .finish()
+            .expect("record producer batch final event");
+
+        let mut consumer_batch = HipCompletionBatch::new(&consumer_stream);
+        consumer_batch
+            .wait_for_batch(&mut producer_completion)
+            .expect("enqueue batch dependency and transfer both buffer leases");
+        // SAFETY: wait_for_batch orders this consumer after both producer launches and transfers
+        // all producer-owned leases to the consumer stream before this launch acquires the word.
+        unsafe {
+            consumer
+                .launch_into_batch(&mut consumer_batch, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .expect("launch consumer after producer batch");
+        }
+        let mut completion = consumer_batch
+            .finish()
+            .expect("record consumer batch final event");
+        completion
+            .wait()
+            .expect("wait for consumer batch completion");
+
+        let mut actual = [0_u8; size_of::<u32>()];
+        buffer
+            .copy_to(&mut actual)
+            .expect("read completed device value");
+        assert_eq!(u32::from_ne_bytes(actual), 42);
+    }
+
+    #[test]
+    #[ignore = "requires RX 6900 XT and ROCm device access"]
+    fn rx_6900_xt_batch_device_copy_retains_buffers_until_final_event() {
+        let runtime = HipRuntime::new(0).expect("RX 6900 XT HIP runtime");
+        let info = runtime.device_info().expect("selected HIP device info");
+        assert!(
+            info.name.contains("6900 XT"),
+            "unexpected GPU: {}",
+            info.name
+        );
+        let stream = runtime.create_stream().expect("create HIP stream");
+        let mut source = runtime
+            .allocate(size_of::<u32>())
+            .expect("allocate source word");
+        let destination = runtime
+            .allocate(size_of::<u32>())
+            .expect("allocate destination word");
+        source
+            .copy_from(&0xA1B2_C3D4_u32.to_ne_bytes())
+            .expect("initialize source word");
+
+        let mut batch = HipCompletionBatch::new(&stream);
+        batch
+            .copy_device_to_device(&destination, &source, size_of::<u32>())
+            .expect("enqueue asynchronous batch copy");
+        assert!(matches!(destination.acquire_access(), Err(HipError::Busy)));
+        assert!(matches!(source.acquire_access(), Err(HipError::Busy)));
+        batch
+            .finish()
+            .expect("record final batch event")
+            .wait()
+            .expect("wait for copied data");
+
+        let mut actual = [0_u8; size_of::<u32>()];
+        destination
+            .copy_to(&mut actual)
+            .expect("read copied destination word");
+        assert_eq!(u32::from_ne_bytes(actual), 0xA1B2_C3D4);
+    }
+
+    #[test]
+    #[ignore = "requires RX 6900 XT and ROCm device access"]
+    fn rx_6900_xt_batch_host_upload_retains_payload_and_destination_until_final_event() {
+        let runtime = HipRuntime::new(0).expect("RX 6900 XT HIP runtime");
+        let info = runtime.device_info().expect("selected HIP device info");
+        assert!(
+            info.name.contains("6900 XT"),
+            "unexpected GPU: {}",
+            info.name
+        );
+        let stream = runtime.create_stream().expect("create HIP stream");
+        let mut destination = runtime.allocate(8).expect("allocate destination bytes");
+        destination
+            .copy_from(&[0xA5; 8])
+            .expect("initialize bytes outside the upload range");
+        let payload: Arc<[u8]> = Arc::from([0x10_u8, 0x20, 0x30, 0x40]);
+        let payload_weak = Arc::downgrade(&payload);
+
+        let mut batch = HipCompletionBatch::new(&stream);
+        batch
+            .copy_host_to_device_at(&destination, 2, Arc::clone(&payload))
+            .expect("enqueue asynchronous host upload");
+        drop(payload);
+        assert!(payload_weak.upgrade().is_some());
+        assert!(matches!(destination.acquire_access(), Err(HipError::Busy)));
+
+        batch
+            .finish()
+            .expect("record final batch event")
+            .wait()
+            .expect("wait for uploaded data");
+        assert!(payload_weak.upgrade().is_none());
+
+        let mut actual = [0_u8; 8];
+        destination
+            .copy_to(&mut actual)
+            .expect("read uploaded destination bytes");
+        assert_eq!(actual, [0xA5, 0xA5, 0x10, 0x20, 0x30, 0x40, 0xA5, 0xA5]);
+    }
+
+    #[test]
+    #[ignore = "requires RX 6900 XT and ROCm device access"]
+    fn rx_6900_xt_batch_device_readback_is_hidden_until_full_completion() {
+        let runtime = HipRuntime::new(0).expect("RX 6900 XT HIP runtime");
+        let info = runtime.device_info().expect("selected HIP device info");
+        assert!(
+            info.name.contains("6900 XT"),
+            "unexpected GPU: {}",
+            info.name
+        );
+        let stream = runtime.create_stream().expect("create HIP stream");
+        let mut source = runtime.allocate(8).expect("allocate source bytes");
+        source
+            .copy_from(&[0x10_u8, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80])
+            .expect("initialize source bytes");
+
+        let mut batch = HipCompletionBatch::new(&stream);
+        let id = batch
+            .allocate_readback(6)
+            .expect("allocate readback storage");
+        batch
+            .copy_device_to_host_at(&source, 2, &id, 1, 4)
+            .expect("enqueue asynchronous readback from checked ranges");
+        assert_eq!(
+            batch.copy_device_to_host_at(&source, 0, &id, 0, 1),
+            Err(HipError::ReadbackAlreadyQueued)
+        );
+        assert!(matches!(source.acquire_access(), Err(HipError::Busy)));
+
+        let mut completion = batch.finish().expect("record final readback event");
+        let mut consumer_batch =
+            HipCompletionBatch::new(&runtime.create_stream().expect("create consumer stream"));
+        assert_eq!(
+            consumer_batch.wait_for_batch(&mut completion),
+            Err(HipError::Busy)
+        );
+        assert_eq!(completion.readback(&id), Err(HipError::BatchNotComplete));
+        completion.wait().expect("wait for asynchronous readback");
+        assert_eq!(
+            completion.readback(&id).expect("borrow completed bytes"),
+            &[0, 0x30, 0x40, 0x50, 0x60, 0]
+        );
+        assert_eq!(
+            completion.take_readback(&id).unwrap().as_ref(),
+            &[0, 0x30, 0x40, 0x50, 0x60, 0]
+        );
+        assert_eq!(
+            completion.take_readback(&id),
+            Err(HipError::InvalidReadbackId)
+        );
+        assert!(source.acquire_access().is_ok());
     }
 
     #[test]

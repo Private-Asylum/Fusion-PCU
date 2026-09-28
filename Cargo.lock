@@ -475,8 +475,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
-name = "fusion-example-hosted-compute-rocm"
-version = "0.1.0"
+name = "fusion-pcu"
+version = "0.0.1"
+
+[[package]]
+name = "fusion-pcu-cpu"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-cuda"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-dx12"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-example-rocm"
+version = "0.0.1"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -484,11 +509,13 @@ dependencies = [
  "fusion-pcu-macros",
  "fusion-pcu-rocm",
  "fusion-pcu-tensor",
+ "libc",
+ "libloading",
 ]
 
 [[package]]
-name = "fusion-example-hosted-graphics-vulkan"
-version = "0.1.0"
+name = "fusion-pcu-example-vulkan"
+version = "0.0.1"
 dependencies = [
  "fusion-pcu",
  "fusion-pcu-macros",
@@ -497,19 +524,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "fusion-pcu"
-version = "0.1.0"
-
-[[package]]
-name = "fusion-pcu-cpu"
-version = "0.1.0"
+name = "fusion-pcu-ilz"
+version = "0.0.1"
 dependencies = [
  "fusion-pcu",
 ]
 
 [[package]]
 name = "fusion-pcu-macros"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "fusion-pcu",
  "fusion-pcu-cpu",
@@ -522,8 +545,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "fusion-pcu-metal"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-mlx"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-opencl"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-opengl"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
 name = "fusion-pcu-rocm"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "fusion-pcu",
  "fusion-pcu-tensor",
@@ -533,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-runner"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "ash",
  "fusion-pcu",
@@ -542,21 +593,35 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-spirv"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "fusion-pcu",
 ]
 
 [[package]]
 name = "fusion-pcu-tensor"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "fusion-pcu",
 ]
 
 [[package]]
 name = "fusion-pcu-vm-reference"
-version = "0.1.0"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-vulkan"
+version = "0.0.1"
+dependencies = [
+ "fusion-pcu",
+]
+
+[[package]]
+name = "fusion-pcu-wgpu"
+version = "0.0.1"
 dependencies = [
  "fusion-pcu",
 ]

@@ -281,6 +281,9 @@ fn lower_dispatch_to_hip_source_with_preamble(
     } else {
         String::new()
     };
+    // Ordinary IR arithmetic preserves each operation's rounding boundary.
+    // Explicit fused operations remain explicit intrinsics.
+    source.push_str("#pragma clang fp contract(off)\n");
     source.push_str("extern \"C\" __global__ void fusion_kernel(");
     for (index, binding) in kernel.bindings.iter().enumerate() {
         if index != 0 {
@@ -651,6 +654,9 @@ fn lower_exact_f32_f64_to_hip(
     } else {
         String::new()
     };
+    // Ordinary IR arithmetic preserves each operation's rounding boundary.
+    // Explicit fused operations remain explicit intrinsics.
+    source.push_str("#pragma clang fp contract(off)\n");
     source.push_str(EXACT_F32_F64_HIP_HELPER);
     source.push_str("\nextern \"C\" __global__ void fusion_kernel(");
     for (index, binding) in kernel.bindings.iter().enumerate() {
@@ -867,6 +873,9 @@ fn lower_half_conversion_to_hip(
     } else {
         String::new()
     };
+    // Ordinary IR arithmetic preserves each operation's rounding boundary.
+    // Explicit fused operations remain explicit intrinsics.
+    source.push_str("#pragma clang fp contract(off)\n");
     source.push_str(half_conversion_helpers(profile));
     source.push_str("\nextern \"C\" __global__ void fusion_kernel(");
     for (index, binding) in kernel.bindings.iter().enumerate() {
@@ -1225,6 +1234,9 @@ fn lower_mixed_widening_to_hip(
     } else {
         String::new()
     };
+    // Ordinary IR arithmetic preserves each operation's rounding boundary.
+    // Explicit fused operations remain explicit intrinsics.
+    source.push_str("#pragma clang fp contract(off)\n");
     source.push_str("extern \"C\" __global__ void fusion_kernel(");
     for (index, binding) in kernel.bindings.iter().enumerate() {
         if index != 0 {

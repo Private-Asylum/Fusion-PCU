@@ -19,6 +19,13 @@ use fusion_pcu_rocm::{
     compile_hip_source_for_device,
 };
 use fusion_pcu::PcuObjectRef;
+#[cfg(feature = "insights")]
+use fusion_pcu::insights::{
+    InsightClock,
+    InsightLedger,
+    InsightRecord,
+    InsightStatus,
+};
 
 #[derive(Clone, Copy)]
 pub struct TrainInputs<'a> {
@@ -68,6 +75,28 @@ pub struct NativeTrainTimings {
     pub batched_update_wait: Duration,
     pub output_readback: Duration,
     pub total: Duration,
+}
+
+/// Caller-clock tick records for the strict fully-batched route, available with `insights`.
+/// Per-step arrays are ordered as graph step 0 then graph step 1. Every phase record exposes
+/// inclusive and exclusive ticks; `final_readback` includes result allocation and copy.
+#[cfg(feature = "insights")]
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // Shared support module is also compiled by benches that do not use profiling.
+pub struct NativeFullyBatchedTickProfile {
+    pub forward_sgemm_enqueue: [InsightRecord; 2],
+    pub delta_enqueue: [InsightRecord; 2],
+    pub scale_enqueue: [InsightRecord; 2],
+    pub gradient_sgemm_enqueue: [InsightRecord; 2],
+    pub update_enqueue: [InsightRecord; 2],
+    /// `batch.finish()`, including event recording and ownership transfer to completion.
+    pub batch_finish: [InsightRecord; 2],
+    pub completion_wait: [InsightRecord; 2],
+    /// Dropping the completed batch and releasing its retained launch resources.
+    pub postwait_drop: [InsightRecord; 2],
+    pub final_readback: InsightRecord,
+    pub whole_call: InsightRecord,
+    pub status: InsightStatus,
 }
 
 const SOURCE: &str = r#"
@@ -135,7 +164,48 @@ pub struct NativeTrainStep {
     route: TrainingRoute,
 }
 
+#[cfg(feature = "insights")]
+macro_rules! native_phase {
+    ($timings:expr, $phase:expr, $step:expr, $operation:block) => {
+        $timings.measure($phase, $step, || $operation.map_err(Into::into))
+    };
+}
+
+#[cfg(not(feature = "insights"))]
+macro_rules! native_phase {
+    ($timings:expr, $phase:expr, $step:expr, $operation:block) => {
+        $operation
+    };
+}
+
 impl NativeTrainStep {
+    /// Replace resident strict-route inputs without rebuilding kernels or intermediate storage.
+    /// Previous executions must have completed before this method is called.
+    #[allow(dead_code)] // Used by the volume bench; the fixed-input bench shares this module.
+    pub fn replace_strict_inputs(
+        &mut self,
+        samples: &[f32],
+        target: &[f32],
+        initial_weights: &[f32],
+    ) -> Result<(), Box<dyn Error>> {
+        if !matches!(self.route, TrainingRoute::Strict { .. })
+            || samples.len()
+                != self
+                    .rows
+                    .checked_mul(self.features)
+                    .ok_or("input extent overflow")?
+            || target.len() != self.rows
+            || initial_weights.len() != self.features
+        {
+            return Err("replacement strict inputs have an incompatible route or shape".into());
+        }
+        self.samples.copy_from(bytemuck::cast_slice(samples))?;
+        self.target.copy_from(bytemuck::cast_slice(target))?;
+        self.initial_weights
+            .copy_from(bytemuck::cast_slice(initial_weights))?;
+        Ok(())
+    }
+
     pub fn prepare(
         discovery: &RocmDiscovery,
         device: PcuObjectRef,
@@ -243,6 +313,171 @@ impl NativeTrainStep {
     /// update completes before the following step reads its output as weights.
     pub fn execute_two_batched(&self) -> Result<Vec<f32>, Box<dyn Error>> {
         self.execute_two_inner(None, true)
+    }
+
+    /// Run the strict route with each complete graph step queued into one same-stream batch.
+    ///
+    /// The two SGEMMs and the dependent pointwise kernels share a batch. Each graph step waits
+    /// once before the next step consumes its updated weights, matching the PCU step boundary.
+    pub fn execute_two_fully_batched(&self) -> Result<Vec<f32>, Box<dyn Error>> {
+        #[cfg(feature = "insights")]
+        {
+            self.execute_two_fully_batched_inner(&mut NoopFullyBatchedTiming)
+        }
+        #[cfg(not(feature = "insights"))]
+        {
+            self.execute_two_fully_batched_inner()
+        }
+    }
+
+    /// Collect caller-clock phase records for the strict fully-batched route.
+    ///
+    /// Available only with the example crate's `insights` feature. These are host timings, not GPU
+    /// event durations; caller-provided clock context changes invalidate samples per core policy.
+    #[cfg(feature = "insights")]
+    #[allow(dead_code)] // Used by the opt-in training insights bench.
+    pub fn execute_two_fully_batched_profiled<C: InsightClock>(
+        &self,
+        clock: &mut C,
+    ) -> Result<(Vec<f32>, NativeFullyBatchedTickProfile), Box<dyn Error>> {
+        let mut ledger = InsightLedger::<_, 18, 2>::new(BorrowedInsightClock(clock));
+        let result = ledger.scope(0, |ledger| {
+            self.execute_two_fully_batched_inner(&mut CollectFullyBatchedTiming(ledger))
+        })?;
+        let records = ledger.records();
+        Ok((
+            result,
+            NativeFullyBatchedTickProfile {
+                forward_sgemm_enqueue: [records[1], records[9]],
+                delta_enqueue: [records[2], records[10]],
+                scale_enqueue: [records[3], records[11]],
+                gradient_sgemm_enqueue: [records[4], records[12]],
+                update_enqueue: [records[5], records[13]],
+                batch_finish: [records[6], records[14]],
+                completion_wait: [records[7], records[15]],
+                postwait_drop: [records[8], records[16]],
+                final_readback: records[17],
+                whole_call: records[0],
+                status: ledger.status(),
+            },
+        ))
+    }
+
+    #[allow(
+        clippy::explicit_counter_loop, // Step index selects the corresponding fixed ledger slots.
+        clippy::too_many_lines // Keep ordered graph phases beside their enqueue operations.
+    )]
+    fn execute_two_fully_batched_inner(
+        &self,
+        #[cfg(feature = "insights")] timings: &mut impl FullyBatchedTimingSink,
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        let TrainingRoute::Strict { learning_rate } = self.route else {
+            return Err("fully batched execution requires the strict native route".into());
+        };
+        let delta = self
+            .delta
+            .as_ref()
+            .ok_or("strict route has no delta buffer")?;
+
+        #[cfg(feature = "insights")]
+        let mut step_index = 0;
+        for (weights, updated) in [
+            (&self.initial_weights, &self.weights),
+            (&self.weights, &self.updated),
+        ] {
+            #[cfg(feature = "insights")]
+            let step = step_index;
+            let mut batch = HipCompletionBatch::new(&self.stream);
+            native_phase!(timings, FullyBatchedPhase::ForwardSgemm, step, {
+                self.blas.sgemm_into_batch(
+                    &mut batch,
+                    false,
+                    false,
+                    1,
+                    self.rows,
+                    self.features,
+                    1.0,
+                    weights,
+                    1,
+                    &self.samples,
+                    self.features,
+                    0.0,
+                    &self.prediction,
+                    1,
+                )
+            })?;
+            native_phase!(timings, FullyBatchedPhase::DeltaEnqueue, step, {
+                launch_binary_into_batch(
+                    &self.delta_kernel,
+                    &mut batch,
+                    &self.prediction,
+                    &self.target,
+                    delta,
+                    self.rows,
+                )
+            })?;
+            native_phase!(timings, FullyBatchedPhase::ScaleEnqueue, step, {
+                launch_binary_into_batch(
+                    &self.scale_error_kernel,
+                    &mut batch,
+                    delta,
+                    &self.factor,
+                    &self.error,
+                    self.rows,
+                )
+            })?;
+            native_phase!(timings, FullyBatchedPhase::GradientSgemm, step, {
+                self.blas.sgemm_into_batch(
+                    &mut batch,
+                    false,
+                    true,
+                    1,
+                    self.features,
+                    self.rows,
+                    1.0,
+                    &self.error,
+                    1,
+                    &self.samples,
+                    self.features,
+                    0.0,
+                    &self.gradient,
+                    1,
+                )
+            })?;
+            native_phase!(timings, FullyBatchedPhase::UpdateEnqueue, step, {
+                launch_scalar_update_into_batch(
+                    &self.strict_update_kernel,
+                    &mut batch,
+                    weights,
+                    &self.gradient,
+                    learning_rate,
+                    updated,
+                    self.features,
+                )
+            })?;
+            let mut completion = native_phase!(timings, FullyBatchedPhase::BatchFinish, step, {
+                batch.finish()
+            })?;
+            let wait_result = native_phase!(timings, FullyBatchedPhase::CompletionWait, step, {
+                completion.wait()
+            });
+            native_phase!(timings, FullyBatchedPhase::PostwaitDrop, step, {
+                drop(completion);
+                Ok::<(), Box<dyn Error>>(())
+            })?;
+            wait_result?;
+            #[cfg(feature = "insights")]
+            {
+                step_index += 1;
+            }
+        }
+
+        native_phase!(timings, FullyBatchedPhase::FinalReadback, 0, {
+            let mut result = vec![0.0_f32; self.features];
+            self.updated
+                .copy_to(bytemuck::cast_slice_mut(&mut result))?;
+            Ok::<Vec<f32>, Box<dyn Error>>(result)
+        })
     }
 
     /// Run two strict-route batched steps while profiling host launch and completion waits.
@@ -605,6 +840,92 @@ impl NativeTrainStep {
     }
 }
 
+#[cfg(feature = "insights")]
+#[derive(Clone, Copy)]
+enum FullyBatchedPhase {
+    ForwardSgemm,
+    DeltaEnqueue,
+    ScaleEnqueue,
+    GradientSgemm,
+    UpdateEnqueue,
+    BatchFinish,
+    CompletionWait,
+    PostwaitDrop,
+    FinalReadback,
+}
+
+#[cfg(feature = "insights")]
+trait FullyBatchedTimingSink {
+    fn measure<T>(
+        &mut self,
+        phase: FullyBatchedPhase,
+        step: usize,
+        operation: impl FnOnce() -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>>;
+}
+
+#[cfg(feature = "insights")]
+struct NoopFullyBatchedTiming;
+
+#[cfg(feature = "insights")]
+impl FullyBatchedTimingSink for NoopFullyBatchedTiming {
+    fn measure<T>(
+        &mut self,
+        _: FullyBatchedPhase,
+        _: usize,
+        operation: impl FnOnce() -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        operation()
+    }
+}
+
+#[cfg(feature = "insights")]
+#[allow(dead_code)] // Shared support module is also compiled by benches that do not use profiling.
+struct BorrowedInsightClock<'a, C>(&'a mut C);
+
+#[cfg(feature = "insights")]
+impl<C: InsightClock> InsightClock for BorrowedInsightClock<'_, C> {
+    fn stamp(&mut self) -> fusion_pcu::insights::InsightStamp {
+        self.0.stamp()
+    }
+}
+
+#[cfg(feature = "insights")]
+#[allow(dead_code)] // Constructed only by the opt-in training insights bench.
+struct CollectFullyBatchedTiming<'a, C: InsightClock>(&'a mut InsightLedger<C, 18, 2>);
+
+#[cfg(feature = "insights")]
+impl<C: InsightClock> FullyBatchedTimingSink for CollectFullyBatchedTiming<'_, C> {
+    fn measure<T>(
+        &mut self,
+        phase: FullyBatchedPhase,
+        step: usize,
+        operation: impl FnOnce() -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        let point = phase.point(step);
+        self.0.scope(point, |_| operation())
+    }
+}
+
+#[cfg(feature = "insights")]
+impl FullyBatchedPhase {
+    #[cfg(feature = "insights")]
+    const fn point(self, step: usize) -> usize {
+        let per_step = match self {
+            Self::ForwardSgemm => 0,
+            Self::DeltaEnqueue => 1,
+            Self::ScaleEnqueue => 2,
+            Self::GradientSgemm => 3,
+            Self::UpdateEnqueue => 4,
+            Self::BatchFinish => 5,
+            Self::CompletionWait => 6,
+            Self::PostwaitDrop => 7,
+            Self::FinalReadback => return 17,
+        };
+        1 + step * 8 + per_step
+    }
+}
+
 fn timed<T>(
     duration: Option<&mut Duration>,
     operation: impl FnOnce() -> Result<T, Box<dyn Error>>,
@@ -849,6 +1170,33 @@ fn launch_scalar_update_batched(
     count: usize,
     mut timing: Option<&mut NativeTrainTimings>,
 ) -> Result<(), Box<dyn Error>> {
+    let mut batch = HipCompletionBatch::new(stream);
+    let launch_started = timing.as_ref().map(|_| Instant::now());
+    launch_scalar_update_into_batch(
+        kernel,
+        &mut batch,
+        weights,
+        gradient,
+        learning_rate,
+        updated,
+        count,
+    )?;
+    if let (Some(timing), Some(launch_started)) = (timing.as_deref_mut(), launch_started) {
+        timing.batched_update_launch += launch_started.elapsed();
+    }
+    finish_batch_host_timed(&mut batch, timing, true)
+}
+
+#[allow(clippy::too_many_arguments)] // Keep the strict update ABI arguments explicit.
+fn launch_scalar_update_into_batch(
+    kernel: &HipKernel,
+    batch: &mut HipCompletionBatch,
+    weights: &DeviceBuffer,
+    gradient: &DeviceBuffer,
+    learning_rate: f32,
+    updated: &DeviceBuffer,
+    count: usize,
+) -> Result<(), Box<dyn Error>> {
     let count_u32 = u32::try_from(count)?;
     let learning_rate_bytes = learning_rate.to_ne_bytes();
     let count_bytes = count_u32.to_ne_bytes();
@@ -859,24 +1207,19 @@ fn launch_scalar_update_batched(
         HipKernelArgument::Buffer(updated),
         HipKernelArgument::Bytes(&count_bytes),
     ];
-    let mut batch = HipCompletionBatch::new(stream);
-    let launch_started = timing.as_ref().map(|_| Instant::now());
     // SAFETY: This matches the strict update ABI. Buffer lifetimes extend through enqueue, and
-    // the batch retains launch resources until the final completion is waited.
+    // the batch retains launch resources until its final completion is waited.
     #[allow(unsafe_code)]
     unsafe {
         kernel.launch_into_batch(
-            &mut batch,
+            batch,
             [count_u32.div_ceil(256), 1, 1],
             [256, 1, 1],
             0,
             &args,
         )?;
     }
-    if let (Some(timing), Some(launch_started)) = (timing.as_deref_mut(), launch_started) {
-        timing.batched_update_launch += launch_started.elapsed();
-    }
-    finish_batch_host_timed(&mut batch, timing, true)
+    Ok(())
 }
 
 fn launch_scalar_update_batched_timed(

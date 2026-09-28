@@ -27,6 +27,10 @@ pub enum HipError {
     DifferentRuntime,
     DifferentStream,
     BatchPoisoned,
+    BatchNotComplete,
+    InvalidReadbackId,
+    ReadbackNotQueued,
+    ReadbackAlreadyQueued,
     InvalidExecutionFaultWord(u64),
     Busy,
     InvalidLaunchDimensions,
@@ -81,6 +85,14 @@ impl fmt::Display for HipError {
             Self::BatchPoisoned => formatter.write_str(
                 "HIP completion batch cannot accept work after a launch failure",
             ),
+            Self::BatchNotComplete => formatter
+                .write_str("HIP batch readback is unavailable before all completion dependencies succeed"),
+            Self::InvalidReadbackId => formatter
+                .write_str("HIP readback identifier is foreign, invalid, or already consumed"),
+            Self::ReadbackNotQueued => formatter
+                .write_str("HIP readback identifier has no queued device-to-host copy"),
+            Self::ReadbackAlreadyQueued => formatter
+                .write_str("HIP readback identifier already has a queued device-to-host copy"),
             Self::InvalidExecutionFaultWord(word) => write!(
                 formatter,
                 "HIP returned an invalid checked-division fault word {word:#x}"

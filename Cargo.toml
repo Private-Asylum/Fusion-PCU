@@ -4,8 +4,17 @@ members = [
     "Crates/fusion-pcu",
     "Crates/macros",
     "Crates/backends/rocm",
+    "Crates/backends/cuda",
+    "Crates/backends/mlx",
     "Crates/backends/cpu",
     "Crates/backends/spirv",
+    "Crates/backends/vulkan",
+    "Crates/backends/metal",
+    "Crates/backends/dx12",
+    "Crates/backends/opencl",
+    "Crates/backends/ilz",
+    "Crates/backends/wgpu",
+    "Crates/backends/opengl",
     "Crates/runner",
     "Crates/dialects/tensor",
     "Crates/dialects/vm-reference",
@@ -14,19 +23,28 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 authors = ["Private Asylum LLC"]
 license = "Apache-2.0"
 repository = "https://github.com/Private-Asylum/Fusion-PCU"
 
 [workspace.dependencies]
-fusion-pcu = { version = "0.1.0", path = "Crates/fusion-pcu", default-features = false }
-fusion-pcu-macros = { version = "0.1.0", path = "Crates/macros" }
-fusion-pcu-rocm = { version = "0.1.0", path = "Crates/backends/rocm", default-features = false }
-fusion-pcu-spirv = { version = "0.1.0", path = "Crates/backends/spirv", default-features = false }
-fusion-pcu-runner = { version = "0.1.0", path = "Crates/runner", default-features = false }
-fusion-pcu-tensor = { version = "0.1.0", path = "Crates/dialects/tensor" }
+fusion-pcu = { version = "0.0.1", path = "Crates/fusion-pcu", default-features = false }
+fusion-pcu-macros = { version = "0.0.1", path = "Crates/macros" }
+fusion-pcu-rocm = { version = "0.0.1", path = "Crates/backends/rocm", default-features = false }
+fusion-pcu-cuda = { version = "0.0.1", path = "Crates/backends/cuda", default-features = false }
+fusion-pcu-mlx = { version = "0.0.1", path = "Crates/backends/mlx", default-features = false }
+fusion-pcu-spirv = { version = "0.0.1", path = "Crates/backends/spirv", default-features = false }
+fusion-pcu-vulkan = { version = "0.0.1", path = "Crates/backends/vulkan", default-features = false }
+fusion-pcu-metal = { version = "0.0.1", path = "Crates/backends/metal", default-features = false }
+fusion-pcu-dx12 = { version = "0.0.1", path = "Crates/backends/dx12", default-features = false }
+fusion-pcu-opencl = { version = "0.0.1", path = "Crates/backends/opencl", default-features = false }
+fusion-pcu-ilz = { version = "0.0.1", path = "Crates/backends/ilz", default-features = false }
+fusion-pcu-wgpu = { version = "0.0.1", path = "Crates/backends/wgpu", default-features = false }
+fusion-pcu-opengl = { version = "0.0.1", path = "Crates/backends/opengl", default-features = false }
+fusion-pcu-runner = { version = "0.0.1", path = "Crates/runner", default-features = false }
+fusion-pcu-tensor = { version = "0.0.1", path = "Crates/dialects/tensor" }
 
 ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
 proc-macro2 = "1.0.103"

@@ -21,9 +21,12 @@ pub mod builder;
 pub mod contract;
 pub mod core;
 pub mod dialect;
+mod insight_macros;
 pub use dialect::builder as dialect_builder;
 pub mod dispatch;
 pub mod function;
+#[cfg(feature = "insights")]
+pub mod insights;
 pub mod ir;
 pub mod map_validation;
 #[path = "model/model.rs"]
@@ -46,7 +49,10 @@ pub use runtime::{
 pub use runtime::activation::*;
 pub use runtime::assessment::*;
 pub use runtime::discovery::*;
+pub use runtime::device_kernel::*;
 pub use runtime::execution::*;
+pub use runtime::host_kernel::*;
+pub use runtime::kernel::*;
 pub use runtime::registry::*;
 pub use resource::{
     borrowed,

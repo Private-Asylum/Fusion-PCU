@@ -1,10 +1,11 @@
 [package]
-name = "fusion-example-hosted-graphics-vulkan"
+name = "fusion-pcu-example-vulkan"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [[bin]]
 name = "fusion-vulkan-example"

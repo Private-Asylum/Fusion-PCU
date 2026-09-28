@@ -153,10 +153,25 @@ fn run_on(
     let assessor = RocmTensorAssessor::new(&session)?;
     let prepared = assessor.prepare_graph(&program.graph, program.updated_weights)?;
     let mut memory = PcuOwnedDispatchMemorySession::memory_provider(&session, candidate.pool);
-    let samples_device = assessor.upload_input(samples, candidate.pool, &mut memory)?;
-    let mut weights_device = assessor.upload_input(initial_weights, candidate.pool, &mut memory)?;
-    let target_device = assessor.upload_input(target, candidate.pool, &mut memory)?;
-    let rate_device = assessor.upload_input(rate, candidate.pool, &mut memory)?;
+    let inputs = vec![
+        (
+            program.samples,
+            assessor.upload_input(samples, candidate.pool, &mut memory)?,
+        ),
+        (
+            program.weights,
+            assessor.upload_input(initial_weights, candidate.pool, &mut memory)?,
+        ),
+        (
+            program.target,
+            assessor.upload_input(target, candidate.pool, &mut memory)?,
+        ),
+        (
+            program.learning_rate,
+            assessor.upload_input(rate, candidate.pool, &mut memory)?,
+        ),
+    ];
+    let mut execution = assessor.bind(&prepared, inputs, candidate.pool, memory)?;
     let mut weights = initial_weights.clone();
     for step in 0..2 {
         let host_inputs = [
@@ -171,19 +186,9 @@ fn run_on(
             .value(program.loss)?
             .data()[0];
         let expected = expected_step(program, &host_inputs)?;
-        let device_inputs = [
-            (program.samples, &samples_device),
-            (program.weights, &weights_device),
-            (program.target, &target_device),
-            (program.learning_rate, &rate_device),
-        ];
-        let next_weights_device = assessor.execute_prepared_with_resources_resident(
-            &prepared,
-            &device_inputs,
-            candidate.pool,
-            &mut memory,
-        )?;
-        let actual = assessor.download_output(&next_weights_device, candidate.pool, &mut memory)?;
+        execution.update_input(program.weights, &weights)?;
+        execution.execute()?;
+        let actual = execution.read_output(program.updated_weights)?;
         if actual.shape() != expected.shape()
             || actual
                 .data()
@@ -209,7 +214,6 @@ fn run_on(
             );
         }
         weights = actual;
-        weights_device = next_weights_device;
     }
     Ok(())
 }

@@ -1,0 +1,21 @@
+[package]
+name = "fusion-pcu-opencl"
+description = "OpenCL backend scaffold for Fusion PCU"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "opencl.rs"
+
+[features]
+default = []
+
+[dependencies]
+fusion-pcu.workspace = true
+
+[lints]
+workspace = true

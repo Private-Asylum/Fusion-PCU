@@ -337,6 +337,8 @@ fn run_on(
     let pcu_cold = run_pcu()?;
     let native_result = native.execute_two_steps()?;
     verify_weights(&native_result, &pcu_cold)?;
+    let native_queued_cold = native.execute_two_steps_queued()?;
+    verify_weights(&native_result, &native_queued_cold)?;
     let bank_cold = run_pcu_output_bank()?;
     verify_weights(&native_result, &bank_cold)?;
     let batched_bank_cold = run_pcu_output_bank_batched()?;
@@ -393,6 +395,21 @@ fn run_on(
                         native
                             .execute_two_steps()
                             .expect("native two-step MLP failed"),
+                    );
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new(
+                "native_hip_rocblas_queued",
+                format!("{batch}x{INPUT}-{HIDDEN}-{HIDDEN}-{OUTPUT}"),
+            ),
+            |b| {
+                b.iter(|| {
+                    black_box(
+                        native
+                            .execute_two_steps_queued()
+                            .expect("queued native two-step MLP failed"),
                     );
                 });
             },
