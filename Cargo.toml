@@ -28,9 +28,17 @@ edition = "2024"
 authors = ["Private Asylum LLC"]
 license = "Apache-2.0"
 repository = "https://github.com/Private-Asylum/Fusion-PCU"
+homepage = "https://github.com/Private-Asylum/Fusion-PCU"
+readme = "README.md"
+license-file = "LICENSE"
+keywords = ["compute", "gpu", "ir", "coprocessor", "heterogeneous"]
+categories = ["hardware-support", "science", "development-tools"]
+publish = ["crates-io"]
 
 [workspace.dependencies]
 fusion-pcu = { version = "0.0.1", path = "Crates/fusion-pcu", default-features = false }
+fusion-pcu-cpu = { version = "0.0.1", path = "Crates/backends/cpu" }
+pcu_alias = { package = "fusion-pcu", version = "0.0.1", path = "Crates/fusion-pcu", default-features = false }
 fusion-pcu-macros = { version = "0.0.1", path = "Crates/macros" }
 fusion-pcu-rocm = { version = "0.0.1", path = "Crates/backends/rocm", default-features = false }
 fusion-pcu-cuda = { version = "0.0.1", path = "Crates/backends/cuda", default-features = false }
@@ -51,6 +59,10 @@ proc-macro2 = "1.0.103"
 quote = "1.0.41"
 syn = { version = "2.0.108", features = ["full"] }
 smallvec = "1"
+libloading = "0.8"
+libc = "0.2"
+criterion = "0.7"
+trybuild = "1.0"
 winit = "0.30"
 
 [workspace.lints.clippy]

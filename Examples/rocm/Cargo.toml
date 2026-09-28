@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+license-file.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish = false
 
 [[bin]]
@@ -230,10 +235,10 @@ fusion-pcu-macros.workspace = true
 fusion-pcu-tensor.workspace = true
 
 [dev-dependencies]
-libloading = "0.8"
-libc = "0.2"
+libloading.workspace = true
+libc.workspace = true
 bytemuck = "1.25"
-criterion = "0.7"
+criterion.workspace = true
 
 [lints.clippy]
 all = "warn"

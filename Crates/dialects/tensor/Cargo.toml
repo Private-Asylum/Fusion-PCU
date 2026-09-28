@@ -6,9 +6,15 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+license-file.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [dependencies]
-fusion-pcu = { version = "0.0.1", path = "../../fusion-pcu", default-features = false }
+fusion-pcu.workspace = true
 
 [lib]
 crate-type = ["rlib"]

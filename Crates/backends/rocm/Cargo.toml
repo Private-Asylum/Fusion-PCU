@@ -6,6 +6,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+license-file.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
 
 [lib]
 crate-type = ["rlib"]
@@ -19,7 +25,7 @@ tensor = ["dep:fusion-pcu-tensor"]
 [dependencies]
 fusion-pcu.workspace = true
 fusion-pcu-tensor = { workspace = true, optional = true }
-libloading = "0.8"
+libloading.workspace = true
 smallvec.workspace = true
 
 [lints]
