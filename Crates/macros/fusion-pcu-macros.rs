@@ -1,7 +1,13 @@
 #[path = "fusion-pcu-macros/checked_div_rem.rs"]
 mod checked_div_rem;
+#[path = "fusion-pcu-macros/hosted.rs"]
+mod hosted;
+#[path = "fusion-pcu-macros/owned.rs"]
+mod owned;
 #[path = "fusion-pcu-macros/prepared.rs"]
 mod prepared;
+#[path = "fusion-pcu-macros/shape.rs"]
+mod shape;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -15,8 +21,10 @@ use quote::{
 use syn::parse::{
     Parse,
     ParseStream,
+    Parser,
 };
 use syn::spanned::Spanned;
+use syn::visit_mut::{self, VisitMut};
 #[rustfmt::skip]
 use syn::{
     BinOp,
@@ -49,6 +57,37 @@ struct PcuDispatchArgs {
     crate_path: Path,
 }
 
+struct PcuScalarHelperArgs {
+    crate_path: Path,
+}
+
+impl Parse for PcuScalarHelperArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self, Error> {
+        let mut crate_path = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            let _: Token![=] = input.parse()?;
+            if key != "crate_path" {
+                return Err(Error::new(
+                    key.span(),
+                    "scalar `#[pcu]` helpers only accept `crate_path = <path>`",
+                ));
+            }
+            if crate_path.is_some() {
+                return Err(Error::new(key.span(), "duplicate `crate_path` argument"));
+            }
+            crate_path = Some(input.parse()?);
+            if input.is_empty() {
+                break;
+            }
+            let _: Token![,] = input.parse()?;
+        }
+        Ok(Self {
+            crate_path: crate_path.unwrap_or_else(|| syn::parse_quote!(::fusion_pcu)),
+        })
+    }
+}
+
 impl Parse for PcuDispatchArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self, Error> {
         let mut kernel_id = None;
@@ -57,7 +96,11 @@ impl Parse for PcuDispatchArgs {
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
-            let _: Token![=] = input.parse()?;
+            if key == "invocations" && input.peek(Token![:]) {
+                let _: Token![:] = input.parse()?;
+            } else {
+                let _: Token![=] = input.parse()?;
+            }
             match key.to_string().as_str() {
                 "kernel_id" => {
                     let value: syn::LitInt = input.parse()?;
@@ -152,12 +195,36 @@ struct BindingSpec {
     binding: u32,
     scalar: ScalarKind,
     generic_scalar: Option<Ident>,
+    scalar_reference: bool,
+    matrix: Option<shape::FixedMatrixShape>,
+}
+
+#[derive(Clone)]
+struct MatrixLocals {
+    row: Ident,
+    column: Ident,
+    columns: Expr,
+    invocation: Ident,
+    stride: Option<Ident>,
 }
 
 struct PcuHelper {
     ident: Ident,
     parameters: Vec<Ident>,
+    scalar: ScalarKind,
     body: Expr,
+}
+
+fn scalar_kind(ty: &Type) -> Option<ScalarKind> {
+    match ty {
+        Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32") => {
+            Some(ScalarKind::F32)
+        }
+        Type::Path(path) if path.qself.is_none() && path.path.is_ident("f64") => {
+            Some(ScalarKind::F64)
+        }
+        _ => None,
+    }
 }
 
 struct ExprEmitter<'a> {
@@ -165,11 +232,305 @@ struct ExprEmitter<'a> {
     invocation_ident: &'a Ident,
     crate_path: &'a Path,
     grid_stride: bool,
-    helpers: &'a [PcuHelper],
-    helper_stack: Vec<Ident>,
+    expected_scalar: ScalarKind,
     values: Vec<(Ident, u16, ScalarKind)>,
     next_value: u16,
     ops: Vec<TokenStream2>,
+}
+
+/// Emits ordered runtime builder statements for expressions that cross a generated helper
+/// companion. The regular no-helper path stays const-sized and proc-macro-lowered.
+struct RuntimeExprEmitter<'a> {
+    bindings: &'a [BindingSpec],
+    invocation_ident: &'a Ident,
+    crate_path: &'a Path,
+    grid_stride: bool,
+    expected_scalar: ScalarKind,
+    context_is_owned: bool,
+    values: Vec<(Ident, TokenStream2, ScalarKind)>,
+    statements: Vec<TokenStream2>,
+    next_local: usize,
+}
+
+impl<'a> RuntimeExprEmitter<'a> {
+    const fn new(
+        bindings: &'a [BindingSpec],
+        invocation_ident: &'a Ident,
+        crate_path: &'a Path,
+        grid_stride: bool,
+        expected_scalar: ScalarKind,
+        context_is_owned: bool,
+    ) -> Self {
+        Self {
+            bindings,
+            invocation_ident,
+            crate_path,
+            grid_stride,
+            expected_scalar,
+            context_is_owned,
+            values: Vec::new(),
+            statements: Vec::new(),
+            next_local: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn emit_expr(&mut self, expr: &Expr) -> Result<(TokenStream2, ScalarKind), Error> {
+        match expr {
+            Expr::Binary(binary) => {
+                let (lhs, lhs_type) = self.emit_expr(&binary.left)?;
+                let (rhs, rhs_type) = self.emit_expr(&binary.right)?;
+                if lhs_type != rhs_type || !matches!(lhs_type, ScalarKind::F32 | ScalarKind::F64) {
+                    return Err(Error::new(
+                        binary.span(),
+                        "PCU helper arithmetic requires matching f32 or f64 operands",
+                    ));
+                }
+                let op = match &binary.op {
+                    BinOp::Add(_) => quote! { Add },
+                    BinOp::Sub(_) => quote! { Sub },
+                    BinOp::Mul(_) => quote! { Mul },
+                    BinOp::Div(_) => quote! { Div },
+                    _ => {
+                        return Err(Error::new(
+                            binary.op.span(),
+                            "unsupported PCU binary operator; supported operators are + - * /",
+                        ));
+                    }
+                };
+                let result = self.fresh_local();
+                let pcu = self.crate_path;
+                self.statements.push(quote! {
+                    let #result = __pcu_context.alu_value(#pcu::PcuDispatchAluOp::#op, #lhs, #rhs)?;
+                });
+                Ok((quote! { #result }, lhs_type))
+            }
+            Expr::Index(index) => {
+                let matrix_binding =
+                    shape::matrix_base(index)
+                        .and_then(expr_ident)
+                        .and_then(|ident| {
+                            self.bindings
+                                .iter()
+                                .find(|binding| binding.ident == *ident && binding.matrix.is_some())
+                        });
+                let base = if let Some(binding) = matrix_binding {
+                    let shape = binding.matrix.as_ref().expect("matrix binding checked");
+                    if !shape::is_canonical_matrix_index(
+                        index,
+                        self.invocation_ident,
+                        &shape.columns,
+                    ) {
+                        return Err(Error::new(
+                            index.span(),
+                            "matrix access must use `matrix[id / C][id % C]`",
+                        ));
+                    }
+                    shape::matrix_base(index).expect("canonical matrix index has a base")
+                } else {
+                    validate_invocation_index(&index.index, self.invocation_ident)?;
+                    &index.expr
+                };
+                let Some(binding_ident) = expr_ident(base) else {
+                    return Err(Error::new(
+                        base.span(),
+                        "PCU binding load must use `binding[invocation]`",
+                    ));
+                };
+                let (slot, scalar) = {
+                    let binding = self.binding(binding_ident, BindingAccess::ReadOnly)?;
+                    (binding.binding, binding.scalar)
+                };
+                if !matches!(scalar, ScalarKind::F32 | ScalarKind::F64) {
+                    return Err(Error::new(
+                        index.span(),
+                        "floating scalar helper calls support only f32 or f64 bindings",
+                    ));
+                }
+                let result = self.fresh_local();
+                let index_kind = if self.grid_stride {
+                    quote! { GridStrideId }
+                } else {
+                    quote! { InvocationId }
+                };
+                let pcu = self.crate_path;
+                let scalar_ty = scalar.rust_type();
+                self.statements.push(quote! {
+                    let #result = __pcu_context.load_value::<#scalar_ty>(
+                        #pcu::PcuBindingRef::new(0, #slot),
+                        #pcu::PcuDispatchIndex::#index_kind,
+                    )?;
+                });
+                Ok((quote! { #result }, scalar))
+            }
+            Expr::Lit(literal) => {
+                let Lit::Float(float) = &literal.lit else {
+                    return Err(Error::new(
+                        literal.span(),
+                        "PCU constants support f32 float literals in this profile",
+                    ));
+                };
+                let (scalar, bits) = parse_float_bits(float, self.expected_scalar)?;
+                let result = self.fresh_local();
+                let method = if scalar == ScalarKind::F32 {
+                    quote! { constant_f32_value }
+                } else {
+                    quote! { constant_f64_value }
+                };
+                let bits = if scalar == ScalarKind::F32 {
+                    quote! { u32::try_from(#bits).expect("f32 bits fit u32") }
+                } else {
+                    quote! { #bits }
+                };
+                self.statements.push(quote! {
+                    let #result = __pcu_context.#method(#bits)?;
+                });
+                Ok((quote! { #result }, scalar))
+            }
+            Expr::Paren(paren) => self.emit_expr(&paren.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+                let Expr::Path(path) = unary.expr.as_ref() else {
+                    return Err(Error::new(
+                        unary.expr.span(),
+                        "PCU scalar dereference must refer directly to a read-only scalar binding",
+                    ));
+                };
+                let Some(ident) = path.path.get_ident() else {
+                    return Err(Error::new(
+                        path.span(),
+                        "PCU scalar dereference must refer directly to a read-only scalar binding",
+                    ));
+                };
+                if !self
+                    .binding(ident, BindingAccess::ReadOnly)?
+                    .scalar_reference
+                {
+                    return Err(Error::new(
+                        path.span(),
+                        "PCU dereference is supported only for read-only scalar bindings",
+                    ));
+                }
+                self.emit_expr(&unary.expr)
+            }
+            Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+                let ident = &path.path.segments[0].ident;
+                if let Some(value) = self
+                    .values
+                    .iter()
+                    .rev()
+                    .find(|(name, _, _)| name == ident)
+                    .map(|(_, value, scalar)| (value.clone(), *scalar))
+                {
+                    return Ok(value);
+                }
+                let (scalar_reference, slot, scalar) = {
+                    let binding = self.binding(ident, BindingAccess::ReadOnly)?;
+                    (binding.scalar_reference, binding.binding, binding.scalar)
+                };
+                if !scalar_reference || !matches!(scalar, ScalarKind::F32 | ScalarKind::F64) {
+                    return Err(Error::new(
+                        path.span(),
+                        "PCU helper expressions may only reference scalar parameters or f32/f64 scalar bindings",
+                    ));
+                }
+                let result = self.fresh_local();
+                let pcu = self.crate_path;
+                let scalar_ty = scalar.rust_type();
+                self.statements.push(quote! {
+                    let #result = __pcu_context.load_value::<#scalar_ty>(
+                        #pcu::PcuBindingRef::new(0, #slot),
+                        #pcu::PcuDispatchIndex::BindingElementZero,
+                    )?;
+                });
+                Ok((quote! { #result }, scalar))
+            }
+            Expr::Call(call) => {
+                let Expr::Path(path) = call.func.as_ref() else {
+                    return Err(Error::new(
+                        call.func.span(),
+                        "PCU helper calls must name a `#[pcu]` scalar function",
+                    ));
+                };
+                if path.qself.is_some() {
+                    return Err(Error::new(
+                        path.span(),
+                        "PCU helper calls must use a Rust-resolved function path",
+                    ));
+                }
+                let mut companion = path.path.clone();
+                if !self.context_is_owned {
+                    companion = rebase_companion_path(companion);
+                }
+                let mut args = Vec::with_capacity(call.args.len());
+                for arg in &call.args {
+                    args.push(self.emit_expr(arg)?);
+                }
+                let known_kinds = args
+                    .iter()
+                    .map(|(_, kind)| *kind)
+                    .filter(|kind| matches!(kind, ScalarKind::F32 | ScalarKind::F64))
+                    .collect::<Vec<_>>();
+                if known_kinds.windows(2).any(|kinds| kinds[0] != kinds[1]) {
+                    return Err(Error::new(
+                        call.span(),
+                        "PCU helper calls cannot mix f32 and f64 arguments",
+                    ));
+                }
+                let values = args.iter().map(|(value, _)| value).collect::<Vec<_>>();
+                let result = self.fresh_local();
+                let context = if self.context_is_owned {
+                    quote! { &mut __pcu_context }
+                } else {
+                    quote! { __pcu_context }
+                };
+                self.statements.push(quote! {
+                    let #result = #companion::__pcu_lower(#context, [#(#values),*])?;
+                });
+                let result_kind = known_kinds.first().copied().unwrap_or(self.expected_scalar);
+                if result_kind != self.expected_scalar {
+                    return Err(Error::new(
+                        call.span(),
+                        "PCU helper call scalar type does not match the enclosing scalar profile",
+                    ));
+                }
+                Ok((quote! { #result }, result_kind))
+            }
+            _ => Err(Error::new(
+                unsupported_expression_span(expr),
+                "unsupported PCU expression; supported subset is binding[index], f32/f64 literals, parentheses, arithmetic, and #[pcu] scalar helper calls",
+            )),
+        }
+    }
+
+    fn binding(&self, ident: &Ident, required: BindingAccess) -> Result<&BindingSpec, Error> {
+        let Some(binding) = self.bindings.iter().find(|binding| binding.ident == *ident) else {
+            return Err(Error::new(ident.span(), "unknown PCU binding"));
+        };
+        if required == BindingAccess::ReadWrite && binding.access != BindingAccess::ReadWrite {
+            return Err(Error::new(
+                ident.span(),
+                "PCU binding access does not match the expression context",
+            ));
+        }
+        Ok(binding)
+    }
+
+    fn fresh_local(&mut self) -> Ident {
+        let ident = format_ident!("__pcu_helper_value_{}", self.next_local);
+        self.next_local += 1;
+        ident
+    }
+}
+
+fn rebase_companion_path(mut path: Path) -> Path {
+    if let Some(first) = path.segments.first_mut() {
+        match first.ident.to_string().as_str() {
+            "self" => first.ident = format_ident!("super"),
+            "super" => path.segments.insert(0, syn::parse_quote!(super)),
+            _ => {}
+        }
+    }
+    path
 }
 
 impl<'a> ExprEmitter<'a> {
@@ -178,15 +539,14 @@ impl<'a> ExprEmitter<'a> {
         invocation_ident: &'a Ident,
         crate_path: &'a Path,
         grid_stride: bool,
-        helpers: &'a [PcuHelper],
+        expected_scalar: ScalarKind,
     ) -> Self {
         Self {
             bindings,
             invocation_ident,
             crate_path,
             grid_stride,
-            helpers,
-            helper_stack: Vec::new(),
+            expected_scalar,
             values: Vec::new(),
             next_value: 1,
             ops: Vec::new(),
@@ -199,94 +559,79 @@ impl<'a> ExprEmitter<'a> {
             Expr::Index(index) => self.emit_index_load(index),
             Expr::Lit(lit) => self.emit_lit(lit),
             Expr::Paren(paren) => self.emit_expr(&paren.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+                let Expr::Path(path) = unary.expr.as_ref() else {
+                    return Err(Error::new(
+                        unary.expr.span(),
+                        "PCU scalar dereference must refer directly to a read-only scalar binding",
+                    ));
+                };
+                let Some(ident) = path.path.get_ident() else {
+                    return Err(Error::new(
+                        path.span(),
+                        "PCU scalar dereference must refer directly to a read-only scalar binding",
+                    ));
+                };
+                if !self
+                    .binding(ident, BindingAccess::ReadOnly)?
+                    .scalar_reference
+                {
+                    return Err(Error::new(
+                        path.span(),
+                        "PCU dereference is supported only for read-only scalar bindings",
+                    ));
+                }
+                self.emit_expr(&unary.expr)
+            }
             Expr::MethodCall(call) => self.emit_wrapping_method(call),
-            Expr::Call(call) => self.emit_helper_call(call),
+            Expr::Call(call) => Err(Error::new(
+                call.func.span(),
+                "PCU helper calls require `#[pcu]` scalar helpers and `#[pcu(...)]` kernels",
+            )),
             Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
                 let ident = &path.path.segments[0].ident;
-                self.values
+                if let Some(value) = self
+                    .values
                     .iter()
                     .rev()
                     .find(|(name, _, _)| name == ident)
                     .map(|(_, value, scalar)| (*value, *scalar))
-                    .ok_or_else(|| {
-                        Error::new(
-                            path.span(),
-                            "PCU helper expressions may only reference their scalar parameters",
-                        )
-                    })
+                {
+                    return Ok(value);
+                }
+                let (scalar_reference, slot, scalar) = {
+                    let binding = self.binding(ident, BindingAccess::ReadOnly)?;
+                    (binding.scalar_reference, binding.binding, binding.scalar)
+                };
+                if !scalar_reference {
+                    return Err(Error::new(
+                        path.span(),
+                        "PCU expressions may only use scalar bindings as bare names",
+                    ));
+                }
+                if !matches!(scalar, ScalarKind::F32 | ScalarKind::F64) {
+                    return Err(Error::new(
+                        path.span(),
+                        "read-only scalar parameters currently support only f32 and f64",
+                    ));
+                }
+                let result = self.alloc_value(path.span())?;
+                let pcu = self.crate_path;
+                self.ops.push(quote! {
+                    #pcu::PcuDispatchDataOp::BindingLoad {
+                        result: #pcu::PcuDispatchValueId(#result),
+                        binding: #pcu::PcuBindingRef::new(0, #slot),
+                        index: #pcu::PcuDispatchIndex::BindingElementZero,
+                    }
+                });
+                self.values.push((ident.clone(), result, scalar));
+                Ok((result, scalar))
             }
             _ => Err(Error::new(
                 unsupported_expression_span(expr),
-                "unsupported PCU expression; supported subset is binding[index], f32 literals, parentheses, and + - * /",
+                "unsupported PCU expression; supported subset is binding[index], f32/f64 literals, parentheses, and + - * /",
             )),
         }
-    }
-
-    fn emit_helper_call(&mut self, call: &syn::ExprCall) -> Result<(u16, ScalarKind), Error> {
-        let Expr::Path(path) = call.func.as_ref() else {
-            return Err(Error::new(
-                call.func.span(),
-                "PCU helper calls must name a `#[pcu_fn]` sibling directly",
-            ));
-        };
-        if path.qself.is_some() || path.path.segments.len() != 1 {
-            return Err(Error::new(
-                path.span(),
-                "PCU helper calls must name a `#[pcu_fn]` sibling directly",
-            ));
-        }
-        let helper_ident = &path.path.segments[0].ident;
-        let Some(helper) = self
-            .helpers
-            .iter()
-            .find(|helper| helper.ident == *helper_ident)
-        else {
-            return Err(Error::new(
-                helper_ident.span(),
-                "PCU helper calls require `#[pcu_module]` and a sibling `#[pcu_fn]` definition",
-            ));
-        };
-        if helper.parameters.len() != call.args.len() {
-            return Err(Error::new(
-                call.span(),
-                "PCU helper argument count does not match its definition",
-            ));
-        }
-        if self.helper_stack.iter().any(|name| name == helper_ident) {
-            return Err(Error::new(
-                call.span(),
-                "recursive PCU helper calls are not supported",
-            ));
-        }
-
-        let mut arguments = Vec::with_capacity(call.args.len());
-        for argument in &call.args {
-            arguments.push(self.emit_expr(argument)?);
-        }
-        if arguments
-            .iter()
-            .any(|(_, scalar)| *scalar != ScalarKind::F32)
-        {
-            return Err(Error::new(
-                call.span(),
-                "this PCU helper profile currently accepts only f32 arguments",
-            ));
-        }
-
-        let values_len = self.values.len();
-        self.helper_stack.push(helper_ident.clone());
-        self.values.extend(
-            helper
-                .parameters
-                .iter()
-                .cloned()
-                .zip(arguments.iter().map(|(value, scalar)| (*value, *scalar)))
-                .map(|(ident, (value, scalar))| (ident, value, scalar)),
-        );
-        let result = self.emit_expr(&helper.body);
-        self.values.truncate(values_len);
-        self.helper_stack.pop();
-        result
     }
 
     fn emit_binary(&mut self, binary: &ExprBinary) -> Result<(u16, ScalarKind), Error> {
@@ -338,7 +683,7 @@ impl<'a> ExprEmitter<'a> {
             _ => {
                 return Err(Error::new(
                     unsupported_expression_span(&Expr::MethodCall(call.clone())),
-                    "unsupported PCU expression; supported subset is binding[index], f32 literals, parentheses, and + - * /",
+                    "unsupported PCU expression; supported subset is binding[index], f32/f64 literals, parentheses, and + - * /",
                 ));
             }
         };
@@ -406,16 +751,38 @@ impl<'a> ExprEmitter<'a> {
     }
 
     fn emit_index_load(&mut self, index: &ExprIndex) -> Result<(u16, ScalarKind), Error> {
-        validate_invocation_index(&index.index, self.invocation_ident)?;
-        let Some(binding_ident) = expr_ident(&index.expr) else {
+        let (base, matrix) =
+            shape::matrix_base(index).map_or((&*index.expr, false), |base| (base, true));
+        let Some(binding_ident) = expr_ident(base) else {
             return Err(Error::new(
-                index.expr.span(),
-                "PCU binding load must use `binding[invocation]`",
+                base.span(),
+                "PCU binding load must use `binding[invocation]` or the canonical `matrix[invocation / C][invocation % C]` form",
             ));
         };
-        let slot = self
-            .binding(binding_ident, BindingAccess::ReadOnly)?
-            .binding;
+        let binding = self.binding(binding_ident, BindingAccess::ReadOnly)?;
+        if let Some(dimensions) = &binding.matrix {
+            if !matrix
+                || !shape::is_canonical_matrix_index(
+                    index,
+                    self.invocation_ident,
+                    &dimensions.columns,
+                )
+            {
+                return Err(Error::new(
+                    index.span(),
+                    "rank-two PCU binding loads must use `matrix[invocation / C][invocation % C]` with the declared column extent",
+                ));
+            }
+        } else if matrix {
+            return Err(Error::new(
+                index.span(),
+                "nested PCU indexing is supported only for fixed rank-two array bindings",
+            ));
+        } else {
+            validate_invocation_index(&index.index, self.invocation_ident)?;
+        }
+        let slot = binding.binding;
+        let scalar = binding.scalar;
         let result = self.alloc_value(index.span())?;
         let pcu = self.crate_path;
         let dispatch_index = self.index();
@@ -426,29 +793,32 @@ impl<'a> ExprEmitter<'a> {
                 index: #dispatch_index,
             }
         });
-        Ok((
-            result,
-            self.binding(binding_ident, BindingAccess::ReadOnly)?.scalar,
-        ))
+        Ok((result, scalar))
     }
 
     fn emit_lit(&mut self, lit: &ExprLit) -> Result<(u16, ScalarKind), Error> {
         let Lit::Float(float) = &lit.lit else {
             return Err(Error::new(
                 lit.span(),
-                "PCU constants support f32 float literals in this first cut",
+                "PCU constants support floating-point literals in this profile",
             ));
         };
-        let bits = parse_f32_bits(float)?;
+        let (scalar, bits) = parse_float_bits(float, self.expected_scalar)?;
         let result = self.alloc_value(lit.span())?;
         let pcu = self.crate_path;
+        let value = if scalar == ScalarKind::F32 {
+            let bits = u32::try_from(bits).expect("f32 bits fit u32");
+            quote! { #pcu::PcuParameterValue::F32(#bits) }
+        } else {
+            quote! { #pcu::PcuParameterValue::F64(#bits) }
+        };
         self.ops.push(quote! {
             #pcu::PcuDispatchDataOp::Constant {
                 result: #pcu::PcuDispatchValueId(#result),
-                value: #pcu::PcuParameterValue::from_f32_bits(#bits),
+                value: #value,
             }
         });
-        Ok((result, ScalarKind::F32))
+        Ok((result, scalar))
     }
 
     fn index(&self) -> TokenStream2 {
@@ -498,64 +868,135 @@ pub fn pcu_dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Define a bounded PCU kernel with Rust-style invocation-count syntax.
+/// Marks a scalar helper or defines a bounded PCU kernel.
 ///
-/// `#[pcu(invocations = R * C)]` is the concise spelling of [`pcu_dispatch`]. It keeps the
-/// generated builder and bindings APIs, and adds `<name>_prepare` for typed host slices and
-/// `<name>_prepare_device` for typed [`PcuDeviceBuffer`](https://docs.rs/fusion-pcu/latest/fusion_pcu/struct.PcuDeviceBuffer.html)
-/// arguments. Each prepare function builds the IR and calls the selected backend once, returning
-/// a reusable `FnMut` that forwards later calls to the prepared executable and propagates its
-/// `Result`. Host closures accept the source slice types; device closures accept shared or mutable
-/// `PcuDeviceBuffer` references in the same argument order. Their argument lifetimes are independent.
+/// Bare `#[pcu]` marks a pure, expression-bodied f32 or f64 helper. The source function remains
+/// callable on the CPU, while its hidden companion lowers the same expression into kernel IR.
+/// Helpers may call nested or module-qualified helpers, including through import aliases.
+/// Helper recursion and total IR size are bounded and report `PcuError` during IR construction.
+/// An explicit `Result<PcuTensor<f32>, PcuExecutionError>` return instead selects the initial
+/// owned-tensor profile: immutable let-bound chains of `pcu::relu` and `pcu::identity`, followed
+/// by one operation or a previously bound value. The same source name accepts a host slice borrow
+/// or a resident tensor borrow.
 ///
-/// Preparation is limited to the same bounded source subset as the IR builder: indexed and
-/// grid-stride scalar maps, the supported concrete scalar arithmetic profiles, and the existing
-/// generic scalar identity or wrapping profiles. It does not turn arbitrary Rust function bodies
-/// into kernels; helper bodies still require the documented `#[pcu_module]` subset.
+/// `#[pcu(invocations = N)]` or `#[pcu(invocations: N)]` defines a kernel. It keeps
+/// `<name>_bindings`, `<name>_ir`, and typed `<name>_prepare` / `<name>_prepare_device` APIs, and
+/// generates a direct function with the source name and signature. The direct function uses the
+/// facade's selected global backend and returns `Result<(), PcuExecutionError>`; it never selects
+/// a CPU fallback. The prepare functions build IR and prepare the backend once, then return a
+/// reusable `FnMut` that calls that prepared executable. Host and resident-device calls preserve
+/// the source slice and [`PcuDeviceBuffer`](https://docs.rs/fusion-pcu/latest/fusion_pcu/struct.PcuDeviceBuffer.html)
+/// argument types respectively.
+///
+/// Kernel bodies are limited to the documented bounded indexed or canonical grid-stride maps and
+/// supported scalar profiles. Helper bodies support homogeneous f32 or f64 arithmetic expressions.
 #[proc_macro_attribute]
 pub fn pcu(attr: TokenStream, item: TokenStream) -> TokenStream {
-    pcu_dispatch(attr, item)
-}
-
-/// Mark a pure, expression-bodied scalar helper owned by an enclosing `#[pcu_module]`.
-#[proc_macro_attribute]
-pub fn pcu_fn(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return Error::new(
-            proc_macro2::Span::call_site(),
-            "`#[pcu_fn]` takes no arguments",
-        )
-        .into_compile_error()
-        .into();
+    if let Ok(helper_args) = syn::parse::<PcuScalarHelperArgs>(attr.clone()) {
+        let function = parse_macro_input!(item as ItemFn);
+        if owned::declares_owned_tensor_return(&function.sig.output) {
+            return match owned::expand_owned_return(&function, &helper_args.crate_path) {
+                Ok(tokens) => tokens.into(),
+                Err(error) => error.into_compile_error().into(),
+            };
+        }
+        return match expand_pcu_scalar_helper(function, &helper_args.crate_path) {
+            Ok(tokens) => tokens.into(),
+            Err(error) => error.into_compile_error().into(),
+        };
     }
+    let args = parse_macro_input!(attr as PcuDispatchArgs);
     let function = parse_macro_input!(item as ItemFn);
-    Error::new(
-        function.sig.ident.span(),
-        "`#[pcu_fn]` helpers must be declared inside an inline `#[pcu_module]`",
-    )
-    .into_compile_error()
-    .into()
-}
-
-/// Owns a module of bounded PCU kernels and explicitly marked pure scalar helpers.
-///
-/// The first helper profile accepts only `f32` scalar arguments and return values, with a pure
-/// arithmetic expression body. Helpers are inlined into the kernel's dispatch IR.
-#[proc_macro_attribute]
-pub fn pcu_module(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return Error::new(
-            proc_macro2::Span::call_site(),
-            "`#[pcu_module]` takes no arguments",
-        )
-        .into_compile_error()
-        .into();
-    }
-    let mut module = parse_macro_input!(item as syn::ItemMod);
-    match expand_pcu_module(&mut module) {
+    match expand_pcu_direct(args, &function) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.into_compile_error().into(),
     }
+}
+
+fn expand_pcu_scalar_helper(
+    mut function: ItemFn,
+    crate_path: &Path,
+) -> Result<TokenStream2, Error> {
+    if function.sig.asyncness.is_some()
+        || function.sig.constness.is_some()
+        || function.sig.unsafety.is_some()
+        || function.sig.abi.is_some()
+        || !function.sig.generics.params.is_empty()
+        || function.sig.generics.where_clause.is_some()
+        || function.sig.variadic.is_some()
+    {
+        return Err(Error::new_spanned(
+            &function.sig,
+            "PCU helpers must be plain, non-generic, safe Rust functions",
+        ));
+    }
+    let helper = parse_pcu_helper(&function)?;
+    let companion_crate_path = rebase_companion_path(crate_path.clone());
+    let mut emitter = RuntimeExprEmitter::new(
+        &[],
+        &helper.ident,
+        &companion_crate_path,
+        false,
+        helper.scalar,
+        false,
+    );
+    emitter
+        .values
+        .extend(helper.parameters.iter().enumerate().map(|(index, ident)| {
+            (
+                ident.clone(),
+                quote! { __pcu_arguments[#index] },
+                helper.scalar,
+            )
+        }));
+    let (result, result_kind) = emitter.emit_expr(&helper.body)?;
+    if result_kind != helper.scalar {
+        return Err(Error::new(
+            helper.body.span(),
+            "PCU helper result must match its f32 or f64 parameter profile",
+        ));
+    }
+    let statements = emitter.statements;
+    let helper_ident = &function.sig.ident;
+    let companion_ident = helper_ident;
+    let scalar_ty = helper.scalar.rust_type();
+    let vis = &function.vis;
+    let companion_cfg = function
+        .attrs
+        .iter()
+        .flat_map(project_companion_cfg)
+        .collect::<Vec<_>>();
+    function
+        .attrs
+        .retain(|attribute| !attribute_ends_with(attribute, "pcu"));
+    function.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
+    let argument_count = helper.parameters.len();
+    Ok(quote! {
+        #function
+
+        #[doc(hidden)]
+        #(#companion_cfg)*
+        #vis mod #companion_ident {
+            #[allow(unused_imports)]
+            use super::*;
+
+            pub fn __pcu_lower<'a, const __PCU_MAX_OPS: usize>(
+                __pcu_context: &mut #companion_crate_path::PcuScalarLowering<'a, __PCU_MAX_OPS>,
+                __pcu_arguments: [#companion_crate_path::PcuScalarValue<#scalar_ty>; #argument_count],
+            ) -> ::core::result::Result<#companion_crate_path::PcuScalarValue<#scalar_ty>, #companion_crate_path::PcuError> {
+                __pcu_context.enter_helper()?;
+                let __pcu_result = (|| -> ::core::result::Result<
+                    #companion_crate_path::PcuScalarValue<#scalar_ty>,
+                    #companion_crate_path::PcuError,
+                > {
+                    #(#statements)*
+                    ::core::result::Result::Ok(#result)
+                })();
+                __pcu_context.leave_helper();
+                __pcu_result
+            }
+        }
+    })
 }
 
 fn build_body_operations(
@@ -595,54 +1036,167 @@ fn build_body_operations(
 }
 
 fn expand_pcu_dispatch(args: PcuDispatchArgs, function: &ItemFn) -> Result<TokenStream2, Error> {
-    expand_pcu_dispatch_with_helpers(args, function, &[])
+    let function = normalize_function_where(function)?;
+    expand_pcu_dispatch_inner(args, &function, false)
+}
+
+fn expand_pcu_direct(args: PcuDispatchArgs, function: &ItemFn) -> Result<TokenStream2, Error> {
+    let function = normalize_function_where(function)?;
+    expand_pcu_dispatch_inner(args, &function, true)
+}
+
+fn normalize_function_where(function: &ItemFn) -> Result<ItemFn, Error> {
+    let mut normalized = function.clone();
+    let Some(where_clause) = normalized.sig.generics.where_clause.take() else {
+        return Ok(normalized);
+    };
+    if where_clause.predicates.len() != 1 {
+        return Err(Error::new_spanned(
+            where_clause,
+            "PCU generic kernels support one sealed scalar bound in the where clause",
+        ));
+    }
+    let predicate = where_clause
+        .predicates
+        .first()
+        .expect("one where predicate was checked");
+    let syn::WherePredicate::Type(predicate) = predicate else {
+        return Err(Error::new_spanned(
+            predicate,
+            "PCU generic kernels support only a sealed scalar type bound",
+        ));
+    };
+    let Type::Path(bounded_type) = &predicate.bounded_ty else {
+        return Err(Error::new_spanned(
+            &predicate.bounded_ty,
+            "PCU generic kernels support only a sealed scalar type bound",
+        ));
+    };
+    if bounded_type.qself.is_some() || bounded_type.path.segments.len() != 1 {
+        return Err(Error::new_spanned(
+            &predicate.bounded_ty,
+            "PCU generic kernels support only a sealed scalar type bound",
+        ));
+    }
+    let Some(GenericParam::Type(parameter)) = normalized
+        .sig
+        .generics
+        .params
+        .iter_mut()
+        .find(|parameter| matches!(parameter, GenericParam::Type(parameter) if parameter.ident == bounded_type.path.segments[0].ident))
+    else {
+        return Err(Error::new_spanned(
+            &predicate.bounded_ty,
+            "where-clause scalar bound must name the kernel's type parameter",
+        ));
+    };
+    if !parameter.bounds.is_empty() {
+        return Err(Error::new_spanned(
+            &parameter.bounds,
+            "PCU generic kernels do not combine inline and where-clause bounds",
+        ));
+    }
+    if predicate.bounds.len() != 1
+        || !predicate.bounds.iter().any(|bound| match bound {
+            syn::TypeParamBound::Trait(bound) => {
+                bound.path.segments.last().is_some_and(|segment| {
+                    segment.ident == "PcuScalar" || segment.ident == "PcuWrappingInteger"
+                })
+            }
+            _ => false,
+        })
+    {
+        return Err(Error::new_spanned(
+            predicate,
+            "where-clause bounds must be exactly `T: PcuScalar` or `T: PcuWrappingInteger`",
+        ));
+    }
+    parameter.bounds.clone_from(&predicate.bounds);
+    Ok(normalized)
+}
+
+fn unique_builder_lifetime(function: &ItemFn) -> syn::Lifetime {
+    let mut name = String::from("__pcu_builder");
+    while function.sig.generics.params.iter().any(|parameter| {
+        matches!(parameter, GenericParam::Lifetime(parameter) if parameter.lifetime.ident == name)
+    }) {
+        name.insert(0, '_');
+    }
+    syn::Lifetime::new(&format!("'{name}"), function.sig.ident.span())
 }
 
 // Keep the shared lowering path together: generic identities and concrete kernels must pass the
 // same structural/body validation before they diverge into their respective typed builders.
 #[allow(clippy::too_many_lines)]
-fn expand_pcu_dispatch_with_helpers(
+fn expand_pcu_dispatch_inner(
     args: PcuDispatchArgs,
     function: &ItemFn,
-    helpers: &[PcuHelper],
+    direct_entry: bool,
 ) -> Result<TokenStream2, Error> {
     let vis = function.vis.clone();
     let function_ident = function.sig.ident.clone();
+    let builder_ident = if direct_entry {
+        format_ident!("{}_ir", function_ident)
+    } else {
+        function_ident.clone()
+    };
     let bindings_ident = format_ident!("{}_bindings", function_ident);
     let crate_path = args.crate_path;
     let const_generics = validate_const_generics(function)?;
     let generic_scalar = generic_scalar_type(function)?;
-    if generic_scalar.is_some() && !helpers.is_empty() {
-        return Err(Error::new(
-            function.sig.generics.span(),
-            "generic PCU kernels currently do not support helper functions",
-        ));
-    }
     let invocation_expr = lower_invocation_expr(&args.invocations, &const_generics)?;
+    let builder_lifetime = unique_builder_lifetime(function);
     let generated_generics = if function.sig.generics.params.is_empty() {
-        quote! { <'a> }
+        quote! { <#builder_lifetime> }
     } else {
         let params = &function.sig.generics.params;
-        quote! { <'a, #params> }
+        quote! { <#builder_lifetime, #params> }
     };
-    let binding_specs = parse_bindings(&function.sig.inputs, generic_scalar.as_ref())?;
+    let binding_specs = parse_bindings(
+        &function.sig.inputs,
+        generic_scalar.as_ref(),
+        &const_generics,
+    )?;
+    validate_binding_shapes(&binding_specs)?;
+    let mut runtime_helper_body = None;
     let (loop_extent, data_ops) = if let Some((extent, data_ops)) =
         checked_div_rem::lower(function, &binding_specs, &crate_path)?
     {
         (extent, data_ops)
     } else {
         let body = validate_body(function)?;
-        let (invocation, assignment, extent) = match &body {
+        let (invocation, assignment, extent, matrix_locals) = match &body {
             ValidatedBody::Indexed {
                 invocation,
                 assignment,
-            } => (invocation, *assignment, None),
+                matrix_locals,
+            } => (invocation, *assignment, None, matrix_locals.as_ref()),
             ValidatedBody::GridStride {
                 invocation,
                 assignment,
                 extent,
-            } => (invocation, *assignment, Some(*extent)),
+                matrix_locals,
+            } => (
+                invocation,
+                *assignment,
+                Some(*extent),
+                matrix_locals.as_ref(),
+            ),
         };
+        if let Some(locals) = matrix_locals {
+            validate_matrix_locals(locals, &binding_specs, &const_generics)?;
+        }
+        if let Some(extent) = extent
+            && binding_specs.iter().any(|binding| binding.matrix.is_some())
+        {
+            validate_matrix_grid_extent(extent, &binding_specs)?;
+        }
+        let normalized_assignment = if let Some(locals) = matrix_locals {
+            normalize_matrix_local_indices(assignment, invocation, locals, &binding_specs)?
+        } else {
+            assignment.clone()
+        };
+        let assignment = &normalized_assignment;
         let output_binding = validate_assignment_target(assignment, &binding_specs, invocation)?;
         if let Some(scalar_type) = &generic_scalar {
             if generic_scalar_wrapping(function) {
@@ -652,7 +1206,7 @@ fn expand_pcu_dispatch_with_helpers(
                     invocation,
                     &crate_path,
                     extent.is_some(),
-                    helpers,
+                    output_binding.scalar,
                 );
                 let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
                 if result_type != ScalarKind::Generic {
@@ -686,39 +1240,83 @@ fn expand_pcu_dispatch_with_helpers(
                 (extent, data_ops)
             }
         } else {
-            let mut emitter = ExprEmitter::new(
-                &binding_specs,
-                invocation,
-                &crate_path,
-                extent.is_some(),
-                helpers,
-            );
-            let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
-            if result_type != output_binding.scalar {
-                return Err(Error::new(
-                    assignment.right.span(),
-                    "PCU store value type must match the output binding element type",
-                ));
-            }
-            let pcu = &crate_path;
-            let output_slot = output_binding.binding;
-            let store_index = if extent.is_some() {
-                quote! { GridStrideId }
-            } else {
-                quote! { InvocationId }
-            };
-            emitter.ops.push(quote! {
-                #pcu::PcuDispatchDataOp::BindingStore {
-                    binding: #pcu::PcuBindingRef::new(0, #output_slot),
-                    index: #pcu::PcuDispatchIndex::#store_index,
-                    value: #pcu::PcuDispatchValueId(#result_value),
+            if expr_contains_call(&assignment.right) {
+                if !matches!(output_binding.scalar, ScalarKind::F32 | ScalarKind::F64) {
+                    return Err(Error::new(
+                        assignment.right.span(),
+                        "PCU scalar helper calls require f32 or f64 output bindings",
+                    ));
                 }
-            });
-            (extent, emitter.ops)
+                let mut emitter = RuntimeExprEmitter::new(
+                    &binding_specs,
+                    invocation,
+                    &crate_path,
+                    extent.is_some(),
+                    output_binding.scalar,
+                    true,
+                );
+                let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
+                if result_type != output_binding.scalar {
+                    return Err(Error::new(
+                        assignment.right.span(),
+                        "PCU store value type must match the output binding element type",
+                    ));
+                }
+                let output_slot = output_binding.binding;
+                let pcu = &crate_path;
+                let statements = emitter.statements;
+                let store_index = if extent.is_some() {
+                    quote! { GridStrideId }
+                } else {
+                    quote! { InvocationId }
+                };
+                runtime_helper_body = Some(quote! {
+                    let mut __pcu_context = #pcu::PcuScalarLowering::new(builder, 1);
+                    #(#statements)*
+                    __pcu_context.store_value(
+                        #pcu::PcuBindingRef::new(0, #output_slot),
+                        #pcu::PcuDispatchIndex::#store_index,
+                        #result_value,
+                    )?;
+                    let builder = __pcu_context.finish()?;
+                });
+                (extent, Vec::new())
+            } else {
+                let mut emitter = ExprEmitter::new(
+                    &binding_specs,
+                    invocation,
+                    &crate_path,
+                    extent.is_some(),
+                    output_binding.scalar,
+                );
+                let (result_value, result_type) = emitter.emit_expr(&assignment.right)?;
+                if result_type != output_binding.scalar {
+                    return Err(Error::new(
+                        assignment.right.span(),
+                        "PCU store value type must match the output binding element type",
+                    ));
+                }
+                let pcu = &crate_path;
+                let output_slot = output_binding.binding;
+                let store_index = if extent.is_some() {
+                    quote! { GridStrideId }
+                } else {
+                    quote! { InvocationId }
+                };
+                emitter.ops.push(quote! {
+                    #pcu::PcuDispatchDataOp::BindingStore {
+                        binding: #pcu::PcuBindingRef::new(0, #output_slot),
+                        index: #pcu::PcuDispatchIndex::#store_index,
+                        value: #pcu::PcuDispatchValueId(#result_value),
+                    }
+                });
+                (extent, emitter.ops)
+            }
         }
     };
     let pcu = &crate_path;
 
+    let runtime_grid_stride = runtime_helper_body.is_some() && loop_extent.is_some();
     let generic_wrapping = generic_scalar.is_some() && generic_scalar_wrapping(function);
     let wrapping_body_ident = format_ident!("__{}_PcuWrappingBody", function_ident);
     let (operations, mut op_count, wrapping_body_item) = if generic_wrapping
@@ -746,6 +1344,13 @@ fn expand_pcu_dispatch_with_helpers(
             })?;
         };
         (operation, 2, body_type)
+    } else if runtime_helper_body.is_some() {
+        let runtime_body = runtime_helper_body
+            .take()
+            .expect("runtime helper body was checked");
+        let operations = quote! { #runtime_body };
+        let capacity = 256_usize;
+        (operations, capacity, quote! {})
     } else {
         let (operations, count) =
             build_body_operations(&data_ops, loop_extent, &const_generics, &crate_path)?;
@@ -771,15 +1376,40 @@ fn expand_pcu_dispatch_with_helpers(
         // The typed builder has a fixed three-op capacity: loop region plus terminal return.
         op_count = 3;
     }
-    let normal_builder = quote! {
-        let builder = #pcu::model::PcuDispatchKernelBuilder::<#op_count>::new(
-            #kernel_id,
-            "main",
-            [invocations, 1, 1],
-        )
-        .with_bindings(bindings);
-        #operations
-        builder.with_control_op(#pcu::PcuDispatchControlOp::Return)
+    let normal_builder = if runtime_grid_stride {
+        let extent = lower_invocation_expr(
+            loop_extent.expect("runtime grid-stride lowering has an extent"),
+            &const_generics,
+        )?;
+        quote! {
+            let builder = #pcu::model::PcuDispatchKernelBuilder::<#op_count>::new(
+                #kernel_id,
+                "main",
+                [invocations, 1, 1],
+            )
+            .with_bindings(bindings);
+            #operations
+            #pcu::model::PcuGridStrideKernelBuilder::new(
+                builder,
+                const {
+                    let extent: usize = #extent;
+                    assert!(extent != 0, "PCU grid-stride extent must be nonzero");
+                    assert!(extent <= u32::MAX as usize, "PCU grid-stride extent exceeds u32");
+                    extent as u32
+                },
+            )
+        }
+    } else {
+        quote! {
+            let builder = #pcu::model::PcuDispatchKernelBuilder::<#op_count>::new(
+                #kernel_id,
+                "main",
+                [invocations, 1, 1],
+            )
+            .with_bindings(bindings);
+            #operations
+            builder.with_control_op(#pcu::PcuDispatchControlOp::Return)
+        }
     };
     let builder_body = if let Some(scalar_ident) = &generic_scalar
         && generic_identity
@@ -811,10 +1441,49 @@ fn expand_pcu_dispatch_with_helpers(
     } else {
         normal_builder
     };
+    let builder_type = if runtime_grid_stride {
+        quote! { #pcu::model::PcuGridStrideKernelBuilder<#builder_lifetime, #op_count> }
+    } else {
+        quote! { #pcu::model::PcuDispatchKernelBuilder<#builder_lifetime, #op_count> }
+    };
     let builder_result = if generic_identity {
         quote! { #pcu::model::PcuScalarIdentityBuildError }
     } else {
         quote! { #pcu::PcuError }
+    };
+    let matrix_count_check = if let Some(matrix) = binding_specs
+        .iter()
+        .find_map(|binding| binding.matrix.as_ref())
+    {
+        let rows = lower_invocation_expr(&matrix.rows, &const_generics)?;
+        let columns = lower_invocation_expr(&matrix.columns, &const_generics)?;
+        if let Some(extent) = loop_extent {
+            let extent = lower_invocation_expr(extent, &const_generics)?;
+            quote! {
+                let __pcu_matrix_rows: usize = #rows;
+                let __pcu_matrix_columns: usize = #columns;
+                assert!(__pcu_matrix_rows != 0, "PCU matrix row count must be nonzero");
+                assert!(__pcu_matrix_columns != 0, "PCU matrix column count must be nonzero");
+                let __pcu_matrix_count = __pcu_matrix_rows
+                    .checked_mul(__pcu_matrix_columns)
+                    .expect("PCU matrix element count overflow");
+                let __pcu_grid_extent: usize = #extent;
+                assert!(__pcu_grid_extent == __pcu_matrix_count, "PCU grid-stride extent must equal matrix rows times columns");
+            }
+        } else {
+            quote! {
+                let __pcu_matrix_rows: usize = #rows;
+                let __pcu_matrix_columns: usize = #columns;
+                assert!(__pcu_matrix_rows != 0, "PCU matrix row count must be nonzero");
+                assert!(__pcu_matrix_columns != 0, "PCU matrix column count must be nonzero");
+                let __pcu_matrix_count = __pcu_matrix_rows
+                    .checked_mul(__pcu_matrix_columns)
+                    .expect("PCU matrix element count overflow");
+                assert!(count == __pcu_matrix_count, "PCU invocation count must equal matrix rows times columns");
+            }
+        }
+    } else {
+        quote! {}
     };
     let generic_arguments = function
         .sig
@@ -832,9 +1501,9 @@ fn expand_pcu_dispatch_with_helpers(
         |scalar_ident| quote! { #bindings_ident::<#scalar_ident>() },
     );
     let builder_call = if generic_arguments.is_empty() {
-        quote! { #function_ident(&bindings) }
+        quote! { #builder_ident(&bindings) }
     } else {
-        quote! { #function_ident::<#(#generic_arguments),*>(&bindings) }
+        quote! { #builder_ident::<#(#generic_arguments),*>(&bindings) }
     };
     let prepared_arguments = binding_specs
         .iter()
@@ -857,12 +1526,14 @@ fn expand_pcu_dispatch_with_helpers(
                 ident: binding.ident.clone(),
                 binding: binding.binding,
                 read_write: binding.access == BindingAccess::ReadWrite,
+                scalar_reference: binding.scalar_reference,
+                flatten_matrix: binding.matrix.is_some(),
                 scalar,
                 ty: input.ty.as_ref().clone(),
             }
         })
         .collect::<Vec<_>>();
-    let generated = prepared::generate(prepared::Input {
+    let prepared_input = prepared::Input {
         pcu,
         function,
         visibility: &vis,
@@ -872,18 +1543,21 @@ fn expand_pcu_dispatch_with_helpers(
         prepare_error: &builder_result,
         bindings_call,
         builder_call,
-    });
+    };
+    let direct = direct_entry.then(|| hosted::generate(&prepared_input));
+    let generated = prepared::generate(prepared_input);
     Ok(quote! {
         #wrapping_body_item
         #vis const fn #bindings_ident #binding_generic() -> [#pcu::PcuBinding<#binding_lifetime>; #binding_count] {
             [#(#binding_items),*]
         }
 
-        #vis fn #function_ident #generated_generics(
-            bindings: &'a [#pcu::PcuBinding<'a>],
-        ) -> ::core::result::Result<#pcu::model::PcuDispatchKernelBuilder<'a, #op_count>, #builder_result> {
+        #vis fn #builder_ident #generated_generics(
+            bindings: &#builder_lifetime [#pcu::PcuBinding<#builder_lifetime>],
+        ) -> ::core::result::Result<#builder_type, #builder_result> {
             let invocations: u32 = const {
                 let count: usize = #invocation_expr;
+                #matrix_count_check
                 assert!(count != 0, "PCU invocation count must be nonzero");
                 assert!(count <= u32::MAX as usize, "PCU invocation count exceeds u32");
                 count as u32
@@ -892,7 +1566,19 @@ fn expand_pcu_dispatch_with_helpers(
         }
 
         #generated
+        #direct
     })
+}
+
+fn expr_contains_call(expression: &Expr) -> bool {
+    match expression {
+        Expr::Call(_) => true,
+        Expr::Binary(binary) => {
+            expr_contains_call(&binary.left) || expr_contains_call(&binary.right)
+        }
+        Expr::Paren(paren) => expr_contains_call(&paren.expr),
+        _ => false,
+    }
 }
 
 fn lower_generic_identity(
@@ -930,134 +1616,6 @@ fn lower_generic_identity(
     ]
 }
 
-fn expand_pcu_module(module: &mut syn::ItemMod) -> Result<TokenStream2, Error> {
-    let Some((_, items)) = module.content.take() else {
-        return Err(Error::new_spanned(
-            module,
-            "`#[pcu_module]` requires an inline module so its helpers are visible to the frontend",
-        ));
-    };
-
-    let helpers = items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Fn(function) if has_attribute(&function.attrs, "pcu_fn") => {
-                Some(parse_pcu_helper(function))
-            }
-            _ => None,
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    validate_pcu_helpers(&helpers)?;
-
-    let mut expanded = Vec::with_capacity(items.len());
-    let mut kernel_count = 0_usize;
-    for item in items {
-        match item {
-            syn::Item::Fn(function) if has_attribute(&function.attrs, "pcu_fn") => {}
-            syn::Item::Fn(mut function) => {
-                let pcu_attributes = function
-                    .attrs
-                    .iter()
-                    .filter(|attribute| {
-                        attribute_ends_with(attribute, "pcu")
-                            || attribute_ends_with(attribute, "pcu_dispatch")
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if pcu_attributes.is_empty() {
-                    expanded.push(quote! { #function });
-                    continue;
-                }
-                if pcu_attributes.len() != 1 {
-                    return Err(Error::new_spanned(
-                        &function.sig.ident,
-                        "a PCU module function must have exactly one `#[pcu(...)]` or `#[pcu_dispatch(...)]` attribute",
-                    ));
-                }
-                if helpers
-                    .iter()
-                    .any(|helper| helper.ident == function.sig.ident)
-                {
-                    return Err(Error::new_spanned(
-                        &function.sig.ident,
-                        "a PCU kernel and a `#[pcu_fn]` helper cannot share a name",
-                    ));
-                }
-                let attribute = &pcu_attributes[0];
-                let args = attribute.parse_args::<PcuDispatchArgs>()?;
-                function.attrs.retain(|candidate| {
-                    !attribute_ends_with(candidate, "pcu")
-                        && !attribute_ends_with(candidate, "pcu_dispatch")
-                });
-                if let Some(attribute) = function.attrs.first() {
-                    return Err(Error::new_spanned(
-                        attribute,
-                        "`#[pcu_module]` kernels currently accept only their PCU attribute",
-                    ));
-                }
-                kernel_count += 1;
-                expanded.push(expand_pcu_dispatch_with_helpers(args, &function, &helpers)?);
-            }
-            other => {
-                if let Some(attribute) = item_attribute(&other, "pcu_fn") {
-                    return Err(Error::new_spanned(
-                        attribute,
-                        "`#[pcu_fn]` may only mark a free function inside `#[pcu_module]`",
-                    ));
-                }
-                expanded.push(quote! { #other });
-            }
-        }
-    }
-    if kernel_count == 0 {
-        return Err(Error::new_spanned(
-            &module.ident,
-            "`#[pcu_module]` requires at least one `#[pcu(...)]` or `#[pcu_dispatch(...)]` kernel",
-        ));
-    }
-
-    let attrs = &module.attrs;
-    let vis = &module.vis;
-    let unsafety = &module.unsafety;
-    let ident = &module.ident;
-    Ok(quote! {
-        #(#attrs)*
-        #vis #unsafety mod #ident {
-            #(#expanded)*
-        }
-    })
-}
-
-fn item_attribute<'a>(item: &'a syn::Item, name: &str) -> Option<&'a syn::Attribute> {
-    let attrs = match item {
-        syn::Item::Const(item) => &item.attrs,
-        syn::Item::Enum(item) => &item.attrs,
-        syn::Item::ExternCrate(item) => &item.attrs,
-        syn::Item::Fn(item) => &item.attrs,
-        syn::Item::ForeignMod(item) => &item.attrs,
-        syn::Item::Impl(item) => &item.attrs,
-        syn::Item::Macro(item) => &item.attrs,
-        syn::Item::Mod(item) => &item.attrs,
-        syn::Item::Static(item) => &item.attrs,
-        syn::Item::Struct(item) => &item.attrs,
-        syn::Item::Trait(item) => &item.attrs,
-        syn::Item::TraitAlias(item) => &item.attrs,
-        syn::Item::Type(item) => &item.attrs,
-        syn::Item::Union(item) => &item.attrs,
-        syn::Item::Use(item) => &item.attrs,
-        _ => return None,
-    };
-    attrs
-        .iter()
-        .find(|attribute| attribute_ends_with(attribute, name))
-}
-
-fn has_attribute(attrs: &[syn::Attribute], name: &str) -> bool {
-    attrs
-        .iter()
-        .any(|attribute| attribute_ends_with(attribute, name))
-}
-
 fn attribute_ends_with(attribute: &syn::Attribute, name: &str) -> bool {
     attribute
         .path()
@@ -1066,36 +1624,49 @@ fn attribute_ends_with(attribute: &syn::Attribute, name: &str) -> bool {
         .is_some_and(|segment| segment.ident == name)
 }
 
+fn project_companion_cfg(attribute: &syn::Attribute) -> Vec<syn::Attribute> {
+    if attribute.path().is_ident("cfg") {
+        return vec![attribute.clone()];
+    }
+    if !attribute.path().is_ident("cfg_attr") {
+        return Vec::new();
+    }
+    let syn::Meta::List(list) = &attribute.meta else {
+        return Vec::new();
+    };
+    let parser = syn::punctuated::Punctuated::<syn::Meta, Token![,]>::parse_terminated;
+    let Ok(arguments) = parser.parse2(list.tokens.clone()) else {
+        return Vec::new();
+    };
+    if arguments.is_empty() {
+        return Vec::new();
+    }
+    let condition = arguments.first().expect("nonempty cfg_attr").clone();
+    let nested = arguments
+        .iter()
+        .skip(1)
+        .flat_map(|meta| match meta {
+            syn::Meta::List(nested_list) if nested_list.path.is_ident("cfg_attr") => {
+                let nested_attribute: syn::Attribute = syn::parse_quote!(#[cfg_attr #nested_list]);
+                project_companion_cfg(&nested_attribute)
+            }
+            syn::Meta::List(_) if meta.path().is_ident("cfg") => {
+                vec![syn::parse_quote!(#[#meta])]
+            }
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if nested.is_empty() {
+        return Vec::new();
+    }
+    let nested_meta = nested
+        .iter()
+        .map(|attribute| &attribute.meta)
+        .collect::<Vec<_>>();
+    vec![syn::parse_quote!(#[cfg_attr(#condition, #(#nested_meta),*)])]
+}
+
 fn parse_pcu_helper(function: &ItemFn) -> Result<PcuHelper, Error> {
-    let marker_count = function
-        .attrs
-        .iter()
-        .filter(|attribute| attribute_ends_with(attribute, "pcu_fn"))
-        .count();
-    if marker_count != 1 {
-        return Err(Error::new_spanned(
-            &function.sig.ident,
-            "a PCU helper must have exactly one `#[pcu_fn]` marker",
-        ));
-    }
-    if let Some(marker) = function
-        .attrs
-        .iter()
-        .find(|attribute| attribute_ends_with(attribute, "pcu_fn"))
-        && !matches!(marker.meta, syn::Meta::Path(_))
-    {
-        return Err(Error::new_spanned(marker, "`#[pcu_fn]` takes no arguments"));
-    }
-    if let Some(attribute) = function
-        .attrs
-        .iter()
-        .find(|attribute| !attribute_ends_with(attribute, "pcu_fn"))
-    {
-        return Err(Error::new_spanned(
-            attribute,
-            "`#[pcu_module]` helpers currently accept only the `#[pcu_fn]` marker",
-        ));
-    }
     if function.sig.asyncness.is_some()
         || function.sig.constness.is_some()
         || function.sig.unsafety.is_some()
@@ -1115,13 +1686,12 @@ fn parse_pcu_helper(function: &ItemFn) -> Result<PcuHelper, Error> {
             "PCU helpers must declare an explicit `-> f32` return type",
         ));
     };
-    if !matches!(return_type.as_ref(), Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32"))
-    {
+    let Some(scalar) = scalar_kind(return_type) else {
         return Err(Error::new_spanned(
             return_type,
-            "this PCU helper profile supports only the `f32` scalar type",
+            "this PCU helper profile supports only `f32` or `f64` scalar types",
         ));
-    }
+    };
     let mut parameters = Vec::with_capacity(function.sig.inputs.len());
     for input in &function.sig.inputs {
         let FnArg::Typed(argument) = input else {
@@ -1136,11 +1706,10 @@ fn parse_pcu_helper(function: &ItemFn) -> Result<PcuHelper, Error> {
                 "PCU helper parameters must be simple identifiers",
             ));
         };
-        if !matches!(argument.ty.as_ref(), Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32"))
-        {
+        if scalar_kind(&argument.ty) != Some(scalar) {
             return Err(Error::new_spanned(
                 &argument.ty,
-                "this PCU helper profile supports only `f32` scalar parameters",
+                "PCU helper parameters must match the declared f32 or f64 result type",
             ));
         }
         if parameters
@@ -1163,143 +1732,9 @@ fn parse_pcu_helper(function: &ItemFn) -> Result<PcuHelper, Error> {
     Ok(PcuHelper {
         ident: function.sig.ident.clone(),
         parameters,
+        scalar,
         body: body.clone(),
     })
-}
-
-fn validate_pcu_helpers(helpers: &[PcuHelper]) -> Result<(), Error> {
-    for (index, helper) in helpers.iter().enumerate() {
-        if helpers[..index]
-            .iter()
-            .any(|prior| prior.ident == helper.ident)
-        {
-            return Err(Error::new(
-                helper.ident.span(),
-                "duplicate PCU helper name in this module",
-            ));
-        }
-    }
-    let mut call_graph = Vec::with_capacity(helpers.len());
-    for helper in helpers {
-        let mut calls = Vec::new();
-        validate_helper_expression(&helper.body, &helper.parameters, helpers, &mut calls)?;
-        call_graph.push(calls);
-    }
-    let mut state = vec![0_u8; helpers.len()];
-    for index in 0..helpers.len() {
-        validate_helper_acyclic(index, helpers, &call_graph, &mut state)?;
-    }
-    Ok(())
-}
-
-fn validate_helper_expression(
-    expression: &Expr,
-    parameters: &[Ident],
-    helpers: &[PcuHelper],
-    calls: &mut Vec<usize>,
-) -> Result<(), Error> {
-    match expression {
-        Expr::Binary(binary) => {
-            if !matches!(
-                binary.op,
-                BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
-            ) {
-                return Err(Error::new(
-                    binary.op.span(),
-                    "PCU helper arithmetic supports only `+`, `-`, `*`, and `/`",
-                ));
-            }
-            validate_helper_expression(&binary.left, parameters, helpers, calls)?;
-            validate_helper_expression(&binary.right, parameters, helpers, calls)
-        }
-        Expr::Call(call) => {
-            let Expr::Path(path) = call.func.as_ref() else {
-                return Err(Error::new(
-                    call.func.span(),
-                    "PCU helpers may call only direct sibling `#[pcu_fn]` helpers",
-                ));
-            };
-            if path.qself.is_some() || path.path.segments.len() != 1 {
-                return Err(Error::new(
-                    path.span(),
-                    "PCU helpers may call only direct sibling `#[pcu_fn]` helpers",
-                ));
-            }
-            let name = &path.path.segments[0].ident;
-            let Some((helper_index, target)) = helpers
-                .iter()
-                .enumerate()
-                .find(|(_, candidate)| candidate.ident == *name)
-            else {
-                return Err(Error::new(
-                    name.span(),
-                    "PCU helper calls must resolve to a sibling `#[pcu_fn]` helper",
-                ));
-            };
-            if target.parameters.len() != call.args.len() {
-                return Err(Error::new(
-                    call.span(),
-                    "PCU helper argument count does not match its definition",
-                ));
-            }
-            calls.push(helper_index);
-            for argument in &call.args {
-                validate_helper_expression(argument, parameters, helpers, calls)?;
-            }
-            Ok(())
-        }
-        Expr::Lit(literal) => match &literal.lit {
-            Lit::Float(value) if matches!(value.suffix(), "" | "f32") => Ok(()),
-            Lit::Float(value) => Err(Error::new(
-                value.span(),
-                "PCU helper constants must be unsuffixed or explicitly suffixed `f32`",
-            )),
-            _ => Err(Error::new(
-                literal.span(),
-                "PCU helper constants must be floating point literals",
-            )),
-        },
-        Expr::Paren(paren) => validate_helper_expression(&paren.expr, parameters, helpers, calls),
-        Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
-            let name = &path.path.segments[0].ident;
-            if parameters.iter().any(|parameter| parameter == name) {
-                Ok(())
-            } else {
-                Err(Error::new(
-                    name.span(),
-                    "PCU helper expressions may reference only their scalar parameters",
-                ))
-            }
-        }
-        _ => Err(Error::new(
-            expression.span(),
-            "PCU helper bodies support only scalar parameters, f32 literals, parentheses, arithmetic, and sibling helper calls",
-        )),
-    }
-}
-
-fn validate_helper_acyclic(
-    index: usize,
-    helpers: &[PcuHelper],
-    call_graph: &[Vec<usize>],
-    state: &mut [u8],
-) -> Result<(), Error> {
-    match state[index] {
-        1 => {
-            return Err(Error::new(
-                helpers[index].ident.span(),
-                "recursive PCU helper calls are not supported",
-            ));
-        }
-        2 => return Ok(()),
-        _ => {}
-    }
-    state[index] = 1;
-    for &called in &call_graph[index] {
-        validate_helper_acyclic(called, helpers, call_graph, state)?;
-    }
-    state[index] = 2;
-    Ok(())
 }
 
 fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
@@ -1514,32 +1949,62 @@ fn validate_generic_identity(
     let Expr::Index(source_index) = assignment.right.as_ref() else {
         return Err(Error::new(
             assignment.right.span(),
-            "generic `T: PcuScalar` kernels currently support only `output[id] = input[id]`",
+            "generic `T: PcuScalar` kernels currently support only an indexed identity copy",
         ));
     };
-    let Some(source) = expr_ident(&source_index.expr) else {
+    let source_matrix = shape::matrix_base(source_index).is_some();
+    let source_base = shape::matrix_base(source_index).unwrap_or(&source_index.expr);
+    let Some(source) = expr_ident(source_base) else {
         return Err(Error::new(
-            source_index.expr.span(),
+            source_base.span(),
             "identity source must be a binding",
         ));
     };
-    validate_invocation_index(&source_index.index, invocation)?;
     let Expr::Index(target_index) = assignment.left.as_ref() else {
         unreachable!("validated generic output binding is indexed")
     };
-    let Some(target) = expr_ident(&target_index.expr) else {
+    let target_matrix = shape::matrix_base(target_index).is_some();
+    let target_base = shape::matrix_base(target_index).unwrap_or(&target_index.expr);
+    let Some(target) = expr_ident(target_base) else {
         unreachable!("validated generic output binding is named")
     };
-    validate_invocation_index(&target_index.index, invocation)?;
+    let source_binding = bindings
+        .iter()
+        .find(|binding| binding.ident == *source)
+        .ok_or_else(|| Error::new(source.span(), "identity source must be a binding"))?;
+    let target_binding = bindings
+        .iter()
+        .find(|binding| binding.ident == *target)
+        .ok_or_else(|| Error::new(target.span(), "identity target must be a binding"))?;
+    if source_matrix != target_matrix || source_binding.matrix.is_some() != source_matrix {
+        return Err(Error::new(
+            assignment.span(),
+            "generic identity copy must use matching flat or rank-two bindings",
+        ));
+    }
+    if let Some(dimensions) = &source_binding.matrix {
+        if !shape::is_canonical_matrix_index(source_index, invocation, &dimensions.columns) {
+            return Err(Error::new(
+                source_index.span(),
+                "generic rank-two identity source must use canonical row and column indexing",
+            ));
+        }
+    } else {
+        validate_invocation_index(&source_index.index, invocation)?;
+    }
+    if let Some(dimensions) = &target_binding.matrix {
+        if !shape::is_canonical_matrix_index(target_index, invocation, &dimensions.columns) {
+            return Err(Error::new(
+                target_index.span(),
+                "generic rank-two identity target must use canonical row and column indexing",
+            ));
+        }
+    } else {
+        validate_invocation_index(&target_index.index, invocation)?;
+    }
     if source == target
-        || bindings
-            .iter()
-            .find(|binding| binding.ident == *source)
-            .is_none_or(|binding| binding.access != BindingAccess::ReadOnly)
-        || bindings
-            .iter()
-            .find(|binding| binding.ident == *target)
-            .is_none_or(|binding| binding.access != BindingAccess::ReadWrite)
+        || source_binding.access != BindingAccess::ReadOnly
+        || target_binding.access != BindingAccess::ReadWrite
     {
         return Err(Error::new(
             assignment.span(),
@@ -1613,6 +2078,7 @@ fn lower_invocation_expr(expr: &Expr, const_generics: &[Ident]) -> Result<TokenS
 fn parse_bindings(
     inputs: &syn::punctuated::Punctuated<FnArg, Token![,]>,
     generic_scalar: Option<&Ident>,
+    const_generics: &[Ident],
 ) -> Result<Vec<BindingSpec>, Error> {
     let mut bindings = Vec::new();
     for input in inputs {
@@ -1628,7 +2094,8 @@ fn parse_bindings(
                 "PCU kernel bindings must be identifiers",
             ));
         };
-        let (access, scalar, binding_generic) = parse_binding_type(&input.ty, generic_scalar)?;
+        let (access, scalar, binding_generic, scalar_reference, matrix) =
+            parse_binding_type(&input.ty, generic_scalar, const_generics)?;
         let binding = u32::try_from(bindings.len())
             .map_err(|_| Error::new(input.span(), "too many PCU bindings for this macro"))?;
         bindings.push(BindingSpec {
@@ -1637,42 +2104,118 @@ fn parse_bindings(
             binding,
             scalar,
             generic_scalar: binding_generic,
+            scalar_reference,
+            matrix,
         });
     }
     Ok(bindings)
 }
 
+fn validate_binding_shapes(bindings: &[BindingSpec]) -> Result<(), Error> {
+    let mut matrix_bindings = bindings
+        .iter()
+        .filter_map(|binding| binding.matrix.as_ref().map(|matrix| (binding, matrix)));
+    let Some((reference_binding, reference)) = matrix_bindings.next() else {
+        return Ok(());
+    };
+    let generic_scalar = reference_binding.generic_scalar.as_ref();
+    if generic_scalar.is_none()
+        && !matches!(reference_binding.scalar, ScalarKind::F32 | ScalarKind::F64)
+    {
+        return Err(Error::new(
+            reference_binding.ident.span(),
+            "rank-two PCU maps currently support concrete f32/f64 or one generic `T: PcuScalar` element type",
+        ));
+    }
+    for binding in bindings {
+        let same_scalar = generic_scalar.map_or_else(
+            || binding.scalar == reference_binding.scalar && binding.generic_scalar.is_none(),
+            |generic| {
+                binding.scalar == ScalarKind::Generic
+                    && binding.generic_scalar.as_ref() == Some(generic)
+            },
+        );
+        if !same_scalar {
+            return Err(Error::new(
+                binding.ident.span(),
+                "rank-two PCU maps require every binding to use the same scalar type",
+            ));
+        }
+        if binding.matrix.is_none() && (generic_scalar.is_some() || !binding.scalar_reference) {
+            return Err(Error::new(
+                binding.ident.span(),
+                "rank-two PCU maps do not mix flat vectors or scalar references with matrices",
+            ));
+        }
+    }
+    for (binding, matrix) in matrix_bindings {
+        if !shape::same_dimension(&reference.rows, &matrix.rows)
+            || !shape::same_dimension(&reference.columns, &matrix.columns)
+        {
+            return Err(Error::new(
+                binding.ident.span(),
+                "all PCU rank-two matrix bindings must have identical row and column extents",
+            ));
+        }
+    }
+    Ok(())
+}
+
+type ParsedBindingType = (
+    BindingAccess,
+    ScalarKind,
+    Option<Ident>,
+    bool,
+    Option<shape::FixedMatrixShape>,
+);
+
 fn parse_binding_type(
     ty: &Type,
     generic_scalar: Option<&Ident>,
-) -> Result<(BindingAccess, ScalarKind, Option<Ident>), Error> {
+    const_generics: &[Ident],
+) -> Result<ParsedBindingType, Error> {
     let Type::Reference(reference) = ty else {
         return Err(Error::new(
             ty.span(),
-            "PCU binding types must be slices of f32, f64, u8, u16, u32, u64, i8, i16, i32, or i64",
+            "PCU binding types must be scalar references to f32 or f64, or slices/fixed arrays of supported PCU scalars",
         ));
     };
-    if reference.lifetime.is_some() {
-        return Err(Error::new(
-            reference.span(),
-            "explicit lifetimes on PCU dispatch bindings are unsupported",
-        ));
+    let (element_type, scalar_reference, matrix) = match reference.elem.as_ref() {
+        Type::Slice(slice) => (slice.elem.as_ref(), false, None),
+        Type::Array(array) => {
+            if let Some((element, matrix)) = shape::nested_array_type(&reference.elem) {
+                (element, false, Some(matrix))
+            } else {
+                (array.elem.as_ref(), false, None)
+            }
+        }
+        Type::Path(_) if reference.mutability.is_none() => (reference.elem.as_ref(), true, None),
+        _ => {
+            return Err(Error::new(
+                reference.elem.span(),
+                "PCU dispatch resources must be scalar slices or fixed arrays",
+            ));
+        }
+    };
+    if let Some(matrix) = &matrix {
+        lower_invocation_expr(&matrix.rows, const_generics)?;
+        lower_invocation_expr(&matrix.columns, const_generics)?;
     }
-    let Type::Slice(slice) = reference.elem.as_ref() else {
+    let Type::Path(element) = element_type else {
         return Err(Error::new(
-            reference.elem.span(),
-            "PCU dispatch resources must be slices of f32, f64, u8, u16, u32, u64, i8, i16, i32, or i64",
-        ));
-    };
-    let Type::Path(element) = slice.elem.as_ref() else {
-        return Err(Error::new(
-            slice.elem.span(),
+            element_type.span(),
             "this PCU dispatch macro currently supports only f32, f64, u8, u16, u32, u64, i8, i16, i32, and i64 elements",
         ));
     };
     if let Some(generic) = generic_scalar
         && element.path.is_ident(generic)
     {
+        if scalar_reference {
+            return Err(Error::new(
+                element.span(),
+                "generic scalar references are unsupported; use a concrete f32 or f64 reference",
+            ));
+        }
         return Ok((
             if reference.mutability.is_some() {
                 BindingAccess::ReadWrite
@@ -1681,6 +2224,8 @@ fn parse_binding_type(
             },
             ScalarKind::Generic,
             Some(generic.clone()),
+            false,
+            matrix,
         ));
     }
     let scalar = if element.path.is_ident("f32") {
@@ -1709,6 +2254,12 @@ fn parse_binding_type(
             "this PCU dispatch macro currently supports only f32, f64, u8, u16, u32, u64, i8, i16, i32, and i64 elements",
         ));
     };
+    if scalar_reference && !matches!(scalar, ScalarKind::F32 | ScalarKind::F64) {
+        return Err(Error::new(
+            element.span(),
+            "read-only scalar parameters currently support only f32 and f64",
+        ));
+    }
     Ok((
         if reference.mutability.is_some() {
             BindingAccess::ReadWrite
@@ -1717,6 +2268,8 @@ fn parse_binding_type(
         },
         scalar,
         None,
+        scalar_reference,
+        matrix,
     ))
 }
 
@@ -1724,11 +2277,13 @@ enum ValidatedBody<'a> {
     Indexed {
         invocation: Ident,
         assignment: &'a ExprAssign,
+        matrix_locals: Option<MatrixLocals>,
     },
     GridStride {
         invocation: Ident,
         assignment: &'a ExprAssign,
         extent: &'a Expr,
+        matrix_locals: Option<MatrixLocals>,
     },
 }
 
@@ -1739,7 +2294,7 @@ fn validate_body(function: &ItemFn) -> Result<ValidatedBody<'_>, Error> {
     {
         return validate_grid_stride_body(statements);
     }
-    if statements.len() != 2 {
+    if statements.len() != 2 && statements.len() != 4 {
         let span = statements
             .get(2)
             .map_or_else(|| function.block.span(), syn::spanned::Spanned::span);
@@ -1786,15 +2341,22 @@ fn validate_body(function: &ItemFn) -> Result<ValidatedBody<'_>, Error> {
         ));
     }
 
-    let Stmt::Expr(Expr::Assign(assignment), Some(_)) = &statements[1] else {
+    let (assignment_index, matrix_locals) = if statements.len() == 4 {
+        let locals = parse_matrix_locals(&statements[1], &statements[2], &pat.ident, None)?;
+        (3, Some(locals))
+    } else {
+        (1, None)
+    };
+    let Stmt::Expr(Expr::Assign(assignment), Some(_)) = &statements[assignment_index] else {
         return Err(Error::new(
-            diagnostic_statement_span(&statements[1]),
+            diagnostic_statement_span(&statements[assignment_index]),
             "second PCU dispatch statement must be `output[invocation] = <expr>;`",
         ));
     };
     Ok(ValidatedBody::Indexed {
         invocation: pat.ident.clone(),
         assignment,
+        matrix_locals,
     })
 }
 
@@ -1850,17 +2412,30 @@ fn validate_grid_stride_body(statements: &[Stmt]) -> Result<ValidatedBody<'_>, E
     if !matches!(condition.op, BinOp::Lt(_)) || !is_ident_expr(&condition.left, &id_pat.ident) {
         return Err(unsupported(condition.span()));
     }
-    let [
-        Stmt::Expr(Expr::Assign(assignment), Some(_)),
-        Stmt::Expr(Expr::Binary(increment), Some(_)),
-    ] = loop_expr.body.stmts.as_slice()
-    else {
-        let span = loop_expr
-            .body
-            .stmts
-            .first()
-            .map_or_else(|| loop_expr.while_token.span(), grid_stride_statement_span);
-        return Err(unsupported(span));
+    let (assignment, increment, matrix_locals) = match loop_expr.body.stmts.as_slice() {
+        [
+            Stmt::Expr(Expr::Assign(assignment), Some(_)),
+            Stmt::Expr(Expr::Binary(increment), Some(_)),
+        ] => (assignment, increment, None),
+        [
+            row,
+            column,
+            Stmt::Expr(Expr::Assign(assignment), Some(_)),
+            Stmt::Expr(Expr::Binary(increment), Some(_)),
+        ] => {
+            let locals =
+                parse_matrix_locals(row, column, &id_pat.ident, Some(stride_pat.ident.clone()))
+                    .map_err(|_| unsupported(row.span()))?;
+            (assignment, increment, Some(locals))
+        }
+        _ => {
+            let span = loop_expr
+                .body
+                .stmts
+                .first()
+                .map_or_else(|| loop_expr.while_token.span(), grid_stride_statement_span);
+            return Err(unsupported(span));
+        }
     };
     if !matches!(increment.op, BinOp::AddAssign(_)) {
         return Err(unsupported(increment.op.span()));
@@ -1875,7 +2450,192 @@ fn validate_grid_stride_body(statements: &[Stmt]) -> Result<ValidatedBody<'_>, E
         invocation: id_pat.ident.clone(),
         assignment,
         extent: &condition.right,
+        matrix_locals,
     })
+}
+
+fn parse_matrix_locals(
+    row_statement: &Stmt,
+    column_statement: &Stmt,
+    invocation: &Ident,
+    stride: Option<Ident>,
+) -> Result<MatrixLocals, Error> {
+    let (row_name, row_expression) = matrix_local_declaration(row_statement)?;
+    let (column_name, column_expression) = matrix_local_declaration(column_statement)?;
+    let Some(columns) = shape::matrix_local_extent(row_expression, column_expression, invocation)
+    else {
+        return Err(Error::new(
+            row_expression.span(),
+            "matrix locals must be `let row = id / C; let column = id % C` using one extent",
+        ));
+    };
+    if *row_name == *column_name {
+        return Err(Error::new(
+            row_statement.span(),
+            "row and column coordinates must use distinct local names",
+        ));
+    }
+    Ok(MatrixLocals {
+        row: row_name.clone(),
+        column: column_name.clone(),
+        columns,
+        invocation: invocation.clone(),
+        stride,
+    })
+}
+
+fn matrix_local_declaration(statement: &Stmt) -> Result<(&Ident, &Expr), Error> {
+    let Stmt::Local(local) = statement else {
+        return Err(Error::new(
+            statement.span(),
+            "matrix coordinates must be immutable local bindings",
+        ));
+    };
+    let Pat::Ident(pattern) = &local.pat else {
+        return Err(Error::new(
+            local.pat.span(),
+            "matrix coordinates must use plain local names",
+        ));
+    };
+    if !local.attrs.is_empty()
+        || pattern.mutability.is_some()
+        || pattern.by_ref.is_some()
+        || pattern.subpat.is_some()
+    {
+        return Err(Error::new(
+            pattern.span(),
+            "matrix coordinates must be immutable plain local bindings",
+        ));
+    }
+    let Some(initializer) = &local.init else {
+        return Err(Error::new(
+            pattern.span(),
+            "matrix coordinates must be initialized from the invocation id",
+        ));
+    };
+    if initializer.diverge.is_some() {
+        return Err(Error::new(
+            initializer.expr.span(),
+            "matrix coordinate initializer cannot diverge",
+        ));
+    }
+    Ok((&pattern.ident, &initializer.expr))
+}
+
+fn validate_matrix_locals(
+    locals: &MatrixLocals,
+    bindings: &[BindingSpec],
+    const_generics: &[Ident],
+) -> Result<(), Error> {
+    let Some(matrix) = bindings.iter().find_map(|binding| binding.matrix.as_ref()) else {
+        return Err(Error::new(
+            locals.row.span(),
+            "row and column locals are supported only with fixed rank-two matrix bindings",
+        ));
+    };
+    if !shape::same_dimension(&locals.columns, &matrix.columns) {
+        return Err(Error::new(
+            locals.columns.span(),
+            "matrix coordinate divisor must equal the declared column extent",
+        ));
+    }
+    let reserved = bindings
+        .iter()
+        .map(|binding| binding.ident.clone())
+        .chain(core::iter::once(locals.invocation.clone()))
+        .chain(locals.stride.iter().cloned())
+        .chain(const_generics.iter().cloned());
+    if let Some(shadowed) = [locals.row.clone(), locals.column.clone()]
+        .into_iter()
+        .find(|coordinate| reserved.clone().any(|name| name == *coordinate))
+    {
+        return Err(Error::new(
+            shadowed.span(),
+            "matrix coordinate locals cannot shadow a binding, invocation, stride, or const parameter",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_matrix_grid_extent(extent: &Expr, bindings: &[BindingSpec]) -> Result<(), Error> {
+    let Some(matrix) = bindings.iter().find_map(|binding| binding.matrix.as_ref()) else {
+        return Err(Error::new(
+            extent.span(),
+            "rank-two grid-stride extent requires fixed rank-two matrix bindings",
+        ));
+    };
+    if !shape::is_matrix_element_count(extent, &matrix.rows, &matrix.columns) {
+        return Err(Error::new(
+            extent.span(),
+            "rank-two grid-stride loop extent must equal the checked matrix row count times column count",
+        ));
+    }
+    Ok(())
+}
+
+struct MatrixIndexNormalizer<'a> {
+    invocation: &'a Ident,
+    locals: &'a MatrixLocals,
+    bindings: &'a [BindingSpec],
+    error: Option<Error>,
+}
+
+impl VisitMut for MatrixIndexNormalizer<'_> {
+    fn visit_expr_index_mut(&mut self, index: &mut ExprIndex) {
+        let Some(base) = shape::matrix_base(index).and_then(expr_ident) else {
+            visit_mut::visit_expr_index_mut(self, index);
+            return;
+        };
+        let Some(binding) = self
+            .bindings
+            .iter()
+            .find(|binding| binding.ident == *base && binding.matrix.is_some())
+        else {
+            visit_mut::visit_expr_index_mut(self, index);
+            return;
+        };
+        let columns = &binding.matrix.as_ref().expect("matrix checked").columns;
+        let row_column = shape::is_matrix_local_index(index, &self.locals.row, &self.locals.column);
+        if row_column {
+            let invocation = self.invocation;
+            let Expr::Index(inner) = index.expr.as_mut() else {
+                unreachable!("matrix base check guarantees nested index");
+            };
+            let row_index: Expr = syn::parse_quote!(#invocation / #columns);
+            let column_index: Expr = syn::parse_quote!(#invocation % #columns);
+            *inner.index = row_index;
+            *index.index = column_index;
+            visit_mut::visit_expr_index_mut(self, index);
+            return;
+        }
+        if !shape::is_canonical_matrix_index(index, self.invocation, columns) {
+            self.error = Some(Error::new(
+                index.span(),
+                "rank-two binding access must use canonical `matrix[row][column]` locals or `matrix[id / C][id % C]` indexing",
+            ));
+        }
+        visit_mut::visit_expr_index_mut(self, index);
+    }
+}
+
+fn normalize_matrix_local_indices(
+    assignment: &ExprAssign,
+    invocation: &Ident,
+    locals: &MatrixLocals,
+    bindings: &[BindingSpec],
+) -> Result<ExprAssign, Error> {
+    let mut assignment = assignment.clone();
+    let mut normalizer = MatrixIndexNormalizer {
+        invocation,
+        locals,
+        bindings,
+        error: None,
+    };
+    normalizer.visit_expr_assign_mut(&mut assignment);
+    if let Some(error) = normalizer.error {
+        return Err(error);
+    }
+    Ok(assignment)
 }
 
 fn grid_stride_statement_span(statement: &Stmt) -> proc_macro2::Span {
@@ -1975,29 +2735,81 @@ fn validate_assignment_target<'a>(
     let Expr::Index(ExprIndex { expr, index, .. }) = assignment.left.as_ref() else {
         return Err(Error::new(
             assignment.left.span(),
-            "PCU dispatch assignment target must be `output[invocation]`",
+            "PCU dispatch assignment target must be `output[invocation]` or canonical `output[invocation / C][invocation % C]`",
         ));
     };
-    validate_invocation_index(index, invocation_ident)?;
-    let Some(output_ident) = expr_ident(expr) else {
-        return Err(Error::new(
-            expr.span(),
-            "PCU dispatch assignment target must be `output[invocation]`",
-        ));
+    let output_ident = if let Expr::Index(inner) = expr.as_ref() {
+        let Some(output_ident) = expr_ident(&inner.expr) else {
+            return Err(Error::new(
+                inner.expr.span(),
+                "PCU matrix assignment target must be a named fixed rank-two binding",
+            ));
+        };
+        let Some(binding) = bindings
+            .iter()
+            .find(|binding| binding.ident == *output_ident)
+        else {
+            return Err(Error::new(
+                output_ident.span(),
+                "unknown PCU output binding",
+            ));
+        };
+        let Some(dimensions) = binding.matrix.as_ref() else {
+            return Err(Error::new(
+                inner.span(),
+                "nested PCU assignment is supported only for fixed rank-two array bindings",
+            ));
+        };
+        if !shape::is_canonical_matrix_components(
+            &inner.index,
+            index,
+            invocation_ident,
+            &dimensions.columns,
+        ) {
+            return Err(Error::new(
+                assignment.left.span(),
+                "rank-two PCU assignment target must use `output[invocation / C][invocation % C]` with the declared column extent",
+            ));
+        }
+        output_ident.clone()
+    } else {
+        validate_invocation_index(index, invocation_ident)?;
+        let Some(output_ident) = expr_ident(expr) else {
+            return Err(Error::new(
+                expr.span(),
+                "PCU dispatch assignment target must be `output[invocation]`",
+            ));
+        };
+        let Some(binding) = bindings
+            .iter()
+            .find(|binding| binding.ident == *output_ident)
+        else {
+            return Err(Error::new(
+                output_ident.span(),
+                "unknown PCU output binding",
+            ));
+        };
+        if binding.matrix.is_some() {
+            return Err(Error::new(
+                expr.span(),
+                "rank-two PCU assignment targets must use canonical row and column indexing",
+            ));
+        }
+        output_ident.clone()
     };
     let Some(binding) = bindings
         .iter()
-        .find(|binding| binding.ident == *output_ident)
+        .find(|binding| binding.ident == output_ident)
     else {
         return Err(Error::new(
             output_ident.span(),
             "unknown PCU output binding",
         ));
     };
-    if !matches!(binding.access, BindingAccess::ReadWrite) {
+    if binding.access != BindingAccess::ReadWrite {
         return Err(Error::new(
             output_ident.span(),
-            "PCU assignment target must be a mutable f32, u32, u64, i32, or i64 slice binding",
+            "PCU assignment target must be mutable",
         ));
     }
     Ok(binding)
@@ -2030,9 +2842,51 @@ fn expr_ident(expr: &Expr) -> Option<&Ident> {
     path.path.segments.first().map(|segment| &segment.ident)
 }
 
-fn parse_f32_bits(float: &LitFloat) -> Result<u32, Error> {
-    let value = float.base10_parse::<f32>()?;
-    Ok(value.to_bits())
+fn parse_float_bits(float: &LitFloat, expected: ScalarKind) -> Result<(ScalarKind, u64), Error> {
+    let suffix = float.suffix();
+    let scalar = match suffix {
+        "" => match expected {
+            ScalarKind::F32 | ScalarKind::F64 => expected,
+            _ => ScalarKind::F32,
+        },
+        "f32" => ScalarKind::F32,
+        "f64" => ScalarKind::F64,
+        _ => {
+            return Err(Error::new(
+                float.span(),
+                "PCU floating literals may use only the f32 or f64 suffix",
+            ));
+        }
+    };
+    if matches!(expected, ScalarKind::F32 | ScalarKind::F64) && scalar != expected {
+        return Err(Error::new(
+            float.span(),
+            "PCU floating literal suffix does not match the scalar profile",
+        ));
+    }
+    match scalar {
+        ScalarKind::F32 => {
+            let value = float.base10_parse::<f32>()?;
+            if !value.is_finite() {
+                return Err(Error::new(
+                    float.span(),
+                    "PCU floating literal is outside the finite f32 range",
+                ));
+            }
+            Ok((scalar, u64::from(value.to_bits())))
+        }
+        ScalarKind::F64 => {
+            let value = float.base10_parse::<f64>()?;
+            if !value.is_finite() {
+                return Err(Error::new(
+                    float.span(),
+                    "PCU floating literal is outside the finite f64 range",
+                ));
+            }
+            Ok((scalar, value.to_bits()))
+        }
+        _ => unreachable!("the scalar profile was restricted to f32/f64"),
+    }
 }
 
 fn binding_tokens(binding: &BindingSpec, pcu: &Path) -> TokenStream2 {
@@ -2568,7 +3422,7 @@ mod tests {
         let error =
             expand_pcu_dispatch(args, &function).expect_err("generic arithmetic is unsupported");
         let message = error.to_string();
-        assert!(message.contains("currently support only `output[id] = input[id]`"));
+        assert!(message.contains("currently support only an indexed identity copy"));
     }
 
     #[test]

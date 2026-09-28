@@ -142,7 +142,7 @@ fn run_chain_case<const N: usize>(
     native_right.copy_from(&right_bytes)?;
 
     let bindings = wrapping_add_mul_u32_bindings();
-    let builder = wrapping_add_mul_u32::<N>(&bindings)?;
+    let builder = wrapping_add_mul_u32_ir::<N>(&bindings)?;
     let kernel = builder.ir();
     let invocations = u32::try_from(N)?;
     let prepared = support::cold_once("PCU chained u32 cold prepare", || {
@@ -235,7 +235,7 @@ fn verify_other_u32_operations(backend: &RocmOwnedDispatchBackend) -> Result<(),
     device_right.copy_from(&encode_u32(&right))?;
     {
         let bindings = wrapping_sub_u32_bindings();
-        let builder = wrapping_sub_u32(&bindings)?;
+        let builder = wrapping_sub_u32_ir(&bindings)?;
         let kernel = builder.ir();
         let prepared = backend.prepare_dispatch(PcuDispatchSubmission {
             kernel: &kernel,
@@ -259,7 +259,7 @@ fn verify_other_u32_operations(backend: &RocmOwnedDispatchBackend) -> Result<(),
     }
     {
         let bindings = wrapping_mul_grid_u32_bindings();
-        let builder = wrapping_mul_grid_u32::<65>(&bindings)?;
+        let builder = wrapping_mul_grid_u32_ir::<65>(&bindings)?;
         let kernel = builder.ir();
         let prepared = backend.prepare_dispatch(PcuDispatchSubmission {
             kernel: &kernel,
@@ -322,7 +322,7 @@ fn run_case<const N: usize>(
     native_right.copy_from(&right_bytes)?;
 
     let bindings = wrapping_add_generic_bindings::<u32>();
-    let builder = wrapping_add_generic::<u32, N>(&bindings)?;
+    let builder = wrapping_add_generic_ir::<u32, N>(&bindings)?;
     let kernel = builder.ir();
     let invocations = u32::try_from(N)?;
     let prepared = support::cold_once("PCU cold prepare", || {

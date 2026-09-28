@@ -338,7 +338,13 @@ fn lower_checked_div_rem_body<'a>(
             "checked u32 DivRem requires two read-only inputs followed by two writable outputs",
         ));
     }
-    let mut emitter = ExprEmitter::new(bindings, &body.invocation, pcu, body.extent.is_some(), &[]);
+    let mut emitter = ExprEmitter::new(
+        bindings,
+        &body.invocation,
+        pcu,
+        body.extent.is_some(),
+        ScalarKind::Generic,
+    );
     let (lhs, lhs_type) = emitter.emit_expr(body.lhs)?;
     let (rhs, rhs_type) = emitter.emit_expr(body.rhs)?;
     if lhs_type != ScalarKind::U32 || rhs_type != ScalarKind::U32 {

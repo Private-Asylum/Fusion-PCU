@@ -176,22 +176,22 @@ fn run_case(
     ];
     let builder = match (ty, invocations, grid_stride) {
         (value, 65, false) if value == PcuValueType::f16() => {
-            generic_identity::<PcuF16Bits, 65>(&bindings)
+            generic_identity_ir::<PcuF16Bits, 65>(&bindings)
         }
         (value, 1_048_576, false) if value == PcuValueType::f16() => {
-            generic_identity::<PcuF16Bits, 1_048_576>(&bindings)
+            generic_identity_ir::<PcuF16Bits, 1_048_576>(&bindings)
         }
         (value, 65, false) if value == PcuValueType::bf16() => {
-            generic_identity::<PcuBf16Bits, 65>(&bindings)
+            generic_identity_ir::<PcuBf16Bits, 65>(&bindings)
         }
         (value, 1_048_576, false) if value == PcuValueType::bf16() => {
-            generic_identity::<PcuBf16Bits, 1_048_576>(&bindings)
+            generic_identity_ir::<PcuBf16Bits, 1_048_576>(&bindings)
         }
         (value, 250, true) if value == PcuValueType::f16() => {
-            generic_grid_identity::<PcuF16Bits, 250, 2048>(&bindings)
+            generic_grid_identity_ir::<PcuF16Bits, 250, 2048>(&bindings)
         }
         (value, 250, true) if value == PcuValueType::bf16() => {
-            generic_grid_identity::<PcuBf16Bits, 250, 2048>(&bindings)
+            generic_grid_identity_ir::<PcuBf16Bits, 250, 2048>(&bindings)
         }
         _ => return Err("unsupported generic identity benchmark specialization".into()),
     }

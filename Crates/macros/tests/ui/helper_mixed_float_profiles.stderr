@@ -1,0 +1,5 @@
+error: PCU helper call scalar type does not match the enclosing scalar profile
+  --> tests/ui/helper_mixed_float_profiles.rs:13:18
+   |
+13 |     output[id] = widen(input[id]);
+   |                  ^^^^^

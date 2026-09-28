@@ -1,6 +1,6 @@
 [package]
 name = "fusion-pcu"
-description = "Backend-neutral intermediate representation and execution contracts for coprocessors"
+description = "Backend-neutral facade and optional provider selection for Fusion PCU"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -18,11 +18,17 @@ path = "fusion-pcu.rs"
 
 [features]
 default = []
-insights = []
-std = []
+insights = ["fusion-pcu-core/insights"]
+std = ["fusion-pcu-core/std"]
 hosted = ["std"]
-tensor = []
-vm-reference = []
+tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor"]
+vm-reference = ["fusion-pcu-core/vm-reference"]
+rocm = ["std", "dep:fusion-pcu-rocm"]
+
+[dependencies]
+fusion-pcu-core.workspace = true
+fusion-pcu-macros.workspace = true
+fusion-pcu-rocm = { workspace = true, optional = true }
 
 [lints]
 workspace = true

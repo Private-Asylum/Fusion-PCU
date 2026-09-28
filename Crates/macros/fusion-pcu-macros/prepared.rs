@@ -21,6 +21,8 @@ pub struct Argument {
     pub ident: Ident,
     pub binding: u32,
     pub read_write: bool,
+    pub scalar_reference: bool,
+    pub flatten_matrix: bool,
     pub scalar: TokenStream,
     pub ty: Type,
 }
@@ -93,7 +95,6 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         prepared_ident = format_ident!("_{}", prepared_ident);
     }
     let argument_idents = args.iter().map(|arg| &arg.ident).collect::<Vec<_>>();
-    let argument_types = args.iter().map(|arg| &arg.ty).collect::<Vec<_>>();
     let call_lifetimes = argument_lifetimes(args.len(), &function.sig.generics, function);
     let host_call_types = args
         .iter()
@@ -106,12 +107,38 @@ pub fn generate(input: Input<'_>) -> TokenStream {
             ty
         })
         .collect::<Vec<_>>();
+    let closure_argument_types = args
+        .iter()
+        .map(|arg| {
+            let mut ty = arg.ty.clone();
+            if let Type::Reference(reference) = &mut ty {
+                reference.lifetime = None;
+            }
+            ty
+        })
+        .collect::<Vec<_>>();
     let argument_count = args.len();
     let host_arguments = args.iter().map(|arg| {
         let ident = &arg.ident;
         let slot = arg.binding;
         let target = quote! { #pcu::PcuBindingRef::new(0, #slot) };
-        if arg.read_write {
+        if arg.flatten_matrix {
+            let view = if arg.read_write {
+                quote! { #ident.as_flattened_mut() }
+            } else {
+                quote! { #ident.as_flattened() }
+            };
+            let borrow = if arg.read_write {
+                quote! { read_write }
+            } else {
+                quote! { read }
+            };
+            return quote! { #pcu::PcuHostArgument::#borrow(#target, #view) };
+        }
+        if arg.scalar_reference {
+            let scalar = &arg.scalar;
+            quote! { #pcu::PcuHostArgument::read_scalar::<#scalar>(#target, #ident) }
+        } else if arg.read_write {
             quote! { #pcu::PcuHostArgument::read_write(#target, #ident) }
         } else {
             quote! { #pcu::PcuHostArgument::read(#target, #ident) }
@@ -171,9 +198,9 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         {
             let bindings = #bindings_call;
             let builder = #builder_call.map_err(#pcu::PcuKernelPrepareError::Ir)?;
-            let mut #prepared_ident = <#backend_ident as #pcu::PcuHostKernelBackend>::prepare_host_kernel(backend, &builder.ir())
+            let mut #prepared_ident = builder.with_ir(|ir| <#backend_ident as #pcu::PcuHostKernelBackend>::prepare_host_kernel(backend, ir))
                 .map_err(#pcu::PcuKernelPrepareError::Backend)?;
-            ::core::result::Result::Ok(move |#(#argument_idents: #argument_types),*| {
+            ::core::result::Result::Ok(move |#(#argument_idents: #closure_argument_types),*| {
                 let mut arguments: [#pcu::PcuHostArgument<'_>; #argument_count] = [#(#host_arguments),*];
                 <<#backend_ident as #pcu::PcuHostKernelBackend>::Prepared as #pcu::PcuPreparedHostKernel>::call(
                     &mut #prepared_ident,
@@ -195,7 +222,7 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         {
             let bindings = #bindings_call;
             let builder = #builder_call.map_err(#pcu::PcuKernelPrepareError::Ir)?;
-            let mut #prepared_ident = <#device_backend_ident as #pcu::PcuDeviceKernelBackend>::prepare_device_kernel(backend, &builder.ir())
+            let mut #prepared_ident = builder.with_ir(|ir| <#device_backend_ident as #pcu::PcuDeviceKernelBackend>::prepare_device_kernel(backend, ir))
                 .map_err(#pcu::PcuKernelPrepareError::Backend)?;
             ::core::result::Result::Ok(move |#(#argument_idents: #device_closure_types),*| {
                 let mut arguments: [#pcu::PcuDeviceArgument<'_, <#device_backend_ident as #pcu::PcuDeviceKernelBackend>::Resource>; #argument_count] = [#(#device_arguments),*];

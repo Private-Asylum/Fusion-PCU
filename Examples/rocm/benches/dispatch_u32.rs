@@ -133,7 +133,7 @@ fn verify_grid_stride_copy(backend: &RocmOwnedDispatchBackend) -> Result<(), Box
     let output = backend.allocate(bytes.len())?;
     input.copy_from(&bytes)?;
     let bindings = grid_stride_copy_u32_bindings();
-    let builder = grid_stride_copy_u32::<2048>(&bindings)?;
+    let builder = grid_stride_copy_u32_ir::<2048>(&bindings)?;
     let kernel = builder.ir();
     let prepared = backend.prepare_dispatch(PcuDispatchSubmission {
         kernel: &kernel,
@@ -179,11 +179,11 @@ fn run_case(
 
     let bindings = copy_u32_bindings();
     let direct_builder = if elements == 65 {
-        copy_u32::<65>(&bindings)?
+        copy_u32_ir::<65>(&bindings)?
     } else {
-        copy_u32::<{ 1 << 20 }>(&bindings)?
+        copy_u32_ir::<{ 1 << 20 }>(&bindings)?
     };
-    let grid_stride_builder = grid_stride_copy_u32::<2048>(&bindings)?;
+    let grid_stride_builder = grid_stride_copy_u32_ir::<2048>(&bindings)?;
     let kernel = if logical_invocations == 250 {
         grid_stride_builder.ir()
     } else {

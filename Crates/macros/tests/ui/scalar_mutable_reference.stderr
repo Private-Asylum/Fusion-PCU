@@ -1,0 +1,5 @@
+error: PCU dispatch resources must be scalar slices or fixed arrays
+ --> tests/ui/scalar_mutable_reference.rs:6:40
+  |
+6 | fn invalid(input: &[f32], factor: &mut f32, output: &mut [f32]) {
+  |                                        ^^^

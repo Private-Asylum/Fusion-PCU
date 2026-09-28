@@ -4,6 +4,7 @@
 //! and submits them through module launches. Runtime resources and completion ownership are kept
 //! here; unsupported PCU operations are rejected by the lowerer.
 
+extern crate fusion_pcu_core as fusion_pcu;
 #[rustfmt::skip]
 use std::{
     any::Any,
@@ -72,6 +73,7 @@ pub use error::*;
 #[rustfmt::skip]
 pub use host_kernel::{
     RocmHostKernelError,
+    RocmMixedHostArgument,
     RocmPreparedHostKernel,
 };
 #[rustfmt::skip]
@@ -115,6 +117,8 @@ pub use tensor::{
     RocmPreparedTensorGraph,
     RocmTensorExecution,
     RocmTensorAssessor,
+    RocmOwnedTensorAssessor,
+    RocmOwnedPreparedTensorGraph,
     RocmTensorElementwiseHostTiming,
     RocmTensorError,
     RocmTensorExecutionError,
@@ -124,6 +128,7 @@ pub use tensor::{
     RocmTensorInput,
     RocmTensorNodeTiming,
     RocmTensorOutputBank,
+    RocmTensorOwnedOutput,
     RocmTensorPrewarmReport,
     RocmTensorScratch,
 };
@@ -1311,6 +1316,14 @@ impl DeviceBuffer {
             allocation: Rc::clone(&self.allocation),
             guard,
         })
+    }
+
+    pub(crate) fn validate_access_available(&self) -> Result<(), HipError> {
+        if self.allocation.access.state.get() == AllocationAccessState::Idle {
+            Ok(())
+        } else {
+            Err(HipError::Busy)
+        }
     }
 
     fn acquire_stream_access(

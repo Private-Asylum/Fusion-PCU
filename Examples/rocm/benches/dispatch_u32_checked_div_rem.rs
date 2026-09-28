@@ -182,7 +182,7 @@ fn run_case<const N: usize>(
     let builder = if grid_stride {
         CheckedDivRemBuilder::Grid(checked_u32_div_rem_grid::<N>(&bindings)?)
     } else {
-        CheckedDivRemBuilder::Direct(checked_u32_div_rem_direct::<N>(&bindings)?)
+        CheckedDivRemBuilder::Direct(checked_u32_div_rem_direct_ir::<N>(&bindings)?)
     };
     let kernel = builder.ir();
     let prepared = backend.prepare_dispatch(PcuDispatchSubmission {

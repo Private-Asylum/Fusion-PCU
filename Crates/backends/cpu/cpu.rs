@@ -5,6 +5,7 @@
 
 #![no_std]
 
+extern crate fusion_pcu_core as fusion_pcu;
 #[cfg(test)]
 extern crate std;
 
@@ -17,6 +18,8 @@ use fusion_pcu::{
 
 #[path = "cpu/floats.rs"]
 mod floats;
+#[path = "cpu/identity.rs"]
+mod identity;
 #[path = "cpu/integer.rs"]
 mod integer;
 #[path = "cpu/stream.rs"]
@@ -27,6 +30,12 @@ mod typed_conversion;
 mod validation;
 
 const VALUE_SLOTS: usize = 256;
+
+#[rustfmt::skip]
+pub use identity::{
+    PcuScalarIdentityReference,
+    PcuScalarIdentityReferenceError,
+};
 
 #[rustfmt::skip]
 pub use floats::{
@@ -3051,16 +3060,9 @@ mod tests {
                 PcuBindingAccess::ReadOnly,
             ),
             PcuBinding::scalar::<f64>(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-            ),
-            PcuBinding::scalar::<f64>(
                 Some("out"),
                 0,
-                2,
+                1,
                 PcuBindingStorageClass::Storage,
                 PcuBindingAccess::WriteOnly,
             ),
@@ -3071,10 +3073,9 @@ mod tests {
                 binding: PcuBindingRef::new(0, 0),
                 index: PcuDispatchIndex::InvocationId,
             }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
                 result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
+                value: PcuParameterValue::F64(1.0_f64.to_bits()),
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
                 value_type: PcuValueType::f64(),
@@ -3084,7 +3085,7 @@ mod tests {
                 rhs: PcuDispatchValueId(2),
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
+                binding: PcuBindingRef::new(0, 1),
                 index: PcuDispatchIndex::InvocationId,
                 value: PcuDispatchValueId(3),
             }),
@@ -3104,7 +3105,6 @@ mod tests {
             feature_caps: PcuDispatchFeatureCaps::default(),
         };
         let a = [1.25_f64, 2.5];
-        let b = [0.5_f64, 4.0];
         let mut output = [0.0_f64; 2];
         let mut host = [
             PcuHostScalarBinding {
@@ -3113,10 +3113,6 @@ mod tests {
             },
             PcuHostScalarBinding {
                 target: PcuBindingRef::new(0, 1),
-                slice: PcuHostScalarSlice::Read(&b),
-            },
-            PcuHostScalarBinding {
-                target: PcuBindingRef::new(0, 2),
                 slice: PcuHostScalarSlice::ReadWrite(&mut output),
             },
         ];
@@ -3130,6 +3126,6 @@ mod tests {
                 PcuInvocationParameters::empty(),
             )
             .expect("f64 profile executes");
-        assert_eq!(output.map(f64::to_bits), [1.75_f64, 6.5].map(f64::to_bits));
+        assert_eq!(output.map(f64::to_bits), [2.25_f64, 3.5].map(f64::to_bits));
     }
 }

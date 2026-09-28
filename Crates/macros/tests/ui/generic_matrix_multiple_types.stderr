@@ -1,0 +1,5 @@
+error: generic PCU kernels support exactly one sealed scalar type parameter
+ --> tests/ui/generic_matrix_multiple_types.rs:8:9
+  |
+8 | fn mixed<T: PcuScalar, U: PcuScalar, const R: usize, const C: usize>(
+  |         ^

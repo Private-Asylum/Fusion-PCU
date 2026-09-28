@@ -24,7 +24,7 @@ fn grid_stride<const N: usize>(input: &[f32], output: &mut [f32]) {
 
 fn main() {
     let map_bindings = map_bindings();
-    let _map = map::<32>(&map_bindings).expect("qualified global ID lowers");
+    let _map = map_ir::<32>(&map_bindings).expect("qualified global ID lowers");
     let grid_bindings = grid_stride_bindings();
     let _grid = grid_stride::<16>(&grid_bindings).expect("qualified grid-stride context lowers");
 }

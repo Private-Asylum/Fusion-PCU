@@ -6,6 +6,7 @@
 
 #![no_std]
 
+extern crate fusion_pcu_core as fusion_pcu;
 extern crate alloc;
 
 #[cfg(test)]

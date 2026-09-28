@@ -52,6 +52,27 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
     if !kernel.ports.is_empty() || !kernel.parameters.is_empty() {
         return Err(RocmLowerError::UnsupportedKernelInterface);
     }
+    if let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
+        kernel.bindings.first().map(|binding| binding.binding_type)
+        && matches!(
+            scalar,
+            fusion_pcu::PcuScalarType::I8
+                | fusion_pcu::PcuScalarType::U8
+                | fusion_pcu::PcuScalarType::I16
+                | fusion_pcu::PcuScalarType::U16
+                | fusion_pcu::PcuScalarType::I32
+                | fusion_pcu::PcuScalarType::U32
+                | fusion_pcu::PcuScalarType::I64
+                | fusion_pcu::PcuScalarType::U64
+                | fusion_pcu::PcuScalarType::F16
+                | fusion_pcu::PcuScalarType::BF16
+                | fusion_pcu::PcuScalarType::F32
+                | fusion_pcu::PcuScalarType::F64
+        )
+        && fusion_pcu::validate_scalar_identity_kernel(kernel, scalar).is_ok()
+    {
+        return Ok(());
+    }
     if super::mixed_widening_profile(kernel).is_some() {
         return Ok(());
     }
@@ -188,10 +209,7 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         .iter()
         .any(|binding| binding.binding_type == PcuBindingType::Value(PcuValueType::f64()))
     {
-        if validate_f64_map_kernel(kernel).is_ok() {
-            return Ok(());
-        }
-        return Err(RocmLowerError::UnsupportedKernelInterface);
+        return validate_f64_map_kernel(kernel).map_err(RocmLowerError::InvalidF64Map);
     }
     let allowed_types = PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::SCALAR_VALUES;
     let allowed_features =
@@ -365,8 +383,14 @@ fn validate_grid_stride_body(
                 op,
                 lhs,
                 rhs,
-                ..
+                value_type,
             }) => {
+                if value_type != PcuValueType::f32() {
+                    return Err(RocmLowerError::UnsupportedOperation {
+                        index,
+                        support: op.support_flag(),
+                    });
+                }
                 if !matches!(
                     op,
                     PcuDispatchAluOp::Add

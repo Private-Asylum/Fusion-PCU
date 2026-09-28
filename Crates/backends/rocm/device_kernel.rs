@@ -15,6 +15,8 @@ use fusion_pcu::{
     PcuCompletionOutcome,
     PcuDeviceArgument,
     PcuDeviceBuffer,
+    PcuDeviceBufferAllocationError,
+    PcuDeviceBufferAllocator,
     PcuDeviceKernelBackend,
     PcuDispatchKernelIr,
     PcuMemoryAccess,
@@ -227,9 +229,7 @@ impl PcuPreparedDeviceKernel for RocmPreparedDeviceKernel {
                     actual: argument.scalar(),
                 });
             }
-            if argument.access() == PcuBindingAccess::ReadOnly
-                && requirement.access != PcuBindingAccess::ReadOnly
-            {
+            if !binding_access_supports(argument.access(), requirement.access) {
                 return Err(RocmDeviceKernelError::AccessMismatch(target));
             }
             let resource_access = argument.resource().access();
@@ -317,6 +317,25 @@ impl PcuPreparedDeviceKernel for RocmPreparedDeviceKernel {
 }
 
 impl RocmOwnedDispatchBackend {
+    /// Allocates typed, initially unspecified device storage in this backend's selected runtime
+    /// and the pool named by `request`.
+    ///
+    /// This uses the same provider allocation contract as uploads, but performs no host transfer
+    /// or initialization. The caller must not read output elements until a complete writer has
+    /// finished successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed extent, request, provider, or allocation-resource contract error.
+    pub fn allocate_device_buffer<T: PcuScalar>(
+        &self,
+        request: fusion_pcu::PcuMemoryAllocationRequest,
+        elements: usize,
+    ) -> Result<PcuDeviceBuffer<T, RocmMemoryResource>, PcuDeviceBufferAllocationError> {
+        let mut provider = self.memory_provider(request.pool);
+        provider.allocate_device_buffer::<T>(request, elements)
+    }
+
     /// Uploads typed host values into reusable provider-owned `ROCm` storage.
     ///
     /// # Errors
@@ -442,4 +461,41 @@ const fn memory_access_supports(memory: PcuMemoryAccess, required: PcuBindingAcc
             | (PcuMemoryAccess::ReadOnly, PcuBindingAccess::ReadOnly)
             | (PcuMemoryAccess::WriteOnly, PcuBindingAccess::WriteOnly)
     )
+}
+
+const fn binding_access_supports(provided: PcuBindingAccess, required: PcuBindingAccess) -> bool {
+    matches!(
+        (provided, required),
+        (PcuBindingAccess::ReadWrite, _)
+            | (PcuBindingAccess::ReadOnly, PcuBindingAccess::ReadOnly)
+            | (PcuBindingAccess::WriteOnly, PcuBindingAccess::WriteOnly)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binding_access_supports;
+    use fusion_pcu::PcuBindingAccess::{ReadOnly, ReadWrite, WriteOnly};
+
+    #[test]
+    fn device_argument_access_must_cover_every_kernel_access() {
+        let cases = [
+            (ReadOnly, ReadOnly, true),
+            (ReadOnly, WriteOnly, false),
+            (ReadOnly, ReadWrite, false),
+            (WriteOnly, ReadOnly, false),
+            (WriteOnly, WriteOnly, true),
+            (WriteOnly, ReadWrite, false),
+            (ReadWrite, ReadOnly, true),
+            (ReadWrite, WriteOnly, true),
+            (ReadWrite, ReadWrite, true),
+        ];
+        for (provided, required, expected) in cases {
+            assert_eq!(
+                binding_access_supports(provided, required),
+                expected,
+                "{provided:?} cannot satisfy {required:?}"
+            );
+        }
+    }
 }

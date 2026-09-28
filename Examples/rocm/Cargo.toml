@@ -43,6 +43,10 @@ path = "fma_witness.rs"
 name = "fusion-rocm-typed-kernel"
 path = "typed_kernel.rs"
 
+[[bin]]
+name = "fusion-rocm-direct"
+path = "direct.rs"
+
 [[bench]]
 name = "dispatch"
 path = "benches/dispatch.rs"
@@ -228,7 +232,7 @@ default = []
 insights = ["fusion-pcu/insights", "fusion-pcu-rocm/insights"]
 
 [dependencies]
-fusion-pcu = { workspace = true, features = ["tensor"] }
+fusion-pcu = { workspace = true, features = ["tensor", "rocm"] }
 fusion-pcu-rocm = { workspace = true, features = ["tensor"] }
 fusion-pcu-macros.workspace = true
 
@@ -260,3 +264,15 @@ name = "tensor_train_insights"
 path = "benches/tensor_train_insights.rs"
 harness = false
 required-features = ["insights"]
+
+[[bench]]
+name = "owned_program"
+harness = false
+
+[[bench]]
+name = "owned_binary"
+harness = false
+
+[[bin]]
+name = "fusion-rocm-ownership"
+path = "ownership.rs"

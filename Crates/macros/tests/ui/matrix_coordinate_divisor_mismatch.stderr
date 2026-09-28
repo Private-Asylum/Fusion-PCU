@@ -1,0 +1,5 @@
+error: matrix coordinate divisor must equal the declared column extent
+ --> tests/ui/matrix_coordinate_divisor_mismatch.rs:8:20
+  |
+8 |     let row = id / (C + 1);
+  |                    ^^^^^^^

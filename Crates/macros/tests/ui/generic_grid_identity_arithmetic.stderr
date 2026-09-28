@@ -1,4 +1,4 @@
-error: generic `T: PcuScalar` kernels currently support only `output[id] = input[id]`
+error: generic `T: PcuScalar` kernels currently support only an indexed identity copy
  --> tests/ui/generic_grid_identity_arithmetic.rs:9:22
   |
 9 |         output[id] = input[id] + input[id];

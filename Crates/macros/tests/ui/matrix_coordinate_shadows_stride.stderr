@@ -1,0 +1,5 @@
+error: matrix coordinate locals cannot shadow a binding, invocation, stride, or const parameter
+  --> tests/ui/matrix_coordinate_shadows_stride.rs:11:13
+   |
+11 |         let stride = id % C;
+   |             ^^^^^^

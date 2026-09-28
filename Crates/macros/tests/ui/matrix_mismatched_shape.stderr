@@ -1,0 +1,5 @@
+error: all PCU rank-two matrix bindings must have identical row and column extents
+ --> tests/ui/matrix_mismatched_shape.rs:8:5
+  |
+8 |     output: &mut [[f32; D]; R],
+  |     ^^^^^^

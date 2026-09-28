@@ -1,0 +1,5 @@
+error: PCU floating literal suffix does not match the scalar profile
+ --> tests/ui/helper_float_suffix_mismatch.rs:7:13
+  |
+7 |     value + 1.0f32
+  |             ^^^^^^

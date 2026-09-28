@@ -1,0 +1,5 @@
+error: rank-two PCU maps require every binding to use the same scalar type
+  --> tests/ui/generic_matrix_mixed_scalar.rs:10:5
+   |
+10 |     scale: &[[f32; C]; R],
+   |     ^^^^^

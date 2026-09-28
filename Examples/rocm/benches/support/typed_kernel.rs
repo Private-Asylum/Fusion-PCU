@@ -59,6 +59,10 @@ pub fn run(criterion: &mut Criterion) -> Result<(), Box<dyn Error>> {
         );
     }
     let (backend, selected) = crate::support::selection::open_ranked(&discovery, candidates, 256)?;
+    fusion_pcu::global::configure(fusion_pcu::global::PcuExecutionPolicy {
+        device: Some(selected.device.id),
+        ..fusion_pcu::global::PcuExecutionPolicy::default()
+    })?;
     let architecture = selected
         .architecture
         .as_deref()
@@ -98,6 +102,9 @@ fn run_case<const N: usize>(
     architecture: &str,
 ) -> Result<(), Box<dyn Error>> {
     println!("Typed kernel shape {N} on {device}");
+    println!(
+        "Matched complete-writer host boundary: input upload, launch, terminal wait, output readback; neither route uploads old output contents."
+    );
     let mut host_call = crate::support::cold_once("typed PCU host preparation", || {
         transform_prepare::<N, _>(backend)
     })?;
@@ -118,7 +125,7 @@ fn run_case<const N: usize>(
     let initial_output = vec![-5.0_f32; N];
     let mut host_output = initial_output.clone();
     let mut native_input = runtime.allocate(N * core::mem::size_of::<f32>())?;
-    let mut native_output = runtime.allocate(N * core::mem::size_of::<f32>())?;
+    let native_output = runtime.allocate(N * core::mem::size_of::<f32>())?;
     let mut native_result = vec![0.0_f32; N];
     let grid = u32::try_from(N)?.div_ceil(256);
 
@@ -131,7 +138,19 @@ fn run_case<const N: usize>(
         &mut cpu_output,
         &initial_output,
         &mut native_input,
-        &mut native_output,
+        &native_output,
+        &function,
+        &stream,
+        grid,
+    )?;
+    balanced_host_diagnostic::<N, _>(
+        &mut host_call,
+        &mut host_input,
+        &mut host_output,
+        &mut cpu_output,
+        &initial_output,
+        &mut native_input,
+        &native_output,
         &function,
         &stream,
         grid,
@@ -141,13 +160,25 @@ fn run_case<const N: usize>(
         &mut host_output,
         &initial_output,
         &mut native_input,
-        &mut native_output,
+        &native_output,
         &mut native_result,
         &function,
         &stream,
         grid,
     )?;
 
+    println!("Direct facade allocation control:");
+    allocation_diagnostic::<N, _>(
+        &mut |input: &[f32], output: &mut [f32]| transform::<N>(input, output),
+        &mut host_output,
+        &initial_output,
+        &mut native_input,
+        &native_output,
+        &mut native_result,
+        &function,
+        &stream,
+        grid,
+    )?;
     let mut resident_input = backend.upload_buffer(pool, &fresh_input::<N>(0))?;
     let mut resident_output = backend.upload_buffer(pool, &initial_output)?;
     let mut native_resident_input = runtime.allocate(N * core::mem::size_of::<f32>())?;
@@ -209,18 +240,20 @@ fn sample_host<const N: usize, E: Error + 'static>(
     oracle: &mut [f32],
     initial: &[f32],
     native_input: &mut DeviceBuffer,
-    native_output: &mut DeviceBuffer,
+    native_output: &DeviceBuffer,
     function: &HipKernel,
     stream: &HipStreamHandle,
     grid: u32,
 ) -> Result<(), Box<dyn Error>> {
+    // Cold facade resolution/compilation must not enter the warm Criterion interval.
+    transform::<N>(&fresh_input::<N>(0), output)?;
     let mut group = criterion.benchmark_group(format!("typed-host-{N}"));
     group.throughput(Throughput::Elements(u64::try_from(N)?));
-    for pcu_target in [true, false] {
-        let label = if pcu_target {
-            "Prepared typed PCU"
-        } else {
-            "Native HIP full boundary"
+    for target in 0..3 {
+        let label = match target {
+            0 => "Prepared typed PCU",
+            1 => "Direct typed PCU",
+            _ => "Native HIP full boundary",
         };
         let mut sequence = 0_u64;
         group.bench_function(BenchmarkId::new(label, N), |bencher| {
@@ -234,32 +267,21 @@ fn sample_host<const N: usize, E: Error + 'static>(
                     // Both routes begin from the same initialized mutable host output.
                     output.copy_from_slice(initial);
                     let started = Instant::now();
-                    if pcu_target {
+                    if target == 0 {
                         call(input, &mut *output).expect("typed host call");
+                    } else if target == 1 {
+                        transform::<N>(input, &mut *output).expect("direct typed host call");
                     } else {
-                        let input_view = PcuHostArgument::read(PcuBindingRef::new(0, 0), input);
-                        let output_view = PcuHostArgument::read(PcuBindingRef::new(0, 1), output);
-                        native_input
-                            .copy_from(input_view.bytes())
-                            .expect("native input upload");
-                        native_output
-                            .copy_from(output_view.bytes())
-                            .expect("native mutable-output upload");
-                        let arguments = [
-                            HipKernelArgument::Buffer(native_input),
-                            HipKernelArgument::Buffer(native_output),
-                        ];
-                        // SAFETY: The handwritten HIP kernel has the same two-buffer ABI and extent.
-                        let mut completion = unsafe {
-                            function.launch(stream, [grid, 1, 1], [256, 1, 1], 0, &arguments)
-                        }
-                        .expect("native HIP launch");
-                        completion.wait().expect("native HIP completion");
-                        let mut native_bytes =
-                            PcuHostArgument::read_write(PcuBindingRef::new(0, 0), &mut *output);
-                        native_output
-                            .copy_to(native_bytes.bytes_mut().expect("native mutable bytes"))
-                            .expect("native output download");
+                        native_host_call(
+                            input,
+                            &mut *output,
+                            native_input,
+                            native_output,
+                            function,
+                            stream,
+                            grid,
+                        )
+                        .expect("native HIP full host boundary");
                     }
                     elapsed += started.elapsed();
                     assert!(
@@ -274,6 +296,128 @@ fn sample_host<const N: usize, E: Error + 'static>(
     }
     group.finish();
     Ok(())
+}
+
+#[allow(unsafe_code)]
+fn native_host_call(
+    input: &[f32],
+    output: &mut [f32],
+    native_input: &mut DeviceBuffer,
+    native_output: &DeviceBuffer,
+    function: &HipKernel,
+    stream: &HipStreamHandle,
+    grid: u32,
+) -> Result<(), Box<dyn Error>> {
+    let input_view = PcuHostArgument::read(PcuBindingRef::new(0, 0), input);
+    native_input.copy_from(input_view.bytes())?;
+    // This independent native kernel writes every output element without reading old contents.
+    // Match PCU's admitted complete-writer plan: only the input needs an incoming transfer.
+    let arguments = [
+        HipKernelArgument::Buffer(native_input),
+        HipKernelArgument::Buffer(native_output),
+    ];
+    // SAFETY: The HIP source ABI has two f32 buffers and guards every indexed access by N.
+    let mut completion =
+        unsafe { function.launch(stream, [grid, 1, 1], [256, 1, 1], 0, &arguments) }?;
+    completion.wait()?;
+    let mut result = PcuHostArgument::read_write(PcuBindingRef::new(0, 0), output);
+    native_output.copy_to(result.bytes_mut().expect("mutable output bytes"))?;
+    Ok(())
+}
+
+// The borrowed fixtures are the inputs to the paired routes and stay explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
+fn balanced_host_diagnostic<const N: usize, E: Error + 'static>(
+    prepared: &mut impl FnMut(&[f32], &mut [f32]) -> Result<(), E>,
+    input: &mut Vec<f32>,
+    output: &mut [f32],
+    oracle: &mut [f32],
+    initial: &[f32],
+    native_input: &mut DeviceBuffer,
+    native_output: &DeviceBuffer,
+    function: &HipKernel,
+    stream: &HipStreamHandle,
+    grid: u32,
+) -> Result<(), Box<dyn Error>> {
+    const PERMUTATIONS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    const PAIRS: usize = 36;
+    let mut prepared_times = [Duration::ZERO; PAIRS];
+    let mut direct_times = [Duration::ZERO; PAIRS];
+    let mut native_times = [Duration::ZERO; PAIRS];
+    let mut prepared_native_ratios = [0.0_f64; PAIRS];
+    let mut direct_native_ratios = [0.0_f64; PAIRS];
+
+    for repeat in 0..6 {
+        for (permutation_index, permutation) in PERMUTATIONS.into_iter().enumerate() {
+            let sample_index = repeat * PERMUTATIONS.len() + permutation_index;
+            let seed = 1_000_000 + u64::try_from(sample_index)?;
+            *input = fresh_input::<N>(seed);
+            fill_oracle(input, oracle);
+
+            for route in permutation {
+                // Host setup and restoration are outside the measured device call for every route.
+                output.copy_from_slice(initial);
+                let started = Instant::now();
+                match route {
+                    0 => prepared(input, output)
+                        .map_err(|error| Box::new(error) as Box<dyn Error>)?,
+                    1 => transform::<N>(input, output)?,
+                    _ => native_host_call(
+                        input,
+                        output,
+                        native_input,
+                        native_output,
+                        function,
+                        stream,
+                        grid,
+                    )?,
+                }
+                let elapsed = started.elapsed();
+                match route {
+                    0 => prepared_times[sample_index] = elapsed,
+                    1 => direct_times[sample_index] = elapsed,
+                    _ => native_times[sample_index] = elapsed,
+                }
+                verify("balanced host diagnostic", output, oracle)?;
+                black_box(&*output);
+            }
+            prepared_native_ratios[sample_index] = prepared_times[sample_index].as_secs_f64()
+                / native_times[sample_index].as_secs_f64();
+            direct_native_ratios[sample_index] =
+                direct_times[sample_index].as_secs_f64() / native_times[sample_index].as_secs_f64();
+        }
+    }
+
+    println!(
+        "Balanced host diagnostic ({N}, six permutations × six, 36 triples): prepared median {:?}, direct median {:?}, native median {:?}; prepared/native median {:.4}×, direct/native median {:.4}×. These are paired host-wall diagnostics, not Criterion confidence intervals.",
+        median_duration(prepared_times),
+        median_duration(direct_times),
+        median_duration(native_times),
+        median_f64(prepared_native_ratios),
+        median_f64(direct_native_ratios),
+    );
+    Ok(())
+}
+
+fn median_duration(mut values: [Duration; 36]) -> Duration {
+    values.sort_unstable();
+    values[17]
+        + values[18]
+            .checked_sub(values[17])
+            .expect("durations are sorted")
+            / 2
+}
+
+fn median_f64(mut values: [f64; 36]) -> f64 {
+    values.sort_unstable_by(f64::total_cmp);
+    values[17].midpoint(values[18])
 }
 
 #[allow(clippy::too_many_lines)]
@@ -362,6 +506,61 @@ fn sample_resident<const N: usize, E: Error + 'static>(
         });
     }
     group.finish();
+    // Alternate adjacent routes to check whether sequential Criterion groups hide clock/order
+    // effects. Fresh inputs, uploads, result verification and readback remain outside each timer.
+    let mut pcu_walls = [Duration::ZERO; 32];
+    let mut native_walls = [Duration::ZERO; 32];
+    let mut paired_ratios = [0.0_f64; 32];
+    for sample in 0..32 {
+        let values = fresh_input::<N>(u64::try_from(sample)? + 1_000_000);
+        fill_oracle(&values, oracle);
+        for pcu_target in [sample % 2 == 0, sample % 2 != 0] {
+            if pcu_target {
+                backend.refresh_buffer(pool, input, &values)?;
+                let started = Instant::now();
+                call(input, output)?;
+                pcu_walls[sample] = started.elapsed();
+                backend.download_buffer(pool, output, native_result)?;
+            } else {
+                let view = PcuHostArgument::read(PcuBindingRef::new(0, 0), &values);
+                native_input.copy_from(view.bytes())?;
+                let arguments = [
+                    HipKernelArgument::Buffer(native_input),
+                    HipKernelArgument::Buffer(native_output),
+                ];
+                let started = Instant::now();
+                // SAFETY: Identical native ABI, live allocations and extent as the timed group.
+                let mut completion =
+                    unsafe { function.launch(stream, [grid, 1, 1], [256, 1, 1], 0, &arguments)? };
+                completion.wait()?;
+                native_walls[sample] = started.elapsed();
+                let mut result =
+                    PcuHostArgument::read_write(PcuBindingRef::new(0, 0), &mut *native_result);
+                native_output.copy_to(result.bytes_mut().expect("mutable native result bytes"))?;
+            }
+            verify("paired resident diagnostic", native_result, oracle)?;
+            black_box(&*native_result);
+        }
+        paired_ratios[sample] =
+            pcu_walls[sample].as_secs_f64() / native_walls[sample].as_secs_f64();
+    }
+    pcu_walls.sort_unstable();
+    native_walls.sort_unstable();
+    paired_ratios.sort_unstable_by(f64::total_cmp);
+    println!(
+        "Paired resident {N}, 32 alternating CPU-verified pairs: PCU {:?}, native {:?}, paired-ratio median {:.4}; diagnostic medians, not Criterion intervals",
+        pcu_walls[15]
+            + pcu_walls[16]
+                .checked_sub(pcu_walls[15])
+                .expect("durations sorted")
+                / 2,
+        native_walls[15]
+            + native_walls[16]
+                .checked_sub(native_walls[15])
+                .expect("durations sorted")
+                / 2,
+        paired_ratios[15].midpoint(paired_ratios[16])
+    );
     Ok(())
 }
 
@@ -403,7 +602,7 @@ fn allocation_diagnostic<const N: usize, E: Error + 'static>(
     pcu_output: &mut [f32],
     initial: &[f32],
     native_input: &mut DeviceBuffer,
-    native_output: &mut DeviceBuffer,
+    native_output: &DeviceBuffer,
     native_result: &mut [f32],
     function: &HipKernel,
     stream: &HipStreamHandle,
@@ -420,10 +619,8 @@ fn allocation_diagnostic<const N: usize, E: Error + 'static>(
     verify("PCU heap census", pcu_output, &expected)?;
 
     let input_view = PcuHostArgument::read(PcuBindingRef::new(0, 0), &input);
-    let output_view = PcuHostArgument::read(PcuBindingRef::new(0, 1), initial);
     let capture = alloc::AllocationCapture::start();
     native_input.copy_from(input_view.bytes())?;
-    native_output.copy_from(output_view.bytes())?;
     let arguments = [
         HipKernelArgument::Buffer(native_input),
         HipKernelArgument::Buffer(native_output),

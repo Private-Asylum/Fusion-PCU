@@ -5,7 +5,6 @@ mod selection;
 
 use std::error::Error;
 
-use fusion_pcu_macros::pcu_module;
 #[rustfmt::skip]
 use fusion_pcu_rocm::{
     HipKernelArgument,
@@ -14,9 +13,9 @@ use fusion_pcu_rocm::{
     lower_dispatch_to_hip_rtc_source,
 };
 
-#[pcu_module]
 mod kernels {
-    #[pcu_fn]
+    use fusion_pcu::pcu;
+    #[pcu]
     fn plus_one(value: f32) -> f32 {
         value + 1.0
     }
@@ -34,9 +33,8 @@ mod kernels {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let bindings = kernels::rtc_probe_bindings();
-    let builder = kernels::rtc_probe::<2048>(&bindings)?;
-    let kernel = builder.ir();
-    let source = lower_dispatch_to_hip_rtc_source(&kernel)?;
+    let builder = kernels::rtc_probe_ir::<2048>(&bindings)?;
+    let source = builder.with_ir(lower_dispatch_to_hip_rtc_source)?;
     let discovery = RocmDiscovery::new();
     let candidates = selection::ranked_devices(&discovery, selection::preferred_device()?, false)?;
     let mut failures = Vec::new();

@@ -113,7 +113,7 @@ fn run_case<const N: usize>(
     native_right.copy_from(&right_bytes)?;
 
     let bindings = add_f64_bindings();
-    let builder = add_f64::<N>(&bindings)?;
+    let builder = add_f64_ir::<N>(&bindings)?;
     let kernel = builder.ir();
     let invocations = u32::try_from(N)?;
     let prepared = support::cold_once("PCU f64 cold prepare", || {

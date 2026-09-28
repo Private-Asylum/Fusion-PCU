@@ -131,7 +131,7 @@ fn u32_checked_div_rem_grid<const N: usize>(
 #[test]
 fn u32_checked_div_rem_macro_builds_admitted_direct_and_grid_stride_ir() {
     let bindings = u32_checked_div_rem_bindings();
-    let direct = u32_checked_div_rem::<8>(&bindings).expect("direct DivRem builds");
+    let direct = u32_checked_div_rem_ir::<8>(&bindings).expect("direct DivRem builds");
     pcu_alias::validate_u32_checked_div_rem_kernel(&direct.ir())
         .expect("direct checked DivRem profile admits");
     assert!(matches!(
@@ -282,7 +282,7 @@ fn const_generic_invocations_specialize_to_the_declared_shape() {
     let typed_bindings = u32_copy_bindings();
     assert_eq!(typed_bindings[0].value_type(), Some(PcuValueType::u32()));
     assert_eq!(typed_bindings[1].value_type(), Some(PcuValueType::u32()));
-    let typed = u32_copy::<8>(&typed_bindings).expect("u32 identity copy builds typed IR");
+    let typed = u32_copy_ir::<8>(&typed_bindings).expect("u32 identity copy builds typed IR");
     assert_eq!(typed.ir().entry.logical_shape, [8, 1, 1]);
     assert!(matches!(
         typed.ir().ops[0],
@@ -294,7 +294,7 @@ fn const_generic_invocations_specialize_to_the_declared_shape() {
     ));
 
     let alias_bindings = concise_alias_map_bindings();
-    let alias = concise_alias_map::<12>(&alias_bindings).expect("the alias lowers identically");
+    let alias = concise_alias_map_ir::<12>(&alias_bindings).expect("the alias lowers identically");
     assert_eq!(alias.ir().entry.logical_shape, [24, 1, 1]);
 
     let bindings = matrix_map_bindings();

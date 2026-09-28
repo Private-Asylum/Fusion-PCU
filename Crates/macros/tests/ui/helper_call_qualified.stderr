@@ -1,5 +1,5 @@
-error: PCU helper calls must name a `#[pcu_fn]` sibling directly
-  --> tests/ui/helper_call_qualified.rs:12:26
+error[E0433]: cannot find `scale` in `math`
+  --> tests/ui/helper_call_qualified.rs:14:32
    |
-12 |     output[invocation] = math::scale(input[invocation]);
-   |                          ^^^^
+14 |     output[invocation] = math::scale(input[invocation]);
+   |                                ^^^^^ expected type, found function `scale` in `math`

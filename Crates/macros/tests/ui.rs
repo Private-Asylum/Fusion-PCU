@@ -6,9 +6,8 @@ fn dispatch_macro_ui() {
     tests.compile_fail("tests/ui/helper_call.rs");
     tests.compile_fail("tests/ui/helper_call_nested.rs");
     tests.compile_fail("tests/ui/helper_call_qualified.rs");
-    tests.compile_fail("tests/ui/pcu_module_recursive_helper.rs");
-    tests.compile_fail("tests/ui/pcu_module_effectful_helper.rs");
-    tests.compile_fail("tests/ui/pcu_module_helper_type_mismatch.rs");
+    tests.compile_fail("tests/ui/helper_mixed_float_profiles.rs");
+    tests.compile_fail("tests/ui/helper_float_suffix_mismatch.rs");
     tests.pass("tests/ui/grid_stride_multi_iteration.rs");
     tests.pass("tests/ui/grid_stride_symbolic_mismatch.rs");
     tests.pass("tests/ui/qualified_context.rs");
@@ -23,6 +22,8 @@ fn dispatch_macro_ui() {
     tests.pass("tests/ui/renamed_crate.rs");
     tests.compile_fail("tests/ui/mixed_scalar_store.rs");
     tests.compile_fail("tests/ui/mixed_scalar_operation.rs");
+    tests.compile_fail("tests/ui/scalar_mutable_reference.rs");
+    tests.compile_fail("tests/ui/mixed_scalar_references.rs");
     tests.pass("tests/ui/u32_wrapping_arithmetic.rs");
     tests.compile_fail("tests/ui/u32_plain_arithmetic.rs");
     tests.pass("tests/ui/u32_checked_div_rem.rs");
@@ -30,4 +31,18 @@ fn dispatch_macro_ui() {
     tests.compile_fail("tests/ui/generic_identity_arithmetic.rs");
     tests.compile_fail("tests/ui/generic_grid_identity_arithmetic.rs");
     tests.compile_fail("tests/ui/generic_identity_unsupported_bound.rs");
+    tests.compile_fail("tests/ui/matrix_noncanonical_index.rs");
+    tests.compile_fail("tests/ui/matrix_mismatched_shape.rs");
+    tests.compile_fail("tests/ui/matrix_invocation_count_mismatch.rs");
+    tests.compile_fail("tests/ui/matrix_zero_column_extent.rs");
+    tests.pass("tests/ui/matrix_coordinate_locals.rs");
+    tests.pass("tests/ui/matrix_grid_stride_coordinate_locals.rs");
+    tests.compile_fail("tests/ui/matrix_coordinate_divisor_mismatch.rs");
+    tests.compile_fail("tests/ui/matrix_grid_stride_extent_mismatch.rs");
+    tests.compile_fail("tests/ui/matrix_coordinate_shadows_binding.rs");
+    tests.compile_fail("tests/ui/matrix_coordinate_shadows_invocation.rs");
+    tests.compile_fail("tests/ui/matrix_coordinate_shadows_stride.rs");
+    tests.compile_fail("tests/ui/generic_matrix_mixed_scalar.rs");
+    tests.compile_fail("tests/ui/generic_matrix_multiple_types.rs");
+    tests.compile_fail("tests/ui/generic_matrix_arithmetic.rs");
 }

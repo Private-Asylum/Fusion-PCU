@@ -493,6 +493,12 @@ fn execute_f64_map_ops(
                 };
                 values[usize::from(result.0)] = Some(value);
             }
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
+                let PcuParameterValue::F64(bits) = value else {
+                    unreachable!("f64 validator checks constant width");
+                };
+                values[usize::from(result.0)] = Some(f64::from_bits(*bits));
+            }
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
                 result,
                 op,

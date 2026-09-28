@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 path = "spirv.rs"
 
 [dependencies]
-fusion-pcu.workspace = true
+fusion-pcu-core.workspace = true
 
 [lints]
 workspace = true

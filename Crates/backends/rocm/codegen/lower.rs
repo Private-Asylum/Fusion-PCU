@@ -56,6 +56,7 @@ use fusion_pcu::{
 pub enum RocmLowerError {
     InvalidKernelShape,
     UnsupportedKernelInterface,
+    InvalidF64Map(fusion_pcu::PcuF64MapValidationError),
     UnsupportedRequirements,
     InvalidBinding(PcuBindingRef),
     InvalidBindingAccess(PcuBindingRef),
@@ -83,8 +84,9 @@ impl fmt::Display for RocmLowerError {
             Self::UnsupportedKernelInterface => formatter.write_str(
                 "HIP lowering supports storage bindings only; ports and parameters are unsupported",
             ),
+            Self::InvalidF64Map(error) => write!(formatter, "invalid f64 map profile: {error:?}"),
             Self::UnsupportedRequirements => formatter.write_str(
-                "HIP lowering supports its scalar f32, u32, and u64 profiles with mutable/read-only resources",
+                "HIP lowering cannot satisfy the declared scalar or resource requirements",
             ),
             Self::InvalidBinding(binding) => write!(
                 formatter,
@@ -355,6 +357,15 @@ fn lower_dispatch_to_hip_source_with_preamble(
             }) => writeln!(
                 &mut source,
                 "    float v{} = __builtin_bit_cast(float, 0x{bits:08x}u);",
+                result.0
+            )
+            .map_err(|_| RocmLowerError::FormattingFailure)?,
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result,
+                value: PcuParameterValue::F64(bits),
+            }) => writeln!(
+                &mut source,
+                "    double v{} = __builtin_bit_cast(double, 0x{bits:016x}ull);",
                 result.0
             )
             .map_err(|_| RocmLowerError::FormattingFailure)?,
@@ -1332,6 +1343,15 @@ fn emit_hip_data_op(
             result.0
         )
         .map_err(|_| RocmLowerError::FormattingFailure),
+        PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+            result,
+            value: PcuParameterValue::F64(bits),
+        }) => writeln!(
+            source,
+            "        double v{} = __builtin_bit_cast(double, 0x{bits:016x}ull);",
+            result.0
+        )
+        .map_err(|_| RocmLowerError::FormattingFailure),
         PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
             result,
             op,
@@ -1713,6 +1733,176 @@ mod tests {
             ops,
             type_caps: PcuValueTypeCaps::empty(),
             feature_caps: PcuDispatchFeatureCaps::empty(),
+        }
+    }
+
+    #[test]
+    fn scalar_transport_is_admitted_independently_of_arithmetic_profiles() {
+        use fusion_pcu::PcuScalarType;
+        for scalar in PcuScalarType::ALL {
+            for grid in [false, true] {
+                let index = if grid {
+                    PcuDispatchIndex::GridStrideId
+                } else {
+                    PcuDispatchIndex::InvocationId
+                };
+                let bindings = [
+                    PcuBinding::value(
+                        Some("input"),
+                        0,
+                        0,
+                        PcuBindingStorageClass::Storage,
+                        PcuBindingAccess::ReadOnly,
+                        PcuValueType::Scalar(scalar),
+                    ),
+                    PcuBinding::value(
+                        Some("output"),
+                        0,
+                        1,
+                        PcuBindingStorageClass::Storage,
+                        PcuBindingAccess::ReadWrite,
+                        PcuValueType::Scalar(scalar),
+                    ),
+                ];
+                let body = [
+                    PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                        result: PcuDispatchValueId(1),
+                        binding: PcuBindingRef::new(0, 0),
+                        index,
+                    }),
+                    PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                        binding: PcuBindingRef::new(0, 1),
+                        index,
+                        value: PcuDispatchValueId(1),
+                    }),
+                ];
+                let direct = [
+                    body[0],
+                    body[1],
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ];
+                let loop_ops = [
+                    PcuDispatchOp::GridStrideLoop {
+                        extent: 513,
+                        body: &body,
+                    },
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ];
+                let ir = kernel(if grid { &loop_ops } else { &direct }, &bindings);
+                let expected_type = match scalar {
+                    PcuScalarType::Bool | PcuScalarType::I4 | PcuScalarType::U4 => None,
+                    PcuScalarType::I8 | PcuScalarType::U8 => Some("unsigned char"),
+                    PcuScalarType::I16
+                    | PcuScalarType::U16
+                    | PcuScalarType::F16
+                    | PcuScalarType::BF16 => Some("unsigned short"),
+                    PcuScalarType::I32 => Some("int"),
+                    PcuScalarType::U32 => Some("unsigned int"),
+                    PcuScalarType::I64 | PcuScalarType::U64 => Some("unsigned long long"),
+                    PcuScalarType::F32 => Some("float"),
+                    PcuScalarType::F64 => Some("double"),
+                };
+                match expected_type {
+                    Some(expected) => {
+                        let source =
+                            lower_dispatch_to_hip_source(&ir).expect("scalar identity source");
+                        assert!(
+                            source.contains(&format!("{expected} v1 =")),
+                            "wrong scalar representation: {scalar:?}"
+                        );
+                    }
+                    None => assert!(
+                        lower_dispatch_to_hip_source(&ir).is_err(),
+                        "unsupported scalar must not become f32: {scalar:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f64_profile_errors_do_not_masquerade_as_port_errors() {
+        let bindings = [PcuBinding::value(
+            Some("output"),
+            0,
+            0,
+            PcuBindingStorageClass::Storage,
+            PcuBindingAccess::WriteOnly,
+            PcuValueType::f64(),
+        )];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(1),
+                value: PcuParameterValue::F32(1.0_f32.to_bits()),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(1),
+            }),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        assert_eq!(
+            lower_dispatch_to_hip_source(&kernel(&ops, &bindings)),
+            Err(RocmLowerError::InvalidF64Map(
+                fusion_pcu::PcuF64MapValidationError::UnsupportedOperation(0)
+            ))
+        );
+    }
+
+    #[test]
+    fn f64_constants_preserve_bits_in_direct_and_grid_source() {
+        let bindings = [PcuBinding::value(
+            Some("output"),
+            0,
+            0,
+            PcuBindingStorageClass::Storage,
+            PcuBindingAccess::WriteOnly,
+            PcuValueType::f64(),
+        )];
+        for bits in [
+            0x8000_0000_0000_0000_u64,
+            0x0000_0000_0000_0001,
+            0x3ff0_0000_0000_0001,
+            0x7ff0_0000_0000_0000,
+            0x7ff8_0000_0000_0042,
+        ] {
+            let constant = PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(1),
+                value: PcuParameterValue::F64(bits),
+            });
+            let store = |index| {
+                PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                    binding: PcuBindingRef::new(0, 0),
+                    index,
+                    value: PcuDispatchValueId(1),
+                })
+            };
+            let direct = [
+                constant,
+                store(PcuDispatchIndex::InvocationId),
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let body = [constant, store(PcuDispatchIndex::GridStrideId)];
+            let grid = [
+                PcuDispatchOp::GridStrideLoop {
+                    extent: 257,
+                    body: &body,
+                },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            for ops in [&direct[..], &grid[..]] {
+                let ir = kernel(ops, &bindings);
+                for source in [
+                    lower_dispatch_to_hip_source(&ir).expect("f64 constant source"),
+                    lower_dispatch_to_hip_rtc_source(&ir).expect("f64 RTC constant source"),
+                ] {
+                    assert!(source.contains(&format!(
+                        "double v1 = __builtin_bit_cast(double, 0x{bits:016x}ull);"
+                    )));
+                    assert!(!source.contains("float v1"));
+                }
+            }
         }
     }
 
@@ -3082,6 +3272,23 @@ mod tests {
         ));
         assert!(source.contains("binding_0_0[fusion_idx]"));
         assert!(source.contains("binding_0_1[fusion_idx] = v3;"));
+
+        // Binding types do not authorize contradictory ALU metadata.
+        let mut wrong_width_body = body;
+        if let PcuDispatchOp::Data(PcuDispatchDataOp::Alu { value_type, .. }) =
+            &mut wrong_width_body[2]
+        {
+            *value_type = PcuValueType::f64();
+        }
+        let wrong_width_ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 2048,
+                body: &wrong_width_body,
+            },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let wrong_width_kernel = kernel(&wrong_width_ops, &bindings);
+        assert!(lower_dispatch_to_hip_source(&wrong_width_kernel).is_err());
 
         let mut near_limit_kernel = loop_kernel;
         let near_limit_ops = [

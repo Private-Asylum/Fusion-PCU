@@ -1,3 +1,5 @@
+extern crate pcu_alias as fusion_pcu;
+
 use fusion_pcu_macros::pcu_dispatch;
 
 mod math {
@@ -6,7 +8,7 @@ mod math {
     }
 }
 
-#[pcu_dispatch(invocations = 8)]
+#[pcu_dispatch(crate_path = ::pcu_alias, invocations = 8)]
 fn kernel(input: &[f32], output: &mut [f32]) {
     let invocation = context.global_invocation_id;
     output[invocation] = math::scale(input[invocation]);

@@ -1,0 +1,29 @@
+[package]
+name = "fusion-pcu-core"
+description = "Backend-neutral core IR, contracts, tensor semantics, and reference VM for Fusion PCU"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+path = "fusion-pcu-core.rs"
+
+[features]
+default = []
+insights = []
+alloc = []
+std = ["alloc"]
+hosted = ["std"]
+tensor = ["alloc"]
+vm-reference = []
+
+[lints]
+workspace = true

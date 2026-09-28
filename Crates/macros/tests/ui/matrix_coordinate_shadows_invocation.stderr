@@ -1,0 +1,5 @@
+error: matrix coordinate locals cannot shadow a binding, invocation, stride, or const parameter
+ --> tests/ui/matrix_coordinate_shadows_invocation.rs:8:9
+  |
+8 |     let id = id / C;
+  |         ^^

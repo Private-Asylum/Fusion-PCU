@@ -139,7 +139,7 @@ fn run_case<const N: usize>(
     native_right.copy_from(&right_bytes)?;
 
     let bindings = wrapping_add_u8_bindings();
-    let builder = wrapping_add_u8::<N>(&bindings)?;
+    let builder = wrapping_add_u8_ir::<N>(&bindings)?;
     let kernel = builder.ir();
     let invocations = u32::try_from(N)?;
     let prepared = support::cold_once("PCU u8 cold prepare", || {
@@ -150,7 +150,7 @@ fn run_case<const N: usize>(
     })?;
 
     let grid_bindings = wrapping_add_grid_u8_bindings();
-    let grid_builder = wrapping_add_grid_u8::<N>(&grid_bindings)?;
+    let grid_builder = wrapping_add_grid_u8_ir::<N>(&grid_bindings)?;
     let grid_kernel = grid_builder.ir();
     let grid_prepared = support::cold_once("PCU u8 grid-stride cold prepare", || {
         backend.prepare_dispatch(PcuDispatchSubmission {

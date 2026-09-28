@@ -1,0 +1,5 @@
+error: rank-two grid-stride loop extent must equal the checked matrix row count times column count
+ --> tests/ui/matrix_grid_stride_extent_mismatch.rs:9:16
+  |
+9 |     while id < R * C + 1 {
+  |                ^

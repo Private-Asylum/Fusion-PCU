@@ -20,7 +20,7 @@ path = "dx12.rs"
 default = []
 
 [dependencies]
-fusion-pcu.workspace = true
+fusion-pcu-core.workspace = true
 
 [lints]
 workspace = true

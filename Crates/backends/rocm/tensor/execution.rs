@@ -23,6 +23,7 @@ use super::super::{
     RocmTensorAssessor,
     RocmTensorExecutionError,
     RocmTensorInput,
+    RocmTensorOwnedOutput,
     RocmTensorOutputBank,
     RocmTensorScratch,
 };
@@ -365,22 +366,60 @@ where
     ///
     /// Returns an error before a successful run or when the output bank is poisoned.
     pub fn outputs(&self) -> Result<&[RocmTensorInput<'_>], RocmTensorExecutionError> {
-        if self.completed_steps == 0 {
-            return Err(RocmTensorExecutionError::FeedbackStepUnavailable {
-                requested: 0,
-                first_available: 0,
-                completed: 0,
-            });
-        }
-        let bank = if self.feedback.is_some() {
-            (self.completed_steps - 1) % 2
-        } else {
-            0
-        };
+        let bank = completed_output_bank_index(
+            self.completed_steps,
+            self.feedback.is_some(),
+            self.resources.banks.len(),
+        )?;
         if self.resources.banks[bank].poisoned {
             return Err(RocmTensorExecutionError::OutputResourceMismatch);
         }
         Ok(self.resources.banks[bank].outputs())
+    }
+
+    /// Consumes this execution and transfers its latest completed outputs into owned typed
+    /// tensors. This performs no host readback; the returned buffers retain the exact output
+    /// allocations and can be passed directly to `PcuDeviceArgument`.
+    ///
+    /// The execution must have completed successfully. Pending, failed, or poisoned output
+    /// storage is never exposed. The output vector preserves the prepared graph's output order
+    /// and includes each `ValueId` beside its tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unavailable-output error before a successful step or a storage error if the
+    /// completed output bank is poisoned or inconsistent with its shape metadata.
+    pub fn into_outputs(self) -> Result<Vec<RocmTensorOwnedOutput>, RocmTensorExecutionError> {
+        let Self {
+            prepared,
+            completed_steps,
+            feedback,
+            resources,
+            ..
+        } = self;
+        let bank_index = completed_output_bank_index(
+            completed_steps,
+            feedback.is_some(),
+            resources.banks.len(),
+        )?;
+        if resources.banks[bank_index].poisoned {
+            return Err(RocmTensorExecutionError::OutputResourceMismatch);
+        }
+        if prepared.outputs.len() != resources.banks[bank_index].outputs.len() {
+            return Err(RocmTensorExecutionError::OutputResourceMismatch);
+        }
+        let bank = resources
+            .banks
+            .into_iter()
+            .nth(bank_index)
+            .ok_or(RocmTensorExecutionError::OutputResourceMismatch)?;
+        prepared
+            .outputs
+            .iter()
+            .copied()
+            .zip(bank.outputs)
+            .map(|(value, output)| Ok((value, output.into_device_tensor()?)))
+            .collect()
     }
 
     /// Downloads one selected output from the latest successful run.
@@ -389,24 +428,17 @@ where
     ///
     /// Returns an unknown or unavailable output, or a provider readback error.
     pub fn read_output(&mut self, value: ValueId) -> Result<Tensor, RocmTensorExecutionError> {
-        if self.completed_steps == 0 {
-            return Err(RocmTensorExecutionError::FeedbackStepUnavailable {
-                requested: 0,
-                first_available: 0,
-                completed: 0,
-            });
-        }
+        let bank = completed_output_bank_index(
+            self.completed_steps,
+            self.feedback.is_some(),
+            self.resources.banks.len(),
+        )?;
         let index = self
             .prepared
             .outputs
             .iter()
             .position(|output| *output == value)
             .ok_or(RocmTensorExecutionError::MissingResource(value))?;
-        let bank = if self.feedback.is_some() {
-            (self.completed_steps - 1) % 2
-        } else {
-            0
-        };
         if self.resources.banks[bank].poisoned {
             return Err(RocmTensorExecutionError::OutputResourceMismatch);
         }
@@ -417,6 +449,29 @@ where
         self.assessor
             .download_output(output, self.pool, &mut self.memory)
     }
+}
+
+const fn completed_output_bank_index(
+    completed_steps: usize,
+    feedback: bool,
+    bank_count: usize,
+) -> Result<usize, RocmTensorExecutionError> {
+    if completed_steps == 0 {
+        return Err(RocmTensorExecutionError::FeedbackStepUnavailable {
+            requested: 0,
+            first_available: 0,
+            completed: 0,
+        });
+    }
+    let bank = if feedback {
+        (completed_steps - 1) % 2
+    } else {
+        0
+    };
+    if bank >= bank_count {
+        return Err(RocmTensorExecutionError::OutputResourceMismatch);
+    }
+    Ok(bank)
 }
 
 impl<P> fusion_pcu::dialect::tensor::TensorExecution for RocmTensorExecution<'_, '_, '_, P>
@@ -501,4 +556,28 @@ fn routed_inputs<'a, 'session>(
             Ok((route.value, input))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RocmTensorExecutionError, completed_output_bank_index};
+
+    #[test]
+    fn output_bank_is_unavailable_until_a_successful_step() {
+        assert!(matches!(
+            completed_output_bank_index(0, false, 1),
+            Err(RocmTensorExecutionError::FeedbackStepUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn feedback_output_bank_tracks_the_last_completed_step() {
+        assert_eq!(completed_output_bank_index(1, true, 2).unwrap(), 0);
+        assert_eq!(completed_output_bank_index(2, true, 2).unwrap(), 1);
+        assert_eq!(completed_output_bank_index(3, true, 2).unwrap(), 0);
+        assert!(matches!(
+            completed_output_bank_index(2, true, 1),
+            Err(RocmTensorExecutionError::OutputResourceMismatch)
+        ));
+    }
 }

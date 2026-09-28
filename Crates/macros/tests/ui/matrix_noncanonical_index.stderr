@@ -1,0 +1,5 @@
+error: rank-two PCU assignment target must use `output[invocation / C][invocation % C]` with the declared column extent
+  --> tests/ui/matrix_noncanonical_index.rs:11:5
+   |
+11 |     output[id / C][id % (C + 1)] = input[id / C][id % C];
+   |     ^^^^^^

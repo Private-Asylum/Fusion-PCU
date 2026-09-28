@@ -1,9 +1,0 @@
-error: PCU helper bodies must be one pure scalar expression without statements or control flow
- --> tests/ui/pcu_module_effectful_helper.rs:6:34
-  |
-6 |       fn effect(value: f32) -> f32 {
-  |  __________________________________^
-7 | |         let adjusted = value + 1.0;
-8 | |         adjusted
-9 | |     }
-  | |_____^

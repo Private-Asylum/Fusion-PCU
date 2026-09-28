@@ -49,7 +49,7 @@ fn generic_scalar_copy_specializes_binding_type_and_executes_on_cpu() {
     );
     assert_eq!(bindings[1].access, PcuBindingAccess::ReadWrite);
 
-    let builder = copy::<f32, 4>(&bindings).expect("bounded generic identity builder");
+    let builder = copy_ir::<f32, 4>(&bindings).expect("bounded generic identity builder");
     let kernel = builder.ir();
     assert!(matches!(
         kernel.ops[0],
@@ -86,7 +86,7 @@ fn generic_scalar_grid_stride_copy_specializes_extent_and_executes_on_cpu() {
     const EXTENT: usize = 11;
     const LANES: usize = 3;
     let bindings = copy_grid_bindings::<f32>();
-    let builder = copy_grid::<f32, EXTENT>(&bindings).expect("bounded generic grid identity");
+    let builder = copy_grid_ir::<f32, EXTENT>(&bindings).expect("bounded generic grid identity");
     let kernel = builder.ir();
     let [
         pcu_alias::PcuDispatchOp::GridStrideLoop { extent, body },
@@ -158,7 +158,7 @@ fn assert_identity_specialization<T: PcuScalar, const N: usize>() {
     let expected = PcuBindingType::Value(PcuValueType::Scalar(T::TYPE));
     assert_eq!(bindings[0].binding_type, expected);
     assert_eq!(bindings[1].binding_type, expected);
-    let kernel = copy::<T, N>(&bindings).expect("sealed scalar identity lowers");
+    let kernel = copy_ir::<T, N>(&bindings).expect("sealed scalar identity lowers");
     assert!(
         kernel
             .ir()

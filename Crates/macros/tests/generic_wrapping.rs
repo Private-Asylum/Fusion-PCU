@@ -47,7 +47,7 @@ fn generic_wrapping_maps_specialize_typed_ir_and_execute_on_cpu() {
     let right = [1_u8, 255, 129, 1, 9, 8, 4];
     let mut output = [0_u8; 7];
     let bindings = wrapping_add_bindings::<u8>();
-    let builder = wrapping_add::<u8, 7>(&bindings).expect("generic wrapping add builder");
+    let builder = wrapping_add_ir::<u8, 7>(&bindings).expect("generic wrapping add builder");
     let kernel = builder.ir();
     assert!(kernel.ops.iter().any(|op| matches!(
         op,
@@ -83,7 +83,7 @@ fn generic_wrapping_maps_specialize_typed_ir_and_execute_on_cpu() {
     let mut output = [0_u8; 7];
     let bindings = wrapping_sub_grid_bindings::<u8>();
     let builder =
-        wrapping_sub_grid::<u8, 7>(&bindings).expect("generic grid wrapping subtract builder");
+        wrapping_sub_grid_ir::<u8, 7>(&bindings).expect("generic grid wrapping subtract builder");
     let kernel = builder.ir();
     let submission = PcuDispatchSubmission {
         kernel: &kernel,
@@ -110,7 +110,7 @@ fn generic_wrapping_maps_specialize_typed_ir_and_execute_on_cpu() {
 
     let mut output = [0_u8; 7];
     let bindings = wrapping_mul_bindings::<u8>();
-    let builder = wrapping_mul::<u8, 7>(&bindings).expect("generic wrapping multiply builder");
+    let builder = wrapping_mul_ir::<u8, 7>(&bindings).expect("generic wrapping multiply builder");
     let kernel = builder.ir();
     assert!(kernel.ops.iter().any(|op| matches!(
         op,

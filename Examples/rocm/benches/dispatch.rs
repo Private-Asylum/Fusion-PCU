@@ -33,7 +33,6 @@ use fusion_pcu::{
     PcuInvocationShape,
     PcuValueType,
 };
-use fusion_pcu_macros::pcu_module;
 #[rustfmt::skip]
 use fusion_pcu_rocm::{
     HipKernelArgument,
@@ -54,9 +53,9 @@ use dispatch_support::{
     verify_output,
 };
 
-#[pcu_module]
 mod kernels {
-    #[pcu_fn]
+    use fusion_pcu::pcu;
+    #[pcu]
     fn plus_one(value: f32) -> f32 {
         value + 1.0
     }
@@ -158,8 +157,8 @@ fn run_case(
         ),
     ];
     let builder = match elements {
-        65 => kernels::add::<65>(&declarations)?,
-        1_048_576 => kernels::add::<1_048_576>(&declarations)?,
+        65 => kernels::add_ir::<65>(&declarations)?,
+        1_048_576 => kernels::add_ir::<1_048_576>(&declarations)?,
         _ => return Err("dispatch benchmark shape has no kernel specialization".into()),
     };
     let kernel = builder.ir();

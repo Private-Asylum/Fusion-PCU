@@ -56,7 +56,7 @@ impl RocmMemoryProvider {
         }
     }
 
-    fn validate_resource(
+    pub(crate) fn validate_resource(
         &self,
         resource: &RocmMemoryResource,
         operation: PcuMemoryProviderOperation,
@@ -165,7 +165,6 @@ impl RocmMemoryResource {
     }
 
     /// Conservatively checks whether two complete resources can refer to the same bytes.
-    #[cfg(feature = "tensor")]
     pub(crate) fn may_overlap(&self, other: &Self) -> bool {
         self.overlap(
             other,
@@ -202,10 +201,36 @@ impl RocmMemoryResource {
         }
     }
 
+    /// Clone the allocation lease as an immutable tensor-input view.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn clone_read_only_for_tensor_input(&self) -> Self {
+        Self {
+            pool: self.pool,
+            buffer: self.buffer.clone(),
+            alignment: self.alignment,
+            access: PcuMemoryAccess::ReadOnly,
+        }
+    }
+
+    /// Checks that this allocation is quiescent and available for a new operation.
+    ///
+    /// This is a preflight check, not an access lease. Submission must still acquire the
+    /// allocation's physical lease; availability can change before that acquisition.
+    ///
+    /// # Errors
+    /// Returns `HipError::Busy` for an active or quarantined allocation.
+    pub fn validate_access_available(&self) -> Result<(), HipError> {
+        self.buffer.validate_access_available()
+    }
+
     /// Borrow the underlying HIP allocation for the `ROCm` adapter's internal dispatch binding.
     #[must_use]
     pub(crate) const fn device_buffer(&self) -> &DeviceBuffer {
         &self.buffer
+    }
+
+    pub(crate) const fn access(&self) -> PcuMemoryAccess {
+        self.access
     }
 }
 

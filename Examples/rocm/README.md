@@ -1,6 +1,41 @@
 # Fusion ROCm host smoke test
 
+## Owned results and captured composition
+
+`cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-ownership --release` demonstrates
+ordinary calls over RAM and resident borrows, individually marked helper functions captured into
+one graph, a mixed-input transform, exclusive resident mutation, explicit stack readback and
+ordinary early/scope Drop. Device ownership is opaque: no backend upload/binding API is needed.
+The current bounded owned-source profile is rank-one f32 with identity, ReLU, Add/Sub/Mul,
+ordinary elementwise `+`, `-`, `*`, nested pure expressions and marked helper calls, immutable
+let bindings and `?`/`Ok(...)`; it is not arbitrary Rust compilation. Every synchronous call
+returns after terminal completion. Separate calls retain residency; calls captured inside a
+marked composition describe one graph and allow internal liveness planning.
+
+For example, a marked function can return `Ok(pcu::relu((lhs + rhs) * rhs)?)`.
+Grouping and operand order are preserved in the cold capture. Literal broadcasting, division,
+mutable expression borrows and arbitrary control flow are rejected; expression nesting is bounded.
+
+`cargo bench -p fusion-pcu-example-rocm --bench owned_program` compares raw owned PCU,
+source-authored owned PCU and native HIP with fresh output allocation, launch, completion and
+release timed. Current input setup/refresh and verified readback are outside timing. The retained
+source-input control separates that boundary from repeated input ownership setup. Cold preparation,
+Rust heap counts and balanced paired diagnostics are reported separately from Criterion intervals.
+
+`cargo bench -p fusion-pcu-example-rocm --bench owned_binary` compares two-input Add through
+the same three routes at 65 and 1,048,576 elements. Both inputs remain allocated and receive
+new values before every job. Cold source/refresh preparation finishes before calibration;
+CPU result checks and input refresh stay outside the matched fresh-output timing boundary.
+
 ## Typed kernel calls
+
+`cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-direct --release` demonstrates
+`transform(&seed, &input, &mut output)?` with lazy runtime defaults and individually annotated `#[pcu]`
+scalar helpers. The facade's `rocm` feature makes the provider available; compatible device
+selection happens at runtime. Optional `fusion_pcu::global::configure` preferences select a
+specific device or scoring policy. Prepared state is cached per thread and specialization;
+every host call still uses the current borrowed input and mutable output contents. No CPU
+fallback is enabled. Host-call staging reuse is distinct from device-resident result chaining.
 
 `cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-typed-kernel` prepares one
 typed `#[pcu]` kernel and calls it repeatedly with ordinary Rust slices on the explicitly selected
@@ -10,11 +45,15 @@ for completion, and returns results through the same mutable borrow. The output 
 kernel extent remains intact, and short buffers return an error.
 
 The `typed_kernel` Criterion target has distinct host-slice and resident-device groups. The host
-group compares prepared PCU calls with native HIP including matched input and mutable-output
-uploads, launch, wait, and result download at 65 and 1,048,576 elements. Preparation and native
+group compares prepared PCU, direct PCU, and native HIP calls including matched input upload,
+launch, wait, and result download at 65 and 1,048,576 elements. This complete-writer kernel does
+not read old output contents, so neither route uploads them. Other kernels still receive current
+mutable input contents whenever required, and untouched host tails remain intact. Preparation and native
 compilation are reported separately. Each measured job uses a new input and checks the full result
 against a CPU oracle. The resident group keeps typed device buffers across invocations to measure
-reusable device-side calls without introducing a host-transfer flag. Run it with
+reusable device-side calls without introducing a host-transfer flag. Additional alternating pairs
+check order effects separately from Criterion intervals, and a warm Rust heap census reports
+allocations without claiming to count driver/device allocations. Run it with
 `cargo bench -p fusion-pcu-example-rocm --bench typed_kernel` on a ROCm host. The ignored
 host-borrow regressions run with
 `cargo test -p fusion-pcu-example-rocm --test typed_kernel_host -- --ignored --nocapture`.
@@ -31,7 +70,9 @@ device with the most physical memory, breaking ties by lowest index; set `FUSION
 an explicit device index to override that policy. It tries each ranked device until the actual
 Dispatch program prepares successfully. The tensor example similarly requires the selected
 graph to assess as supported on its rocBLAS and synthesized Dispatch routes. An explicit device request never selects a
-different device. PCU itself does not select or rank devices.
+different device. The neutral PCU discovery contracts expose selection information; these explicit
+examples own their policies. The optional hosted facade separately supplies configurable defaults
+for ordinary direct calls.
 The example imports the ROCm crate only to register/open the explicitly chosen provider; the
 workload uses PCU traits and submits twice from one prepared executable. Prepared warm-loop timing
 belongs in the Cargo `dispatch` benchmark.

@@ -1,5 +1,0 @@
-error: recursive PCU helper calls are not supported
- --> tests/ui/pcu_module_recursive_helper.rs:6:8
-  |
-6 |     fn recurse(value: f32) -> f32 {
-  |        ^^^^^^^

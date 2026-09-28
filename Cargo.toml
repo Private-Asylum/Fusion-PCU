@@ -1,7 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "Crates/core",
     "Crates/fusion-pcu",
+    "Crates/core",
     "Crates/macros",
     "Crates/backends/rocm",
     "Crates/backends/cuda",
@@ -33,6 +35,7 @@ categories = ["hardware-support", "science", "development-tools"]
 publish = ["crates-io"]
 
 [workspace.dependencies]
+fusion-pcu-core = { version = "0.0.2", path = "Crates/core", default-features = false }
 fusion-pcu = { version = "0.0.2", path = "Crates/fusion-pcu", default-features = false }
 fusion-pcu-cpu = { version = "0.0.2", path = "Crates/backends/cpu" }
 pcu_alias = { package = "fusion-pcu", version = "0.0.2", path = "Crates/fusion-pcu", default-features = false }
