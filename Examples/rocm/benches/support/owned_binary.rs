@@ -122,8 +122,8 @@ fn run_case(
     let assessor_root = RocmOwnedTensorAssessor::new(Rc::clone(backend))?;
     let assessor = assessor_root.assessor();
     let mut graph = Graph::default();
-    let lhs_id = graph.input([elements])?;
-    let rhs_id = graph.input([elements])?;
+    let lhs_id = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
+    let rhs_id = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
     let output_id = graph.add(lhs_id, rhs_id)?;
     let program = graph.into_selected_program(
         &[output_id],

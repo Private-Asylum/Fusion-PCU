@@ -1,0 +1,5 @@
+error: use of consumed PCU owner after move
+  --> tests/ui/owned_helper_double_move_alias.rs:17:24
+   |
+17 |     Ok(pcu::add(first, owner)?)
+   |                        ^^^^^

@@ -1,17 +1,27 @@
-//! Feature-gated tensor dialect with a deterministic CPU reference evaluator.
+//! Feature-gated heterogeneous tensor graphs and typed host storage.
 //!
 //! Tensor semantics remain isolated from generic coprocessor contracts. This module uses
-//! `core` and `alloc`, never `std`. The current graph supports f32 inputs/constants, elementwise
-//! add/subtract/multiply, SGD updates, matrix multiplication, `ReLU`, and mean-squared error. It can append
-//! a backward graph for the supported MSE-rooted subset. It does not implement broadcasting,
-//! batching, convolution, views, mixed precision, optimizers, or serialization; selected backend
-//! adapters provide device execution separately.
+//! `core` and `alloc`, never `std`. Graph inputs, constants, and uniforms retain scalar identity
+//! in one erased graph; [`TensorValueId`] provides checked typed handles, with no implicit type
+//! promotion. Dense host storage round-trips each [`TensorValue`] scalar variant, but that fact
+//! does not claim that every executor implements its type or arithmetic. The reference evaluator
+//! transports typed leaf values and implements forward f32/f64 elementwise arithmetic, `ReLU`,
+//! and matrix multiplication. Mean-squared error, SGD, and reverse-mode differentiation remain
+//! f32-only. Integer elementwise operations can be described in a graph but are not executed by
+//! the current reference evaluator; packed and opaque half-bit arithmetic has no assigned
+//! semantics. Broadcasting, batching, convolution, views, optimizers, and serialization remain
+//! outside this dialect.
 
 #[rustfmt::skip]
 use alloc::{
     string::String,
     vec,
     vec::Vec,
+};
+#[rustfmt::skip]
+use crate::{
+    PcuScalar,
+    core::PcuScalarType,
 };
 use core::fmt;
 #[rustfmt::skip]
@@ -24,17 +34,26 @@ use core::sync::atomic::{
 mod storage;
 #[rustfmt::skip]
 pub use storage::{
+    TerminalBinaryDonorProof,
+    TensorBinaryOperand,
+    TensorBinaryOperation,
     TensorGraphRequirements,
+    TensorInputReuseProof,
     TensorScratchStorageAssignment,
     TensorScratchStoragePlan,
     TensorScratchStorageSlot,
     TensorStorageConstraint,
+    TensorStorageReuseError,
     TensorStorageValidationError,
     TensorValueLiveness,
     TensorValueRequirement,
     TensorValueStorageRequirement,
 };
-use storage::node_output_bytes;
+#[rustfmt::skip]
+use storage::{
+    dense_scalar_layout,
+    node_output_bytes,
+};
 
 #[path = "tensor/feedback.rs"]
 mod feedback;
@@ -45,9 +64,34 @@ pub use feedback::{
     TensorFeedbackPlan,
 };
 
+#[path = "tensor/value.rs"]
+mod value;
+#[rustfmt::skip]
+pub use value::{
+    TensorElement,
+    TensorScalarValue,
+    TensorValue,
+    TensorValueTypeMismatch,
+};
+
 #[path = "tensor/execution.rs"]
 mod execution;
 pub use execution::TensorExecution;
+
+#[path = "tensor/reference.rs"]
+mod reference;
+#[rustfmt::skip]
+use reference::{
+    as_f32_value,
+    binary,
+    binary_value,
+    execution_f32_value,
+    matmul_value,
+    mean_denominator,
+    mean_squared_error_value,
+    relu_backward_value,
+    relu_value,
+};
 
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -56,26 +100,26 @@ fn next_graph_id() -> u64 {
 }
 
 #[derive(Clone, Debug)]
-pub struct Tensor {
+pub struct Tensor<T: PcuScalar = f32> {
     shape: Vec<usize>,
-    data: Vec<f32>,
-    known_uniform_value: Option<f32>,
+    data: Vec<T>,
+    known_uniform_value: Option<T>,
 }
 
-impl PartialEq for Tensor {
+impl<T: PcuScalar + PartialEq> PartialEq for Tensor<T> {
     fn eq(&self, other: &Self) -> bool {
         self.shape == other.shape && self.data == other.data
     }
 }
 
-impl Tensor {
+impl<T: PcuScalar> Tensor<T> {
     /// Creates a tensor after checking that its data length matches its shape.
     ///
     /// # Errors
     ///
     /// Returns [`TensorError::ShapeOverflow`] if the element count overflows, or
     /// [`TensorError::DataLength`] if `data` has the wrong number of elements.
-    pub fn new(shape: impl Into<Vec<usize>>, data: Vec<f32>) -> Result<Self, TensorError> {
+    pub fn new(shape: impl Into<Vec<usize>>, data: Vec<T>) -> Result<Self, TensorError> {
         let shape = shape.into();
         let len = element_count(&shape)?;
         if len != data.len() {
@@ -101,7 +145,7 @@ impl Tensor {
     /// # Errors
     ///
     /// Returns [`TensorError::ShapeOverflow`] if the element count overflows.
-    pub fn splat(shape: impl Into<Vec<usize>>, value: f32) -> Result<Self, TensorError> {
+    pub fn splat(shape: impl Into<Vec<usize>>, value: T) -> Result<Self, TensorError> {
         let shape = shape.into();
         let len = element_count(&shape)?;
         Ok(Self {
@@ -112,7 +156,7 @@ impl Tensor {
     }
 
     #[must_use]
-    pub fn scalar(value: f32) -> Self {
+    pub fn scalar(value: T) -> Self {
         Self {
             shape: vec![],
             data: vec![value],
@@ -123,8 +167,25 @@ impl Tensor {
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
+
     #[must_use]
-    pub fn data(&self) -> &[f32] {
+    pub const fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Scalar element type associated with this sealed host-storage type.
+    #[must_use]
+    pub const fn scalar_type(&self) -> PcuScalarType {
+        T::TYPE
+    }
+
+    #[must_use]
+    pub fn data(&self) -> &[T] {
         &self.data
     }
 
@@ -132,13 +193,13 @@ impl Tensor {
     /// constructor. General tensors created with [`Self::new`] remain unknown until an
     /// optimization elects to inspect their data.
     #[must_use]
-    pub const fn known_uniform_value(&self) -> Option<f32> {
+    pub const fn known_uniform_value(&self) -> Option<T> {
         self.known_uniform_value
     }
 
     /// Consumes the tensor and returns its contiguous data without copying it.
     #[must_use]
-    pub fn into_data(self) -> Vec<f32> {
+    pub fn into_data(self) -> Vec<T> {
         self.data
     }
 }
@@ -146,10 +207,32 @@ impl Tensor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TensorError {
     ShapeOverflow,
-    DataLength { expected: usize, actual: usize },
+    InvalidStorageAlignment {
+        value: ValueId,
+        alignment_bytes: usize,
+    },
+    UnsupportedScalarType {
+        value: ValueId,
+        scalar_type: PcuScalarType,
+    },
+    ScalarTypeMismatch {
+        value: ValueId,
+        expected: PcuScalarType,
+        actual: PcuScalarType,
+    },
+    DataLength {
+        expected: usize,
+        actual: usize,
+    },
     UnknownValue(ValueId),
-    ShapeMismatch { left: Vec<usize>, right: Vec<usize> },
-    MatMulShape { left: Vec<usize>, right: Vec<usize> },
+    ShapeMismatch {
+        left: Vec<usize>,
+        right: Vec<usize>,
+    },
+    MatMulShape {
+        left: Vec<usize>,
+        right: Vec<usize>,
+    },
     LossMustBeScalar(Vec<usize>),
     MissingInput(ValueId),
     DuplicateInput(ValueId),
@@ -184,17 +267,62 @@ pub struct ValueId {
     index: usize,
 }
 
+/// A graph value whose scalar representation was checked against `T` when the handle was made.
+///
+/// The graph ID and scalar type stay private. Values can only be created by typed graph methods
+/// or by [`Graph::typed_view`], which checks the referenced node before constructing this handle.
+#[derive(Clone, Copy, Debug)]
+pub struct TensorValueId<T: PcuScalar> {
+    value: ValueId,
+    marker: core::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: PcuScalar> PartialEq for TensorValueId<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<T: PcuScalar> Eq for TensorValueId<T> {}
+
+impl<T: PcuScalar> core::hash::Hash for TensorValueId<T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&self.value, state);
+    }
+}
+
+impl<T: PcuScalar> TensorValueId<T> {
+    const fn new(value: ValueId) -> Self {
+        Self {
+            value,
+            marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Erases the compile-time scalar marker for dynamic graph/model boundaries.
+    #[must_use]
+    pub const fn erase(self) -> ValueId {
+        self.value
+    }
+
+    /// Scalar type proven when this handle was constructed.
+    #[must_use]
+    pub const fn scalar_type(self) -> PcuScalarType {
+        T::TYPE
+    }
+}
+
 /// A read-only description of one operation in a graph.
 ///
 /// Constants are borrowed from the graph, so inspecting a plan does not clone tensor data.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OpDescriptor<'a> {
     Input,
-    Constant(&'a Tensor),
+    Constant(&'a TensorValue),
     /// A compact graph-level constant whose logical output is a dense tensor filled with `value`.
     /// Storage and liveness metadata continue to describe the full logical tensor extent.
     Uniform {
-        value: f32,
+        value: TensorScalarValue,
     },
     Add {
         left: ValueId,
@@ -238,6 +366,7 @@ pub struct NodeDescriptor<'a> {
     pub value: ValueId,
     pub op: OpDescriptor<'a>,
     pub shape: &'a [usize],
+    pub scalar_type: PcuScalarType,
 }
 
 /// Execution route selected by an explicit tensor operation assessor.
@@ -342,10 +471,20 @@ pub unsafe trait TensorSynchronousF32MatMulBackend: TensorOperationAssessor {
 pub struct TensorReferenceAssessor;
 
 impl TensorOperationAssessor for TensorReferenceAssessor {
-    fn assess_node(&self, _graph: &Graph, _node: NodeDescriptor<'_>) -> TensorOperationSupport {
-        TensorOperationSupport::Supported {
-            route: TensorExecutionRoute::Reference,
-            workspace_bytes: None,
+    fn assess_node(&self, _graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+        let leaf = matches!(
+            node.op,
+            OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+        );
+        if leaf || matches!(node.scalar_type, PcuScalarType::F32 | PcuScalarType::F64) {
+            TensorOperationSupport::Supported {
+                route: TensorExecutionRoute::Reference,
+                workspace_bytes: None,
+            }
+        } else {
+            TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+            }
         }
     }
 }
@@ -779,8 +918,8 @@ impl<'a> TensorSelectedLoweringPlan<'a> {
                 {
                     continue;
                 }
-                let left_bytes = selected_operation_bytes(left)?;
-                let right_bytes = selected_operation_bytes(right)?;
+                let left_bytes = selected_operation_bytes(left, &self.nodes)?;
+                let right_bytes = selected_operation_bytes(right, &self.nodes)?;
                 constraints.push(TensorStorageConstraint {
                     left: selected_operation_output(left),
                     right: selected_operation_output(right),
@@ -847,12 +986,23 @@ impl<'a> TensorSelectedLoweringPlan<'a> {
             .iter()
             .enumerate()
             .map(|(position, operation)| {
+                let output = selected_operation_output(operation);
+                let scalar_type = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.value == output)
+                    .map(|node| node.scalar_type)
+                    .ok_or(TensorError::UnknownValue(output))?;
                 Ok(TensorValueLiveness {
-                    value: selected_operation_output(operation),
-                    output_bytes: Some(
-                        node_output_bytes(selected_operation_shape(operation))
-                            .ok_or(TensorError::ShapeOverflow)?,
-                    ),
+                    value: output,
+                    scalar_type,
+                    output_bytes: Some(checked_node_output_bytes(
+                        output,
+                        selected_operation_shape(operation),
+                        scalar_type,
+                    )?),
+                    alignment_bytes: dense_scalar_layout(scalar_type)
+                        .map(|(_, alignment)| alignment),
                     first_live_node: position,
                     last_live_node: last_use[position],
                 })
@@ -895,12 +1045,17 @@ impl<'a> TensorSelectedLoweringPlan<'a> {
                 {
                     continue;
                 }
-                let left_bytes =
-                    u64::try_from(node_output_bytes(left.shape).ok_or(TensorError::ShapeOverflow)?)
-                        .map_err(|_| TensorError::ShapeOverflow)?;
-                let right_bytes = u64::try_from(
-                    node_output_bytes(right.shape).ok_or(TensorError::ShapeOverflow)?,
-                )
+                let left_bytes = u64::try_from(checked_node_output_bytes(
+                    left.value,
+                    left.shape,
+                    left.scalar_type,
+                )?)
+                .map_err(|_| TensorError::ShapeOverflow)?;
+                let right_bytes = u64::try_from(checked_node_output_bytes(
+                    right.value,
+                    right.shape,
+                    right.scalar_type,
+                )?)
                 .map_err(|_| TensorError::ShapeOverflow)?;
                 constraints.push(TensorStorageConstraint {
                     left: left.value,
@@ -937,6 +1092,283 @@ impl TensorOwnedSelectedProgram {
     #[must_use]
     pub fn output_values(&self) -> &[ValueId] {
         &self.output_values
+    }
+
+    /// Proves that a consumed external input can supply the storage for a selected `ReLU` output.
+    ///
+    /// This is deliberately limited to a direct, same-index `ReLU` of an external input. It
+    /// rejects input fanout, output-pinned inputs, and `ReLU` outputs that feed another selected
+    /// operation. The returned proof describes graph legality
+    /// only; a backend must still prove physical exclusivity, quiescence, and an in-place binding
+    /// contract before reusing a resource. Ordinary storage constraints remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reuse error when the selected graph does not meet the narrow contract, or
+    /// a shape/layout error when dense extents cannot be represented.
+    pub fn prove_consumed_relu_reuse(
+        &self,
+        input: ValueId,
+        output: ValueId,
+    ) -> Result<TensorInputReuseProof, TensorStorageReuseError> {
+        if input.graph_id != self.graph.id || self.graph.nodes.get(input.index).is_none() {
+            return Err(TensorStorageReuseError::ValueNotInProgram(input));
+        }
+        if output.graph_id != self.graph.id || self.graph.nodes.get(output.index).is_none() {
+            return Err(TensorStorageReuseError::ValueNotInProgram(output));
+        }
+        if !self.input_values.contains(&input)
+            || !matches!(self.graph.nodes[input.index].op, Op::Input)
+        {
+            return Err(TensorStorageReuseError::InputIsNotGraphInput(input));
+        }
+        let Some(output_operation_index) = self.operation_index_of(output) else {
+            return Err(TensorStorageReuseError::OutputIsNotSelectedOutput(output));
+        };
+        if !self.output_values.contains(&output) {
+            return Err(TensorStorageReuseError::OutputIsNotSelectedOutput(output));
+        }
+        if self.output_values.contains(&input) {
+            return Err(TensorStorageReuseError::InputIsSelectedOutput(input));
+        }
+
+        let output_uses = self.operation_use_counts[output_operation_index];
+        if output_uses != 1 {
+            return Err(TensorStorageReuseError::OutputHasSelectedConsumers {
+                value: output,
+                actual: output_uses.saturating_sub(1),
+            });
+        }
+
+        let Some(input_operation_index) = self.operation_index_of(input) else {
+            return Err(TensorStorageReuseError::ValueNotInProgram(input));
+        };
+        let actual_uses = self.operation_use_counts[input_operation_index];
+        if actual_uses != 1 {
+            return Err(TensorStorageReuseError::InputUseCount {
+                value: input,
+                actual: actual_uses,
+            });
+        }
+
+        if !matches!(self.graph.nodes[output.index].op, Op::Relu(actual) if actual == input)
+            || !matches!(
+                self.operations.get(output_operation_index),
+                Some(TensorOwnedSelectedOperation::Node { value }) if *value == output
+            )
+        {
+            return Err(TensorStorageReuseError::NotDirectRelu { input, output });
+        }
+
+        let input_node = &self.graph.nodes[input.index];
+        let output_node = &self.graph.nodes[output.index];
+        if input_node.shape != output_node.shape {
+            return Err(TensorStorageReuseError::ShapeMismatch { input, output });
+        }
+        if input_node.scalar_type != output_node.scalar_type {
+            return Err(TensorStorageReuseError::ScalarTypeMismatch { input, output });
+        }
+        let scalar_type = input_node.scalar_type;
+        let Some((_, alignment_bytes)) = dense_scalar_layout(scalar_type) else {
+            return Err(TensorStorageReuseError::UnsupportedScalarType {
+                value: input,
+                scalar_type,
+            });
+        };
+        let input_bytes = checked_node_output_bytes(input, &input_node.shape, scalar_type)
+            .map_err(|_| TensorStorageReuseError::ShapeOverflow(input))?;
+        let output_bytes = checked_node_output_bytes(output, &output_node.shape, scalar_type)
+            .map_err(|_| TensorStorageReuseError::ShapeOverflow(output))?;
+        if input_bytes != output_bytes {
+            return Err(TensorStorageReuseError::LayoutMismatch { input, output });
+        }
+        let bytes = u64::try_from(input_bytes)
+            .map_err(|_| TensorStorageReuseError::ShapeOverflow(input))?;
+        let alignment_bytes = u64::try_from(alignment_bytes)
+            .map_err(|_| TensorStorageReuseError::ShapeOverflow(input))?;
+        Ok(TensorInputReuseProof::new(
+            self.graph.id,
+            input,
+            output,
+            scalar_type,
+            bytes,
+            alignment_bytes,
+        ))
+    }
+
+    /// Proves that a terminal Add, Sub, or Mul can overwrite one designated input.
+    ///
+    /// The selected program must contain exactly two distinct external inputs and one binary
+    /// operation, with the result as its sole requested output. Both operands must have one
+    /// selected use. This proves graph legality only; a backend must independently validate
+    /// resource ownership, overlap, quiescence, and its in-place binding contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed reuse error when the selected graph does not meet this profile or its
+    /// dense storage facts cannot be represented.
+    pub fn prove_consumed_binary_donor(
+        &self,
+        donor: ValueId,
+        other: ValueId,
+        output: ValueId,
+    ) -> Result<TerminalBinaryDonorProof, TensorStorageReuseError> {
+        self.validate_binary_donor_selection(donor, other, output)?;
+        let (operation, donor_operand) =
+            binary_donor_operation(&self.graph.nodes[output.index].op, donor, other).ok_or(
+                TensorStorageReuseError::NotTerminalBinary {
+                    donor,
+                    other,
+                    output,
+                },
+            )?;
+        let (scalar_type, bytes, alignment_bytes) =
+            self.binary_donor_layout(donor, other, output)?;
+        Ok(TerminalBinaryDonorProof::new(
+            self.graph.id,
+            donor,
+            other,
+            output,
+            operation,
+            donor_operand,
+            scalar_type,
+            bytes,
+            alignment_bytes,
+        ))
+    }
+
+    fn validate_binary_donor_selection(
+        &self,
+        donor: ValueId,
+        other: ValueId,
+        output: ValueId,
+    ) -> Result<(), TensorStorageReuseError> {
+        for value in [donor, other, output] {
+            if value.graph_id != self.graph.id || self.graph.nodes.get(value.index).is_none() {
+                return Err(TensorStorageReuseError::ValueNotInProgram(value));
+            }
+        }
+        if donor == other {
+            return Err(TensorStorageReuseError::DonorAndOtherAreSameValue(donor));
+        }
+        if !self.input_values.contains(&donor)
+            || !matches!(self.graph.nodes[donor.index].op, Op::Input)
+        {
+            return Err(TensorStorageReuseError::InputIsNotGraphInput(donor));
+        }
+        if !self.input_values.contains(&other)
+            || !matches!(self.graph.nodes[other.index].op, Op::Input)
+        {
+            return Err(TensorStorageReuseError::InputIsNotGraphInput(other));
+        }
+        if self.input_values.len() != 2
+            || !self.input_values.contains(&donor)
+            || !self.input_values.contains(&other)
+            || self.output_values.as_slice() != [output]
+        {
+            return Err(TensorStorageReuseError::NotTerminalBinary {
+                donor,
+                other,
+                output,
+            });
+        }
+
+        let Some(output_operation_index) = self.operation_index_of(output) else {
+            return Err(TensorStorageReuseError::OutputIsNotSelectedOutput(output));
+        };
+        let output_uses = self.operation_use_counts[output_operation_index];
+        if output_uses != 1 {
+            return Err(TensorStorageReuseError::OutputHasSelectedConsumers {
+                value: output,
+                actual: output_uses.saturating_sub(1),
+            });
+        }
+        let donor_operation_index = self
+            .operation_index_of(donor)
+            .ok_or(TensorStorageReuseError::ValueNotInProgram(donor))?;
+        let other_operation_index = self
+            .operation_index_of(other)
+            .ok_or(TensorStorageReuseError::ValueNotInProgram(other))?;
+        for (value, index) in [
+            (donor, donor_operation_index),
+            (other, other_operation_index),
+        ] {
+            let actual = self.operation_use_counts[index];
+            if actual != 1 {
+                return Err(TensorStorageReuseError::InputUseCount { value, actual });
+            }
+        }
+
+        if self.operations.len() != 3
+            || !matches!(
+                self.operations.get(donor_operation_index),
+                Some(TensorOwnedSelectedOperation::Node { value }) if *value == donor
+            )
+            || !matches!(
+                self.operations.get(other_operation_index),
+                Some(TensorOwnedSelectedOperation::Node { value }) if *value == other
+            )
+            || !matches!(
+                self.operations.get(output_operation_index),
+                Some(TensorOwnedSelectedOperation::Node { value }) if *value == output
+            )
+        {
+            return Err(TensorStorageReuseError::NotTerminalBinary {
+                donor,
+                other,
+                output,
+            });
+        }
+        Ok(())
+    }
+
+    fn binary_donor_layout(
+        &self,
+        donor: ValueId,
+        other: ValueId,
+        output: ValueId,
+    ) -> Result<(PcuScalarType, u64, u64), TensorStorageReuseError> {
+        let donor_node = &self.graph.nodes[donor.index];
+        let other_node = &self.graph.nodes[other.index];
+        let output_node = &self.graph.nodes[output.index];
+        if donor_node.shape != other_node.shape || donor_node.shape != output_node.shape {
+            return Err(TensorStorageReuseError::ShapeMismatch {
+                input: donor,
+                output,
+            });
+        }
+        if donor_node.scalar_type != other_node.scalar_type
+            || donor_node.scalar_type != output_node.scalar_type
+        {
+            return Err(TensorStorageReuseError::ScalarTypeMismatch {
+                input: donor,
+                output,
+            });
+        }
+        let scalar_type = donor_node.scalar_type;
+        let Some((_, alignment_bytes)) = dense_scalar_layout(scalar_type) else {
+            return Err(TensorStorageReuseError::UnsupportedScalarType {
+                value: donor,
+                scalar_type,
+            });
+        };
+        let donor_bytes = checked_node_output_bytes(donor, &donor_node.shape, scalar_type)
+            .map_err(|_| TensorStorageReuseError::ShapeOverflow(donor))?;
+        let output_bytes = checked_node_output_bytes(output, &output_node.shape, scalar_type)
+            .map_err(|_| TensorStorageReuseError::ShapeOverflow(output))?;
+        if donor_bytes != output_bytes {
+            return Err(TensorStorageReuseError::LayoutMismatch {
+                input: donor,
+                output,
+            });
+        }
+        Ok((
+            scalar_type,
+            u64::try_from(donor_bytes)
+                .map_err(|_| TensorStorageReuseError::ShapeOverflow(donor))?,
+            u64::try_from(alignment_bytes)
+                .map_err(|_| TensorStorageReuseError::ShapeOverflow(donor))?,
+        ))
     }
 
     /// Source-graph inclusive liveness facts aligned with [`Self::node_order`].
@@ -1061,7 +1493,7 @@ impl TensorOwnedSelectedProgram {
     /// Returns an error for missing, duplicate, extra, or wrongly shaped graph inputs.
     pub fn execute_reference(
         &self,
-        inputs: &[(ValueId, Tensor)],
+        inputs: &[(ValueId, TensorValue)],
     ) -> Result<Execution, TensorError> {
         self.graph.evaluate(inputs)
     }
@@ -1163,6 +1595,9 @@ impl<'a> TensorExecutionPlan<'a> {
             };
             let (learning_rate, rate_shape, rate_is_uniform) = match &rate_node.op {
                 Op::Constant(rate_tensor) => {
+                    let Ok(rate_tensor) = rate_tensor.as_typed::<f32>() else {
+                        continue;
+                    };
                     let Some(value) = rate_tensor
                         .known_uniform_value
                         .or_else(|| rate_tensor.data.first().copied())
@@ -1179,7 +1614,12 @@ impl<'a> TensorExecutionPlan<'a> {
                                 .all(|rate| rate.to_bits() == value.to_bits()),
                     )
                 }
-                Op::Uniform(value) => (*value, rate_node.shape.as_slice(), true),
+                Op::Uniform(value) => {
+                    let Ok(value) = value.as_typed::<f32>() else {
+                        continue;
+                    };
+                    (value, rate_node.shape.as_slice(), true)
+                }
                 _ => continue,
             };
             if !learning_rate.is_finite()
@@ -1380,8 +1820,9 @@ impl<'a> TensorExecutionPlan<'a> {
     /// Returns all pairwise storage disjointness requirements implied by live writable values.
     ///
     /// Lifetimes are inclusive, so values whose intervals touch at a node are both considered
-    /// live there. Read-only input/constant pairs are omitted; all computed values require unique
-    /// storage until an operation explicitly grants an in-place alias permission.
+    /// live there. Read-only input/constant pairs are omitted; computed values remain disjoint
+    /// under these default constraints. A consumed-ReLU graph proof is separate evidence and
+    /// does not relax this validation path.
     ///
     /// # Errors
     ///
@@ -1399,12 +1840,18 @@ impl<'a> TensorExecutionPlan<'a> {
                 {
                     continue;
                 }
-                let left_bytes =
-                    u64::try_from(left.output_bytes.ok_or(TensorError::ShapeOverflow)?)
-                        .map_err(|_| TensorError::ShapeOverflow)?;
-                let right_bytes =
-                    u64::try_from(right.output_bytes.ok_or(TensorError::ShapeOverflow)?)
-                        .map_err(|_| TensorError::ShapeOverflow)?;
+                let left_bytes = u64::try_from(checked_node_output_bytes(
+                    left.value,
+                    &self.graph.nodes[left.value.index].shape,
+                    left.scalar_type,
+                )?)
+                .map_err(|_| TensorError::ShapeOverflow)?;
+                let right_bytes = u64::try_from(checked_node_output_bytes(
+                    right.value,
+                    &self.graph.nodes[right.value.index].shape,
+                    right.scalar_type,
+                )?)
+                .map_err(|_| TensorError::ShapeOverflow)?;
                 constraints.push(TensorStorageConstraint {
                     left: left.value,
                     right: right.value,
@@ -1439,12 +1886,21 @@ impl<'a> TensorExecutionPlan<'a> {
         self.value_liveness
             .iter()
             .map(|life| {
+                let shape = &self.graph.nodes[life.value.index].shape;
+                let output_bytes = checked_node_output_bytes(life.value, shape, life.scalar_type)?;
+                let (_, alignment_bytes) = dense_scalar_layout(life.scalar_type).ok_or(
+                    TensorError::UnsupportedScalarType {
+                        value: life.value,
+                        scalar_type: life.scalar_type,
+                    },
+                )?;
                 Ok(TensorValueStorageRequirement {
                     value: life.value,
-                    output_bytes: u64::try_from(
-                        life.output_bytes.ok_or(TensorError::ShapeOverflow)?,
-                    )
-                    .map_err(|_| TensorError::ShapeOverflow)?,
+                    scalar_type: life.scalar_type,
+                    output_bytes: u64::try_from(output_bytes)
+                        .map_err(|_| TensorError::ShapeOverflow)?,
+                    alignment_bytes: u64::try_from(alignment_bytes)
+                        .map_err(|_| TensorError::ShapeOverflow)?,
                     access: if self.is_writable_value(life.value) {
                         crate::PcuMemoryAccess::ReadWrite
                     } else {
@@ -1467,7 +1923,7 @@ impl<'a> TensorExecutionPlan<'a> {
     /// Returns an error for missing, duplicate, extra, or wrongly shaped inputs.
     pub fn execute_reference(
         &self,
-        inputs: &[(ValueId, Tensor)],
+        inputs: &[(ValueId, TensorValue)],
     ) -> Result<Execution, TensorError> {
         self.graph.evaluate(inputs)
     }
@@ -2247,10 +2703,30 @@ fn selected_operation_shape<'op>(operation: &'op TensorSelectedOperation<'_>) ->
     }
 }
 
-fn selected_operation_bytes(operation: &TensorSelectedOperation<'_>) -> Result<u64, TensorError> {
+fn selected_operation_bytes(
+    operation: &TensorSelectedOperation<'_>,
+    nodes: &[NodeDescriptor<'_>],
+) -> Result<u64, TensorError> {
+    let output = selected_operation_output(operation);
+    let scalar_type = nodes
+        .iter()
+        .find(|node| node.value == output)
+        .map(|node| node.scalar_type)
+        .ok_or(TensorError::UnknownValue(output))?;
     let bytes =
-        node_output_bytes(selected_operation_shape(operation)).ok_or(TensorError::ShapeOverflow)?;
+        checked_node_output_bytes(output, selected_operation_shape(operation), scalar_type)?;
     u64::try_from(bytes).map_err(|_| TensorError::ShapeOverflow)
+}
+
+fn checked_node_output_bytes(
+    value: ValueId,
+    shape: &[usize],
+    scalar_type: PcuScalarType,
+) -> Result<usize, TensorError> {
+    if dense_scalar_layout(scalar_type).is_none() {
+        return Err(TensorError::UnsupportedScalarType { value, scalar_type });
+    }
+    node_output_bytes(shape, scalar_type).ok_or(TensorError::ShapeOverflow)
 }
 
 const fn selected_operation_is_read_only(operation: &TensorSelectedOperation<'_>) -> bool {
@@ -2272,8 +2748,8 @@ const fn is_read_only_descriptor(op: OpDescriptor<'_>) -> bool {
 #[derive(Clone, Debug)]
 enum Op {
     Input,
-    Constant(Tensor),
-    Uniform(f32),
+    Constant(TensorValue),
+    Uniform(TensorScalarValue),
     Add(ValueId, ValueId),
     Sub(ValueId, ValueId),
     Mul(ValueId, ValueId),
@@ -2282,6 +2758,34 @@ enum Op {
     Relu(ValueId),
     ReluBackward(ValueId, ValueId),
     MeanSquaredError(ValueId, ValueId),
+}
+
+fn binary_donor_operation(
+    op: &Op,
+    donor: ValueId,
+    other: ValueId,
+) -> Option<(TensorBinaryOperation, TensorBinaryOperand)> {
+    match *op {
+        Op::Add(left, right) if left == donor && right == other => {
+            Some((TensorBinaryOperation::Add, TensorBinaryOperand::Left))
+        }
+        Op::Add(left, right) if left == other && right == donor => {
+            Some((TensorBinaryOperation::Add, TensorBinaryOperand::Right))
+        }
+        Op::Sub(left, right) if left == donor && right == other => {
+            Some((TensorBinaryOperation::Sub, TensorBinaryOperand::Left))
+        }
+        Op::Sub(left, right) if left == other && right == donor => {
+            Some((TensorBinaryOperation::Sub, TensorBinaryOperand::Right))
+        }
+        Op::Mul(left, right) if left == donor && right == other => {
+            Some((TensorBinaryOperation::Mul, TensorBinaryOperand::Left))
+        }
+        Op::Mul(left, right) if left == other && right == donor => {
+            Some((TensorBinaryOperation::Mul, TensorBinaryOperand::Right))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2310,6 +2814,7 @@ fn operands(op: &Op) -> impl Iterator<Item = ValueId> + '_ {
 struct Node {
     op: Op,
     shape: Vec<usize>,
+    scalar_type: PcuScalarType,
 }
 
 /// An immutable-in-practice, append-only graph builder. Value identifiers are graph-local.
@@ -2443,7 +2948,13 @@ impl Graph {
             .enumerate()
             .map(|(position, value)| TensorValueLiveness {
                 value: *value,
-                output_bytes: node_output_bytes(&self.nodes[value.index].shape),
+                scalar_type: self.nodes[value.index].scalar_type,
+                output_bytes: node_output_bytes(
+                    &self.nodes[value.index].shape,
+                    self.nodes[value.index].scalar_type,
+                ),
+                alignment_bytes: dense_scalar_layout(self.nodes[value.index].scalar_type)
+                    .map(|(_, alignment)| alignment),
                 first_live_node: position,
                 last_live_node: last_use[value.index],
             })
@@ -2606,7 +3117,10 @@ impl Graph {
             .map(|node| TensorValueRequirement {
                 value: node.value,
                 shape: node.shape,
-                output_bytes: node_output_bytes(node.shape),
+                scalar_type: node.scalar_type,
+                output_bytes: node_output_bytes(node.shape, node.scalar_type),
+                alignment_bytes: dense_scalar_layout(node.scalar_type)
+                    .map(|(_, alignment)| alignment),
             })
             .collect();
         let total_value_bytes = values.iter().try_fold(0usize, |total, value| {
@@ -2628,7 +3142,7 @@ impl Graph {
             nodes: self
                 .nodes()
                 .map(|node| TensorNodeAssessment {
-                    output_bytes: node_output_bytes(node.shape),
+                    output_bytes: node_output_bytes(node.shape, node.scalar_type),
                     support: assessor.assess_node(self, node),
                     node,
                 })
@@ -2692,15 +3206,20 @@ impl Graph {
             value,
             op,
             shape: &node.shape,
+            scalar_type: node.scalar_type,
         }
     }
 
-    fn push(&mut self, op: Op, shape: Vec<usize>) -> ValueId {
+    fn push(&mut self, op: Op, shape: Vec<usize>, scalar_type: PcuScalarType) -> ValueId {
         let id = ValueId {
             graph_id: self.id,
             index: self.nodes.len(),
         };
-        self.nodes.push(Node { op, shape });
+        self.nodes.push(Node {
+            op,
+            shape,
+            scalar_type,
+        });
         id
     }
 
@@ -2709,14 +3228,151 @@ impl Graph {
     /// # Errors
     ///
     /// Returns [`TensorError::ShapeOverflow`] if the shape's element count overflows.
-    pub fn input(&mut self, shape: impl Into<Vec<usize>>) -> Result<ValueId, TensorError> {
+    pub fn input(
+        &mut self,
+        shape: impl Into<Vec<usize>>,
+        scalar_type: PcuScalarType,
+    ) -> Result<ValueId, TensorError> {
         let shape = shape.into();
         element_count(&shape)?;
-        Ok(self.push(Op::Input, shape))
+        Ok(self.push(Op::Input, shape, scalar_type))
     }
 
-    pub fn constant(&mut self, value: Tensor) -> ValueId {
-        self.push(Op::Constant(value.clone()), value.shape)
+    /// Adds a typed input and retains its scalar type in the graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeOverflow` when its logical extent cannot be represented.
+    pub fn input_typed<T: PcuScalar>(
+        &mut self,
+        shape: impl Into<Vec<usize>>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.input(shape, T::TYPE).map(TensorValueId::new)
+    }
+
+    /// Checks a dynamic value's graph identity and scalar type before creating a typed handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownValue` for a foreign value or `ScalarTypeMismatch` when its type differs.
+    pub fn typed_view<T: PcuScalar>(
+        &self,
+        value: ValueId,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        let descriptor = self.node(value)?;
+        if descriptor.scalar_type != T::TYPE {
+            return Err(TensorError::ScalarTypeMismatch {
+                value,
+                expected: T::TYPE,
+                actual: descriptor.scalar_type,
+            });
+        }
+        Ok(TensorValueId::new(value))
+    }
+
+    /// Adds an owned heterogeneous tensor constant.
+    pub fn constant_value(&mut self, value: TensorValue) -> ValueId {
+        let scalar_type = value.scalar_type();
+        let shape = value.shape().to_vec();
+        self.push(Op::Constant(value), shape, scalar_type)
+    }
+
+    /// Adds a typed tensor constant.
+    pub fn constant_typed<T: TensorElement>(&mut self, value: Tensor<T>) -> TensorValueId<T> {
+        TensorValueId::new(self.constant_value(TensorValue::from_tensor(value)))
+    }
+
+    /// Adds a same-type typed elementwise sum.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity or shape/type validation errors from [`Self::add`].
+    pub fn add_typed<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.add(a.value, b.value).map(TensorValueId::new)
+    }
+
+    /// Adds a same-type typed elementwise difference.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity or shape/type validation errors from [`Self::sub`].
+    pub fn sub_typed<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.sub(a.value, b.value).map(TensorValueId::new)
+    }
+
+    /// Adds a same-type typed elementwise product.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity or shape/type validation errors from [`Self::mul`].
+    pub fn mul_typed<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.mul(a.value, b.value).map(TensorValueId::new)
+    }
+
+    /// Adds a typed `ReLU` operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownValue` if the handle is not from this graph.
+    pub fn relu_typed<T: PcuScalar>(
+        &mut self,
+        value: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.relu(value.value).map(TensorValueId::new)
+    }
+
+    /// Returns the same typed graph handle without adding an operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownValue` for a foreign handle or `ScalarTypeMismatch` if its metadata does
+    /// not match `T`.
+    pub fn identity_typed<T: PcuScalar>(
+        &self,
+        value: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.typed_view(value.erase())
+    }
+
+    /// Adds a same-type typed matrix multiplication.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity or matrix-shape errors from [`Self::matmul`].
+    pub fn matmul_typed<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.matmul(a.value, b.value).map(TensorValueId::new)
+    }
+
+    /// Adds a same-type typed matrix multiplication with logical transposes.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity or matrix-shape errors from [`Self::matmul_transposed`].
+    pub fn matmul_transposed_typed<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+        transpose_left: bool,
+        transpose_right: bool,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.matmul_transposed(a.value, b.value, transpose_left, transpose_right)
+            .map(TensorValueId::new)
     }
 
     /// Adds a compact graph-level constant with the supplied logical shape.
@@ -2729,22 +3385,37 @@ impl Graph {
     /// # Errors
     ///
     /// Returns [`TensorError::ShapeOverflow`] if the logical element count overflows.
-    pub fn uniform(
+    pub fn uniform_value(
         &mut self,
         shape: impl Into<Vec<usize>>,
-        value: f32,
+        value: TensorScalarValue,
     ) -> Result<ValueId, TensorError> {
         let shape = shape.into();
         element_count(&shape)?;
-        Ok(self.push(Op::Uniform(value), shape))
+        Ok(self.push(Op::Uniform(value), shape, value.scalar_type()))
+    }
+
+    /// Adds a uniform value with compile-time scalar identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ShapeOverflow` when the logical extent cannot be represented.
+    pub fn uniform_typed<T: TensorElement>(
+        &mut self,
+        shape: impl Into<Vec<usize>>,
+        value: T,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.uniform_value(shape, T::into_scalar(value))
+            .map(TensorValueId::new)
     }
 
     /// Adds two values with identical shapes.
     ///
     /// # Errors
     ///
-    /// Returns [`TensorError::UnknownValue`] for an invalid value ID or
-    /// [`TensorError::ShapeMismatch`] when the shapes differ.
+    /// Returns `UnknownValue` for an invalid value ID, `ShapeMismatch` for different shapes,
+    /// `ScalarTypeMismatch` for different scalar identities, or `UnsupportedScalarType` when
+    /// the scalar has no elementwise arithmetic semantics.
     pub fn add(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
         self.same_shape_binary(a, b, BinaryOp::Add)
     }
@@ -2753,8 +3424,7 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorError::UnknownValue`] for an invalid value ID or
-    /// [`TensorError::ShapeMismatch`] when the shapes differ.
+    /// Returns the same graph identity, shape, and scalar-semantics errors as [`Self::add`].
     pub fn sub(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
         self.same_shape_binary(a, b, BinaryOp::Sub)
     }
@@ -2763,8 +3433,7 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorError::UnknownValue`] for an invalid value ID or
-    /// [`TensorError::ShapeMismatch`] when the shapes differ.
+    /// Returns the same graph identity, shape, and scalar-semantics errors as [`Self::add`].
     pub fn mul(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
         self.same_shape_binary(a, b, BinaryOp::Mul)
     }
@@ -2790,12 +3459,25 @@ impl Graph {
                 right: gradient_shape,
             });
         }
+        let weights_type = self.nodes[weights.index].scalar_type;
+        let gradient_type = self.nodes[gradient.index].scalar_type;
+        if weights_type != gradient_type {
+            return Err(TensorError::ScalarTypeMismatch {
+                value: gradient,
+                expected: weights_type,
+                actual: gradient_type,
+            });
+        }
         if !learning_rate.is_finite() {
             return Err(TensorError::InvalidLearningRate);
         }
+        let scalar_type = self.nodes[weights.index].scalar_type;
+        self.require_f32(weights)?;
+        self.require_f32(gradient)?;
         Ok(self.push(
             Op::SgdUpdate(weights, gradient, learning_rate),
             weights_shape,
+            scalar_type,
         ))
     }
 
@@ -2813,21 +3495,62 @@ impl Graph {
                 right: sb,
             });
         }
+        let left_type = self.nodes[a.index].scalar_type;
+        let right_type = self.nodes[b.index].scalar_type;
+        if left_type != right_type {
+            return Err(TensorError::ScalarTypeMismatch {
+                value: b,
+                expected: left_type,
+                actual: right_type,
+            });
+        }
+        self.require_elementwise_numeric(a)?;
         let op = match operation {
             BinaryOp::Add => Op::Add(a, b),
             BinaryOp::Sub => Op::Sub(a, b),
             BinaryOp::Mul => Op::Mul(a, b),
         };
-        Ok(self.push(op, self.nodes[a.index].shape.clone()))
+        Ok(self.push(op, self.nodes[a.index].shape.clone(), left_type))
+    }
+
+    fn require_f32(&self, value: ValueId) -> Result<(), TensorError> {
+        let scalar_type = self.node(value)?.scalar_type;
+        if scalar_type != PcuScalarType::F32 {
+            return Err(TensorError::UnsupportedScalarType { value, scalar_type });
+        }
+        Ok(())
+    }
+
+    fn require_float(&self, value: ValueId) -> Result<PcuScalarType, TensorError> {
+        let scalar_type = self.node(value)?.scalar_type;
+        if !matches!(scalar_type, PcuScalarType::F32 | PcuScalarType::F64) {
+            return Err(TensorError::UnsupportedScalarType { value, scalar_type });
+        }
+        Ok(scalar_type)
+    }
+
+    fn require_elementwise_numeric(&self, value: ValueId) -> Result<PcuScalarType, TensorError> {
+        let scalar_type = self.node(value)?.scalar_type;
+        if matches!(
+            scalar_type,
+            PcuScalarType::Bool
+                | PcuScalarType::I4
+                | PcuScalarType::U4
+                | PcuScalarType::F16
+                | PcuScalarType::BF16
+        ) {
+            return Err(TensorError::UnsupportedScalarType { value, scalar_type });
+        }
+        Ok(scalar_type)
     }
 
     /// Adds a rank-two matrix multiplication.
     ///
     /// # Errors
     ///
-    /// Returns [`TensorError::UnknownValue`] for an invalid value ID,
-    /// [`TensorError::MatMulShape`] for incompatible shapes, or
-    /// [`TensorError::ShapeOverflow`] if the output element count overflows.
+    /// Returns `UnknownValue` for invalid IDs, `MatMulShape` for incompatible dimensions,
+    /// `ScalarTypeMismatch` for different scalar identities, `UnsupportedScalarType` for types
+    /// without matrix arithmetic semantics, or `ShapeOverflow` for an unrepresentable extent.
     pub fn matmul(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
         self.matmul_transposed(a, b, false, false)
     }
@@ -2837,9 +3560,9 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// Returns [`TensorError::UnknownValue`] for an invalid value ID,
-    /// [`TensorError::MatMulShape`] for incompatible or non-matrix shapes, or
-    /// [`TensorError::ShapeOverflow`] if the output element count overflows.
+    /// Returns `UnknownValue` for invalid IDs, `MatMulShape` for incompatible/non-matrix shapes,
+    /// `ScalarTypeMismatch` for different scalar identities, `UnsupportedScalarType` for types
+    /// without matrix arithmetic semantics, or `ShapeOverflow` for an unrepresentable extent.
     pub fn matmul_transposed(
         &mut self,
         a: ValueId,
@@ -2873,24 +3596,40 @@ impl Graph {
         }
         let shape = vec![left_rows, right_columns];
         element_count(&shape)?;
-        Ok(self.push(Op::MatMul(a, b, transpose_left, transpose_right), shape))
+        let left_type = self.nodes[a.index].scalar_type;
+        let right_type = self.nodes[b.index].scalar_type;
+        if left_type != right_type {
+            return Err(TensorError::ScalarTypeMismatch {
+                value: b,
+                expected: left_type,
+                actual: right_type,
+            });
+        }
+        self.require_float(a)?;
+        Ok(self.push(
+            Op::MatMul(a, b, transpose_left, transpose_right),
+            shape,
+            left_type,
+        ))
     }
 
     /// Adds an elementwise `ReLU` operation.
     ///
     /// # Errors
     ///
-    /// Returns [`TensorError::UnknownValue`] for an invalid value ID.
+    /// Returns `UnknownValue` for a foreign ID or `UnsupportedScalarType` when the scalar has no
+    /// elementwise maximum semantics.
     pub fn relu(&mut self, x: ValueId) -> Result<ValueId, TensorError> {
         let shape = self.shape(x)?.to_vec();
-        Ok(self.push(Op::Relu(x), shape))
+        let scalar_type = self.require_elementwise_numeric(x)?;
+        Ok(self.push(Op::Relu(x), shape, scalar_type))
     }
 
     /// Adds the `ReLU` derivative `input > 0 ? upstream : 0` elementwise.
     ///
     /// # Errors
     ///
-    /// Returns a graph identity or shape error if either operand is invalid or their shapes differ.
+    /// Returns graph identity, shape, type, or unsupported-type errors when inputs are invalid.
     ///
     /// The strict comparison matches reverse-mode differentiation in `Execution::gradients`:
     /// zero and NaN inputs both produce zero gradients.
@@ -2907,7 +3646,21 @@ impl Graph {
                 right: upstream_shape,
             });
         }
-        Ok(self.push(Op::ReluBackward(input, upstream), input_shape))
+        let input_type = self.nodes[input.index].scalar_type;
+        let upstream_type = self.nodes[upstream.index].scalar_type;
+        if input_type != upstream_type {
+            return Err(TensorError::ScalarTypeMismatch {
+                value: upstream,
+                expected: input_type,
+                actual: upstream_type,
+            });
+        }
+        self.require_f32(input)?;
+        Ok(self.push(
+            Op::ReluBackward(input, upstream),
+            input_shape,
+            self.nodes[input.index].scalar_type,
+        ))
     }
 
     /// Adds a scalar mean-squared-error operation over equally shaped values.
@@ -2926,10 +3679,25 @@ impl Graph {
         if p != t {
             return Err(TensorError::ShapeMismatch { left: p, right: t });
         }
+        let prediction_type = self.nodes[prediction.index].scalar_type;
+        let target_type = self.nodes[target.index].scalar_type;
+        if prediction_type != target_type {
+            return Err(TensorError::ScalarTypeMismatch {
+                value: target,
+                expected: prediction_type,
+                actual: target_type,
+            });
+        }
+        self.require_f32(prediction)?;
+        self.require_f32(target)?;
         if element_count(&p)? == 0 {
             return Err(TensorError::ShapeMismatch { left: p, right: t });
         }
-        Ok(self.push(Op::MeanSquaredError(prediction, target), vec![]))
+        Ok(self.push(
+            Op::MeanSquaredError(prediction, target),
+            vec![],
+            PcuScalarType::F32,
+        ))
     }
 
     /// Append a bounded reverse-mode graph for a scalar mean-squared-error root.
@@ -2971,7 +3739,7 @@ impl Graph {
             pending.extend(operands(op).map(|id| id.index));
         }
         let mut gradients = vec![None; original_len];
-        gradients[loss.index] = Some(self.constant(Tensor::scalar(1.0)));
+        gradients[loss.index] = Some(self.constant_typed(Tensor::scalar(1.0)).erase());
         for index in (0..=loss.index).rev() {
             let Some(gradient) = gradients[index] else {
                 continue;
@@ -3047,9 +3815,11 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// Returns an error for missing, duplicate, extra, or wrongly shaped inputs.
-    pub fn evaluate(&self, inputs: &[(ValueId, Tensor)]) -> Result<Execution, TensorError> {
-        let mut supplied: Vec<Option<&Tensor>> = vec![None; self.nodes.len()];
+    /// Returns an error for missing, duplicate, extra, wrongly typed/shaped inputs, or an
+    /// unsupported arithmetic operation in the graph.
+    #[allow(clippy::too_many_lines)] // Keeps reference operation dispatch and validation together.
+    pub fn evaluate(&self, inputs: &[(ValueId, TensorValue)]) -> Result<Execution, TensorError> {
+        let mut supplied: Vec<Option<&TensorValue>> = vec![None; self.nodes.len()];
         for (id, tensor) in inputs {
             let node = self
                 .nodes
@@ -3062,64 +3832,62 @@ impl Graph {
             if supplied[id.index].replace(tensor).is_some() {
                 return Err(TensorError::DuplicateInput(*id));
             }
+            if tensor.scalar_type() != node.scalar_type {
+                return Err(TensorError::ScalarTypeMismatch {
+                    value: *id,
+                    expected: node.scalar_type,
+                    actual: tensor.scalar_type(),
+                });
+            }
+            if tensor.shape() != node.shape {
+                return Err(TensorError::ShapeMismatch {
+                    left: tensor.shape().to_vec(),
+                    right: node.shape.clone(),
+                });
+            }
         }
-        let mut values: Vec<Tensor> = Vec::with_capacity(self.nodes.len());
+        let mut values: Vec<TensorValue> = Vec::with_capacity(self.nodes.len());
         for (index, node) in self.nodes.iter().enumerate() {
+            let id = ValueId {
+                graph_id: self.id,
+                index,
+            };
             let value = match &node.op {
                 Op::Input => {
-                    let id = ValueId {
-                        graph_id: self.id,
-                        index,
-                    };
                     let value = supplied[id.index].ok_or(TensorError::MissingInput(id))?;
-                    if value.shape != node.shape {
-                        return Err(TensorError::ShapeMismatch {
-                            left: value.shape.clone(),
-                            right: node.shape.clone(),
-                        });
-                    }
                     value.clone()
                 }
-                Op::Constant(t) => t.clone(),
-                Op::Uniform(value) => Tensor::splat(node.shape.clone(), *value)?,
-                Op::Add(a, b) => binary(&values[a.index], &values[b.index], |x, y| x + y),
-                Op::Sub(a, b) => binary(&values[a.index], &values[b.index], |x, y| x - y),
-                Op::Mul(a, b) => binary(&values[a.index], &values[b.index], |x, y| x * y),
-                Op::SgdUpdate(weights, gradient, learning_rate) => binary(
-                    &values[weights.index],
-                    &values[gradient.index],
-                    |weight, grad| weight - learning_rate * grad,
-                ),
-                Op::MatMul(a, b, transpose_left, transpose_right) => matmul(
+                Op::Constant(tensor) => tensor.clone(),
+                Op::Uniform(scalar) => scalar.splat(node.shape.clone())?,
+                Op::Add(a, b) => {
+                    binary_value(&values[a.index], &values[b.index], id, BinaryOp::Add)?
+                }
+                Op::Sub(a, b) => {
+                    binary_value(&values[a.index], &values[b.index], id, BinaryOp::Sub)?
+                }
+                Op::Mul(a, b) => {
+                    binary_value(&values[a.index], &values[b.index], id, BinaryOp::Mul)?
+                }
+                Op::SgdUpdate(weights, gradient, learning_rate) => {
+                    let left = as_f32_value(&values[weights.index], id)?;
+                    let right = as_f32_value(&values[gradient.index], id)?;
+                    TensorValue::from_tensor(binary(left, right, |weight, grad| {
+                        weight - learning_rate * grad
+                    }))
+                }
+                Op::MatMul(a, b, transpose_left, transpose_right) => matmul_value(
                     &values[a.index],
                     &values[b.index],
                     *transpose_left,
                     *transpose_right,
-                ),
-                Op::Relu(x) => Tensor::new(
-                    node.shape.clone(),
-                    values[x.index].data.iter().map(|v| v.max(0.0)).collect(),
+                    id,
                 )?,
-                Op::ReluBackward(input, upstream) => Tensor::new(
-                    node.shape.clone(),
-                    values[input.index]
-                        .data
-                        .iter()
-                        .zip(&values[upstream.index].data)
-                        .map(|(x, grad)| if *x > 0.0 { *grad } else { 0.0 })
-                        .collect(),
-                )?,
-                Op::MeanSquaredError(a, b) => {
-                    let n = mean_denominator(values[a.index].data.len());
-                    Tensor::scalar(
-                        values[a.index]
-                            .data
-                            .iter()
-                            .zip(&values[b.index].data)
-                            .map(|(x, y)| (x - y) * (x - y))
-                            .sum::<f32>()
-                            / n,
-                    )
+                Op::Relu(input) => relu_value(&values[input.index], id)?,
+                Op::ReluBackward(input, upstream) => {
+                    relu_backward_value(&values[input.index], &values[upstream.index], id)?
+                }
+                Op::MeanSquaredError(prediction, target) => {
+                    mean_squared_error_value(&values[prediction.index], &values[target.index], id)?
                 }
             };
             values.push(value);
@@ -3146,7 +3914,9 @@ fn append_node_gradients(
         }
         OpDescriptor::Sub { left, right } => {
             accumulate_gradient(graph, gradients, left, gradient)?;
-            let negative = graph.constant(filled_like(graph, right, -1.0)?);
+            let negative = graph
+                .constant_typed(filled_like(graph, right, -1.0)?)
+                .erase();
             let right_gradient = graph.mul(gradient, negative)?;
             accumulate_gradient(graph, gradients, right, right_gradient)?;
         }
@@ -3161,10 +3931,12 @@ fn append_node_gradients(
             gradient: update_gradient,
             learning_rate,
         } => {
-            let scaled = graph.constant(Tensor::new(
-                graph.shape(update_gradient)?.to_vec(),
-                vec![-learning_rate; element_count(graph.shape(update_gradient)?)?],
-            )?);
+            let scaled = graph
+                .constant_typed(Tensor::new(
+                    graph.shape(update_gradient)?.to_vec(),
+                    vec![-learning_rate; element_count(graph.shape(update_gradient)?)?],
+                )?)
+                .erase();
             let input_gradient = graph.mul(gradient, scaled)?;
             accumulate_gradient(graph, gradients, weights, gradient)?;
             accumulate_gradient(graph, gradients, update_gradient, input_gradient)?;
@@ -3207,10 +3979,12 @@ fn append_mse_gradients(
 ) -> Result<(), TensorError> {
     let shape = graph.shape(prediction)?.to_vec();
     let count = element_count(&shape)?;
-    let scale = graph.constant(Tensor::new(
-        shape,
-        vec![2.0 / mean_denominator(count); count],
-    )?);
+    let scale = graph
+        .constant_typed(Tensor::new(
+            shape,
+            vec![2.0 / mean_denominator(count); count],
+        )?)
+        .erase();
     let prediction_difference = graph.sub(prediction, target)?;
     let target_difference = graph.sub(target, prediction)?;
     let prediction_gradient = graph.mul(prediction_difference, scale)?;
@@ -3264,65 +4038,11 @@ fn filled_like(graph: &Graph, value: ValueId, scalar: f32) -> Result<Tensor, Ten
     Tensor::new(shape, vec![scalar; count])
 }
 
-fn binary(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32) -> Tensor {
-    Tensor {
-        shape: a.shape.clone(),
-        data: a.data.iter().zip(&b.data).map(|(x, y)| f(*x, *y)).collect(),
-        known_uniform_value: None,
-    }
-}
-
-// Keep the CPU reference's multiply and accumulation steps explicit; fused rounding is a
-// backend numerical choice and would change this oracle's results.
-#[allow(clippy::suboptimal_flops)]
-fn matmul(left: &Tensor, right: &Tensor, transpose_left: bool, transpose_right: bool) -> Tensor {
-    let (rows, inner) = if transpose_left {
-        (left.shape[1], left.shape[0])
-    } else {
-        (left.shape[0], left.shape[1])
-    };
-    let columns = if transpose_right {
-        right.shape[0]
-    } else {
-        right.shape[1]
-    };
-    let mut output = vec![0.0; rows * columns];
-    for row in 0..rows {
-        for column in 0..columns {
-            for inner_index in 0..inner {
-                let left_index = if transpose_left {
-                    inner_index * left.shape[1] + row
-                } else {
-                    row * left.shape[1] + inner_index
-                };
-                let right_index = if transpose_right {
-                    column * right.shape[1] + inner_index
-                } else {
-                    inner_index * right.shape[1] + column
-                };
-                output[row * columns + column] += left.data[left_index] * right.data[right_index];
-            }
-        }
-    }
-    Tensor {
-        shape: vec![rows, columns],
-        data: output,
-        known_uniform_value: None,
-    }
-}
-
-// Tensor storage must already fit in memory; f32 precision is sufficient for a
-// practically allocatable element count used as a mean divisor.
-#[allow(clippy::cast_precision_loss)]
-const fn mean_denominator(element_count: usize) -> f32 {
-    element_count as f32
-}
-
 #[derive(Clone, Debug)]
 pub struct Execution {
     graph_id: u64,
     node_count: usize,
-    values: Vec<Tensor>,
+    values: Vec<TensorValue>,
 }
 impl Execution {
     /// Returns the evaluated tensor for a graph value.
@@ -3330,11 +4050,28 @@ impl Execution {
     /// # Errors
     ///
     /// Returns [`TensorError::UnknownValue`] if `id` does not belong to this execution.
-    pub fn value(&self, id: ValueId) -> Result<&Tensor, TensorError> {
+    pub fn value(&self, id: ValueId) -> Result<&TensorValue, TensorError> {
         self.values
             .get(id.index)
             .filter(|_| id.graph_id == self.graph_id)
             .ok_or(TensorError::UnknownValue(id))
+    }
+
+    /// Returns one result with its checked typed host representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownValue` for an invalid ID or `ScalarTypeMismatch` when the stored type
+    /// differs from `T`.
+    pub fn value_typed<T: TensorElement>(&self, id: ValueId) -> Result<&Tensor<T>, TensorError> {
+        let value = self.value(id)?;
+        value
+            .as_typed::<T>()
+            .map_err(|_| TensorError::ScalarTypeMismatch {
+                value: id,
+                expected: T::TYPE,
+                actual: value.scalar_type(),
+            })
     }
 
     /// Reverse-mode derivative of the selected scalar output with respect to every graph value.
@@ -3356,10 +4093,15 @@ impl Execution {
             return Err(TensorError::GraphChanged);
         }
         graph.shape(output)?;
-        let out = self.value(output)?;
-        if !out.shape.is_empty() {
-            return Err(TensorError::LossMustBeScalar(out.shape.clone()));
+        let out = self.value_typed::<f32>(output)?;
+        if !out.shape().is_empty() {
+            return Err(TensorError::LossMustBeScalar(out.shape().to_vec()));
         }
+        let values: Vec<Option<&Tensor>> = self
+            .values
+            .iter()
+            .map(|value| value.as_typed::<f32>().ok())
+            .collect();
         let mut grads: Vec<Option<Tensor>> = vec![None; graph.nodes.len()];
         grads[output.index] = Some(Tensor::scalar(1.0));
         for i in (0..=output.index).rev() {
@@ -3382,8 +4124,8 @@ impl Execution {
                     );
                 }
                 Op::Mul(a, b) => {
-                    let left = &self.values[a.index];
-                    let right = &self.values[b.index];
+                    let left = execution_f32_value(&values, graph, a)?;
+                    let right = execution_f32_value(&values, graph, b)?;
                     let (left_gradient, right_gradient) =
                         elementwise_mul_gradients(left, right, &grad)?;
                     accumulate(&mut grads, a, left_gradient);
@@ -3404,7 +4146,7 @@ impl Execution {
                 Op::Relu(x) => {
                     let g = Tensor::new(
                         node_shape(graph, x)?,
-                        self.values[x.index]
+                        execution_f32_value(&values, graph, x)?
                             .data
                             .iter()
                             .zip(grad.data)
@@ -3417,9 +4159,9 @@ impl Execution {
                     "backward operation has no second derivative in reference gradients"
                 ),
                 Op::MeanSquaredError(a, b) => {
-                    let divisor = mean_denominator(self.values[a.index].data.len());
-                    let prediction = &self.values[a.index];
-                    let target = &self.values[b.index];
+                    let prediction = execution_f32_value(&values, graph, a)?;
+                    let target = execution_f32_value(&values, graph, b)?;
+                    let divisor = mean_denominator(prediction.data.len());
                     let gp = Tensor::new(
                         prediction.shape.clone(),
                         prediction
@@ -3446,8 +4188,8 @@ impl Execution {
                     accumulate(&mut grads, b, gt);
                 }
                 Op::MatMul(a, b, transpose_left, transpose_right) => {
-                    let left = &self.values[a.index];
-                    let right = &self.values[b.index];
+                    let left = execution_f32_value(&values, graph, a)?;
+                    let right = execution_f32_value(&values, graph, b)?;
                     let (left_gradient, right_gradient) =
                         matmul_gradients(left, right, &grad, transpose_left, transpose_right)?;
                     accumulate(&mut grads, a, left_gradient);

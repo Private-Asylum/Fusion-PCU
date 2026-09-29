@@ -101,7 +101,7 @@ fn run_on(
         let mut inputs = Vec::with_capacity(case.input_count);
         let mut ids = Vec::with_capacity(case.input_count);
         for values in &host_values {
-            let id = graph.input([size])?;
+            let id = graph.input([size], fusion_pcu::PcuScalarType::F32)?;
             ids.push(id);
             inputs.push((id, Tensor::new([size], values.clone())?));
         }

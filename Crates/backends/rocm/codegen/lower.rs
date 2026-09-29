@@ -376,7 +376,21 @@ fn lower_dispatch_to_hip_source_with_preamble(
                 rhs,
                 ..
             }) => {
-                if op == PcuDispatchAluOp::Max {
+                if scalar_kind == HipScalarKind::F64
+                    && matches!(op, PcuDispatchAluOp::Max | PcuDispatchAluOp::Min)
+                {
+                    let function = if op == PcuDispatchAluOp::Max {
+                        "fmax"
+                    } else {
+                        "fmin"
+                    };
+                    writeln!(
+                        &mut source,
+                        "    double v{} = {function}(v{}, v{});",
+                        result.0, lhs.0, rhs.0
+                    )
+                    .map_err(|_| RocmLowerError::FormattingFailure)?;
+                } else if op == PcuDispatchAluOp::Max {
                     writeln!(
                         &mut source,
                         "    float v{} = fmaxf(v{}, v{});",
@@ -1359,7 +1373,21 @@ fn emit_hip_data_op(
             rhs,
             ..
         }) => {
-            if op == PcuDispatchAluOp::Max {
+            if scalar_kind == HipScalarKind::F64
+                && matches!(op, PcuDispatchAluOp::Max | PcuDispatchAluOp::Min)
+            {
+                let function = if op == PcuDispatchAluOp::Max {
+                    "fmax"
+                } else {
+                    "fmin"
+                };
+                writeln!(
+                    source,
+                    "        double v{} = {function}(v{}, v{});",
+                    result.0, lhs.0, rhs.0
+                )
+                .map_err(|_| RocmLowerError::FormattingFailure)
+            } else if op == PcuDispatchAluOp::Max {
                 writeln!(
                     source,
                     "        float v{} = fmaxf(v{}, v{});",
@@ -2290,6 +2318,99 @@ mod tests {
         let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
         assert!(loop_source.contains("double v1 = binding_0_0[fusion_idx];"));
         assert!(loop_source.contains("double v3 = v1 * v2;"));
+    }
+
+    #[test]
+    fn lowers_f64_relu_and_add_relu_with_double_maximum() {
+        let bindings = [
+            PcuBinding::value(
+                Some("left"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::f64(),
+            ),
+            PcuBinding::value(
+                Some("right"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                PcuValueType::f64(),
+            ),
+            PcuBinding::value(
+                Some("output"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                PcuValueType::f64(),
+            ),
+        ];
+        let ops = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: PcuValueType::f64(),
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Add,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(4),
+                value: PcuParameterValue::F64(0.0_f64.to_bits()),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: PcuValueType::f64(),
+                result: PcuDispatchValueId(5),
+                op: PcuDispatchAluOp::Max,
+                lhs: PcuDispatchValueId(3),
+                rhs: PcuDispatchValueId(4),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(5),
+            }),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let source = lower_dispatch_to_hip_rtc_source(&kernel(&ops, &bindings)).unwrap();
+        assert!(source.contains("double v3 = v1 + v2;"));
+        assert!(source.contains("double v4 = __builtin_bit_cast(double, 0x0000000000000000ull);"));
+        assert!(source.contains("double v5 = fmax(v3, v4);"));
+        assert!(!source.contains("fmaxf"));
+
+        let minimum_ops = [
+            ops[0],
+            ops[1],
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                value_type: PcuValueType::f64(),
+                result: PcuDispatchValueId(3),
+                op: PcuDispatchAluOp::Min,
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index: PcuDispatchIndex::InvocationId,
+                value: PcuDispatchValueId(3),
+            }),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let minimum_source =
+            lower_dispatch_to_hip_rtc_source(&kernel(&minimum_ops, &bindings)).unwrap();
+        assert!(minimum_source.contains("double v3 = fmin(v1, v2);"));
+        assert!(!minimum_source.contains("fminf"));
     }
 
     #[test]

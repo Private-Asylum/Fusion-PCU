@@ -162,7 +162,7 @@ unsafe impl PcuSynchronousHostDispatchBackend<f32> for PcuF32Reference {
     }
 }
 
-/// CPU oracle for direct and grid-stride f64 Add/Sub/Mul/Div maps.
+/// CPU oracle for direct and grid-stride f64 arithmetic maps, including min/max.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PcuF64Reference;
 
@@ -515,6 +515,8 @@ fn execute_f64_map_ops(
                     PcuDispatchAluOp::Sub => left - right,
                     PcuDispatchAluOp::Mul => left * right,
                     PcuDispatchAluOp::Div => left / right,
+                    PcuDispatchAluOp::Min => f64_min(left, right),
+                    PcuDispatchAluOp::Max => f64_max(left, right),
                     _ => unreachable!("validator limits f64 arithmetic"),
                 });
             }
@@ -534,4 +536,20 @@ fn execute_f64_map_ops(
         }
     }
     Ok(())
+}
+
+const fn f64_min(left: f64, right: f64) -> f64 {
+    if left == 0.0 && right == 0.0 {
+        f64::from_bits(1_u64 << 63)
+    } else {
+        left.min(right)
+    }
+}
+
+const fn f64_max(left: f64, right: f64) -> f64 {
+    if left == 0.0 && right == 0.0 {
+        0.0
+    } else {
+        left.max(right)
+    }
 }

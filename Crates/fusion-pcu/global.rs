@@ -37,11 +37,18 @@ pub use arguments::{
 #[doc(hidden)]
 #[rustfmt::skip]
 pub use tensor::{
+    DynamicResidentShape,
     PcuTensorInput,
+    PcuTensorCallInput,
     PcuTensorSource,
     PcuTensorGraphCapture,
+    PcuTensorGraphOwner,
     PcuTensorGraphValue,
+    call_consumed_owners_tensor_capture,
+    call_consumed_pair_tensor_capture,
+    call_consumed_tensor_capture,
     call_owned_tensor_capture,
+    call_mixed_consumed_tensor_capture,
 };
 
 /// Which compiled execution provider may satisfy a direct call.
@@ -100,6 +107,16 @@ pub enum PcuExecutionError {
     TensorExecutionUnavailable,
     EmptyTensorInput,
     InvalidTensorSourcePlan,
+    TensorSourceRankMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    TensorSourceShapeMismatch {
+        expected: PcuSourceShape,
+        actual: alloc::vec::Vec<usize>,
+    },
+    #[cfg(feature = "tensor")]
+    TensorBuild(crate::dialect::tensor::TensorError),
     RecursiveTensorSource,
     TensorSourceNestingLimit,
     #[cfg(feature = "rocm")]
@@ -116,11 +133,13 @@ pub enum PcuExecutionError {
     #[cfg(feature = "rocm")]
     KernelBuildDetails(std::string::String),
     #[cfg(feature = "rocm")]
-    NoCompatibleDevice(std::vec::Vec<(u32, std::string::String)>),
+    NoCompatibleDevice(std::vec::Vec<(u32, Self)>),
     #[cfg(feature = "rocm")]
     Discovery(fusion_pcu_rocm::HipError),
     #[cfg(feature = "rocm")]
     Execution(fusion_pcu_rocm::RocmHostKernelError),
+    #[cfg(feature = "rocm")]
+    BackendInitialization(fusion_pcu_rocm::RocmOwnedDispatchError),
 }
 
 impl fmt::Display for PcuExecutionError {
@@ -145,6 +164,18 @@ impl fmt::Display for PcuExecutionError {
                 f.write_str("owned tensor execution requires a compiled tensor-capable backend")
             }
             Self::InvalidTensorSourcePlan => f.write_str("invalid captured tensor graph value"),
+            Self::TensorSourceRankMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "tensor source rank mismatch: expected {expected}, found {actual}"
+                )
+            }
+            Self::TensorSourceShapeMismatch { expected, actual } => write!(
+                f,
+                "tensor source shape mismatch: expected {expected:?}, found {actual:?}"
+            ),
+            #[cfg(feature = "tensor")]
+            Self::TensorBuild(error) => write!(f, "PCU tensor graph construction failed: {error}"),
             Self::RecursiveTensorSource => {
                 f.write_str("recursive PCU tensor source helper capture is unsupported")
             }
@@ -171,18 +202,36 @@ impl fmt::Display for PcuExecutionError {
             #[cfg(feature = "rocm")]
             Self::KernelBuildDetails(error) => write!(f, "PCU kernel construction failed: {error}"),
             #[cfg(feature = "rocm")]
-            Self::NoCompatibleDevice(errors) => write!(f, "no compatible device: {errors:?}"),
+            Self::NoCompatibleDevice(errors) => {
+                f.write_str("no compatible device")?;
+                for (device, error) in errors {
+                    write!(f, "; device {device}: {error}")?;
+                }
+                Ok(())
+            }
             #[cfg(feature = "rocm")]
             Self::Discovery(error) => write!(f, "PCU discovery failed: {error}"),
             #[cfg(feature = "rocm")]
             Self::Execution(error) => write!(f, "PCU execution failed: {error}"),
+            #[cfg(feature = "rocm")]
+            Self::BackendInitialization(error) => {
+                write!(f, "PCU backend initialization failed: {error}")
+            }
         }
     }
 }
 impl core::error::Error for PcuExecutionError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        #[cfg(feature = "tensor")]
+        if let Self::TensorBuild(error) = self {
+            return Some(error);
+        }
         #[cfg(feature = "rocm")]
         match self {
+            Self::NoCompatibleDevice(errors) => {
+                return errors.first().map(|(_, error)| error as _);
+            }
+            Self::BackendInitialization(error) => return Some(error),
             Self::Discovery(error) => return Some(error),
             Self::Execution(error) => return Some(error),
             Self::DeviceExecution(error) => return Some(error),
@@ -309,6 +358,14 @@ pub fn build_error(error: impl fmt::Debug) -> PcuExecutionError {
     }
 }
 
+/// Preserve structured core tensor graph construction failures at the hosted boundary.
+#[doc(hidden)]
+#[cfg(feature = "tensor")]
+#[must_use]
+pub const fn tensor_build_error(error: crate::dialect::tensor::TensorError) -> PcuExecutionError {
+    PcuExecutionError::TensorBuild(error)
+}
+
 /// Preserve typed argument failures before selection or submission.
 #[doc(hidden)]
 #[must_use]
@@ -381,6 +438,49 @@ mod tests {
                 Err(PcuExecutionError::InvalidPolicy)
             ));
         }
+    }
+
+    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    #[test]
+    fn device_rejections_retain_typed_causes_and_readable_device_order() {
+        let error = PcuExecutionError::NoCompatibleDevice(alloc::vec![
+            (
+                3,
+                PcuExecutionError::TensorExecution(
+                    fusion_pcu_rocm::RocmTensorExecutionError::UnsupportedScalarType(
+                        crate::PcuScalarType::U32,
+                    ),
+                ),
+            ),
+            (
+                7,
+                PcuExecutionError::BackendInitialization(
+                    fusion_pcu_rocm::RocmOwnedDispatchError::InvalidBlockSize,
+                ),
+            ),
+        ]);
+        assert!(matches!(
+            &error,
+            PcuExecutionError::NoCompatibleDevice(rejections)
+                if matches!(
+                    &rejections[0].1,
+                    PcuExecutionError::TensorExecution(
+                        fusion_pcu_rocm::RocmTensorExecutionError::UnsupportedScalarType(
+                            crate::PcuScalarType::U32
+                        )
+                    )
+                )
+        ));
+        let message = error.to_string();
+        assert!(
+            message
+                .find("device 3:")
+                .zip(message.find("device 7:"))
+                .is_some_and(|(first, second)| first < second)
+        );
+        assert!(message.contains("U32"));
+        assert!(message.contains("block size"));
+        assert!(core::error::Error::source(&error).is_some());
     }
 
     #[cfg(not(feature = "rocm"))]

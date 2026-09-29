@@ -72,11 +72,16 @@ fn run_on(
 
     for (name, uniform) in [("DenseSplatConstant", false), ("GraphUniform", true)] {
         let mut graph = Graph::default();
-        let input = graph.input([ELEMENTS])?;
+        let input = graph.input([ELEMENTS], fusion_pcu::PcuScalarType::F32)?;
         let value = if uniform {
-            graph.uniform([ELEMENTS], UNIFORM_VALUE)?
+            graph.uniform_value(
+                [ELEMENTS],
+                fusion_pcu::dialect::tensor::TensorScalarValue::F32(UNIFORM_VALUE),
+            )?
         } else {
-            graph.constant(Tensor::splat([ELEMENTS], UNIFORM_VALUE)?)
+            graph.constant_value(fusion_pcu::dialect::tensor::TensorValue::F32(
+                Tensor::splat([ELEMENTS], UNIFORM_VALUE)?,
+            ))
         };
         let output = graph.add(input, value)?;
         let prepared = assessor.prepare_graph_outputs(&graph, &[output])?;

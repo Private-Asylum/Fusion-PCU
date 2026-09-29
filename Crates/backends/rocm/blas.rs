@@ -1,11 +1,14 @@
-//! A small dynamically loaded rocBLAS SGEMM adapter.
+//! Small dynamically loaded rocBLAS GEMM and vector-operation adapters.
 //!
 //! This uses rocBLAS' public `rocblas_sgemm` ABI directly and does not require hipBLASLt.
 
 #[rustfmt::skip]
 use std::{
     any::Any,
-    cell::Cell,
+    cell::{
+        Cell,
+        OnceCell,
+    },
     ffi::{
         c_int,
         c_void,
@@ -50,6 +53,22 @@ type Sgemm = unsafe extern "C" fn(
     *mut f32,
     c_int,
 ) -> RocblasStatus;
+type Dgemm = unsafe extern "C" fn(
+    RocblasHandle,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    *const f64,
+    *const f64,
+    c_int,
+    *const f64,
+    c_int,
+    *const f64,
+    *mut f64,
+    c_int,
+) -> RocblasStatus;
 type Sdot = unsafe extern "C" fn(
     RocblasHandle,
     c_int,
@@ -73,7 +92,7 @@ const ROCBLAS_OPERATION_TRANSPOSE: c_int = 112;
 const ROCBLAS_POINTER_MODE_HOST: c_int = 0;
 const ROCBLAS_POINTER_MODE_DEVICE: c_int = 1;
 
-/// Failures returned by the rocBLAS SGEMM adapter.
+/// Failures returned by the rocBLAS GEMM and vector adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RocblasError {
     LibraryUnavailable(String),
@@ -183,9 +202,9 @@ impl fmt::Display for RocblasError {
             Self::CompletionUnknown => {
                 f.write_str("a previous rocBLAS operation did not confirm device completion")
             }
-            Self::InvalidDimensions(why) => write!(f, "invalid SGEMM dimensions: {why}"),
+            Self::InvalidDimensions(why) => write!(f, "invalid rocBLAS GEMM dimensions: {why}"),
             Self::DimensionOverflow => {
-                f.write_str("SGEMM dimension or matrix size overflows the supported range")
+                f.write_str("rocBLAS dimension or matrix size overflows the supported range")
             }
             Self::BufferTooSmall {
                 matrix,
@@ -193,7 +212,7 @@ impl fmt::Display for RocblasError {
                 required,
             } => write!(
                 f,
-                "SGEMM {matrix} needs {required} bytes, allocation has {allocation}"
+                "rocBLAS GEMM {matrix} needs {required} bytes, allocation has {allocation}"
             ),
             Self::InvalidVector(why) => write!(f, "invalid rocBLAS vector reduction: {why}"),
         }
@@ -220,12 +239,25 @@ struct RocblasHandleOwner {
     library: Arc<Library>,
     handle: RocblasHandle,
     poisoned: Cell<bool>,
+    dgemm: OnceCell<Result<Dgemm, RocblasError>>,
 }
 
 struct RocblasAsyncOperationOwner {
     _handle: Rc<dyn Any>,
     in_flight: Rc<Cell<usize>>,
     scalars: [f32; 2],
+}
+
+struct RocblasAsyncDoubleOperationOwner {
+    _handle: Rc<dyn Any>,
+    in_flight: Rc<Cell<usize>>,
+    scalars: [f64; 2],
+}
+
+impl Drop for RocblasAsyncDoubleOperationOwner {
+    fn drop(&mut self) {
+        release_async_operation(&self.in_flight);
+    }
 }
 
 impl Drop for RocblasAsyncOperationOwner {
@@ -362,6 +394,90 @@ impl Rocblas {
         Ok(())
     }
 
+    // Keep operand and leading-dimension names aligned with the public BLAS argument order.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::too_many_arguments
+    )]
+    fn validate_dgemm_while_reserved(
+        &self,
+        stream: &HipStreamHandle,
+        transpose_a: bool,
+        transpose_b: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &DeviceBuffer,
+        lda: usize,
+        b: &DeviceBuffer,
+        ldb: usize,
+        c: &DeviceBuffer,
+        ldc: usize,
+    ) -> Result<(), RocblasError> {
+        if self.owner.poisoned.get() {
+            return Err(RocblasError::CompletionUnknown);
+        }
+        if !stream.belongs_to_runtime(&self.owner.runtime) {
+            return Err(RocblasError::DifferentRuntime);
+        }
+        if !self
+            .bound_stream
+            .as_ref()
+            .is_some_and(|bound| Rc::ptr_eq(&bound.inner, &stream.inner))
+        {
+            return Err(RocblasError::DifferentStream);
+        }
+
+        let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
+        let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+        matrix_bytes_f64("A", a_rows, a_cols, lda, a.len())?;
+        matrix_bytes_f64("B", b_rows, b_cols, ldb, b.len())?;
+        matrix_bytes_f64("C", m, n, ldc, c.len())?;
+        for buffer in [a, b, c] {
+            self.owner
+                .runtime
+                .ensure_same_runtime(&buffer.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+        }
+        if Rc::ptr_eq(&a.allocation, &b.allocation)
+            || Rc::ptr_eq(&a.allocation, &c.allocation)
+            || Rc::ptr_eq(&b.allocation, &c.allocation)
+        {
+            return Err(RocblasError::AliasedBuffers);
+        }
+        for dimension in [m, n, k, lda, ldb, ldc] {
+            c_int::try_from(dimension).map_err(|_| RocblasError::DimensionOverflow)?;
+        }
+        Ok(())
+    }
+
+    fn dgemm_function(&self) -> Result<Dgemm, RocblasError> {
+        self.owner
+            .dgemm
+            .get_or_init(|| {
+                // SAFETY: Dgemm matches the installed public rocBLAS C ABI. The owning library
+                // outlives this cached function pointer and every operation that invokes it.
+                unsafe { self.owner.library.get::<Dgemm>(b"rocblas_dgemm\0") }
+                    .map(|symbol| *symbol)
+                    .map_err(|error| RocblasError::MissingSymbol {
+                        symbol: "rocblas_dgemm",
+                        detail: error.to_string(),
+                    })
+            })
+            .clone()
+    }
+
+    /// Resolve double-precision GEMM support without submitting device work.
+    ///
+    /// The independent lookup is cached, including failure, and never affects SGEMM setup.
+    ///
+    /// # Errors
+    /// Returns a missing-symbol error when the loaded library cannot provide DGEMM.
+    pub fn require_dgemm_support(&self) -> Result<(), RocblasError> {
+        self.dgemm_function().map(|_| ())
+    }
+
     /// Whether this handle may safely admit another operation after prior completion results.
     #[must_use]
     pub fn is_usable(&self) -> bool {
@@ -477,6 +593,7 @@ impl Rocblas {
                     library,
                     handle,
                     poisoned: Cell::new(false),
+                    dgemm: OnceCell::new(),
                 }),
                 in_flight: Rc::new(Cell::new(0)),
                 queue_marker: Rc::new(()) as Rc<dyn Any>,
@@ -663,6 +780,120 @@ impl Rocblas {
         Ok(())
     }
 
+    /// Queue DGEMM on this handle's bound stream and retain its buffers, handle, and host scalars
+    /// through the batch's final event.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, runtime/stream, busy-buffer, missing-symbol, or rocBLAS status errors.
+    /// If submission has retained the operation, finish or drop the batch normally so it can
+    /// establish quiescence or quarantine its resources.
+    // Preserve rocBLAS' operand naming and keep retention/completion steps visible at submission.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
+    pub fn dgemm_into_batch(
+        &self,
+        batch: &mut HipCompletionBatch,
+        transpose_a: bool,
+        transpose_b: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a: &DeviceBuffer,
+        lda: usize,
+        b: &DeviceBuffer,
+        ldb: usize,
+        beta: f64,
+        c: &DeviceBuffer,
+        ldc: usize,
+    ) -> Result<(), RocblasError> {
+        let batch_stream = batch.stream_handle();
+        let inherited_reservation = batch.has_queue_marker(&self.queue_marker);
+        if !inherited_reservation {
+            self.ensure_idle()?;
+        }
+        self.validate_dgemm_while_reserved(
+            batch_stream,
+            transpose_a,
+            transpose_b,
+            m,
+            n,
+            k,
+            a,
+            lda,
+            b,
+            ldb,
+            c,
+            ldc,
+        )?;
+        let (m, n, k, lda, ldb, ldc) = (
+            c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
+        );
+        self.owner
+            .runtime
+            .hip_set_device(self.owner.runtime.0.device)?;
+        let dgemm = self.dgemm_function()?;
+
+        reserve_async_operation(&self.in_flight)?;
+        let owner = Rc::new(RocblasAsyncDoubleOperationOwner {
+            _handle: self.owner.clone(),
+            in_flight: Rc::clone(&self.in_flight),
+            scalars: [alpha, beta],
+        });
+        let external_owner: Rc<dyn Any> = owner.clone();
+        batch.retain_external_operation(&[a, b, c], external_owner)?;
+        if !inherited_reservation {
+            batch.register_queue_marker(Rc::clone(&self.queue_marker))?;
+        }
+
+        // SAFETY: f64 extents, leading dimensions, runtime/device, aliasing, and stream were
+        // validated; the batch retains all three leases, the handle, and both scalar addresses
+        // until terminal completion, including when rocBLAS reports a submission error.
+        let status = unsafe {
+            dgemm(
+                self.owner.handle,
+                if transpose_a {
+                    ROCBLAS_OPERATION_TRANSPOSE
+                } else {
+                    ROCBLAS_OPERATION_NONE
+                },
+                if transpose_b {
+                    ROCBLAS_OPERATION_TRANSPOSE
+                } else {
+                    ROCBLAS_OPERATION_NONE
+                },
+                m,
+                n,
+                k,
+                std::ptr::from_ref(&owner.scalars[0]),
+                a.allocation.pointer.cast(),
+                lda,
+                b.allocation.pointer.cast(),
+                ldb,
+                std::ptr::from_ref(&owner.scalars[1]),
+                c.allocation.pointer.cast(),
+                ldc,
+            )
+        };
+        if status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_dgemm",
+                code: status,
+            });
+        }
+        Ok(())
+    }
+
     /// Compute column-major `C = alpha * op(A) * op(B) + beta * C` and wait for device completion.
     /// Leading dimensions and allocation extents are validated before entering the C ABI.
     ///
@@ -756,6 +987,121 @@ impl Rocblas {
             ldc,
             &mut CollectSgemmTiming(timing),
         )
+    }
+
+    /// Compute column-major f64 `C = alpha * op(A) * op(B) + beta * C` and wait for device
+    /// completion. Matrix extents are checked in bytes using the double-precision element size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid dimensions, buffers from another device, concurrent buffer
+    /// use, a missing DGEMM symbol, or a HIP/rocBLAS failure.
+    // Mirror the public BLAS ABI and keep leasing, synchronization, and quarantine together.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
+    pub fn dgemm(
+        &self,
+        transpose_a: bool,
+        transpose_b: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f64,
+        a: &DeviceBuffer,
+        lda: usize,
+        b: &DeviceBuffer,
+        ldb: usize,
+        beta: f64,
+        c: &DeviceBuffer,
+        ldc: usize,
+    ) -> Result<(), RocblasError> {
+        self.ensure_idle()?;
+        let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
+        let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+        matrix_bytes_f64("A", a_rows, a_cols, lda, a.len())?;
+        matrix_bytes_f64("B", b_rows, b_cols, ldb, b.len())?;
+        matrix_bytes_f64("C", m, n, ldc, c.len())?;
+        for buffer in [a, b, c] {
+            self.owner
+                .runtime
+                .ensure_same_runtime(&buffer.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+        }
+        if Rc::ptr_eq(&a.allocation, &b.allocation)
+            || Rc::ptr_eq(&a.allocation, &c.allocation)
+            || Rc::ptr_eq(&b.allocation, &c.allocation)
+        {
+            return Err(RocblasError::AliasedBuffers);
+        }
+        let a_lease = a.acquire_access().map_err(|_| RocblasError::Busy)?;
+        let b_lease = b.acquire_access().map_err(|_| RocblasError::Busy)?;
+        let c_lease = c.acquire_access().map_err(|_| RocblasError::Busy)?;
+        let (m, n, k, lda, ldb, ldc) = (
+            c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
+        );
+        self.owner
+            .runtime
+            .hip_set_device(self.owner.runtime.0.device)?;
+        let dgemm = self.dgemm_function()?;
+        // SAFETY: f64 extents, leading dimensions, runtime/device, and non-aliasing were checked;
+        // all buffers are leased and alpha/beta remain stable until the synchronous call and
+        // terminal device wait have both returned.
+        let status = unsafe {
+            dgemm(
+                self.owner.handle,
+                if transpose_a {
+                    ROCBLAS_OPERATION_TRANSPOSE
+                } else {
+                    ROCBLAS_OPERATION_NONE
+                },
+                if transpose_b {
+                    ROCBLAS_OPERATION_TRANSPOSE
+                } else {
+                    ROCBLAS_OPERATION_NONE
+                },
+                m,
+                n,
+                k,
+                std::ptr::from_ref(&alpha),
+                a.allocation.pointer.cast(),
+                lda,
+                b.allocation.pointer.cast(),
+                ldb,
+                std::ptr::from_ref(&beta),
+                c.allocation.pointer.cast(),
+                ldc,
+            )
+        };
+        let sync = self.owner.runtime.call(
+            "hipDeviceSynchronize",
+            |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
+        );
+        if let Err(error) = sync {
+            self.owner.poisoned.set(true);
+            std::mem::forget(a_lease);
+            std::mem::forget(b_lease);
+            std::mem::forget(c_lease);
+            return Err(error.into());
+        }
+        drop(a_lease);
+        drop(b_lease);
+        drop(c_lease);
+        if status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_dgemm",
+                code: status,
+            });
+        }
+        Ok(())
     }
 
     #[allow(
@@ -1291,7 +1637,38 @@ fn matrix_bytes(
         .checked_mul(columns)
         .ok_or(RocblasError::DimensionOverflow)?;
     let required = elements
-        .checked_mul(std::mem::size_of::<f32>())
+        .checked_mul(size_of::<f32>())
+        .ok_or(RocblasError::DimensionOverflow)?;
+    if required > allocation {
+        return Err(RocblasError::BufferTooSmall {
+            matrix,
+            allocation,
+            required,
+        });
+    }
+    Ok(required)
+}
+
+fn matrix_bytes_f64(
+    matrix: &'static str,
+    rows: usize,
+    columns: usize,
+    leading: usize,
+    allocation: usize,
+) -> Result<usize, RocblasError> {
+    if leading < rows.max(1) {
+        return Err(RocblasError::InvalidDimensions(
+            "leading dimension is smaller than max(1, stored row count)",
+        ));
+    }
+    if columns == 0 {
+        return Ok(0);
+    }
+    let elements = leading
+        .checked_mul(columns)
+        .ok_or(RocblasError::DimensionOverflow)?;
+    let required = elements
+        .checked_mul(size_of::<f64>())
         .ok_or(RocblasError::DimensionOverflow)?;
     if required > allocation {
         return Err(RocblasError::BufferTooSmall {
@@ -1342,6 +1719,131 @@ mod tests {
     }
 
     #[test]
+    fn double_matrix_extent_uses_eight_byte_elements_and_checks_dimensions() {
+        assert_eq!(matrix_bytes_f64("A", 2, 3, 2, 48), Ok(48));
+        assert!(matches!(
+            matrix_bytes_f64("C", 2, 3, 2, 40),
+            Err(RocblasError::BufferTooSmall {
+                required: 48,
+                allocation: 40,
+                ..
+            })
+        ));
+        assert!(matches!(
+            matrix_bytes_f64("B", 3, 2, 2, 48),
+            Err(RocblasError::InvalidDimensions(_))
+        ));
+        assert!(matches!(
+            matrix_bytes_f64("C", 1, usize::MAX / size_of::<f64>() + 1, 1, 0),
+            Err(RocblasError::DimensionOverflow)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires ROCm device and rocBLAS library"]
+    // One fixture exercises both entry points against the same independent column-major oracle.
+    #[allow(
+        clippy::too_many_lines // Keep sync, batch lifetime, terminal wait, and readback together.
+    )]
+    fn dgemm_sync_and_batch_preserve_f64_values_and_completion_ownership() {
+        let runtime = HipRuntime::new(0).expect("HIP runtime");
+        let stream = runtime.create_stream().expect("create DGEMM stream");
+        let mut rocblas = Rocblas::new(&runtime).expect("load rocBLAS");
+        rocblas.bind_stream(&stream).expect("bind DGEMM stream");
+
+        // Column-major A contains values that f32 cannot preserve. B is identity, and C ensures
+        // beta is also exercised in the independent host oracle.
+        let a_values = [16_777_217.0_f64, 2.0, 1.0e-10, -3.5];
+        let b_values = [1.0_f64, 0.0, 0.0, 1.0];
+        let c_values = [5.0_f64, 6.0, 7.0, 8.0];
+        let encode = |values: &[f64]| {
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let expected = |alpha: f64, beta: f64| {
+            let mut output = [0.0_f64; 4];
+            for column in 0..2 {
+                for row in 0..2 {
+                    let mut sum = 0.0_f64;
+                    for inner in 0..2 {
+                        let product = a_values[inner * 2 + row] * b_values[column * 2 + inner];
+                        sum += product;
+                    }
+                    let scaled_product = alpha * sum;
+                    let scaled_initial = beta * c_values[column * 2 + row];
+                    output[column * 2 + row] = scaled_product + scaled_initial;
+                }
+            }
+            output
+        };
+        let read_output = |buffer: &DeviceBuffer| {
+            let mut bytes = [0_u8; 4 * size_of::<f64>()];
+            buffer.copy_to(&mut bytes).expect("read DGEMM output");
+            bytes
+                .as_chunks::<{ size_of::<f64>() }>()
+                .0
+                .iter()
+                .map(|chunk| f64::from_ne_bytes(*chunk))
+                .collect::<Vec<_>>()
+        };
+        let verify = |actual: &[f64], alpha: f64, beta: f64| {
+            let expected = expected(alpha, beta);
+            for (actual, expected) in actual.iter().zip(expected) {
+                let tolerance = 2.0 * f64::EPSILON * expected.abs().max(1.0);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "DGEMM value {actual} differs from independent result {expected}"
+                );
+            }
+            assert_ne!(a_values[0].to_bits(), f64::from(16_777_217.0_f32).to_bits());
+            assert_ne!(a_values[2].to_bits(), f64::from(1.0e-10_f32).to_bits());
+        };
+
+        let mut a = runtime.allocate(4 * size_of::<f64>()).expect("allocate A");
+        let mut b = runtime.allocate(4 * size_of::<f64>()).expect("allocate B");
+        let mut sync_c = runtime
+            .allocate(4 * size_of::<f64>())
+            .expect("allocate sync C");
+        a.copy_from(&encode(&a_values)).expect("upload A");
+        b.copy_from(&encode(&b_values)).expect("upload B");
+        sync_c
+            .copy_from(&encode(&c_values))
+            .expect("initialize sync C");
+
+        rocblas
+            .dgemm(false, false, 2, 2, 2, 1.0, &a, 2, &b, 2, 0.0, &sync_c, 2)
+            .expect("synchronous DGEMM");
+        let sync_output = read_output(&sync_c);
+        verify(&sync_output, 1.0, 0.0);
+        assert_eq!(sync_output[0].to_bits(), a_values[0].to_bits());
+        assert_eq!(sync_output[2].to_bits(), a_values[2].to_bits());
+
+        let mut batch_c = runtime
+            .allocate(4 * size_of::<f64>())
+            .expect("allocate batch C");
+        batch_c
+            .copy_from(&encode(&c_values))
+            .expect("initialize batch C");
+        let mut batch = HipCompletionBatch::new(&stream);
+        rocblas
+            .dgemm_into_batch(
+                &mut batch, false, false, 2, 2, 2, 1.5, &a, 2, &b, 2, -0.25, &batch_c, 2,
+            )
+            .expect("enqueue batched DGEMM");
+        assert!(!rocblas.is_usable());
+        assert!(matches!(
+            batch_c.copy_to(&mut [0_u8; 4 * size_of::<f64>()]),
+            Err(HipError::Busy)
+        ));
+        let mut completion = batch.finish().expect("finish DGEMM batch");
+        drop(rocblas);
+        completion.wait().expect("wait for DGEMM completion");
+        verify(&read_output(&batch_c), 1.5, -0.25);
+    }
+
+    #[test]
     fn vector_extent_checks_stride_and_overflow() {
         assert_eq!(vector_bytes(1, 8), Ok(4));
         assert_eq!(vector_bytes(4, 2), Ok(28));
@@ -1372,6 +1874,34 @@ mod tests {
         assert!(weak_owner.upgrade().is_some());
         assert_eq!(in_flight.get(), 1);
         drop(retained_owner);
+        assert!(weak_owner.upgrade().is_none());
+        assert_eq!(in_flight.get(), 0);
+    }
+
+    #[test]
+    fn double_async_owner_retains_f64_scalars_until_batch_release() {
+        let handle_owner = Rc::new(());
+        let weak_handle = Rc::downgrade(&handle_owner);
+        let in_flight = Rc::new(Cell::new(0));
+        reserve_async_operation(&in_flight).unwrap();
+        let owner = Rc::new(RocblasAsyncDoubleOperationOwner {
+            _handle: handle_owner.clone(),
+            in_flight: Rc::clone(&in_flight),
+            scalars: [f64::from_bits(0x3ff0_0000_0000_0001), -0.0],
+        });
+        let weak_owner = Rc::downgrade(&owner);
+        let retained_owner: Rc<dyn Any> = owner.clone();
+        drop(handle_owner);
+        drop(owner);
+
+        assert!(weak_handle.upgrade().is_some());
+        assert_eq!(in_flight.get(), 1);
+        let retained = weak_owner.upgrade().expect("retained operation");
+        assert_eq!(retained.scalars[0].to_bits(), 0x3ff0_0000_0000_0001);
+        assert_eq!(retained.scalars[1].to_bits(), (-0.0_f64).to_bits());
+        drop(retained);
+        drop(retained_owner);
+        assert!(weak_handle.upgrade().is_none());
         assert!(weak_owner.upgrade().is_none());
         assert_eq!(in_flight.get(), 0);
     }

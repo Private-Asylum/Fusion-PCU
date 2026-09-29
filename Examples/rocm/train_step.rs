@@ -6,6 +6,9 @@ use std::{
     process::ExitCode,
 };
 
+#[path = "reference.rs"]
+mod reference;
+
 #[path = "selection.rs"]
 mod selection;
 
@@ -45,10 +48,10 @@ struct Program {
 
 fn program() -> Result<Program, Box<dyn Error>> {
     let mut graph = Graph::default();
-    let samples = graph.input([4, 2])?;
-    let weights = graph.input([2, 1])?;
-    let target = graph.input([4, 1])?;
-    let learning_rate = graph.input([2, 1])?;
+    let samples = graph.input([4, 2], fusion_pcu::PcuScalarType::F32)?;
+    let weights = graph.input([2, 1], fusion_pcu::PcuScalarType::F32)?;
+    let target = graph.input([4, 1], fusion_pcu::PcuScalarType::F32)?;
+    let learning_rate = graph.input([2, 1], fusion_pcu::PcuScalarType::F32)?;
     let prediction = graph.matmul(samples, weights)?;
     let loss = graph.mean_squared_error(prediction, target)?;
     let gradients = graph.backward_mse(loss)?;
@@ -74,7 +77,7 @@ fn expected_step(
     program: &Program,
     inputs: &[(ValueId, Tensor)],
 ) -> Result<Tensor, Box<dyn Error>> {
-    let execution = program.graph.evaluate(inputs)?;
+    let execution = program.graph.evaluate(&reference::f32_inputs(inputs))?;
     let gradients = execution.gradients(&program.graph, program.loss)?;
     let weight_index = program
         .graph
@@ -185,8 +188,8 @@ fn run_on(
         ];
         let loss_before = program
             .graph
-            .evaluate(&host_inputs)?
-            .value(program.loss)?
+            .evaluate(&reference::f32_inputs(&host_inputs))?
+            .value_typed::<f32>(program.loss)?
             .data()[0];
         let expected = expected_step(program, &host_inputs)?;
         execution.update_input(program.weights, &weights)?;
@@ -205,8 +208,8 @@ fn run_on(
         next_inputs[1].1 = actual.clone();
         let loss_after = program
             .graph
-            .evaluate(&next_inputs)?
-            .value(program.loss)?
+            .evaluate(&reference::f32_inputs(&next_inputs))?
+            .value_typed::<f32>(program.loss)?
             .data()[0];
         if !matches!(
             loss_after.partial_cmp(&loss_before),

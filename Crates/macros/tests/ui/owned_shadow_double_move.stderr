@@ -1,0 +1,5 @@
+error: use of consumed PCU owner after move
+ --> tests/ui/owned_shadow_double_move.rs:9:31
+  |
+9 |     let owner = pcu::identity(owner)?;
+  |                               ^^^^^

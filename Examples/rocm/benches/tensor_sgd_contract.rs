@@ -48,9 +48,11 @@ struct Program {
 
 fn program(elements: usize) -> Result<Program, Box<dyn Error>> {
     let mut graph = Graph::default();
-    let weights = graph.input([elements])?;
-    let gradient = graph.input([elements])?;
-    let rate = graph.constant(Tensor::splat([elements], RATE)?);
+    let weights = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
+    let gradient = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
+    let rate = graph.constant_value(fusion_pcu::dialect::tensor::TensorValue::F32(
+        Tensor::splat([elements], RATE)?,
+    ));
     let scaled = graph.mul(rate, gradient)?;
     let updated = graph.sub(weights, scaled)?;
     Ok(Program {

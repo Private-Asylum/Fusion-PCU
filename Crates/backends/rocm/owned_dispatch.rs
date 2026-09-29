@@ -1306,6 +1306,7 @@ const fn owned_dispatch_support() -> PcuSupport {
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MIN)
             .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
@@ -1344,6 +1345,7 @@ const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_
     .union(PcuDispatchOpCaps::ALU_SUB)
     .union(PcuDispatchOpCaps::ALU_MUL)
     .union(PcuDispatchOpCaps::ALU_DIV)
+    .union(PcuDispatchOpCaps::ALU_MIN)
     .union(PcuDispatchOpCaps::ALU_MAX)
     .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
     .union(PcuDispatchOpCaps::CONTROL_RETURN)
@@ -1353,7 +1355,11 @@ const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_
     .union(PcuDispatchOpCaps::BINDING_STORE);
 
 const fn f32_alu_caps() -> PcuDispatchOpCaps {
-    f64_alu_caps().union(PcuDispatchOpCaps::ALU_MAX)
+    PcuDispatchOpCaps::ALU_ADD
+        .union(PcuDispatchOpCaps::ALU_SUB)
+        .union(PcuDispatchOpCaps::ALU_MUL)
+        .union(PcuDispatchOpCaps::ALU_DIV)
+        .union(PcuDispatchOpCaps::ALU_MAX)
 }
 
 const fn f64_alu_caps() -> PcuDispatchOpCaps {
@@ -1361,6 +1367,8 @@ const fn f64_alu_caps() -> PcuDispatchOpCaps {
         .union(PcuDispatchOpCaps::ALU_SUB)
         .union(PcuDispatchOpCaps::ALU_MUL)
         .union(PcuDispatchOpCaps::ALU_DIV)
+        .union(PcuDispatchOpCaps::ALU_MIN)
+        .union(PcuDispatchOpCaps::ALU_MAX)
 }
 
 const fn int_alu_caps() -> PcuDispatchOpCaps {
@@ -1690,14 +1698,21 @@ mod tests {
                 .contains(PcuDispatchOpCaps::ALU_MAX)
         );
         assert!(
-            !OWNED_EXECUTORS[0]
+            OWNED_EXECUTORS[0]
                 .support
                 .dispatch_scalar_alu
                 .for_scalar(fusion_pcu::PcuScalarType::F64)
                 .contains(PcuDispatchOpCaps::ALU_MAX)
         );
         assert!(
-            !OWNED_EXECUTORS[0]
+            OWNED_EXECUTORS[0]
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::F64)
+                .contains(PcuDispatchOpCaps::ALU_MIN)
+        );
+        assert!(
+            OWNED_EXECUTORS[0]
                 .support
                 .dispatch_instructions
                 .contains(PcuDispatchOpCaps::ALU_MIN)

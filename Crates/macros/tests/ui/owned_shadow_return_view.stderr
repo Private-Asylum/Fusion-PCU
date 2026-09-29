@@ -1,0 +1,5 @@
+error: an owned tensor result cannot return a borrowed owner alias
+ --> tests/ui/owned_shadow_return_view.rs:9:8
+  |
+9 |     Ok(view)
+  |        ^^^^

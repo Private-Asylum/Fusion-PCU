@@ -1,0 +1,5 @@
+error: use of borrowed PCU owner view after its owner was moved
+  --> tests/ui/owned_shadow_old_view_after_move.rs:10:32
+   |
+10 |     let copied = pcu::identity(old_view)?;
+   |                                ^^^^^^^^

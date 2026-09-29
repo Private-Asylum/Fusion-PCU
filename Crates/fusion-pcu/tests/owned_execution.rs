@@ -25,7 +25,7 @@ fn identity(input: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {
 fn compose(input: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {
     let first = pcu::relu(input)?;
     let _dead = pcu::identity(input)?;
-    let _dead_branch = pcu::identity(first)?;
+    let _dead_branch = pcu::identity(&first)?;
     let live_branch = pcu::relu(first)?;
     Ok(pcu::identity(live_branch)?)
 }

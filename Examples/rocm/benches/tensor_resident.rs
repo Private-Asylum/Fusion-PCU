@@ -1,5 +1,7 @@
 //! Compare prepared PCU graphs with reusable device inputs against direct rocBLAS.
 
+#[path = "../reference.rs"]
+mod reference;
 mod support;
 
 #[rustfmt::skip]
@@ -91,12 +93,15 @@ fn run_on(
         let left = Tensor::new([size, size], vec![2.0_f32; elements])?;
         let right = Tensor::new([size, size], vec![3.0_f32; elements])?;
         let mut graph = Graph::default();
-        let left_id = graph.input([size, size])?;
-        let right_id = graph.input([size, size])?;
+        let left_id = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
+        let right_id = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
         let output_id = graph.matmul(left_id, right_id)?;
         let prepared = assessor.prepare_graph(&graph, output_id)?;
         let host_inputs = [(left_id, left.clone()), (right_id, right.clone())];
-        let reference = graph.evaluate(&host_inputs)?.value(output_id)?.clone();
+        let reference = graph
+            .evaluate(&reference::f32_inputs(&host_inputs))?
+            .value_typed::<f32>(output_id)?
+            .clone();
         let mut memory = PcuOwnedDispatchMemorySession::memory_provider(&session, candidate.pool);
         let device_left = support::cold_once(&format!("{size}x{size} PCU left upload"), || {
             assessor.upload_input(&left, candidate.pool, &mut memory)

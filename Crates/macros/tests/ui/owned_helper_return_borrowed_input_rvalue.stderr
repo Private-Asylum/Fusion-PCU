@@ -1,0 +1,5 @@
+error: an owned tensor result cannot return a reference
+ --> tests/ui/owned_helper_return_borrowed_input_rvalue.rs:5:8
+  |
+5 |     Ok(&pcu::relu(input)?)
+  |        ^^^^^^^^^^^^^^^^^^

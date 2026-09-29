@@ -1,0 +1,5 @@
+error: an owned tensor result cannot return a borrowed input
+ --> tests/ui/owned_helper_return_borrowed_resident.rs:7:8
+  |
+7 |     Ok(input)
+  |        ^^^^^

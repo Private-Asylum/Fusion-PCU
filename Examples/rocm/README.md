@@ -6,7 +6,7 @@
 ordinary calls over RAM and resident borrows, individually marked helper functions captured into
 one graph, a mixed-input transform, exclusive resident mutation, explicit stack readback and
 ordinary early/scope Drop. Device ownership is opaque: no backend upload/binding API is needed.
-The current bounded owned-source profile is rank-one f32 with identity, ReLU, Add/Sub/Mul,
+The current bounded owned-source profile supports homogeneous f32 or f64 slices, fixed arrays and matrices, usize const generics, identity, ReLU, MatMul, Add/Sub/Mul,
 ordinary elementwise `+`, `-`, `*`, nested pure expressions and marked helper calls, immutable
 let bindings and `?`/`Ok(...)`; it is not arbitrary Rust compilation. Every synchronous call
 returns after terminal completion. Separate calls retain residency; calls captured inside a
@@ -15,6 +15,30 @@ marked composition describe one graph and allow internal liveness planning.
 For example, a marked function can return `Ok(pcu::relu((lhs + rhs) * rhs)?)`.
 Grouping and operand order are preserved in the cold capture. Literal broadcasting, division,
 mutable expression borrows and arbitrary control flow are rejected; expression nesting is bounded.
+Scalar signatures may be concrete or use `T: PcuScalar`, including const-shaped generic helpers.
+`&PcuTensor<T>` parameters retain a read-only resident borrow and the owner's runtime rank and extents.
+`PcuTensor<T>` parameters may be moved into marked functions, including multiple owners
+and mixtures with RAM or read-only resident borrows. Their captured bodies
+support immutable operation chains and marked helper calls: borrow each external owner before its final bare use;
+any use after that move is rejected. Immutable owner renames move the owner; borrowed views
+use real Rust reference loans and may be used before the final move. Returning a borrowed view
+as an owner or using it after its owner moves is rejected. Returning a bare borrowed parameter
+as an owner is also rejected; use an explicit operation such as `pcu::identity(input)`.
+Produced graph values are non-Copy
+owners too: borrow them for fanout, or move them into their final operation or consuming helper.
+Helper signatures distinguish `&PcuTensor<T>` borrows from
+`PcuTensor<T>` moves, including values produced earlier in the captured composition.
+Consumed identity returns the same owner without copying; terminal ReLU may reuse
+exclusive backing. Wider graphs and ineligible/shared mutation use fresh storage.
+ROCm executes homogeneous f32/f64 arithmetic in this owned profile. Input-only transport also
+preserves all 12 sealed `PcuScalar` representations, including integer extrema and f16/bf16 bits.
+Cold tensor construction failures preserve `TensorBuild(TensorError)` kinds; unsupported execution
+remains a separate typed backend error. Selected-away inputs are not staged or bound and do not
+force readiness or session-affinity checks. Declared source shape contracts remain checked;
+selected inputs retain access, readiness and session checks. Selection is captured once per
+cache miss and reused on warm calls.
+Transport support does not imply arithmetic support: integer/half owned arithmetic, mixed-dtype
+arithmetic and f64 training operators return typed errors without CPU fallback or conversion.
 
 `cargo bench -p fusion-pcu-example-rocm --bench owned_program` compares raw owned PCU,
 source-authored owned PCU and native HIP with fresh output allocation, launch, completion and
@@ -26,6 +50,23 @@ Rust heap counts and balanced paired diagnostics are reported separately from Cr
 the same three routes at 65 and 1,048,576 elements. Both inputs remain allocated and receive
 new values before every job. Cold source/refresh preparation finishes before calibration;
 CPU result checks and input refresh stay outside the matched fresh-output timing boundary.
+
+`cargo run -p fusion-pcu-example-rocm --bin fusion-rocm-ownership-matrix --release` composes
+MatMul, Add and ReLU using const-generic matrices and resident weights, then reads the result into
+a stack matrix. Its escaped matrix result moves directly into a marked consuming activation
+function with runtime shape preserved. Shape and rank survive capture, staging and residency; incompatible resident
+shapes and marked helper contracts return typed errors. Dynamic resident handles require explicit
+const arguments where Rust cannot infer extents.
+
+`cargo bench -p fusion-pcu-example-rocm --bench owned_matmul` compares that shaped source path,
+a raw owned MatMul graph and native rocBLAS SGEMM/DGEMM for f32/f64 at 4x2x4 and 256x256x256. Inputs remain resident and
+receive new values before each job; an independent CPU oracle checks each result. Fresh output
+allocation, submission, completion and release are timed. Readback, refresh and oracle work are
+outside those intervals; total Criterion wall time is also reported. All three routes receive the
+same complete input-refresh sequence before each timed execution to control setup cadence.
+Both precisions call the same generic source `#[pcu]` identity and MatMul functions; the shared
+benchmark driver uses static dispatch, while each native profile retains its own precision and
+refresh policy.
 
 ## Typed kernel calls
 
@@ -102,7 +143,31 @@ cargo bench -p fusion-pcu-example-rocm --bench tensor_train_step
 cargo bench -p fusion-pcu-example-rocm --bench half_transport
 cargo bench -p fusion-pcu-example-rocm --bench dispatch_widen
 cargo bench -p fusion-pcu-example-rocm --bench tensor_mlp_train
+cargo bench -p fusion-pcu-example-rocm --bench owned_binary
+cargo bench -p fusion-pcu-example-rocm --bench owned_matmul
+cargo bench -p fusion-pcu-example-rocm --bench owned_relu
+cargo bench -p fusion-pcu-example-rocm --bench owned_identity_transfer
+cargo bench -p fusion-pcu-example-rocm --bench owned_binary_donor
+cargo bench -p fusion-pcu-example-rocm --bench owned_multi_consuming
+cargo bench -p fusion-pcu-example-rocm --bench owned_selected_owners
 ```
+
+The owned-source benchmarks execute actual per-function `#[pcu]` calls. `owned_relu` separates
+borrowed/raw/native fresh-output work from consumed-source/native in-place work at 65 and
+1,048,576 elements. A consuming source signature transfers the logical owner; PCU reuses its
+backing only after graph legality, physical exclusivity and completion checks. Shared or
+ineligible storage uses fresh output. Inputs change and every comparison route refreshes outside
+each measured sample; readback and independent result oracles also remain outside timing.
+Rust heap counts exclude HIP/driver allocations and do not prove backing reuse on their own.
+
+`owned_binary_donor` compares one moved owner plus a readonly peer with native in-place
+Add/Sub/Mul, including right-donor subtraction. `owned_multi_consuming` separates fresh-output
+borrowing inside an ordinary host consuming wrapper from two-owner donation; each native
+control matches that storage policy and release boundary. `owned_selected_owners` authors three
+owned parameters but uses only the last two, testing selected-input pruning and donation.
+Its separate mixed group borrows the unused owner and RHS, retaining and verifying both across
+the call. Each native control matches that ownership boundary. Non-donor release is timed when
+the signature consumes it; retained output release is timed separately after verified readback.
 
 `dispatch_u32_alu` pairs a macro-authored `wrapping_add` kernel with an independent HIP
 unsigned-add kernel at 65 and 1,048,576 elements. Both keep three buffers resident, verify

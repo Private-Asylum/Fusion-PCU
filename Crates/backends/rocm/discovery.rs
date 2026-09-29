@@ -63,7 +63,11 @@ const PROVIDER: PcuProviderId = PcuProviderId(0x524f_434d);
 const TARGET_ID: u32 = 0;
 
 const fn f32_alu_caps() -> PcuDispatchOpCaps {
-    f64_alu_caps().union(PcuDispatchOpCaps::ALU_MAX)
+    PcuDispatchOpCaps::ALU_ADD
+        .union(PcuDispatchOpCaps::ALU_SUB)
+        .union(PcuDispatchOpCaps::ALU_MUL)
+        .union(PcuDispatchOpCaps::ALU_DIV)
+        .union(PcuDispatchOpCaps::ALU_MAX)
 }
 
 const fn f64_alu_caps() -> PcuDispatchOpCaps {
@@ -71,6 +75,8 @@ const fn f64_alu_caps() -> PcuDispatchOpCaps {
         .union(PcuDispatchOpCaps::ALU_SUB)
         .union(PcuDispatchOpCaps::ALU_MUL)
         .union(PcuDispatchOpCaps::ALU_DIV)
+        .union(PcuDispatchOpCaps::ALU_MIN)
+        .union(PcuDispatchOpCaps::ALU_MAX)
 }
 
 const fn int_alu_caps() -> PcuDispatchOpCaps {
@@ -501,6 +507,7 @@ impl RocmDiscovery {
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MIN)
             .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
@@ -603,6 +610,7 @@ const ROCM_EXECUTOR: PcuExecutorDescriptor = PcuExecutorDescriptor {
             .union(PcuDispatchOpCaps::ALU_SUB)
             .union(PcuDispatchOpCaps::ALU_MUL)
             .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MIN)
             .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
@@ -706,14 +714,21 @@ mod tests {
                 .contains(PcuDispatchOpCaps::ALU_MAX)
         );
         assert!(
-            !ROCM_EXECUTOR
+            ROCM_EXECUTOR
                 .support
                 .dispatch_scalar_alu
                 .for_scalar(fusion_pcu::PcuScalarType::F64)
                 .contains(PcuDispatchOpCaps::ALU_MAX)
         );
         assert!(
-            !ROCM_EXECUTOR
+            ROCM_EXECUTOR
+                .support
+                .dispatch_scalar_alu
+                .for_scalar(fusion_pcu::PcuScalarType::F64)
+                .contains(PcuDispatchOpCaps::ALU_MIN)
+        );
+        assert!(
+            ROCM_EXECUTOR
                 .support
                 .dispatch_instructions
                 .contains(PcuDispatchOpCaps::ALU_MIN)
@@ -755,7 +770,7 @@ mod tests {
             },
         )];
         assert!(
-            !ROCM_EXECUTOR
+            ROCM_EXECUTOR
                 .support
                 .supports_kernel_direct(fusion_pcu::PcuKernel::Dispatch(
                     fusion_pcu::PcuDispatchKernelIr {

@@ -1,0 +1,5 @@
+error: use of consumed PCU owner after move
+  --> tests/ui/owned_helper_temp_bare_fanout.rs:16:27
+   |
+16 |     Ok(pcu::add(consumed, temporary)?)
+   |                           ^^^^^^^^^

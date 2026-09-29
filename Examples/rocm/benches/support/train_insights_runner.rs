@@ -50,9 +50,9 @@ struct StrictGraph {
 
 fn strict_graph() -> Result<StrictGraph, Box<dyn Error>> {
     let mut graph = Graph::default();
-    let samples = graph.input([ROWS, FEATURES])?;
-    let weights = graph.input([FEATURES, 1])?;
-    let target = graph.input([ROWS, 1])?;
+    let samples = graph.input([ROWS, FEATURES], fusion_pcu::PcuScalarType::F32)?;
+    let weights = graph.input([FEATURES, 1], fusion_pcu::PcuScalarType::F32)?;
+    let target = graph.input([ROWS, 1], fusion_pcu::PcuScalarType::F32)?;
     let prediction = graph.matmul(samples, weights)?;
     let loss = graph.mean_squared_error(prediction, target)?;
     let gradients = graph.backward_mse(loss)?;

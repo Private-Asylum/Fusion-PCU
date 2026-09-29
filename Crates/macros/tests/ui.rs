@@ -45,4 +45,7 @@ fn dispatch_macro_ui() {
     tests.compile_fail("tests/ui/generic_matrix_mixed_scalar.rs");
     tests.compile_fail("tests/ui/generic_matrix_multiple_types.rs");
     tests.compile_fail("tests/ui/generic_matrix_arithmetic.rs");
+    tests.compile_fail("tests/ui/owned_input_moved_twice.rs");
+    tests.compile_fail("tests/ui/owned_input_borrowed_after_move.rs");
+    tests.pass("tests/ui/owned_input_alias.rs");
 }

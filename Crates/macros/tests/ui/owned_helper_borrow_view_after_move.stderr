@@ -1,0 +1,5 @@
+error: use of borrowed PCU owner view after its owner was moved
+  --> tests/ui/owned_helper_borrow_view_after_move.rs:21:34
+   |
+21 |     Ok(pcu::add(result, borrowed(view)?)?)
+   |                                  ^^^^

@@ -35,7 +35,7 @@ pub enum PcuF64MapValidationError {
 ///
 /// This profile admits only storage buffers of scalar f64, invocation-ID indexed loads, element-
 /// zero broadcast loads, invocation-ID indexed stores,
-/// f64 add/subtract/multiply/divide, and one terminal return. It
+/// f64 add/subtract/multiply/divide/minimum/maximum, and one terminal return. It
 /// does not assert
 /// backend numeric equivalence or resource availability. The current cross-backend numeric
 /// conformance domain for arithmetic remains deliberately narrower: finite normal operands and
@@ -130,6 +130,8 @@ pub fn validate_f64_map_kernel(
                         | PcuDispatchAluOp::Sub
                         | PcuDispatchAluOp::Mul
                         | PcuDispatchAluOp::Div
+                        | PcuDispatchAluOp::Min
+                        | PcuDispatchAluOp::Max
                 ) {
                     return Err(PcuF64MapValidationError::UnsupportedOperation(position));
                 }
@@ -202,6 +204,8 @@ fn validate_grid_stride_body(
                         | PcuDispatchAluOp::Sub
                         | PcuDispatchAluOp::Mul
                         | PcuDispatchAluOp::Div
+                        | PcuDispatchAluOp::Min
+                        | PcuDispatchAluOp::Max
                 ) {
                     return Err(PcuF64MapValidationError::UnsupportedOperation(
                         body_position,
@@ -414,7 +418,7 @@ mod tests {
     };
 
     #[test]
-    fn accepts_f64_arithmetic_map_and_rejects_minimum() {
+    fn accepts_f64_arithmetic_map_and_rejects_logical_operations() {
         let bindings = [
             PcuBinding::scalar::<f64>(
                 Some("input"),
@@ -483,7 +487,7 @@ mod tests {
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
                 value_type: crate::PcuValueType::f64(),
                 result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Min,
+                op: PcuDispatchAluOp::And,
                 lhs: PcuDispatchValueId(1),
                 rhs: PcuDispatchValueId(2),
             }),
@@ -508,6 +512,116 @@ mod tests {
                 ..kernel
             }),
             Err(PcuF64MapValidationError::UnsupportedOperation(0))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Direct and grid-stride variants share one validation contract.
+    fn admits_f64_minimum_and_maximum_in_direct_and_grid_maps() {
+        let bindings = [
+            PcuBinding::scalar::<f64>(
+                Some("left"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f64>(
+                Some("right"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f64>(
+                Some("output"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let load_left = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(1),
+            binding: PcuBindingRef::new(0, 0),
+            index: PcuDispatchIndex::InvocationId,
+        });
+        let load_right = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(2),
+            binding: PcuBindingRef::new(0, 1),
+            index: PcuDispatchIndex::InvocationId,
+        });
+        let maximum = PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+            value_type: crate::PcuValueType::f64(),
+            result: PcuDispatchValueId(3),
+            op: PcuDispatchAluOp::Max,
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        });
+        let minimum = PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+            value_type: crate::PcuValueType::f64(),
+            result: PcuDispatchValueId(4),
+            op: PcuDispatchAluOp::Min,
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        });
+        let store = PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+            binding: PcuBindingRef::new(0, 2),
+            index: PcuDispatchIndex::InvocationId,
+            value: PcuDispatchValueId(4),
+        });
+        let direct = [
+            load_left,
+            load_right,
+            maximum,
+            minimum,
+            store,
+            PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
+        ];
+        let kernel = PcuDispatchKernelIr {
+            id: PcuKernelId(3),
+            entry: PcuDispatchEntryPoint {
+                name: "f64_min_max",
+                logical_shape: [4, 1, 1],
+            },
+            bindings: &bindings,
+            ports: &[],
+            parameters: &[],
+            ops: &direct,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        assert_eq!(validate_f64_map_kernel(&kernel), Ok(()));
+
+        let grid_load_left = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(1),
+            binding: PcuBindingRef::new(0, 0),
+            index: PcuDispatchIndex::GridStrideId,
+        });
+        let grid_load_right = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(2),
+            binding: PcuBindingRef::new(0, 1),
+            index: PcuDispatchIndex::GridStrideId,
+        });
+        let grid_store = PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+            binding: PcuBindingRef::new(0, 2),
+            index: PcuDispatchIndex::GridStrideId,
+            value: PcuDispatchValueId(3),
+        });
+        let body = [grid_load_left, grid_load_right, maximum, grid_store];
+        let ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 8,
+                body: &body,
+            },
+            PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
+        ];
+        assert_eq!(
+            validate_f64_map_kernel(&PcuDispatchKernelIr {
+                ops: &ops,
+                ..kernel
+            }),
+            Ok(())
         );
     }
 

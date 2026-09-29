@@ -1,5 +1,7 @@
 //! Resident PCU training benchmark for a three-layer f32 MLP.
 
+#[path = "../reference.rs"]
+mod reference;
 mod support;
 
 #[rustfmt::skip]
@@ -63,11 +65,11 @@ struct Program {
 
 fn program(batch: usize) -> Result<Program, Box<dyn Error>> {
     let mut graph = Graph::default();
-    let samples = graph.input([batch, INPUT])?;
-    let w1 = graph.input([INPUT, HIDDEN])?;
-    let w2 = graph.input([HIDDEN, HIDDEN])?;
-    let w3 = graph.input([HIDDEN, OUTPUT])?;
-    let targets = graph.input([batch, OUTPUT])?;
+    let samples = graph.input([batch, INPUT], fusion_pcu::PcuScalarType::F32)?;
+    let w1 = graph.input([INPUT, HIDDEN], fusion_pcu::PcuScalarType::F32)?;
+    let w2 = graph.input([HIDDEN, HIDDEN], fusion_pcu::PcuScalarType::F32)?;
+    let w3 = graph.input([HIDDEN, OUTPUT], fusion_pcu::PcuScalarType::F32)?;
+    let targets = graph.input([batch, OUTPUT], fusion_pcu::PcuScalarType::F32)?;
     let z1 = graph.matmul(samples, w1)?;
     let h1 = graph.relu(z1)?;
     let z2 = graph.matmul(h1, w2)?;
@@ -890,11 +892,11 @@ fn display_bytes_opt(bytes: Option<u64>) -> String {
 
 fn cpu_small_check() -> Result<bool, Box<dyn Error>> {
     let mut graph = Graph::default();
-    let x = graph.input([2, 3])?;
-    let w1 = graph.input([3, 4])?;
-    let w2 = graph.input([4, 4])?;
-    let w3 = graph.input([4, 2])?;
-    let y = graph.input([2, 2])?;
+    let x = graph.input([2, 3], fusion_pcu::PcuScalarType::F32)?;
+    let w1 = graph.input([3, 4], fusion_pcu::PcuScalarType::F32)?;
+    let w2 = graph.input([4, 4], fusion_pcu::PcuScalarType::F32)?;
+    let w3 = graph.input([4, 2], fusion_pcu::PcuScalarType::F32)?;
+    let y = graph.input([2, 2], fusion_pcu::PcuScalarType::F32)?;
     let z1 = graph.matmul(x, w1)?;
     let a = graph.relu(z1)?;
     let z2 = graph.matmul(a, w2)?;
@@ -914,7 +916,7 @@ fn cpu_small_check() -> Result<bool, Box<dyn Error>> {
         (w3, Tensor::new([4, 2], vec![0.05; 8])?),
         (y, Tensor::new([2, 2], vec![0.1; 4])?),
     ];
-    let execution = graph.evaluate(&inputs)?;
+    let execution = graph.evaluate(&reference::f32_inputs(&inputs))?;
     let independent = execution.gradients(&graph, loss)?;
     for (weight, update) in [w1, w2, w3].into_iter().zip(updates) {
         let index = graph
@@ -924,7 +926,8 @@ fn cpu_small_check() -> Result<bool, Box<dyn Error>> {
         let analytic = independent[index]
             .as_ref()
             .ok_or("independent fixture gradient missing")?;
-        let backward = execution.value(grads[index].ok_or("backward fixture gradient missing")?)?;
+        let backward = execution
+            .value_typed::<f32>(grads[index].ok_or("backward fixture gradient missing")?)?;
         if analytic
             .data()
             .iter()
@@ -933,7 +936,7 @@ fn cpu_small_check() -> Result<bool, Box<dyn Error>> {
         {
             return Ok(false);
         }
-        let expected = execution.value(update)?;
+        let expected = execution.value_typed::<f32>(update)?;
         let initial = inputs
             .iter()
             .find(|(id, _)| *id == weight)

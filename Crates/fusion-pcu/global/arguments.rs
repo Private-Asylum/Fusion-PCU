@@ -81,6 +81,8 @@ pub enum PcuArgumentError {
     },
     SessionMismatch,
     ResidentCompletionUncertain,
+    /// A logical resident tensor is unavailable when the facade has no device provider.
+    ProviderUnavailable,
 }
 
 /// Opaque per-argument carrier passed from generated source signatures to the hosted dispatcher.
@@ -515,6 +517,23 @@ enum ResidentValidity {
 ///
 /// Consumers cannot construct this owner directly. It is returned by successful owned-result
 /// kernels and keeps its provider resources alive independently of the thread cache.
+/// Borrowing retains the logical value; moving transfers it. A move permits a provider to
+/// consider storage reuse, but does not establish physical backing exclusivity by itself.
+/// Ordinary `Drop` releases this owner's claim; readback does not consume it.
+///
+/// A live borrow prevents transferring the owner, including while that borrow is used by a
+/// later device operation:
+///
+/// ```compile_fail,E0505
+/// use fusion_pcu::PcuTensor;
+/// fn transfer(value: PcuTensor<f32>) -> PcuTensor<f32> { value }
+/// fn invalid(value: PcuTensor<f32>) {
+///     let borrowed = &value;
+///     let moved = transfer(value);
+///     let _ = borrowed.len();
+///     drop(moved);
+/// }
+/// ```
 pub struct PcuTensor<T: PcuScalar> {
     #[cfg(feature = "rocm")]
     tensor: PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource>,
@@ -526,7 +545,7 @@ pub struct PcuTensor<T: PcuScalar> {
 }
 
 impl<T: PcuScalar> PcuTensor<T> {
-    #[cfg(feature = "rocm")]
+    #[cfg(all(feature = "rocm", feature = "tensor"))]
     pub(super) fn from_successful_output(
         tensor: PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource>,
         session: std::rc::Rc<RocmSession>,
@@ -549,6 +568,16 @@ impl<T: PcuScalar> PcuTensor<T> {
     #[cfg(feature = "rocm")]
     pub(super) const fn session(&self) -> &std::rc::Rc<RocmSession> {
         &self.session
+    }
+
+    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    pub(super) fn into_device_parts(
+        self,
+    ) -> (
+        PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource>,
+        std::rc::Rc<RocmSession>,
+    ) {
+        (self.tensor, self.session)
     }
 
     #[cfg(feature = "rocm")]

@@ -74,9 +74,9 @@ fn run_on(
         let (left_values, right_values, third_values) = values(elements);
         let expected = expected(&left_values, &right_values, &third_values);
         let mut graph = Graph::default();
-        let left_id = graph.input([elements])?;
-        let right_id = graph.input([elements])?;
-        let third_id = graph.input([elements])?;
+        let left_id = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
+        let right_id = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
+        let third_id = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
         let first = graph.add(left_id, right_id)?;
         let second = graph.sub(first, third_id)?;
         let third = graph.add(second, left_id)?;

@@ -1,10 +1,14 @@
 //! Opt-in tensor operation assessment for an explicitly selected `ROCm` session.
 //!
-//! This adapter executes dense row-major f32 matrix multiplication through rocBLAS and elementwise
-//! addition, `ReLU`, and explicitly selected bounded Mul chains through owned PCU Dispatch.
-//! Other tensor operations remain unsupported.
+//! This adapter transports typed owned inputs through selected identity graphs, executes dense
+//! row-major f32/f64 matrix multiplication through rocBLAS, and supports selected f32/f64
+//! pointwise operations through owned PCU Dispatch. Other tensor arithmetic remains unsupported.
 
+#[path = "tensor/consuming.rs"]
+mod consuming;
 mod feedback_runtime;
+#[path = "tensor/pointwise.rs"]
+mod pointwise;
 pub use feedback_runtime::RocmTensorExecution;
 #[rustfmt::skip]
 pub use feedback_runtime::{
@@ -61,6 +65,7 @@ use fusion_pcu::{
     PcuInvocationShape,
     PcuMemoryAccess,
     PcuMemoryAllocationRequest,
+    PcuMemoryBackingOwnership,
     PcuMemoryHostAccess,
     PcuMemoryMemberRequirement,
     PcuMemoryPoolId,
@@ -101,6 +106,10 @@ use fusion_pcu::dialect::tensor::{
     TensorScratchStoragePlan,
     TensorStorageConstraint,
     TensorStorageValidationError,
+    TensorInputReuseProof,
+    TerminalBinaryDonorProof,
+    TensorBinaryOperand,
+    TensorBinaryOperation,
     TensorSgdRewriteCandidate,
     TensorUnsupportedReason,
     ValueId,
@@ -591,9 +600,43 @@ enum TensorDispatchKind {
     SquaredDifference,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum TensorPointwiseScalarType {
+    F32,
+    F64,
+}
+
+impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
+    type Error = RocmTensorExecutionError;
+
+    fn try_from(scalar_type: fusion_pcu::PcuScalarType) -> Result<Self, Self::Error> {
+        match scalar_type {
+            fusion_pcu::PcuScalarType::F32 => Ok(Self::F32),
+            fusion_pcu::PcuScalarType::F64 => Ok(Self::F64),
+            unsupported => Err(RocmTensorExecutionError::UnsupportedScalarType(unsupported)),
+        }
+    }
+}
+
+impl TensorPointwiseScalarType {
+    const fn value_type(self) -> PcuValueType {
+        match self {
+            Self::F32 => PcuValueType::f32(),
+            Self::F64 => PcuValueType::f64(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TensorDispatchCacheKey {
-    Fixed(TensorDispatchKind, u32, u8),
+    Fixed(TensorDispatchKind, TensorPointwiseScalarType, u32, u8),
+    ConsumingRelu(TensorPointwiseScalarType, u32),
+    ConsumingBinary(
+        TensorBinaryOperation,
+        TensorBinaryOperand,
+        TensorPointwiseScalarType,
+        u32,
+    ),
     Pointwise {
         invocation_count: u32,
         scalar_mask: u8,
@@ -602,6 +645,50 @@ enum TensorDispatchCacheKey {
 }
 
 type TensorDispatchCache = VecDeque<(TensorDispatchCacheKey, RocmPreparedDispatch)>;
+
+/// Fixed per-node kernel and binding facts selected during graph preparation.
+#[derive(Clone, Debug)]
+struct PreparedFixedTensorDispatch {
+    value: ValueId,
+    cache_key: TensorDispatchCacheKey,
+    kernel: PcuDispatchKernelIr<'static>,
+    invocation_shape: PcuInvocationShape,
+    scalar_type: TensorPointwiseScalarType,
+    value_type: PcuValueType,
+    left_binding: PcuBindingRef,
+    right_binding: Option<PcuBindingRef>,
+    output_binding: PcuBindingRef,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedConsumingRelu {
+    proof: TensorInputReuseProof,
+    kernel: PcuDispatchKernelIr<'static>,
+    invocation_shape: PcuInvocationShape,
+    scalar_type: TensorPointwiseScalarType,
+    value_type: PcuValueType,
+    binding: PcuBindingRef,
+    logical_count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedConsumingBinary {
+    proof: TerminalBinaryDonorProof,
+    kernel: PcuDispatchKernelIr<'static>,
+    invocation_shape: PcuInvocationShape,
+    scalar_type: TensorPointwiseScalarType,
+    value_type: PcuValueType,
+    donor_binding: PcuBindingRef,
+    other_binding: PcuBindingRef,
+    logical_count: u32,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedConsumingAction {
+    IdentityTransfer(ValueId),
+    TerminalRelu(PreparedConsumingRelu),
+    TerminalBinary(Box<[PreparedConsumingBinary; 2]>),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TensorDispatchCacheAdmission {
@@ -613,6 +700,7 @@ struct TensorDispatchCacheAdmission {
 enum TensorDispatchRequest<'graph> {
     Fixed {
         kind: TensorDispatchKind,
+        scalar_type: TensorPointwiseScalarType,
         logical_count: u32,
         scalar_mask: u8,
     },
@@ -635,9 +723,10 @@ impl TensorDispatchRequest<'_> {
         match self {
             Self::Fixed {
                 kind,
+                scalar_type,
                 logical_count,
                 scalar_mask,
-            } => TensorDispatchCacheKey::Fixed(*kind, *logical_count, *scalar_mask),
+            } => TensorDispatchCacheKey::Fixed(*kind, *scalar_type, *logical_count, *scalar_mask),
             Self::BoundedPointwise {
                 logical_count,
                 scalar_mask,
@@ -660,22 +749,28 @@ impl TensorDispatchRequest<'_> {
 
 #[derive(Clone, Copy)]
 struct ElementwiseOperands<'a> {
-    shape: &'a [usize],
     left: &'a RocmMemoryResource,
     right: Option<&'a RocmMemoryResource>,
     output: &'a RocmMemoryResource,
-    scalar_mask: u8,
 }
 
 impl TensorDispatchKind {
-    fn kernel(self, logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
-        match self {
-            Self::Add => add_kernel(logical_count, scalar_mask),
-            Self::AddRelu => add_relu_kernel(logical_count, scalar_mask),
-            Self::Sub => sub_kernel(logical_count, scalar_mask),
-            Self::Mul => mul_kernel(logical_count, scalar_mask),
-            Self::Relu => relu_kernel(logical_count),
-            Self::SquaredDifference => mse_kernel(logical_count),
+    fn kernel(
+        self,
+        scalar_type: TensorPointwiseScalarType,
+        logical_count: u32,
+        scalar_mask: u8,
+    ) -> Result<PcuDispatchKernelIr<'static>, RocmTensorExecutionError> {
+        match scalar_type {
+            TensorPointwiseScalarType::F32 => Ok(match self {
+                Self::Add => add_kernel(logical_count, scalar_mask),
+                Self::AddRelu => add_relu_kernel(logical_count, scalar_mask),
+                Self::Sub => sub_kernel(logical_count, scalar_mask),
+                Self::Mul => mul_kernel(logical_count, scalar_mask),
+                Self::Relu => relu_kernel(logical_count),
+                Self::SquaredDifference => mse_kernel(logical_count),
+            }),
+            TensorPointwiseScalarType::F64 => pointwise::kernel(self, logical_count, scalar_mask),
         }
     }
 }
@@ -1104,6 +1199,8 @@ pub enum RocmTensorExecutionError {
         value: ValueId,
         reason: TensorUnsupportedReason,
     },
+    UnsupportedScalarType(fusion_pcu::PcuScalarType),
+    InvalidPointwiseProfile,
     Memory(PcuMemoryProviderError),
     MemoryAdmission(fusion_pcu::PcuMemoryAllocateWithPolicyError),
     Operation(RocmTensorError),
@@ -1264,11 +1361,63 @@ pub struct RocmTensorInput<'session> {
     session: &'session RocmOwnedDispatchBackend,
     shape: Vec<usize>,
     resource: RocmMemoryResource,
+    scalar_type: fusion_pcu::PcuScalarType,
     updateable: bool,
 }
 
+/// Borrowed, allocation-free descriptor for an already-owned device resource input.
+pub struct RocmTensorInputRef<'input> {
+    session: &'input RocmOwnedDispatchBackend,
+    shape: &'input [usize],
+    resource: &'input RocmMemoryResource,
+    scalar_type: fusion_pcu::PcuScalarType,
+}
+
+trait RocmTensorInputDescriptor {
+    fn session(&self) -> &RocmOwnedDispatchBackend;
+    fn shape(&self) -> &[usize];
+    fn resource(&self) -> &RocmMemoryResource;
+    fn scalar_type(&self) -> fusion_pcu::PcuScalarType;
+}
+
+impl RocmTensorInputDescriptor for RocmTensorInput<'_> {
+    fn session(&self) -> &RocmOwnedDispatchBackend {
+        self.session
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn resource(&self) -> &RocmMemoryResource {
+        &self.resource
+    }
+
+    fn scalar_type(&self) -> fusion_pcu::PcuScalarType {
+        self.scalar_type
+    }
+}
+
+impl RocmTensorInputDescriptor for RocmTensorInputRef<'_> {
+    fn session(&self) -> &RocmOwnedDispatchBackend {
+        self.session
+    }
+
+    fn shape(&self) -> &[usize] {
+        self.shape
+    }
+
+    fn resource(&self) -> &RocmMemoryResource {
+        self.resource
+    }
+
+    fn scalar_type(&self) -> fusion_pcu::PcuScalarType {
+        self.scalar_type
+    }
+}
+
 /// A selected tensor graph output and its moved, typed device allocation.
-pub type RocmTensorOwnedOutput = (ValueId, PcuDeviceTensor<f32, RocmMemoryResource>);
+pub type RocmTensorOwnedOutput<T = f32> = (ValueId, PcuDeviceTensor<T, RocmMemoryResource>);
 
 impl RocmTensorInput<'_> {
     fn validate_session(
@@ -1288,20 +1437,22 @@ impl RocmTensorInput<'_> {
         self.resource.clone_for_tensor_input()
     }
 
-    fn into_device_tensor(
+    fn into_device_tensor<T: fusion_pcu::PcuScalar>(
         self,
-    ) -> Result<PcuDeviceTensor<f32, RocmMemoryResource>, RocmTensorExecutionError> {
+    ) -> Result<PcuDeviceTensor<T, RocmMemoryResource>, RocmTensorExecutionError> {
         if !self.updateable {
             return Err(RocmTensorExecutionError::BorrowedInputEscape);
         }
+        validate_tensor_scalar_tag::<T>(self.scalar_type)?;
         let elements = self
             .shape
             .iter()
             .try_fold(1_usize, |count, &dimension| count.checked_mul(dimension))
             .ok_or(RocmTensorExecutionError::SizeOverflow)?;
-        let required_bytes = byte_len(&self.shape)?;
+        let required_bytes = byte_len_for::<T>(&self.shape)?;
         if u64::try_from(required_bytes).map_err(|_| RocmTensorExecutionError::SizeOverflow)?
             > self.resource.size_bytes()
+            || !alignment_satisfies(self.resource.alignment_bytes(), scalar_layout(T::TYPE)?.1)
         {
             return Err(RocmTensorExecutionError::OutputResourceMismatch);
         }
@@ -1372,14 +1523,15 @@ impl<'session> RocmTensorAssessor<'session> {
     fn ensure_fixed_dispatch_cached(
         &self,
         kind: TensorDispatchKind,
+        scalar_type: TensorPointwiseScalarType,
         logical_count: u32,
         scalar_mask: u8,
     ) -> Result<TensorDispatchCacheAdmission, RocmTensorExecutionError> {
         let invocations =
             NonZeroU32::new(logical_count).ok_or(RocmTensorExecutionError::SizeOverflow)?;
         self.ensure_dispatch_cached(
-            TensorDispatchCacheKey::Fixed(kind, logical_count, scalar_mask),
-            kind.kernel(logical_count, scalar_mask),
+            TensorDispatchCacheKey::Fixed(kind, scalar_type, logical_count, scalar_mask),
+            kind.kernel(scalar_type, logical_count, scalar_mask)?,
             PcuInvocationShape::invocations(invocations),
             false,
         )
@@ -1572,9 +1724,15 @@ impl<'session> RocmTensorAssessor<'session> {
             let admission = match request {
                 TensorDispatchRequest::Fixed {
                     kind,
+                    scalar_type,
                     logical_count,
                     scalar_mask,
-                } => self.ensure_fixed_dispatch_cached(*kind, *logical_count, *scalar_mask)?,
+                } => self.ensure_fixed_dispatch_cached(
+                    *kind,
+                    *scalar_type,
+                    *logical_count,
+                    *scalar_mask,
+                )?,
                 TensorDispatchRequest::BoundedPointwise {
                     group,
                     logical_count,
@@ -1725,6 +1883,10 @@ impl<'session> RocmTensorAssessor<'session> {
             graph, outputs, self, policy, arithmetic, grouping,
         )?;
         let data = RocmPreparedGraphData {
+            scalar_type: homogeneous_scalar_type(&plan.nodes),
+            requires_blas: nodes_require_blas(&plan.nodes),
+            transport_only_inputs: false,
+            consuming_action: None,
             node_values: plan.nodes.iter().map(|node| node.value).collect(),
             output: outputs[0],
             outputs: outputs.to_vec(),
@@ -1733,6 +1895,7 @@ impl<'session> RocmTensorAssessor<'session> {
             fused_add_by_relu: plan.fused_add_by_relu,
             bounded_pointwise_by_output: plan.bounded_pointwise_by_output,
             bounded_mul_by_output: plan.bounded_mul_by_output,
+            fixed_dispatches: plan.fixed_dispatches,
             suppressed_adds: plan.suppressed_adds,
             indexed_storage_constraints: plan.indexed_storage_constraints,
             matmul_operands: plan.matmul_operands,
@@ -1793,39 +1956,226 @@ impl<'session> RocmTensorAssessor<'session> {
     ///
     /// Returns an input validation error, allocation/provider error, or a `ROCm` operation or
     /// completion error. On failure no output tensor is returned.
-    pub fn execute_owned_program_outputs<P>(
+    pub fn execute_owned_program_outputs<T: fusion_pcu::PcuScalar, P>(
         &self,
         prepared: &RocmOwnedPreparedTensorGraph,
-        inputs: &[(ValueId, &PcuDeviceTensor<f32, RocmMemoryResource>)],
+        inputs: &[(ValueId, &PcuDeviceTensor<T, RocmMemoryResource>)],
         pool: PcuMemoryPoolId,
         memory: &mut P,
-    ) -> Result<Vec<RocmTensorOwnedOutput>, RocmTensorExecutionError>
+    ) -> Result<Vec<RocmTensorOwnedOutput<T>>, RocmTensorExecutionError>
     where
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
     {
-        let view = prepared.view();
         let mut borrowed_inputs = Vec::with_capacity(inputs.len());
         for &(value, tensor) in inputs {
-            borrowed_inputs.push((value, self.borrow_device_input(tensor, pool)?));
+            borrowed_inputs.push((value, self.borrow_device_input_ref(tensor, pool)?));
         }
         let resource_inputs = borrowed_inputs
             .iter()
             .map(|(value, input)| (*value, input))
             .collect::<Vec<_>>();
+        self.execute_owned_program_outputs_from_inputs(prepared, &resource_inputs, pool, memory)
+    }
+
+    /// Executes a selected graph from one moved input. A selected identity graph transfers the
+    /// owner unchanged without dispatch, and a prepared terminal same-index `ReLU` may reuse its
+    /// allocation when graph proof and exclusive physical ownership permit it. Other supported
+    /// single-input/single-output graphs use the ordinary fresh-output scheduler.
+    ///
+    /// The reuse route is never requested by a caller flag. Identity requires no mutation or
+    /// uniqueness; in-place `ReLU` uses a prepared core graph proof and fixed read/write kernel,
+    /// while execution checks the live resource lease and quiescence before dispatch. Its owner
+    /// is returned only after terminal completion succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns ordinary input, allocation, provider, dispatch, or completion errors. No tensor is
+    /// returned after an unsuccessful in-place dispatch.
+    pub fn execute_owned_program_consuming_input<T, P>(
+        &self,
+        prepared: &RocmOwnedPreparedTensorGraph,
+        input: PcuDeviceTensor<T, RocmMemoryResource>,
+        pool: PcuMemoryPoolId,
+        memory: &mut P,
+    ) -> Result<PcuDeviceTensor<T, RocmMemoryResource>, RocmTensorExecutionError>
+    where
+        T: fusion_pcu::PcuScalar,
+        P: PcuMemoryProvider<Resource = RocmMemoryResource>,
+    {
+        if prepared.data.input_values.len() != 1 || prepared.data.outputs.len() != 1 {
+            return Err(RocmTensorExecutionError::InvalidPlan(prepared.data.output));
+        }
+        let input_value = prepared.data.input_values[0];
+        let borrowed = self.borrow_device_input_ref(&input, pool)?;
+        let resource_inputs = [(input_value, &borrowed)];
+        let view = prepared.view();
         self.validate_execution_sources_view(&view, &[], &resource_inputs, pool)?;
+
+        if let Some(PreparedConsumingAction::IdentityTransfer(value)) =
+            prepared.data.consuming_action.as_ref()
+            && *value == input_value
+            && prepared.data.output == input_value
+        {
+            validate_owned_scalar_profile::<T>(prepared.data.scalar_type)?;
+            input
+                .buffer()
+                .resource()
+                .validate_access_available()
+                .map_err(|_| RocmTensorExecutionError::InputResourceMismatch)?;
+            return Ok(input);
+        }
+        let Some(PreparedConsumingAction::TerminalRelu(reuse)) =
+            prepared.data.consuming_action.as_ref()
+        else {
+            return self.execute_fresh_owned_single_output(
+                prepared,
+                input_value,
+                &input,
+                pool,
+                memory,
+            );
+        };
+        let resource = input.buffer().resource();
+        let proof = reuse.proof;
+        let required_alignment = scalar_layout(T::TYPE)?.1;
+        let required_bytes = byte_len_for::<T>(input.shape())?;
+        let can_reuse = proof.input() == input_value
+            && proof.output() == prepared.data.output
+            && proof.scalar_type() == T::TYPE
+            && u64::try_from(required_bytes).ok() == Some(proof.bytes())
+            && alignment_satisfies(resource.alignment_bytes(), required_alignment)
+            && resource.access() == PcuMemoryAccess::ReadWrite
+            && resource.backing_ownership() == PcuMemoryBackingOwnership::Exclusive
+            && resource.validate_access_available().is_ok()
+            && usize::try_from(reuse.logical_count).ok() == Some(input.buffer().len())
+            && reuse.scalar_type.value_type() == reuse.value_type;
+        if !can_reuse {
+            return self.execute_fresh_owned_single_output(
+                prepared,
+                input_value,
+                &input,
+                pool,
+                memory,
+            );
+        }
+
+        let invocation_count =
+            NonZeroU32::new(reuse.logical_count).ok_or(RocmTensorExecutionError::SizeOverflow)?;
+        debug_assert_eq!(
+            reuse.invocation_shape,
+            PcuInvocationShape::invocations(invocation_count)
+        );
+        let cache_key =
+            TensorDispatchCacheKey::ConsumingRelu(reuse.scalar_type, reuse.logical_count);
+        self.ensure_dispatch_cached(cache_key, reuse.kernel, reuse.invocation_shape, false)?;
+        let binding = self
+            .session
+            .bind(
+                reuse.binding,
+                PcuBindingAccess::ReadWrite,
+                PcuBindingType::Value(reuse.value_type),
+                resource,
+            )
+            .map_err(RocmTensorExecutionError::Backend)?;
+        let mut completion = {
+            let cache = self.state().add_dispatches.borrow();
+            let executable = cache
+                .iter()
+                .find(|(key, _)| {
+                    *key == TensorDispatchCacheKey::ConsumingRelu(
+                        reuse.scalar_type,
+                        reuse.logical_count,
+                    )
+                })
+                .map(|(_, executable)| executable)
+                .ok_or_else(|| RocmTensorExecutionError::InvalidPlan(reuse.proof.output()))?;
+            executable
+                .submit(std::slice::from_ref(&binding))
+                .map_err(RocmTensorExecutionError::Backend)?
+        };
+        match completion
+            .wait()
+            .map_err(RocmTensorExecutionError::Completion)?
+        {
+            PcuCompletionOutcome::Succeeded => Ok(input),
+            PcuCompletionOutcome::Failed => Err(RocmTensorExecutionError::FailedCompletion),
+            PcuCompletionOutcome::Fault(fault) => {
+                Err(RocmTensorExecutionError::ExecutionFault(fault))
+            }
+        }
+    }
+
+    fn execute_fresh_owned_single_output<T, P>(
+        &self,
+        prepared: &RocmOwnedPreparedTensorGraph,
+        input_value: ValueId,
+        input: &PcuDeviceTensor<T, RocmMemoryResource>,
+        pool: PcuMemoryPoolId,
+        memory: &mut P,
+    ) -> Result<PcuDeviceTensor<T, RocmMemoryResource>, RocmTensorExecutionError>
+    where
+        T: fusion_pcu::PcuScalar,
+        P: PcuMemoryProvider<Resource = RocmMemoryResource>,
+    {
+        let borrowed = self.borrow_device_input_ref(input, pool)?;
+        let outputs = self.execute_owned_program_outputs_from_inputs(
+            prepared,
+            &[(input_value, &borrowed)],
+            pool,
+            memory,
+        )?;
+        outputs
+            .into_iter()
+            .next()
+            .map(|(_, tensor)| tensor)
+            .ok_or(RocmTensorExecutionError::InvalidPlan(prepared.data.output))
+    }
+
+    /// Executes an owned program from erased, validated-layout resource inputs.
+    ///
+    /// Each input carries its scalar type explicitly; the selected graph profile and every
+    /// input shape/type are checked before output allocation or device work begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input validation error, allocation/provider error, or a `ROCm` operation or
+    /// completion error. On failure no output tensor is returned.
+    pub fn execute_owned_program_outputs_from_inputs<'input, T, P>(
+        &'input self,
+        prepared: &RocmOwnedPreparedTensorGraph,
+        inputs: &[(ValueId, &RocmTensorInputRef<'input>)],
+        pool: PcuMemoryPoolId,
+        memory: &mut P,
+    ) -> Result<Vec<RocmTensorOwnedOutput<T>>, RocmTensorExecutionError>
+    where
+        T: fusion_pcu::PcuScalar,
+        P: PcuMemoryProvider<Resource = RocmMemoryResource>,
+        'session: 'input,
+    {
+        if !matches!(
+            T::TYPE,
+            fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
+        ) && !prepared.data.transport_only_inputs
+        {
+            return Err(RocmTensorExecutionError::UnsupportedScalarType(T::TYPE));
+        }
+        let view = prepared.view();
+        validate_owned_scalar_profile::<T>(prepared.data.scalar_type)?;
+        self.validate_execution_sources_view(&view, &[], inputs, pool)?;
 
         let mut outputs: Vec<(ValueId, RocmTensorInput<'session>)> =
             Vec::with_capacity(view.outputs.len());
         for &value in &view.outputs {
             let shape = view.graph.shape(value)?.to_vec();
-            let resource = allocate_tensor(memory, pool, &shape)?;
+            let resource = allocate_tensor_for::<T, P>(memory, pool, &shape)?;
             if resource.pool() != pool
                 || !resource.belongs_to_runtime(self.session.tensor_runtime())
-                || resource.device_buffer().len() < byte_len(&shape)?
+                || resource.device_buffer().len() < byte_len_for::<T>(&shape)?
+                || !alignment_satisfies(resource.alignment_bytes(), scalar_layout(T::TYPE)?.1)
                 || resource.access() != PcuMemoryAccess::ReadWrite
-                || resource_inputs
+                || inputs
                     .iter()
-                    .any(|(_, input)| input.resource.may_overlap(&resource))
+                    .any(|(_, input)| input.resource().may_overlap(&resource))
                 || outputs
                     .iter()
                     .any(|(_, output): &(ValueId, RocmTensorInput<'session>)| {
@@ -1840,6 +2190,7 @@ impl<'session> RocmTensorAssessor<'session> {
                     session: self.session,
                     shape,
                     resource,
+                    scalar_type: T::TYPE,
                     updateable: true,
                 },
             ));
@@ -1849,7 +2200,7 @@ impl<'session> RocmTensorAssessor<'session> {
         let mut result = self.execute_prepared_schedule(
             &view,
             &[],
-            &resource_inputs,
+            inputs,
             pool,
             memory,
             None,
@@ -1863,7 +2214,7 @@ impl<'session> RocmTensorAssessor<'session> {
         result
             .drain(..)
             .zip(prepared.data.outputs.iter().copied())
-            .map(|(output, value)| Ok((value, output.into_device_tensor()?)))
+            .map(|(output, value)| Ok((value, output.into_device_tensor::<T>()?)))
             .collect()
     }
 
@@ -1935,7 +2286,7 @@ impl<'session> RocmTensorAssessor<'session> {
         let mut outputs = self.execute_prepared_outputs_with_input_sources_and_scratch(
             prepared,
             inputs,
-            &[],
+            &[] as &[(ValueId, &RocmTensorInput<'_>)],
             pool,
             memory,
             None,
@@ -1970,7 +2321,7 @@ impl<'session> RocmTensorAssessor<'session> {
         let mut outputs = self.execute_prepared_outputs_with_input_sources_and_scratch(
             prepared,
             inputs,
-            &[],
+            &[] as &[(ValueId, &RocmTensorInput<'_>)],
             pool,
             memory,
             None,
@@ -1999,6 +2350,7 @@ impl<'session> RocmTensorAssessor<'session> {
     where
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
     {
+        require_f32_graph(&prepared.data)?;
         self.prepare_scratch_with_allocator(
             prepared,
             pool,
@@ -2029,6 +2381,7 @@ impl<'session> RocmTensorAssessor<'session> {
             Option<&Tensor>,
         ) -> Result<RocmMemoryResource, RocmTensorExecutionError>,
     {
+        require_f32_graph(&prepared.data)?;
         let mut resources =
             self.allocate_planned_scratch_resources(prepared, pool, memory, allocate)?;
         let max_mse_count = mse_scratch_element_count(prepared.graph, &prepared.nodes)?;
@@ -2042,12 +2395,24 @@ impl<'session> RocmTensorAssessor<'session> {
                 }
                 resources[index] = match node.op {
                     OpDescriptor::Constant(tensor) => {
+                        let tensor = tensor.as_typed::<f32>().map_err(|_| {
+                            RocmTensorExecutionError::Unsupported {
+                                value: node.value,
+                                reason: TensorUnsupportedReason::ElementType,
+                            }
+                        })?;
                         Some(allocate(memory, pool, node.shape, Some(tensor))?)
                     }
                     OpDescriptor::Uniform { value } => {
-                        let tensor = prepared
-                            .physical_layout(node.value)?
-                            .uniform_tensor(node.shape, value)?;
+                        let tensor = prepared.physical_layout(node.value)?.uniform_tensor(
+                            node.shape,
+                            value.as_typed::<f32>().map_err(|_| {
+                                RocmTensorExecutionError::Unsupported {
+                                    value: node.value,
+                                    reason: TensorUnsupportedReason::ElementType,
+                                }
+                            })?,
+                        )?;
                         Some(allocate(memory, pool, tensor.shape(), Some(&tensor))?)
                     }
                     OpDescriptor::Input => None,
@@ -2121,9 +2486,11 @@ impl<'session> RocmTensorAssessor<'session> {
                 || resource.size_bytes()
                     < u64::try_from(slot.capacity_bytes)
                         .map_err(|_| RocmTensorExecutionError::SizeOverflow)?
-                || resource.alignment_bytes()
-                    < u64::try_from(slot.alignment_bytes)
-                        .map_err(|_| RocmTensorExecutionError::SizeOverflow)?
+                || !alignment_satisfies(
+                    resource.alignment_bytes(),
+                    u64::try_from(slot.alignment_bytes)
+                        .map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
+                )
                 || resource.access() != PcuMemoryAccess::ReadWrite
                 || !resource.supports(PcuMemoryResourceCapability::ReusableStorage)
             {
@@ -2192,6 +2559,7 @@ impl<'session> RocmTensorAssessor<'session> {
             &[usize],
         ) -> Result<RocmMemoryResource, RocmTensorExecutionError>,
     {
+        require_f32_graph(&prepared.data)?;
         let mut outputs = Vec::with_capacity(prepared.outputs.len());
         let mut requirements = Vec::with_capacity(prepared.outputs.len());
         for &value in &prepared.outputs {
@@ -2200,6 +2568,7 @@ impl<'session> RocmTensorAssessor<'session> {
             if resource.pool() != pool
                 || !resource.belongs_to_runtime(self.session.tensor_runtime())
                 || resource.device_buffer().len() < byte_len(&shape)?
+                || !alignment_satisfies(resource.alignment_bytes(), 4)
                 || !matches!(
                     resource.access(),
                     PcuMemoryAccess::WriteOnly | PcuMemoryAccess::ReadWrite
@@ -2217,6 +2586,7 @@ impl<'session> RocmTensorAssessor<'session> {
                 session: self.session,
                 shape,
                 resource,
+                scalar_type: fusion_pcu::PcuScalarType::F32,
                 updateable: true,
             });
         }
@@ -2616,7 +2986,7 @@ impl<'session> RocmTensorAssessor<'session> {
         let result = self.execute_prepared_outputs_with_input_sources_and_scratch(
             prepared,
             inputs,
-            &[],
+            &[] as &[(ValueId, &RocmTensorInput<'_>)],
             scratch.pool,
             memory,
             Some(&mut *scratch),
@@ -2656,7 +3026,7 @@ impl<'session> RocmTensorAssessor<'session> {
         let result = self.execute_prepared_outputs_with_input_sources_and_scratch(
             prepared,
             inputs,
-            &[],
+            &[] as &[(ValueId, &RocmTensorInput<'_>)],
             scratch.pool,
             memory,
             Some(&mut *scratch),
@@ -2877,6 +3247,7 @@ impl<'session> RocmTensorAssessor<'session> {
             session: self.session,
             shape: tensor.shape().to_vec(),
             resource,
+            scalar_type: fusion_pcu::PcuScalarType::F32,
             updateable: true,
         })
     }
@@ -2928,24 +3299,88 @@ impl<'session> RocmTensorAssessor<'session> {
     ///     drop(input);
     /// }
     /// ```
-    pub fn borrow_device_input<'input>(
+    pub fn borrow_device_input<'input, T: fusion_pcu::PcuScalar>(
         &'input self,
-        tensor: &'input PcuDeviceTensor<f32, RocmMemoryResource>,
+        tensor: &'input PcuDeviceTensor<T, RocmMemoryResource>,
         pool: PcuMemoryPoolId,
     ) -> Result<RocmTensorInput<'input>, RocmTensorExecutionError>
     where
         'session: 'input,
     {
-        let resource = tensor.buffer().resource();
+        self.borrow_resource_input(tensor.buffer().resource(), tensor.shape(), T::TYPE, pool)
+    }
+
+    /// Validate and borrow a typed device tensor without allocating per-call input metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session, pool, extent, alignment, or access mismatch.
+    pub fn borrow_device_input_ref<'input, T: fusion_pcu::PcuScalar>(
+        &'input self,
+        tensor: &'input PcuDeviceTensor<T, RocmMemoryResource>,
+        pool: PcuMemoryPoolId,
+    ) -> Result<RocmTensorInputRef<'input>, RocmTensorExecutionError>
+    where
+        'session: 'input,
+    {
+        self.borrow_resource_input_ref(tensor.buffer().resource(), tensor.shape(), T::TYPE, pool)
+    }
+
+    /// Borrow an erased resource as a typed graph input after validating its declared scalar
+    /// layout against the selected session and physical allocation metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session, pool, extent, alignment, or access mismatch.
+    pub fn borrow_resource_input<'input>(
+        &'input self,
+        resource: &'input RocmMemoryResource,
+        shape: &'input [usize],
+        scalar_type: fusion_pcu::PcuScalarType,
+        pool: PcuMemoryPoolId,
+    ) -> Result<RocmTensorInput<'input>, RocmTensorExecutionError>
+    where
+        'session: 'input,
+    {
+        let borrowed = self.borrow_resource_input_ref(resource, shape, scalar_type, pool)?;
+        Ok(RocmTensorInput {
+            session: borrowed.session,
+            shape: borrowed.shape.to_vec(),
+            resource: borrowed.resource.clone_read_only_for_tensor_input(),
+            scalar_type: borrowed.scalar_type,
+            updateable: false,
+        })
+    }
+
+    /// Validate and borrow an erased device resource without allocating descriptor storage.
+    ///
+    /// The caller retains ownership of both the resource and shape for the returned lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session, pool, extent, alignment, or access mismatch.
+    pub fn borrow_resource_input_ref<'input>(
+        &'input self,
+        resource: &'input RocmMemoryResource,
+        shape: &'input [usize],
+        scalar_type: fusion_pcu::PcuScalarType,
+        pool: PcuMemoryPoolId,
+    ) -> Result<RocmTensorInputRef<'input>, RocmTensorExecutionError>
+    where
+        'session: 'input,
+    {
+        let (element_size, alignment) = scalar_layout(scalar_type)?;
         if !resource.belongs_to_runtime(self.session.tensor_runtime()) {
             return Err(RocmTensorExecutionError::InputResourceMismatch);
         }
         if resource.pool() != pool {
             return Err(RocmTensorExecutionError::InputPoolMismatch);
         }
-        let required_bytes = byte_len(tensor.shape())?;
+        let required_bytes = byte_len_for_size(shape, element_size)?;
         if u64::try_from(required_bytes).map_err(|_| RocmTensorExecutionError::SizeOverflow)?
             > resource.size_bytes()
+            || resource.device_buffer().len() < required_bytes
+            || !alignment_satisfies(resource.alignment_bytes(), alignment)
         {
             return Err(RocmTensorExecutionError::InputResourceMismatch);
         }
@@ -2955,12 +3390,11 @@ impl<'session> RocmTensorAssessor<'session> {
         ) {
             return Err(RocmTensorExecutionError::InputAccessMismatch);
         }
-
-        Ok(RocmTensorInput {
+        Ok(RocmTensorInputRef {
             session: self.session,
-            shape: tensor.shape().to_vec(),
-            resource: resource.clone_read_only_for_tensor_input(),
-            updateable: false,
+            shape,
+            resource,
+            scalar_type,
         })
     }
 
@@ -2980,6 +3414,11 @@ impl<'session> RocmTensorAssessor<'session> {
     where
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
     {
+        if input.scalar_type != fusion_pcu::PcuScalarType::F32 {
+            return Err(RocmTensorExecutionError::UnsupportedScalarType(
+                input.scalar_type,
+            ));
+        }
         input.validate_session(self.session)?;
         if !input.updateable {
             return Err(RocmTensorExecutionError::BorrowedInputUpdate);
@@ -3074,15 +3513,16 @@ impl<'session> RocmTensorAssessor<'session> {
         Ok(outputs.remove(0))
     }
 
-    fn validate_execution_sources(
+    fn validate_execution_sources<I: RocmTensorInputDescriptor>(
         &self,
         prepared: &RocmPreparedTensorGraph<'_>,
         host_inputs: &[(ValueId, Tensor)],
-        resource_inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        resource_inputs: &[(ValueId, &I)],
         pool: PcuMemoryPoolId,
         scratch: Option<&RocmTensorScratch<'_, '_, 'session>>,
         output_bank: Option<&RocmTensorOutputBank<'_, '_, 'session>>,
     ) -> Result<(), RocmTensorExecutionError> {
+        require_f32_graph(&prepared.data)?;
         self.validate_execution_sources_view(&prepared.view(), host_inputs, resource_inputs, pool)?;
         if let Some(scratch) = scratch
             && (!std::ptr::eq(scratch.prepared, prepared)
@@ -3099,24 +3539,15 @@ impl<'session> RocmTensorAssessor<'session> {
         Ok(())
     }
 
-    fn validate_execution_sources_view(
+    fn validate_execution_sources_view<I: RocmTensorInputDescriptor>(
         &self,
         prepared: &RocmPreparedGraphView<'_, '_>,
         host_inputs: &[(ValueId, Tensor)],
-        resource_inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        resource_inputs: &[(ValueId, &I)],
         pool: PcuMemoryPoolId,
     ) -> Result<(), RocmTensorExecutionError> {
         validate_graph_input_sources(prepared, host_inputs, resource_inputs, self.session, pool)?;
-        let requires_blas = (0..prepared.node_values.len()).try_fold(false, |found, index| {
-            Ok::<_, RocmTensorExecutionError>(
-                found
-                    || matches!(
-                        prepared.node(index)?.op,
-                        OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. }
-                    ),
-            )
-        })?;
-        if requires_blas && !self.rocblas().map_err(RocmTensorError::from)?.is_usable() {
+        if prepared.requires_blas && !self.rocblas().map_err(RocmTensorError::from)?.is_usable() {
             return Err(RocmTensorExecutionError::Unsupported {
                 value: prepared.output,
                 reason: TensorUnsupportedReason::Other(
@@ -3157,13 +3588,9 @@ impl<'session> RocmTensorAssessor<'session> {
         {
             return Err(RocmTensorExecutionError::OutputResourceMismatch);
         }
-        let requires_blas = prepared.nodes.iter().any(|node| {
-            matches!(
-                node.op,
-                OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. }
-            )
-        });
-        if requires_blas && !self.rocblas().map_err(RocmTensorError::from)?.is_usable() {
+        if prepared.data.requires_blas
+            && !self.rocblas().map_err(RocmTensorError::from)?.is_usable()
+        {
             return Err(RocmTensorExecutionError::Unsupported {
                 value: prepared.output,
                 reason: TensorUnsupportedReason::Other(
@@ -3181,11 +3608,11 @@ impl<'session> RocmTensorAssessor<'session> {
         clippy::too_many_arguments,
         clippy::too_many_lines
     )]
-    fn execute_prepared_outputs_with_input_sources_and_scratch<P>(
+    fn execute_prepared_outputs_with_input_sources_and_scratch<I: RocmTensorInputDescriptor, P>(
         &self,
         prepared: &RocmPreparedTensorGraph<'_>,
         host_inputs: &[(ValueId, Tensor)],
-        resource_inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        resource_inputs: &[(ValueId, &I)],
         pool: PcuMemoryPoolId,
         memory: &mut P,
         scratch: Option<&mut RocmTensorScratch<'_, '_, 'session>>,
@@ -3215,11 +3642,14 @@ impl<'session> RocmTensorAssessor<'session> {
         clippy::too_many_arguments,
         clippy::too_many_lines
     )]
-    fn execute_prepared_outputs_with_input_sources_and_scratch_proven<P>(
+    fn execute_prepared_outputs_with_input_sources_and_scratch_proven<
+        I: RocmTensorInputDescriptor,
+        P,
+    >(
         &self,
         prepared: &RocmPreparedTensorGraph<'_>,
         host_inputs: &[(ValueId, Tensor)],
-        resource_inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        resource_inputs: &[(ValueId, &I)],
         pool: PcuMemoryPoolId,
         memory: &mut P,
         scratch: Option<&mut RocmTensorScratch<'_, '_, 'session>>,
@@ -3272,11 +3702,11 @@ impl<'session> RocmTensorAssessor<'session> {
         clippy::too_many_arguments,
         clippy::too_many_lines
     )]
-    fn execute_prepared_schedule<P>(
+    fn execute_prepared_schedule<I: RocmTensorInputDescriptor, P>(
         &self,
         prepared: &RocmPreparedGraphView<'_, '_>,
         host_inputs: &[(ValueId, Tensor)],
-        resource_inputs: &[(ValueId, &RocmTensorInput<'_>)],
+        resource_inputs: &[(ValueId, &I)],
         pool: PcuMemoryPoolId,
         memory: &mut P,
         mut scratch: Option<&mut RocmTensorScratch<'_, '_, 'session>>,
@@ -3317,11 +3747,12 @@ impl<'session> RocmTensorAssessor<'session> {
                         if let Some((_, input)) =
                             resource_inputs.iter().find(|(id, _)| *id == node.value)
                         {
-                            let bytes = byte_len(&output.shape)?;
+                            let (element_size, _) = scalar_layout(output.scalar_type)?;
+                            let bytes = byte_len_for_size(&output.shape, element_size)?;
                             let binding = proof.map(|_| destination.clone_for_tensor_input());
                             let copied = memory.copy_resource(
                                 &mut destination,
-                                &input.resource,
+                                input.resource(),
                                 bytes as u64,
                             );
                             if binding
@@ -3353,7 +3784,7 @@ impl<'session> RocmTensorAssessor<'session> {
                     if let Some((_, input)) =
                         resource_inputs.iter().find(|(id, _)| *id == node.value)
                     {
-                        resources[index] = Some(input.resource_ref());
+                        resources[index] = Some(input.resource().clone_for_tensor_input());
                         timings.finish(timing_mark, &node);
                         continue;
                     }
@@ -3367,6 +3798,12 @@ impl<'session> RocmTensorAssessor<'session> {
                     resources[index] = Some(upload_tensor(memory, pool, tensor)?);
                 }
                 OpDescriptor::Constant(tensor) => {
+                    let tensor = tensor.as_typed::<f32>().map_err(|_| {
+                        RocmTensorExecutionError::Unsupported {
+                            value: node.value,
+                            reason: TensorUnsupportedReason::ElementType,
+                        }
+                    })?;
                     resources[index] = Some(
                         if let Some(output) = output_bank
                             .and_then(|bank| bank.output(node.value))
@@ -3404,9 +3841,15 @@ impl<'session> RocmTensorAssessor<'session> {
                 OpDescriptor::Uniform { value } => {
                     // Only elementwise consumers use scalar binding indices; every other route
                     // receives a dense fallback allocation during scratch preparation.
-                    let tensor = prepared
-                        .physical_layout(node.value)?
-                        .uniform_tensor(node.shape, value)?;
+                    let tensor = prepared.physical_layout(node.value)?.uniform_tensor(
+                        node.shape,
+                        value.as_typed::<f32>().map_err(|_| {
+                            RocmTensorExecutionError::Unsupported {
+                                value: node.value,
+                                reason: TensorUnsupportedReason::ElementType,
+                            }
+                        })?,
+                    )?;
                     resources[index] = Some(
                         if let Some(output) = output_bank
                             .and_then(|bank| bank.output(node.value))
@@ -3457,6 +3900,7 @@ impl<'session> RocmTensorAssessor<'session> {
                         memory,
                         pool,
                         node.shape,
+                        node.scalar_type,
                         index,
                         node.value,
                         &mut scratch,
@@ -3478,10 +3922,11 @@ impl<'session> RocmTensorAssessor<'session> {
                             operands.right_shape,
                             transpose_left,
                             transpose_right,
+                            node.scalar_type,
                             None,
                             Some(batch),
                         )?;
-                    } else {
+                    } else if node.scalar_type == fusion_pcu::PcuScalarType::F32 {
                         sgemm_host = timings.with_sgemm_timing(|sgemm_timing| {
                             self.execute_matmul_row_major_flags(
                                 left_resource,
@@ -3491,11 +3936,25 @@ impl<'session> RocmTensorAssessor<'session> {
                                 operands.right_shape,
                                 transpose_left,
                                 transpose_right,
+                                node.scalar_type,
                                 sgemm_timing,
                                 None,
                             )
                             .map_err(Into::into)
                         })?;
+                    } else {
+                        self.execute_matmul_row_major_flags(
+                            left_resource,
+                            right_resource,
+                            &result,
+                            operands.left_shape,
+                            operands.right_shape,
+                            transpose_left,
+                            transpose_right,
+                            node.scalar_type,
+                            None,
+                            None,
+                        )?;
                     }
                     resources[index] = Some(result);
                     release_after_read(&mut resources, &mut remaining_uses, operands.left_index)?;
@@ -3509,6 +3968,7 @@ impl<'session> RocmTensorAssessor<'session> {
                             memory,
                             pool,
                             node.shape,
+                            node.scalar_type,
                             index,
                             node.value,
                             &mut scratch,
@@ -3555,6 +4015,7 @@ impl<'session> RocmTensorAssessor<'session> {
                             memory,
                             pool,
                             node.shape,
+                            node.scalar_type,
                             index,
                             node.value,
                             &mut scratch,
@@ -3593,30 +4054,17 @@ impl<'session> RocmTensorAssessor<'session> {
                             &mut remaining_uses,
                         )?;
                     } else {
-                        let kind = match node.op {
-                            OpDescriptor::Add { .. } => TensorDispatchKind::Add,
-                            OpDescriptor::Sub { .. } => TensorDispatchKind::Sub,
-                            OpDescriptor::Mul { .. } => TensorDispatchKind::Mul,
-                            _ => unreachable!("binary branch selects only Add, Sub, or Mul"),
-                        };
                         let left_index = plan
                             .index_of(left)
                             .ok_or(RocmTensorExecutionError::InvalidPlan(left))?;
                         let right_index = plan
                             .index_of(right)
                             .ok_or(RocmTensorExecutionError::InvalidPlan(right))?;
-                        let left_is_scalar =
-                            matches!(plan.node(left_index)?.op, OpDescriptor::Uniform { .. })
-                                && plan.physical_layout(left)?.representation
-                                    == RocmPhysicalRepresentation::UniformScalar;
-                        let right_is_scalar =
-                            matches!(plan.node(right_index)?.op, OpDescriptor::Uniform { .. })
-                                && plan.physical_layout(right)?.representation
-                                    == RocmPhysicalRepresentation::UniformScalar;
                         let output = execution_resource(
                             memory,
                             pool,
                             node.shape,
+                            node.scalar_type,
                             index,
                             node.value,
                             &mut scratch,
@@ -3625,9 +4073,8 @@ impl<'session> RocmTensorAssessor<'session> {
                         )?;
                         let mut elementwise_timing = timings.begin_elementwise();
                         self.execute_elementwise(
-                            kind,
+                            plan.fixed_dispatch(index)?,
                             ElementwiseOperands {
-                                shape: graph.shape(node.value)?,
                                 left: resources[left_index]
                                     .as_ref()
                                     .ok_or(RocmTensorExecutionError::MissingResource(left))?,
@@ -3637,8 +4084,6 @@ impl<'session> RocmTensorAssessor<'session> {
                                         .ok_or(RocmTensorExecutionError::MissingResource(right))?,
                                 ),
                                 output: &output,
-                                scalar_mask: u8::from(left_is_scalar)
-                                    | (u8::from(right_is_scalar) << 1),
                             },
                             batch.as_deref_mut(),
                             &mut elementwise_timing,
@@ -3654,6 +4099,7 @@ impl<'session> RocmTensorAssessor<'session> {
                         memory,
                         pool,
                         node.shape,
+                        node.scalar_type,
                         index,
                         node.value,
                         &mut scratch,
@@ -3699,14 +4145,9 @@ impl<'session> RocmTensorAssessor<'session> {
                         let right_index = plan
                             .index_of(right)
                             .ok_or(RocmTensorExecutionError::InvalidPlan(right))?;
-                        let left_is_scalar = plan.physical_layout(left)?.representation
-                            == RocmPhysicalRepresentation::UniformScalar;
-                        let right_is_scalar = plan.physical_layout(right)?.representation
-                            == RocmPhysicalRepresentation::UniformScalar;
                         self.execute_elementwise(
-                            TensorDispatchKind::AddRelu,
+                            plan.fixed_dispatch(index)?,
                             ElementwiseOperands {
-                                shape: node.shape,
                                 left: resources[left_index]
                                     .as_ref()
                                     .ok_or(RocmTensorExecutionError::MissingResource(left))?,
@@ -3716,8 +4157,6 @@ impl<'session> RocmTensorAssessor<'session> {
                                         .ok_or(RocmTensorExecutionError::MissingResource(right))?,
                                 ),
                                 output: &output,
-                                scalar_mask: u8::from(left_is_scalar)
-                                    | (u8::from(right_is_scalar) << 1),
                             },
                             batch.as_deref_mut(),
                             &mut NoopElementwiseTiming,
@@ -3730,7 +4169,7 @@ impl<'session> RocmTensorAssessor<'session> {
                             .index_of(input)
                             .ok_or(RocmTensorExecutionError::InvalidPlan(input))?;
                         self.execute_relu(
-                            node.shape,
+                            plan.fixed_dispatch(index)?,
                             resources[input_index]
                                 .as_ref()
                                 .ok_or(RocmTensorExecutionError::MissingResource(input))?,
@@ -3752,6 +4191,7 @@ impl<'session> RocmTensorAssessor<'session> {
                         memory,
                         pool,
                         node.shape,
+                        node.scalar_type,
                         index,
                         node.value,
                         &mut scratch,
@@ -3788,6 +4228,7 @@ impl<'session> RocmTensorAssessor<'session> {
                         memory,
                         pool,
                         node.shape,
+                        node.scalar_type,
                         index,
                         node.value,
                         &mut scratch,
@@ -3851,9 +4292,8 @@ impl<'session> RocmTensorAssessor<'session> {
                         allocate_tensor(memory, pool, shape)?
                     };
                     self.execute_elementwise(
-                        TensorDispatchKind::SquaredDifference,
+                        plan.fixed_dispatch(index)?,
                         ElementwiseOperands {
-                            shape,
                             left: resources[prediction_index]
                                 .as_ref()
                                 .ok_or(RocmTensorExecutionError::MissingResource(prediction))?,
@@ -3863,7 +4303,6 @@ impl<'session> RocmTensorAssessor<'session> {
                                     .ok_or(RocmTensorExecutionError::MissingResource(target))?,
                             ),
                             output: &squared,
-                            scalar_mask: 0,
                         },
                         batch.as_deref_mut(),
                         &mut NoopElementwiseTiming,
@@ -3875,6 +4314,7 @@ impl<'session> RocmTensorAssessor<'session> {
                         memory,
                         pool,
                         node.shape,
+                        node.scalar_type,
                         index,
                         node.value,
                         &mut scratch,
@@ -3966,6 +4406,7 @@ impl<'session> RocmTensorAssessor<'session> {
                         session: self.session,
                         shape: graph.shape(output)?.to_vec(),
                         resource,
+                        scalar_type: graph.node(output)?.scalar_type,
                         updateable: true,
                     })
                 })
@@ -3974,19 +4415,17 @@ impl<'session> RocmTensorAssessor<'session> {
     }
     fn execute_relu(
         &self,
-        shape: &[usize],
+        dispatch: &PreparedFixedTensorDispatch,
         input: &RocmMemoryResource,
         output: &RocmMemoryResource,
         batch: Option<&mut HipCompletionBatch>,
     ) -> Result<(), RocmTensorExecutionError> {
         self.execute_elementwise(
-            TensorDispatchKind::Relu,
+            dispatch,
             ElementwiseOperands {
-                shape,
                 left: input,
                 right: None,
                 output,
-                scalar_mask: 0,
             },
             batch,
             &mut NoopElementwiseTiming,
@@ -4329,48 +4768,39 @@ impl<'session> RocmTensorAssessor<'session> {
     #[allow(clippy::too_many_lines)] // Keeps the cache, owned bindings, and completion lifetime explicit.
     fn execute_elementwise<T: ElementwiseTimingSink>(
         &self,
-        kind: TensorDispatchKind,
+        dispatch: &PreparedFixedTensorDispatch,
         operands: ElementwiseOperands<'_>,
         batch: Option<&mut HipCompletionBatch>,
         timing: &mut T,
     ) -> Result<(), RocmTensorExecutionError> {
         let ElementwiseOperands {
-            shape,
             left,
             right,
             output,
-            scalar_mask,
         } = operands;
-        let count = shape
-            .iter()
-            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
-            .ok_or(RocmTensorExecutionError::SizeOverflow)?;
-        let invocations = u32::try_from(count)
-            .ok()
-            .and_then(NonZeroU32::new)
-            .ok_or(RocmTensorExecutionError::SizeOverflow)?;
-        let logical_count = invocations.get();
-        let cache_key = TensorDispatchCacheKey::Fixed(kind, logical_count, scalar_mask);
+        debug_assert_eq!(
+            dispatch.value_type.scalar_type(),
+            match dispatch.scalar_type {
+                TensorPointwiseScalarType::F32 => fusion_pcu::PcuScalarType::F32,
+                TensorPointwiseScalarType::F64 => fusion_pcu::PcuScalarType::F64,
+            }
+        );
+        if right.is_some() != dispatch.right_binding.is_some() {
+            return Err(RocmTensorExecutionError::InvalidPlan(dispatch.value));
+        }
         let setup_mark = timing.begin(ElementwisePhase::CacheAndBind);
         self.ensure_dispatch_cached(
-            cache_key.clone(),
-            kind.kernel(logical_count, scalar_mask),
-            PcuInvocationShape::invocations(invocations),
+            dispatch.cache_key.clone(),
+            dispatch.kernel,
+            dispatch.invocation_shape,
             false,
         )?;
         let left_binding = self
             .session
             .bind(
-                match kind {
-                    TensorDispatchKind::Add
-                    | TensorDispatchKind::AddRelu
-                    | TensorDispatchKind::Sub
-                    | TensorDispatchKind::Mul => ADD_LEFT_REF,
-                    TensorDispatchKind::Relu => RELU_INPUT_REF,
-                    TensorDispatchKind::SquaredDifference => MSE_LEFT_REF,
-                },
+                dispatch.left_binding,
                 PcuBindingAccess::ReadOnly,
-                PcuBindingType::Value(PcuValueType::f32()),
+                PcuBindingType::Value(dispatch.value_type),
                 left,
             )
             .map_err(RocmTensorExecutionError::Backend)?;
@@ -4380,18 +4810,11 @@ impl<'session> RocmTensorAssessor<'session> {
             let right_binding = self
                 .session
                 .bind(
-                    match kind {
-                        TensorDispatchKind::Add
-                        | TensorDispatchKind::AddRelu
-                        | TensorDispatchKind::Sub
-                        | TensorDispatchKind::Mul => ADD_RIGHT_REF,
-                        TensorDispatchKind::Relu => {
-                            return Err(RocmTensorExecutionError::SizeOverflow);
-                        }
-                        TensorDispatchKind::SquaredDifference => MSE_RIGHT_REF,
-                    },
+                    dispatch
+                        .right_binding
+                        .ok_or(RocmTensorExecutionError::SizeOverflow)?,
                     PcuBindingAccess::ReadOnly,
-                    PcuBindingType::Value(PcuValueType::f32()),
+                    PcuBindingType::Value(dispatch.value_type),
                     right,
                 )
                 .map_err(RocmTensorExecutionError::Backend)?;
@@ -4400,16 +4823,9 @@ impl<'session> RocmTensorAssessor<'session> {
         let output_binding = self
             .session
             .bind(
-                match kind {
-                    TensorDispatchKind::Add
-                    | TensorDispatchKind::AddRelu
-                    | TensorDispatchKind::Sub
-                    | TensorDispatchKind::Mul => ADD_OUTPUT_REF,
-                    TensorDispatchKind::Relu => RELU_OUTPUT_REF,
-                    TensorDispatchKind::SquaredDifference => MSE_OUTPUT_REF,
-                },
+                dispatch.output_binding,
                 PcuBindingAccess::WriteOnly,
-                PcuBindingType::Value(PcuValueType::f32()),
+                PcuBindingType::Value(dispatch.value_type),
                 output,
             )
             .map_err(RocmTensorExecutionError::Backend)?;
@@ -4420,7 +4836,7 @@ impl<'session> RocmTensorAssessor<'session> {
             let cache = self.state().add_dispatches.borrow();
             let prepared = cache
                 .iter()
-                .find(|(key, _)| *key == cache_key)
+                .find(|(key, _)| *key == dispatch.cache_key)
                 .map(|(_, prepared)| prepared)
                 .ok_or(RocmTensorExecutionError::SizeOverflow)?;
             if let Some(batch) = batch {
@@ -4473,6 +4889,7 @@ impl<'session> RocmTensorAssessor<'session> {
             [inner, columns],
             false,
             false,
+            fusion_pcu::PcuScalarType::F32,
             None,
             None,
         )
@@ -4490,6 +4907,7 @@ impl<'session> RocmTensorAssessor<'session> {
         b_shape: [usize; 2],
         transpose_a: bool,
         transpose_b: bool,
+        scalar_type: fusion_pcu::PcuScalarType,
         sgemm_timing: Option<&mut RocblasSgemmHostTiming>,
         batch: Option<&mut HipCompletionBatch>,
     ) -> Result<(), RocmTensorError> {
@@ -4503,13 +4921,17 @@ impl<'session> RocmTensorAssessor<'session> {
         if rows == 0 || inner == 0 || columns == 0 {
             return Err(RocmTensorError::InvalidShape);
         }
+        let (element_size, _) =
+            scalar_layout(scalar_type).map_err(|_| RocmTensorError::InvalidShape)?;
         let a_bytes = a_shape[0]
             .checked_mul(a_shape[1])
-            .and_then(|n| n.checked_mul(4));
+            .and_then(|n| n.checked_mul(element_size));
         let b_bytes = b_shape[0]
             .checked_mul(b_shape[1])
-            .and_then(|n| n.checked_mul(4));
-        let c_bytes = rows.checked_mul(columns).and_then(|n| n.checked_mul(4));
+            .and_then(|n| n.checked_mul(element_size));
+        let c_bytes = rows
+            .checked_mul(columns)
+            .and_then(|n| n.checked_mul(element_size));
         if a_bytes.is_none() || b_bytes.is_none() || c_bytes.is_none() {
             return Err(RocmTensorError::DimensionOverflow);
         }
@@ -4542,21 +4964,39 @@ impl<'session> RocmTensorAssessor<'session> {
             m,
         );
         let rocblas = self.rocblas()?;
-        if let Some(batch) = batch {
-            rocblas.sgemm_into_batch(
-                batch, args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8,
-                args.9, args.10, args.11, args.12,
-            )?;
-        } else if let Some(timing) = sgemm_timing {
-            rocblas.sgemm_profiled(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, timing,
-            )?;
-        } else {
-            rocblas.sgemm(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12,
-            )?;
+        match scalar_type {
+            fusion_pcu::PcuScalarType::F32 => {
+                if let Some(batch) = batch {
+                    rocblas.sgemm_into_batch(
+                        batch, args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                        args.8, args.9, args.10, args.11, args.12,
+                    )?;
+                } else if let Some(timing) = sgemm_timing {
+                    rocblas.sgemm_profiled(
+                        args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8,
+                        args.9, args.10, args.11, args.12, timing,
+                    )?;
+                } else {
+                    rocblas.sgemm(
+                        args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8,
+                        args.9, args.10, args.11, args.12,
+                    )?;
+                }
+            }
+            fusion_pcu::PcuScalarType::F64 => {
+                if let Some(batch) = batch {
+                    rocblas.dgemm_into_batch(
+                        batch, args.0, args.1, args.2, args.3, args.4, 1.0, args.6, args.7, args.8,
+                        args.9, 0.0, args.11, args.12,
+                    )?;
+                } else {
+                    rocblas.dgemm(
+                        args.0, args.1, args.2, args.3, args.4, 1.0, args.6, args.7, args.8,
+                        args.9, 0.0, args.11, args.12,
+                    )?;
+                }
+            }
+            _ => return Err(RocmTensorError::InvalidShape),
         }
         Ok(())
     }
@@ -4612,6 +5052,11 @@ pub struct RocmPreparedTensorGraph<'graph> {
 /// Lifetime-free backend facts shared by borrowed and graph-owning prepared schedules.
 #[doc(hidden)]
 pub struct RocmPreparedGraphData {
+    scalar_type: Option<fusion_pcu::PcuScalarType>,
+    requires_blas: bool,
+    transport_only_inputs: bool,
+    consuming_action: Option<PreparedConsumingAction>,
+    fixed_dispatches: Vec<Option<PreparedFixedTensorDispatch>>,
     node_values: Vec<ValueId>,
     output: ValueId,
     outputs: Vec<ValueId>,
@@ -4626,6 +5071,52 @@ pub struct RocmPreparedGraphData {
     physical_layouts: HashMap<ValueId, RocmPhysicalLayout>,
     rewrites: Vec<TensorSgdRewriteCandidate>,
     input_values: Vec<ValueId>,
+}
+
+fn homogeneous_scalar_type(nodes: &[NodeDescriptor<'_>]) -> Option<fusion_pcu::PcuScalarType> {
+    let first = nodes.first()?.scalar_type;
+    nodes
+        .iter()
+        .all(|node| node.scalar_type == first)
+        .then_some(first)
+}
+
+fn nodes_require_blas(nodes: &[NodeDescriptor<'_>]) -> bool {
+    nodes.iter().any(|node| {
+        matches!(
+            node.op,
+            OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. }
+        )
+    })
+}
+
+fn require_f32_graph(data: &RocmPreparedGraphData) -> Result<(), RocmTensorExecutionError> {
+    if data.scalar_type != Some(fusion_pcu::PcuScalarType::F32) {
+        return Err(RocmTensorExecutionError::UnsupportedScalarType(
+            data.scalar_type.unwrap_or(fusion_pcu::PcuScalarType::F64),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_owned_scalar_profile<T: fusion_pcu::PcuScalar>(
+    profile: Option<fusion_pcu::PcuScalarType>,
+) -> Result<(), RocmTensorExecutionError> {
+    match profile {
+        Some(actual) if actual == T::TYPE => Ok(()),
+        Some(actual) => Err(RocmTensorExecutionError::UnsupportedScalarType(actual)),
+        None => Err(RocmTensorExecutionError::UnsupportedScalarType(T::TYPE)),
+    }
+}
+
+fn validate_tensor_scalar_tag<T: fusion_pcu::PcuScalar>(
+    scalar_type: fusion_pcu::PcuScalarType,
+) -> Result<(), RocmTensorExecutionError> {
+    if scalar_type == T::TYPE {
+        Ok(())
+    } else {
+        Err(RocmTensorExecutionError::UnsupportedScalarType(scalar_type))
+    }
 }
 
 /// Owning prepared tensor schedule. The selected graph and all backend indexes live together;
@@ -4691,6 +5182,25 @@ impl RocmPreparedGraphView<'_, '_> {
             .get(&value)
             .copied()
             .ok_or(RocmTensorExecutionError::InvalidPlan(value))
+    }
+
+    fn fixed_dispatch(
+        &self,
+        index: usize,
+    ) -> Result<&PreparedFixedTensorDispatch, RocmTensorExecutionError> {
+        self.data
+            .fixed_dispatches
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                let value = self
+                    .data
+                    .node_values
+                    .get(index)
+                    .copied()
+                    .unwrap_or(self.data.output);
+                RocmTensorExecutionError::InvalidPlan(value)
+            })
     }
 }
 
@@ -5502,12 +6012,12 @@ fn output_position(outputs: &[ValueId], value: ValueId) -> Option<usize> {
     outputs.iter().position(|&output| output == value)
 }
 
-fn validate_output_bank(
+fn validate_output_bank<I: RocmTensorInputDescriptor>(
     bank: &RocmTensorOutputBank<'_, '_, '_>,
     prepared: &RocmPreparedTensorGraph<'_>,
     session: &RocmOwnedDispatchBackend,
     pool: PcuMemoryPoolId,
-    inputs: &[(ValueId, &RocmTensorInput<'_>)],
+    inputs: &[(ValueId, &I)],
     scratch: Option<&RocmTensorScratch<'_, '_, '_>>,
 ) -> Result<(), RocmTensorExecutionError> {
     if bank.poisoned
@@ -5534,7 +6044,7 @@ fn validate_output_bank(
         }
         if inputs
             .iter()
-            .any(|(_, input)| input.resource.may_overlap(&output.resource))
+            .any(|(_, input)| input.resource().may_overlap(&output.resource))
             || scratch.is_some_and(|scratch| {
                 scratch
                     .resources
@@ -5557,16 +6067,16 @@ fn validate_output_bank(
     Ok(())
 }
 
-fn validate_prepared_storage_constraints(
+fn validate_prepared_storage_constraints<I: RocmTensorInputDescriptor>(
     prepared: &RocmPreparedTensorGraph<'_>,
-    inputs: &[(ValueId, &RocmTensorInput<'_>)],
+    inputs: &[(ValueId, &I)],
     scratch: Option<&RocmTensorScratch<'_, '_, '_>>,
     bank: Option<&RocmTensorOutputBank<'_, '_, '_>>,
 ) -> Result<(), RocmTensorExecutionError> {
     if let Some(scratch) = scratch
         && let Some(squared) = scratch.mse_squared.as_ref()
     {
-        let input_resources = inputs.iter().map(|(_, input)| &input.resource);
+        let input_resources = inputs.iter().map(|(_, input)| input.resource());
         let prepared_resources = scratch.resources.iter().flatten();
         if resource_may_overlap_any(squared, input_resources.chain(prepared_resources)) {
             return Err(RocmTensorExecutionError::ScratchMismatch);
@@ -5584,7 +6094,7 @@ fn validate_prepared_storage_constraints(
                 inputs
                     .iter()
                     .find(|(id, _)| *id == value)
-                    .map(|(_, input)| &input.resource)
+                    .map(|(_, input)| input.resource())
             })
             .or_else(|| {
                 scratch
@@ -5644,10 +6154,14 @@ fn resource_may_overlap_any<R: PcuMemoryResource>(
 fn input_storage_requirement(
     value: ValueId,
     shape: &[usize],
+    scalar_type: fusion_pcu::PcuScalarType,
 ) -> Result<fusion_pcu::dialect::tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
+    let (element_size, alignment) = scalar_layout(scalar_type)?;
     Ok(fusion_pcu::dialect::tensor::TensorValueStorageRequirement {
         value,
-        output_bytes: u64::try_from(byte_len(shape)?)
+        scalar_type,
+        alignment_bytes: alignment,
+        output_bytes: u64::try_from(byte_len_for_size(shape, element_size)?)
             .map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
         access: PcuMemoryAccess::ReadOnly,
     })
@@ -5660,6 +6174,8 @@ fn physical_value_storage_requirement(
 ) -> Result<fusion_pcu::dialect::tensor::TensorValueStorageRequirement, RocmTensorExecutionError> {
     Ok(fusion_pcu::dialect::tensor::TensorValueStorageRequirement {
         value,
+        scalar_type: prepared.graph.node(value)?.scalar_type,
+        alignment_bytes: scalar_layout(prepared.graph.node(value)?.scalar_type)?.1,
         output_bytes: prepared.physical_layout(value)?.physical_bytes,
         access: match op {
             OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. } => {
@@ -5695,6 +6211,7 @@ fn execution_resource<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
     memory: &mut P,
     pool: PcuMemoryPoolId,
     shape: &[usize],
+    scalar_type: fusion_pcu::PcuScalarType,
     index: usize,
     value: ValueId,
     scratch: &mut Option<&mut RocmTensorScratch<'_, '_, '_>>,
@@ -5714,7 +6231,14 @@ fn execution_resource<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
     {
         return scratch.lease(index);
     }
-    allocate_tensor(memory, pool, shape)
+    let (element_size, alignment) = scalar_layout(scalar_type)?;
+    allocate_tensor_for_size(
+        memory,
+        pool,
+        shape,
+        element_size,
+        usize::try_from(alignment).map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
+    )
 }
 
 fn fresh_output<'outputs, 'session>(
@@ -5832,6 +6356,7 @@ fn collect_dispatch_requests<'graph>(
                 } else {
                     Some(TensorDispatchRequest::Fixed {
                         kind: TensorDispatchKind::Add,
+                        scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
                     })
@@ -5847,6 +6372,7 @@ fn collect_dispatch_requests<'graph>(
                 } else {
                     Some(TensorDispatchRequest::Fixed {
                         kind: TensorDispatchKind::Sub,
+                        scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
                     })
@@ -5858,6 +6384,7 @@ fn collect_dispatch_requests<'graph>(
                 } else {
                     Some(TensorDispatchRequest::Fixed {
                         kind: TensorDispatchKind::Mul,
+                        scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
                     })
@@ -5869,12 +6396,14 @@ fn collect_dispatch_requests<'graph>(
                 } else if let Some(&(left, right)) = prepared.fused_add_by_relu.get(&node.value) {
                     Some(TensorDispatchRequest::Fixed {
                         kind: TensorDispatchKind::AddRelu,
+                        scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
                     })
                 } else {
                     Some(TensorDispatchRequest::Fixed {
                         kind: TensorDispatchKind::Relu,
+                        scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: 0,
                     })
@@ -5883,6 +6412,9 @@ fn collect_dispatch_requests<'graph>(
             OpDescriptor::MeanSquaredError { prediction, .. } => {
                 Some(TensorDispatchRequest::Fixed {
                     kind: TensorDispatchKind::SquaredDifference,
+                    scalar_type: TensorPointwiseScalarType::try_from(
+                        prepared.graph.node(prediction)?.scalar_type,
+                    )?,
                     logical_count: flattened_invocation_count(prepared.graph.shape(prediction)?)?,
                     scalar_mask: 0,
                 })
@@ -6005,6 +6537,7 @@ struct GraphExecutionPreflight<'a> {
     fused_add_by_relu: HashMap<ValueId, (ValueId, ValueId)>,
     bounded_pointwise_by_output: HashMap<ValueId, TensorBoundedPointwiseFusionGroup>,
     bounded_mul_by_output: HashMap<ValueId, TensorBoundedMulFusionGroup>,
+    fixed_dispatches: Vec<Option<PreparedFixedTensorDispatch>>,
     suppressed_adds: HashSet<ValueId>,
     #[cfg(test)]
     storage_constraints: Vec<TensorStorageConstraint>,
@@ -6055,6 +6588,7 @@ fn prepare_graph_outputs_plan_with_arithmetic<'a, A: TensorOperationAssessor>(
     )
 }
 
+#[allow(clippy::too_many_lines)] // Keeps ordered capability, fusion, and storage preflight in one cold pass.
 fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     graph: &'a Graph,
     outputs: &[ValueId],
@@ -6103,7 +6637,8 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
                 });
             }
         }
-        let _ = byte_len(node.shape)?;
+        let (element_size, _) = scalar_layout(node.scalar_type)?;
+        let _ = byte_len_for_size(node.shape, element_size)?;
     }
     let index_by_value = nodes
         .iter()
@@ -6122,6 +6657,17 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     let fused_add_by_relu = fusion_maps.fused_add_by_relu;
     let bounded_pointwise_by_output = fusion_maps.bounded_pointwise_by_output;
     let bounded_mul_by_output = fusion_maps.bounded_mul_by_output;
+    for value in bounded_pointwise_by_output
+        .keys()
+        .chain(bounded_mul_by_output.keys())
+    {
+        if graph.node(*value)?.scalar_type != fusion_pcu::PcuScalarType::F32 {
+            return Err(RocmTensorExecutionError::Unsupported {
+                value: *value,
+                reason: TensorUnsupportedReason::ElementType,
+            });
+        }
+    }
     let suppressed_adds = fusion_maps.suppressed;
     let compact_uniform_values = compact_uniform_candidates(
         graph,
@@ -6132,6 +6678,16 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
         &bounded_mul_by_output,
     );
     let physical_layouts = physical_layouts(&nodes, compact_uniform_values)?;
+    let fixed_dispatches = prepare_fixed_dispatches(
+        graph,
+        &nodes,
+        &index_by_value,
+        &fused_add_by_relu,
+        &bounded_pointwise_by_output,
+        &bounded_mul_by_output,
+        &suppressed_adds,
+        &physical_layouts,
+    )?;
     let storage_constraints = physicalize_storage_constraints(
         lowering_plan.operation_storage_constraints()?,
         &physical_layouts,
@@ -6150,6 +6706,7 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
         fused_add_by_relu,
         bounded_pointwise_by_output,
         bounded_mul_by_output,
+        fixed_dispatches,
         suppressed_adds,
         #[cfg(test)]
         storage_constraints: test_storage_constraints,
@@ -6173,6 +6730,31 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
         .iter()
         .map(|&value| graph.node(value).map_err(RocmTensorExecutionError::from))
         .collect::<Result<Vec<_>, _>>()?;
+    let scalar_type = homogeneous_scalar_type(&nodes);
+    let transport_only_inputs = !nodes.is_empty()
+        && nodes
+            .iter()
+            .all(|node| matches!(node.op, OpDescriptor::Input))
+        && scalar_type.is_some_and(is_transport_scalar);
+    if nodes
+        .iter()
+        .all(|node| matches!(node.op, OpDescriptor::Input))
+        && !nodes.is_empty()
+        && scalar_type.is_none()
+    {
+        return Err(RocmTensorExecutionError::UnsupportedScalarType(
+            nodes[0].scalar_type,
+        ));
+    }
+    if let Some(scalar_type) = scalar_type
+        && !matches!(
+            scalar_type,
+            fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
+        )
+        && !transport_only_inputs
+    {
+        return Err(RocmTensorExecutionError::UnsupportedScalarType(scalar_type));
+    }
     for node in &nodes {
         let expected_route = match node.op {
             OpDescriptor::Input
@@ -6204,7 +6786,8 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
                 });
             }
         }
-        let _ = byte_len(node.shape)?;
+        let (element_size, _) = scalar_layout(node.scalar_type)?;
+        let _ = byte_len_for_size(node.shape, element_size)?;
     }
 
     let index_by_value = nodes
@@ -6234,9 +6817,21 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
                 fused_add_by_relu.insert(*relu_output, (*left, *right));
             }
             fusion_pcu::dialect::tensor::TensorOwnedSelectedOperation::FusedAddSub { group } => {
+                if graph.node(group.output)?.scalar_type != fusion_pcu::PcuScalarType::F32 {
+                    return Err(RocmTensorExecutionError::Unsupported {
+                        value: group.output,
+                        reason: TensorUnsupportedReason::ElementType,
+                    });
+                }
                 bounded_pointwise_by_output.insert(group.output, group.clone());
             }
             fusion_pcu::dialect::tensor::TensorOwnedSelectedOperation::FusedMul { group } => {
+                if graph.node(group.output)?.scalar_type != fusion_pcu::PcuScalarType::F32 {
+                    return Err(RocmTensorExecutionError::Unsupported {
+                        value: group.output,
+                        reason: TensorUnsupportedReason::ElementType,
+                    });
+                }
                 bounded_mul_by_output.insert(group.output, group.clone());
             }
             fusion_pcu::dialect::tensor::TensorOwnedSelectedOperation::Node { .. } => {}
@@ -6252,6 +6847,16 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
         &bounded_mul_by_output,
     );
     let physical_layouts = physical_layouts(&nodes, compact_uniform_values)?;
+    let fixed_dispatches = prepare_fixed_dispatches(
+        graph,
+        &nodes,
+        &index_by_value,
+        &fused_add_by_relu,
+        &bounded_pointwise_by_output,
+        &bounded_mul_by_output,
+        &suppressed_adds,
+        &physical_layouts,
+    )?;
     let storage_constraints = physicalize_storage_constraints(
         program.operation_storage_constraints().to_vec(),
         &physical_layouts,
@@ -6260,6 +6865,10 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
         prepare_storage_constraint_indices(storage_constraints, &index_by_value, outputs)?;
     let matmul_operands = prepare_matmul_operands(graph, &nodes, &index_by_value)?;
     Ok(RocmPreparedGraphData {
+        scalar_type,
+        requires_blas: nodes_require_blas(&nodes),
+        transport_only_inputs,
+        consuming_action: prepare_consuming_action(program, &nodes)?,
         node_values: program.selected_nodes().to_vec(),
         output: outputs[0],
         outputs: outputs.to_vec(),
@@ -6268,6 +6877,7 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
         fused_add_by_relu,
         bounded_pointwise_by_output,
         bounded_mul_by_output,
+        fixed_dispatches,
         suppressed_adds,
         indexed_storage_constraints,
         matmul_operands,
@@ -6275,6 +6885,67 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
         rewrites: program.rewrites().to_vec(),
         input_values: program.input_values().to_vec(),
     })
+}
+
+fn prepare_consuming_action(
+    program: &fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram,
+    nodes: &[NodeDescriptor<'_>],
+) -> Result<Option<PreparedConsumingAction>, RocmTensorExecutionError> {
+    if program.output_values().len() != 1 {
+        return Ok(None);
+    }
+    if program.input_values().len() == 2 {
+        return consuming::prepare_consuming_binary_action(program, nodes);
+    }
+    if program.input_values().len() != 1 {
+        return Ok(None);
+    }
+    let input = program.input_values()[0];
+    let output = program.output_values()[0];
+    if input == output
+        && program.selected_nodes().len() == 1
+        && nodes.len() == 1
+        && nodes[0].value == input
+        && matches!(nodes[0].op, OpDescriptor::Input)
+    {
+        return Ok(Some(PreparedConsumingAction::IdentityTransfer(input)));
+    }
+    if program.selected_nodes().len() != 2 || nodes.len() != 2 {
+        return Ok(None);
+    }
+    let Ok(proof) = program.prove_consumed_relu_reuse(input, output) else {
+        return Ok(None);
+    };
+    let Some(input_node) = nodes.iter().find(|node| node.value == input) else {
+        return Ok(None);
+    };
+    if input_node.scalar_type != proof.scalar_type() {
+        return Ok(None);
+    }
+    let scalar_type = TensorPointwiseScalarType::try_from(proof.scalar_type())?;
+    let logical_count = input_node.shape.iter().try_fold(1_u32, |count, &extent| {
+        u32::try_from(extent)
+            .ok()
+            .and_then(|extent| count.checked_mul(extent))
+    });
+    let Some(logical_count) = logical_count.filter(|count| *count > 0) else {
+        // A zero-element shape has no valid InvocationCount dispatch geometry. It keeps the
+        // ordinary fresh-output behavior instead of defining a fake in-place no-op allocation.
+        return Ok(None);
+    };
+    let invocation_count =
+        NonZeroU32::new(logical_count).ok_or(RocmTensorExecutionError::SizeOverflow)?;
+    Ok(Some(PreparedConsumingAction::TerminalRelu(
+        PreparedConsumingRelu {
+            proof,
+            kernel: pointwise::consuming_relu_kernel(scalar_type, logical_count),
+            invocation_shape: PcuInvocationShape::invocations(invocation_count),
+            scalar_type,
+            value_type: scalar_type.value_type(),
+            binding: PcuBindingRef::new(0, 0),
+            logical_count,
+        },
+    )))
 }
 
 fn prepare_storage_constraint_indices(
@@ -6570,13 +7241,153 @@ fn physical_layouts(
             let layout = if compact.contains(&node.value) {
                 RocmPhysicalLayout::uniform_scalar()
             } else {
-                let bytes = u64::try_from(byte_len(node.shape)?)
+                let (element_size, _) = scalar_layout(node.scalar_type)?;
+                let bytes = u64::try_from(byte_len_for_size(node.shape, element_size)?)
                     .map_err(|_| RocmTensorExecutionError::SizeOverflow)?;
                 RocmPhysicalLayout::dense(bytes)
             };
             Ok((node.value, layout))
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // All facts are finalized together during cold graph preparation.
+fn prepare_fixed_dispatches(
+    graph: &Graph,
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &HashMap<ValueId, usize>,
+    fused_add_by_relu: &HashMap<ValueId, (ValueId, ValueId)>,
+    bounded_pointwise_by_output: &HashMap<ValueId, TensorBoundedPointwiseFusionGroup>,
+    bounded_mul_by_output: &HashMap<ValueId, TensorBoundedMulFusionGroup>,
+    suppressed_adds: &HashSet<ValueId>,
+    physical_layouts: &HashMap<ValueId, RocmPhysicalLayout>,
+) -> Result<Vec<Option<PreparedFixedTensorDispatch>>, RocmTensorExecutionError> {
+    nodes
+        .iter()
+        .map(|node| {
+            if suppressed_adds.contains(&node.value) {
+                return Ok(None);
+            }
+            let (kind, shape, scalar_mask) = match node.op {
+                OpDescriptor::Add { left, right }
+                    if !bounded_pointwise_by_output.contains_key(&node.value)
+                        && !bounded_mul_by_output.contains_key(&node.value) =>
+                {
+                    (
+                        TensorDispatchKind::Add,
+                        node.shape,
+                        fixed_scalar_mask(left, right, nodes, index_by_value, physical_layouts)?,
+                    )
+                }
+                OpDescriptor::Sub { left, right }
+                    if !bounded_pointwise_by_output.contains_key(&node.value)
+                        && !bounded_mul_by_output.contains_key(&node.value) =>
+                {
+                    (
+                        TensorDispatchKind::Sub,
+                        node.shape,
+                        fixed_scalar_mask(left, right, nodes, index_by_value, physical_layouts)?,
+                    )
+                }
+                OpDescriptor::Mul { left, right }
+                    if !bounded_pointwise_by_output.contains_key(&node.value)
+                        && !bounded_mul_by_output.contains_key(&node.value) =>
+                {
+                    (
+                        TensorDispatchKind::Mul,
+                        node.shape,
+                        fixed_scalar_mask(left, right, nodes, index_by_value, physical_layouts)?,
+                    )
+                }
+                OpDescriptor::Relu { .. }
+                    if !bounded_pointwise_by_output.contains_key(&node.value) =>
+                {
+                    if let Some(&(left, right)) = fused_add_by_relu.get(&node.value) {
+                        (
+                            TensorDispatchKind::AddRelu,
+                            node.shape,
+                            fixed_scalar_mask(
+                                left,
+                                right,
+                                nodes,
+                                index_by_value,
+                                physical_layouts,
+                            )?,
+                        )
+                    } else {
+                        (TensorDispatchKind::Relu, node.shape, 0)
+                    }
+                }
+                OpDescriptor::MeanSquaredError { prediction, .. } => (
+                    TensorDispatchKind::SquaredDifference,
+                    graph.shape(prediction)?,
+                    0,
+                ),
+                _ => return Ok(None),
+            };
+            let logical_count = flattened_invocation_count(shape)?;
+            let invocations =
+                NonZeroU32::new(logical_count).ok_or(RocmTensorExecutionError::SizeOverflow)?;
+            let scalar_type = TensorPointwiseScalarType::try_from(node.scalar_type)?;
+            let cache_key =
+                TensorDispatchCacheKey::Fixed(kind, scalar_type, logical_count, scalar_mask);
+            let kernel = kind.kernel(scalar_type, logical_count, scalar_mask)?;
+            let value_type = match scalar_type {
+                TensorPointwiseScalarType::F32 => PcuValueType::f32(),
+                TensorPointwiseScalarType::F64 => PcuValueType::f64(),
+            };
+            let (left_binding, right_binding, output_binding) = fixed_binding_refs(kind);
+            Ok(Some(PreparedFixedTensorDispatch {
+                value: node.value,
+                cache_key,
+                kernel,
+                invocation_shape: PcuInvocationShape::invocations(invocations),
+                scalar_type,
+                value_type,
+                left_binding,
+                right_binding,
+                output_binding,
+            }))
+        })
+        .collect()
+}
+
+fn fixed_scalar_mask(
+    left: ValueId,
+    right: ValueId,
+    nodes: &[NodeDescriptor<'_>],
+    index_by_value: &HashMap<ValueId, usize>,
+    physical_layouts: &HashMap<ValueId, RocmPhysicalLayout>,
+) -> Result<u8, RocmTensorExecutionError> {
+    let is_compact_uniform = |value| -> Result<bool, RocmTensorExecutionError> {
+        let index = index_by_value
+            .get(&value)
+            .copied()
+            .ok_or(RocmTensorExecutionError::InvalidPlan(value))?;
+        let node = nodes
+            .get(index)
+            .ok_or(RocmTensorExecutionError::InvalidPlan(value))?;
+        Ok(matches!(node.op, OpDescriptor::Uniform { .. })
+            && physical_layouts.get(&value).is_some_and(|layout| {
+                layout.representation == RocmPhysicalRepresentation::UniformScalar
+            }))
+    };
+    Ok(u8::from(is_compact_uniform(left)?) | (u8::from(is_compact_uniform(right)?) << 1))
+}
+
+const fn fixed_binding_refs(
+    kind: TensorDispatchKind,
+) -> (PcuBindingRef, Option<PcuBindingRef>, PcuBindingRef) {
+    match kind {
+        TensorDispatchKind::Add
+        | TensorDispatchKind::AddRelu
+        | TensorDispatchKind::Sub
+        | TensorDispatchKind::Mul => (ADD_LEFT_REF, Some(ADD_RIGHT_REF), ADD_OUTPUT_REF),
+        TensorDispatchKind::Relu => (RELU_INPUT_REF, None, RELU_OUTPUT_REF),
+        TensorDispatchKind::SquaredDifference => {
+            (MSE_LEFT_REF, Some(MSE_RIGHT_REF), MSE_OUTPUT_REF)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6610,10 +7421,10 @@ fn validate_graph_inputs(
     Ok(())
 }
 
-fn validate_graph_input_sources(
+fn validate_graph_input_sources<I: RocmTensorInputDescriptor>(
     prepared: &RocmPreparedGraphView<'_, '_>,
     host_inputs: &[(ValueId, Tensor)],
-    resource_inputs: &[(ValueId, &RocmTensorInput<'_>)],
+    resource_inputs: &[(ValueId, &I)],
     session: &RocmOwnedDispatchBackend,
     pool: PcuMemoryPoolId,
 ) -> Result<(), RocmTensorExecutionError> {
@@ -6630,6 +7441,11 @@ fn validate_graph_input_sources(
         let node = prepared.node(index)?;
         if !matches!(node.op, OpDescriptor::Input) {
             return Err(TensorError::ExtraInput(*id).into());
+        }
+        if node.scalar_type != fusion_pcu::PcuScalarType::F32 {
+            return Err(RocmTensorExecutionError::UnsupportedScalarType(
+                node.scalar_type,
+            ));
         }
         if tensor.shape() != node.shape {
             return Err(TensorError::ShapeMismatch {
@@ -6654,23 +7470,40 @@ fn validate_graph_input_sources(
         if !matches!(node.op, OpDescriptor::Input) {
             return Err(TensorError::ExtraInput(*id).into());
         }
-        if node.shape != input.shape {
+        if node.scalar_type != input.scalar_type() {
+            return Err(RocmTensorExecutionError::UnsupportedScalarType(
+                input.scalar_type(),
+            ));
+        }
+        if node.shape != input.shape() {
             return Err(TensorError::ShapeMismatch {
                 left: node.shape.to_vec(),
-                right: input.shape.clone(),
+                right: input.shape().to_vec(),
             }
             .into());
         }
+        if !alignment_satisfies(
+            input.resource().alignment_bytes(),
+            scalar_layout(node.scalar_type)?.1,
+        ) {
+            return Err(RocmTensorExecutionError::InputResourceMismatch);
+        }
         // This path only accepts Input nodes; compact uniforms are materialized by the executor.
-        input_storage_requirement(*id, node.shape)?
-            .validate(&input.resource)
+        input_storage_requirement(*id, node.shape, node.scalar_type)?
+            .validate(input.resource())
             .map_err(RocmTensorExecutionError::StorageConstraint)?;
-        input.validate_session(session)?;
-        if input.resource.pool() != pool {
+        if !std::ptr::eq(input.session(), session)
+            || !input
+                .resource()
+                .belongs_to_runtime(session.tensor_runtime())
+        {
+            return Err(RocmTensorExecutionError::InputResourceMismatch);
+        }
+        if input.resource().pool() != pool {
             return Err(RocmTensorExecutionError::InputPoolMismatch);
         }
         if !matches!(
-            input.resource.access(),
+            input.resource().access(),
             PcuMemoryAccess::ReadOnly | PcuMemoryAccess::ReadWrite
         ) {
             return Err(RocmTensorExecutionError::InputResourceMismatch);
@@ -6687,17 +7520,69 @@ fn validate_graph_input_sources(
 }
 
 fn byte_len(shape: &[usize]) -> Result<usize, RocmTensorExecutionError> {
-    let bytes = shape
-        .iter()
-        .try_fold(size_of::<f32>(), |bytes, dimension| {
-            bytes
-                .checked_mul(*dimension)
-                .ok_or(RocmTensorExecutionError::SizeOverflow)
-        })?;
+    byte_len_for_size(shape, size_of::<f32>())
+}
+
+fn byte_len_for<T: fusion_pcu::PcuScalar>(
+    shape: &[usize],
+) -> Result<usize, RocmTensorExecutionError> {
+    byte_len_for_size(shape, size_of::<T>())
+}
+
+fn byte_len_for_size(
+    shape: &[usize],
+    element_size: usize,
+) -> Result<usize, RocmTensorExecutionError> {
+    let bytes = shape.iter().try_fold(element_size, |bytes, dimension| {
+        bytes
+            .checked_mul(*dimension)
+            .ok_or(RocmTensorExecutionError::SizeOverflow)
+    })?;
     if bytes > isize::MAX as usize {
         return Err(RocmTensorExecutionError::SizeOverflow);
     }
     Ok(bytes)
+}
+
+const fn scalar_layout(
+    scalar_type: fusion_pcu::PcuScalarType,
+) -> Result<(usize, u64), RocmTensorExecutionError> {
+    match scalar_type {
+        fusion_pcu::PcuScalarType::I8 | fusion_pcu::PcuScalarType::U8 => Ok((1, 1)),
+        fusion_pcu::PcuScalarType::I16
+        | fusion_pcu::PcuScalarType::U16
+        | fusion_pcu::PcuScalarType::F16
+        | fusion_pcu::PcuScalarType::BF16 => Ok((2, 2)),
+        fusion_pcu::PcuScalarType::I32
+        | fusion_pcu::PcuScalarType::U32
+        | fusion_pcu::PcuScalarType::F32 => Ok((4, 4)),
+        fusion_pcu::PcuScalarType::I64
+        | fusion_pcu::PcuScalarType::U64
+        | fusion_pcu::PcuScalarType::F64 => Ok((8, 8)),
+        unsupported => Err(RocmTensorExecutionError::UnsupportedScalarType(unsupported)),
+    }
+}
+
+const fn is_transport_scalar(scalar_type: fusion_pcu::PcuScalarType) -> bool {
+    matches!(
+        scalar_type,
+        fusion_pcu::PcuScalarType::I8
+            | fusion_pcu::PcuScalarType::U8
+            | fusion_pcu::PcuScalarType::I16
+            | fusion_pcu::PcuScalarType::U16
+            | fusion_pcu::PcuScalarType::I32
+            | fusion_pcu::PcuScalarType::U32
+            | fusion_pcu::PcuScalarType::I64
+            | fusion_pcu::PcuScalarType::U64
+            | fusion_pcu::PcuScalarType::F16
+            | fusion_pcu::PcuScalarType::BF16
+            | fusion_pcu::PcuScalarType::F32
+            | fusion_pcu::PcuScalarType::F64
+    )
+}
+
+const fn alignment_satisfies(reported: u64, required: u64) -> bool {
+    required != 0 && reported >= required && reported.is_multiple_of(required)
 }
 
 #[allow(clippy::cast_precision_loss)] // Matches the tensor dialect's f32 mean divisor semantics.
@@ -6710,17 +7595,50 @@ fn allocate_tensor<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
     pool: PcuMemoryPoolId,
     shape: &[usize],
 ) -> Result<RocmMemoryResource, RocmTensorExecutionError> {
-    let size_bytes =
-        u64::try_from(byte_len(shape)?).map_err(|_| RocmTensorExecutionError::SizeOverflow)?;
-    Ok(memory.allocate(PcuMemoryAllocationRequest {
+    allocate_tensor_for_size(memory, pool, shape, size_of::<f32>(), align_of::<f32>())
+}
+
+fn allocate_tensor_for<
+    T: fusion_pcu::PcuScalar,
+    P: PcuMemoryProvider<Resource = RocmMemoryResource>,
+>(
+    memory: &mut P,
+    pool: PcuMemoryPoolId,
+    shape: &[usize],
+) -> Result<RocmMemoryResource, RocmTensorExecutionError> {
+    allocate_tensor_for_size(memory, pool, shape, size_of::<T>(), align_of::<T>())
+}
+
+fn allocate_tensor_for_size<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
+    memory: &mut P,
+    pool: PcuMemoryPoolId,
+    shape: &[usize],
+    element_size: usize,
+    alignment: usize,
+) -> Result<RocmMemoryResource, RocmTensorExecutionError> {
+    let size_bytes = u64::try_from(byte_len_for_size(shape, element_size)?)
+        .map_err(|_| RocmTensorExecutionError::SizeOverflow)?;
+    let size_bytes_usize =
+        usize::try_from(size_bytes).map_err(|_| RocmTensorExecutionError::SizeOverflow)?;
+    let alignment_bytes =
+        u64::try_from(alignment).map_err(|_| RocmTensorExecutionError::SizeOverflow)?;
+    let resource = memory.allocate(PcuMemoryAllocationRequest {
         pool,
         size_bytes,
-        alignment_bytes: u64::try_from(align_of::<f32>())
-            .map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
+        alignment_bytes,
         access: PcuMemoryAccess::ReadWrite,
         host_access: PcuMemoryHostAccess::TransferOnly,
         require_device_local: false,
-    })?)
+    })?;
+    if resource.pool() != pool
+        || resource.size_bytes() < size_bytes
+        || !alignment_satisfies(resource.alignment_bytes(), alignment_bytes)
+        || resource.access() != PcuMemoryAccess::ReadWrite
+        || resource.device_buffer().len() < size_bytes_usize
+    {
+        return Err(RocmTensorExecutionError::OutputResourceMismatch);
+    }
+    Ok(resource)
 }
 
 fn upload_tensor<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
@@ -6862,7 +7780,16 @@ impl TensorOperationAssessor for RocmTensorAssessor<'_> {
         );
         if requires_blas {
             match self.rocblas() {
-                Ok(rocblas) if rocblas.is_usable() => {}
+                Ok(rocblas) if rocblas.is_usable() => {
+                    if node.scalar_type == fusion_pcu::PcuScalarType::F64
+                        && matches!(node.op, OpDescriptor::MatMul { .. })
+                        && let Err(error) = rocblas.require_dgemm_support()
+                    {
+                        return TensorOperationSupport::Unsupported {
+                            reason: TensorUnsupportedReason::Other(error.to_string()),
+                        };
+                    }
+                }
                 Ok(_) => {
                     return TensorOperationSupport::Unsupported {
                         reason: TensorUnsupportedReason::Other(
@@ -6896,16 +7823,73 @@ const fn rocm_supports_operand_representation(
     node: NodeDescriptor<'_>,
     representation: TensorOperandRepresentation,
 ) -> bool {
+    if matches!(node.op, OpDescriptor::Input) {
+        return matches!(representation, TensorOperandRepresentation::Dense)
+            && is_transport_scalar(node.scalar_type);
+    }
+    let supported_scalar = matches!(
+        node.scalar_type,
+        fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
+    );
+    if !supported_scalar {
+        return false;
+    }
     match representation {
-        TensorOperandRepresentation::Dense => true,
-        TensorOperandRepresentation::UniformScalar => matches!(
+        TensorOperandRepresentation::Dense => matches!(
             node.op,
-            OpDescriptor::Add { .. } | OpDescriptor::Sub { .. } | OpDescriptor::Mul { .. }
+            OpDescriptor::Input
+                | OpDescriptor::MatMul { .. }
+                | OpDescriptor::Add { .. }
+                | OpDescriptor::Sub { .. }
+                | OpDescriptor::Mul { .. }
+                | OpDescriptor::Relu { .. }
+                | OpDescriptor::Constant(_)
+                | OpDescriptor::Uniform { .. }
         ),
+        TensorOperandRepresentation::UniformScalar => {
+            matches!(node.scalar_type, fusion_pcu::PcuScalarType::F32)
+                && matches!(
+                    node.op,
+                    OpDescriptor::Add { .. } | OpDescriptor::Sub { .. } | OpDescriptor::Mul { .. }
+                )
+        }
     }
 }
 
 fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+    if matches!(node.op, OpDescriptor::Input) && is_transport_scalar(node.scalar_type) {
+        return TensorOperationSupport::Supported {
+            route: TensorExecutionRoute::Native,
+            workspace_bytes: Some(0),
+        };
+    }
+    if node.scalar_type == fusion_pcu::PcuScalarType::F64
+        && !matches!(
+            node.op,
+            OpDescriptor::Input
+                | OpDescriptor::MatMul { .. }
+                | OpDescriptor::Add { .. }
+                | OpDescriptor::Sub { .. }
+                | OpDescriptor::Mul { .. }
+                | OpDescriptor::Relu { .. }
+        )
+    {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::ElementType,
+        };
+    }
+    if !matches!(
+        node.scalar_type,
+        fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
+    ) {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::ElementType,
+        };
+    }
+    assess_f32_tensor_node(graph, node)
+}
+
+fn assess_f32_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
     match node.op {
         OpDescriptor::Uniform { .. } if node.shape.contains(&0) => {
             TensorOperationSupport::Unsupported {
@@ -7120,6 +8104,8 @@ fn matmul_shape_supported(
 
 #[cfg(test)]
 mod tests {
+    use fusion_pcu::PcuScalarType;
+    use fusion_pcu::{PcuBf16Bits, PcuF16Bits, PcuScalar};
     use std::time::Duration;
 
     #[rustfmt::skip]
@@ -7130,6 +8116,8 @@ mod tests {
         PcuDispatchOp,
         PcuDispatchDataOp,
         PcuDispatchAluOp,
+        PcuBindingType,
+        PcuValueType,
         PcuValueTypeCaps,
     };
     #[rustfmt::skip]
@@ -7138,6 +8126,8 @@ mod tests {
         NodeDescriptor,
         OpDescriptor,
         Tensor,
+        TensorScalarValue,
+        TensorValue,
         TensorError,
         TensorOperationAssessor,
         TensorOperationSupport,
@@ -7147,6 +8137,9 @@ mod tests {
 
     #[rustfmt::skip]
     use super::{
+        ADD_LEFT_REF,
+        ADD_OUTPUT_REF,
+        ADD_RIGHT_REF,
         add_kernel,
         add_relu_kernel,
         assess_tensor_node,
@@ -7156,7 +8149,10 @@ mod tests {
         bounded_mul_program,
         bounded_mul_topology,
         collect_dispatch_requests,
+        byte_len_for,
         execution_resource_slots,
+        homogeneous_scalar_type,
+        is_transport_scalar,
         input_storage_requirement,
         validate_indexed_storage_constraints,
         retained_requested_key_count,
@@ -7164,23 +8160,31 @@ mod tests {
         mse_scratch_length_fits,
         mse_scratch_element_count,
         output_position,
+        prepare_owned_graph_data,
+        prepare_consuming_action,
         prepare_graph,
         prepare_graph_outputs_plan,
         prepare_graph_outputs_plan_with_arithmetic,
         prepare_graph_outputs_plan_with_policies,
         relu_kernel,
         rocm_supports_operand_representation,
+        scalar_layout,
         scratch_stores_node,
         selected_scratch_storage_plan,
         mse_scratch_resource_fits,
+        nodes_require_blas,
         resource_may_overlap_any,
         validate_graph_inputs,
+        validate_owned_scalar_profile,
+        validate_tensor_scalar_tag,
+        alignment_satisfies,
         CollectNodeTimings,
         CollectElementwiseTiming,
         ElementwisePhase,
         ElementwiseTimingSink,
         NodeTimingSink,
         RocmTensorExecutionError,
+        PreparedConsumingAction,
         RocmPreparedGraphData,
         RocmPhysicalLayout,
         TensorExecutionRoute,
@@ -7188,6 +8192,8 @@ mod tests {
         TensorDispatchCacheKey,
         TensorDispatchKind,
         TensorDispatchRequest,
+        TensorPointwiseScalarType,
+        pointwise,
         GraphExecutionPreflight,
         PreparedMatMulOperands,
         PreparedStorageConstraint,
@@ -7200,6 +8206,61 @@ mod tests {
         TensorUnsupportedReason,
         ValueId,
     };
+
+    #[test]
+    fn consuming_action_is_limited_to_identity_or_direct_terminal_relu() {
+        let make_program = |relu_depth: usize| {
+            let mut graph = Graph::default();
+            let input = graph.input([4], PcuScalarType::F32).unwrap();
+            let mut output = input;
+            for _ in 0..relu_depth {
+                output = graph.relu(output).unwrap();
+            }
+            graph
+                .into_selected_program(
+                    &[output],
+                    TensorArithmeticRewritePolicy::Disabled,
+                    TensorArithmeticCapability::Strict,
+                    TensorPointwiseGroupingPolicy::Disabled,
+                )
+                .unwrap()
+        };
+
+        let identity = make_program(0);
+        let nodes = identity
+            .selected_nodes()
+            .iter()
+            .map(|value| identity.graph().node(*value).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            prepare_consuming_action(&identity, &nodes).unwrap(),
+            Some(PreparedConsumingAction::IdentityTransfer(value))
+                if value == identity.input_values()[0]
+        ));
+
+        let terminal_relu = make_program(1);
+        let nodes = terminal_relu
+            .selected_nodes()
+            .iter()
+            .map(|value| terminal_relu.graph().node(*value).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            prepare_consuming_action(&terminal_relu, &nodes).unwrap(),
+            Some(PreparedConsumingAction::TerminalRelu(_))
+        ));
+
+        let nonterminal_relu = make_program(2);
+        let nodes = nonterminal_relu
+            .selected_nodes()
+            .iter()
+            .map(|value| nonterminal_relu.graph().node(*value).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            prepare_consuming_action(&nonterminal_relu, &nodes)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn execution_scheduler_vectors_spill_without_truncating_large_graphs() {
@@ -7221,8 +8282,8 @@ mod tests {
     #[test]
     fn selected_scratch_plan_preserves_fanout_lifetimes_and_reuses_expired_slots() {
         let mut graph = Graph::default();
-        let left = graph.input([16]).unwrap();
-        let right = graph.input([16]).unwrap();
+        let left = graph.input([16], PcuScalarType::F32).unwrap();
+        let right = graph.input([16], PcuScalarType::F32).unwrap();
         let fanout = graph.add(left, right).unwrap();
         let first_output = graph.relu(fanout).unwrap();
         let later = graph.mul(fanout, right).unwrap();
@@ -7251,8 +8312,10 @@ mod tests {
     #[test]
     fn selected_scratch_candidates_skip_uniforms_and_suppressed_fused_values() {
         let mut graph = Graph::default();
-        let input = graph.input([16]).unwrap();
-        let uniform = graph.uniform([16], 2.0).unwrap();
+        let input = graph.input([16], PcuScalarType::F32).unwrap();
+        let uniform = graph
+            .uniform_value([16], TensorScalarValue::F32(2.0))
+            .unwrap();
         let temporary = graph.add(input, uniform).unwrap();
         let output = graph.relu(temporary).unwrap();
         let prepared =
@@ -7263,8 +8326,8 @@ mod tests {
         assert_eq!(plan.slot_for(uniform), None);
 
         let mut fused_graph = Graph::default();
-        let left = fused_graph.input([16]).unwrap();
-        let right = fused_graph.input([16]).unwrap();
+        let left = fused_graph.input([16], PcuScalarType::F32).unwrap();
+        let right = fused_graph.input([16], PcuScalarType::F32).unwrap();
         let suppressed = fused_graph.add(left, right).unwrap();
         let fused_output = fused_graph.sub(suppressed, right).unwrap();
         let fused = prepared_for_request_test(
@@ -7303,18 +8366,20 @@ mod tests {
     #[test]
     fn diagnostic_node_timings_preserve_execution_order_and_count() {
         let mut graph = Graph::default();
-        let left = graph.input([2, 2]).unwrap();
-        let right = graph.input([2, 2]).unwrap();
+        let left = graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let right = graph.input([2, 2], PcuScalarType::F32).unwrap();
         let sum = graph.add(left, right).unwrap();
         let left_node = NodeDescriptor {
             value: left,
             op: graph.nodes().find(|node| node.value == left).unwrap().op,
             shape: graph.shape(left).unwrap(),
+            scalar_type: fusion_pcu::PcuScalarType::F32,
         };
         let sum_node = NodeDescriptor {
             value: sum,
             op: graph.nodes().find(|node| node.value == sum).unwrap().op,
             shape: graph.shape(sum).unwrap(),
+            scalar_type: fusion_pcu::PcuScalarType::F32,
         };
         let mut timings = CollectNodeTimings::default();
 
@@ -7333,8 +8398,8 @@ mod tests {
     #[test]
     fn prepared_matmul_metadata_keeps_original_operand_shapes_and_indices() {
         let mut graph = Graph::default();
-        let left = graph.input([3, 2]).unwrap();
-        let right = graph.input([3, 4]).unwrap();
+        let left = graph.input([3, 2], PcuScalarType::F32).unwrap();
+        let right = graph.input([3, 4], PcuScalarType::F32).unwrap();
         let output = graph.matmul_transposed(left, right, true, false).unwrap();
         let prepared = prepare_graph(&graph, output, &PureRocmAssessor).unwrap();
         let output_index = prepared.index_by_value[&output];
@@ -7367,8 +8432,8 @@ mod tests {
     #[test]
     fn prepared_storage_constraints_resolve_node_and_output_slots() {
         let mut graph = Graph::default();
-        let left = graph.input([4]).unwrap();
-        let right = graph.input([4]).unwrap();
+        let left = graph.input([4], PcuScalarType::F32).unwrap();
+        let right = graph.input([4], PcuScalarType::F32).unwrap();
         let first_output = graph.add(left, right).unwrap();
         let second_output = graph.relu(first_output).unwrap();
         let outputs = [first_output, second_output];
@@ -7443,8 +8508,10 @@ mod tests {
     #[test]
     fn bounded_add_sub_relu_dispatch_preserves_order_and_scalar_leaf_binding() {
         let mut graph = Graph::default();
-        let dense_leaf = graph.input([17]).unwrap();
-        let scalar_leaf = graph.uniform([17], -0.125).unwrap();
+        let dense_leaf = graph.input([17], PcuScalarType::F32).unwrap();
+        let scalar_leaf = graph
+            .uniform_value([17], TensorScalarValue::F32(-0.125))
+            .unwrap();
         let sum = graph.add(dense_leaf, scalar_leaf).unwrap();
         let difference = graph.sub(dense_leaf, sum).unwrap();
         let output = graph.relu(difference).unwrap();
@@ -7490,8 +8557,8 @@ mod tests {
     #[test]
     fn bounded_add_sub_identity_dispatch_has_no_relu_epilogue_and_is_preparable() {
         let mut graph = Graph::default();
-        let left = graph.input([17]).unwrap();
-        let right = graph.input([17]).unwrap();
+        let left = graph.input([17], PcuScalarType::F32).unwrap();
+        let right = graph.input([17], PcuScalarType::F32).unwrap();
         let sum = graph.add(left, right).unwrap();
         let output = graph.sub(sum, left).unwrap();
         let selected = graph
@@ -7547,8 +8614,10 @@ mod tests {
     #[test]
     fn bounded_mul_identity_is_a_distinct_ordered_dispatch_and_prewarm_request() {
         let mut graph = Graph::default();
-        let input = graph.input([17]).unwrap();
-        let factor = graph.uniform([17], 2.0).unwrap();
+        let input = graph.input([17], PcuScalarType::F32).unwrap();
+        let factor = graph
+            .uniform_value([17], TensorScalarValue::F32(2.0))
+            .unwrap();
         let first = graph.mul(input, factor).unwrap();
         let output = graph.mul(first, input).unwrap();
         let prepared = prepared_for_request_test(
@@ -7676,6 +8745,7 @@ mod tests {
             fused_add_by_relu,
             bounded_pointwise_by_output,
             bounded_mul_by_output,
+            fixed_dispatches,
             suppressed_adds,
             storage_constraints: _,
             indexed_storage_constraints,
@@ -7691,6 +8761,10 @@ mod tests {
         )
         .unwrap();
         let data = RocmPreparedGraphData {
+            scalar_type: homogeneous_scalar_type(&nodes),
+            requires_blas: nodes_require_blas(&nodes),
+            transport_only_inputs: false,
+            consuming_action: None,
             node_values: nodes.iter().map(|node| node.value).collect(),
             output: outputs[0],
             outputs: outputs.to_vec(),
@@ -7699,6 +8773,7 @@ mod tests {
             fused_add_by_relu,
             bounded_pointwise_by_output,
             bounded_mul_by_output,
+            fixed_dispatches,
             suppressed_adds,
             indexed_storage_constraints,
             matmul_operands,
@@ -7716,10 +8791,234 @@ mod tests {
     }
 
     #[test]
+    fn prepared_fixed_dispatch_binds_scalar_width_and_kernel_type_cold() {
+        for (scalar_type, expected, expected_value_type) in [
+            (
+                PcuScalarType::F32,
+                TensorPointwiseScalarType::F32,
+                PcuValueType::f32(),
+            ),
+            (
+                PcuScalarType::F64,
+                TensorPointwiseScalarType::F64,
+                PcuValueType::f64(),
+            ),
+        ] {
+            let mut graph = Graph::default();
+            let left = graph.input([17], scalar_type).unwrap();
+            let right = graph.input([17], scalar_type).unwrap();
+            let output = graph.add(left, right).unwrap();
+            let prepared = prepared_for_request_test(
+                &graph,
+                &[output],
+                TensorPointwiseGroupingPolicy::Disabled,
+            );
+            let view = prepared.view();
+            let index = view.index_of(output).unwrap();
+            let dispatch = view.fixed_dispatch(index).unwrap();
+
+            assert_eq!(dispatch.scalar_type, expected);
+            assert_eq!(dispatch.value_type, expected_value_type);
+            assert_eq!(dispatch.left_binding, ADD_LEFT_REF);
+            assert_eq!(dispatch.right_binding, Some(ADD_RIGHT_REF));
+            assert_eq!(dispatch.output_binding, ADD_OUTPUT_REF);
+            assert_eq!(
+                dispatch.cache_key,
+                TensorDispatchCacheKey::Fixed(TensorDispatchKind::Add, expected, 17, 0,)
+            );
+            assert!(dispatch.kernel.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    PcuDispatchOp::Data(PcuDispatchDataOp::Alu { value_type, .. })
+                        if *value_type == expected_value_type
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn prepared_graph_caches_blas_requirement() {
+        let mut add_graph = Graph::default();
+        let left = add_graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let right = add_graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let add = add_graph.add(left, right).unwrap();
+        let prepared_add =
+            prepared_for_request_test(&add_graph, &[add], TensorPointwiseGroupingPolicy::Disabled);
+        assert!(!prepared_add.data.requires_blas);
+
+        let mut matmul_graph = Graph::default();
+        let left = matmul_graph.input([2, 3], PcuScalarType::F32).unwrap();
+        let right = matmul_graph.input([3, 2], PcuScalarType::F32).unwrap();
+        let product = matmul_graph.matmul(left, right).unwrap();
+        let prepared_matmul = prepared_for_request_test(
+            &matmul_graph,
+            &[product],
+            TensorPointwiseGroupingPolicy::Disabled,
+        );
+        assert!(prepared_matmul.data.requires_blas);
+    }
+
+    #[test]
+    fn owned_preparation_rejects_unsupported_scalar_arithmetic_precisely() {
+        let mut graph = Graph::default();
+        let input = graph.input([4], PcuScalarType::U32).unwrap();
+        let sum = graph.add(input, input).unwrap();
+        let program = graph
+            .into_selected_program(
+                &[sum],
+                TensorArithmeticRewritePolicy::Disabled,
+                TensorArithmeticCapability::Strict,
+                TensorPointwiseGroupingPolicy::Disabled,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            prepare_owned_graph_data(&program, &PureRocmAssessor),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(
+                PcuScalarType::U32
+            ))
+        ));
+    }
+
+    fn assert_transport_layout<T: PcuScalar>(scalar_type: PcuScalarType) {
+        let (bytes, alignment) = scalar_layout(scalar_type).unwrap();
+        assert_eq!(bytes, size_of::<T>());
+        assert_eq!(alignment, align_of::<T>() as u64);
+        assert_eq!(bytes, T::HOST_SIZE);
+        assert_eq!(bytes, T::ENCODED_SIZE);
+        assert_eq!(usize::try_from(alignment).unwrap(), T::HOST_ALIGNMENT);
+        assert!(is_transport_scalar(scalar_type));
+    }
+
+    #[test]
+    fn input_only_transport_profile_covers_all_sealed_scalar_layouts() {
+        assert_transport_layout::<i8>(PcuScalarType::I8);
+        assert_transport_layout::<u8>(PcuScalarType::U8);
+        assert_transport_layout::<i16>(PcuScalarType::I16);
+        assert_transport_layout::<u16>(PcuScalarType::U16);
+        assert_transport_layout::<i32>(PcuScalarType::I32);
+        assert_transport_layout::<u32>(PcuScalarType::U32);
+        assert_transport_layout::<i64>(PcuScalarType::I64);
+        assert_transport_layout::<u64>(PcuScalarType::U64);
+        assert_transport_layout::<PcuF16Bits>(PcuScalarType::F16);
+        assert_transport_layout::<PcuBf16Bits>(PcuScalarType::BF16);
+        assert_transport_layout::<f32>(PcuScalarType::F32);
+        assert_transport_layout::<f64>(PcuScalarType::F64);
+
+        for scalar_type in [PcuScalarType::Bool, PcuScalarType::I4, PcuScalarType::U4] {
+            assert!(!is_transport_scalar(scalar_type));
+            assert!(matches!(
+                scalar_layout(scalar_type),
+                Err(RocmTensorExecutionError::UnsupportedScalarType(actual)) if actual == scalar_type
+            ));
+        }
+    }
+
+    #[test]
+    fn owned_input_only_preparation_caches_transport_profile_without_admitting_arithmetic() {
+        for scalar_type in [
+            PcuScalarType::I8,
+            PcuScalarType::U8,
+            PcuScalarType::I16,
+            PcuScalarType::U16,
+            PcuScalarType::I32,
+            PcuScalarType::U32,
+            PcuScalarType::I64,
+            PcuScalarType::U64,
+            PcuScalarType::F16,
+            PcuScalarType::BF16,
+            PcuScalarType::F32,
+            PcuScalarType::F64,
+        ] {
+            let mut graph = Graph::default();
+            let input = graph.input([4], scalar_type).unwrap();
+            let program = graph
+                .into_selected_program(
+                    &[input],
+                    TensorArithmeticRewritePolicy::Disabled,
+                    TensorArithmeticCapability::Strict,
+                    TensorPointwiseGroupingPolicy::Disabled,
+                )
+                .unwrap();
+            let prepared = prepare_owned_graph_data(&program, &PureRocmAssessor).unwrap();
+            assert_eq!(prepared.scalar_type, Some(scalar_type));
+            assert!(prepared.transport_only_inputs);
+            assert_eq!(prepared.node_values, [input]);
+        }
+
+        let mut graph = Graph::default();
+        let input = graph.input([4], PcuScalarType::U32).unwrap();
+        let sum = graph.add(input, input).unwrap();
+        let program = graph
+            .into_selected_program(
+                &[sum],
+                TensorArithmeticRewritePolicy::Disabled,
+                TensorArithmeticCapability::Strict,
+                TensorPointwiseGroupingPolicy::Disabled,
+            )
+            .unwrap();
+        assert!(matches!(
+            prepare_owned_graph_data(&program, &PureRocmAssessor),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(
+                PcuScalarType::U32
+            ))
+        ));
+    }
+
+    #[test]
+    fn owned_input_only_profile_rejects_mixed_and_unrepresented_scalars_before_allocation() {
+        let mut mixed_graph = Graph::default();
+        let integer = mixed_graph.input([4], PcuScalarType::U32).unwrap();
+        let float = mixed_graph.input([4], PcuScalarType::F32).unwrap();
+        let mixed_program = mixed_graph
+            .into_selected_program(
+                &[integer, float],
+                TensorArithmeticRewritePolicy::Disabled,
+                TensorArithmeticCapability::Strict,
+                TensorPointwiseGroupingPolicy::Disabled,
+            )
+            .unwrap();
+        assert!(matches!(
+            prepare_owned_graph_data(&mixed_program, &PureRocmAssessor),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(_))
+        ));
+
+        for scalar_type in [PcuScalarType::Bool, PcuScalarType::I4, PcuScalarType::U4] {
+            let mut graph = Graph::default();
+            let input = graph.input([4], scalar_type).unwrap();
+            let program = graph.into_selected_program(
+                &[input],
+                TensorArithmeticRewritePolicy::Disabled,
+                TensorArithmeticCapability::Strict,
+                TensorPointwiseGroupingPolicy::Disabled,
+            );
+            assert!(matches!(
+                program,
+                Err(TensorError::UnsupportedScalarType { scalar_type: actual, .. })
+                    if actual == scalar_type
+            ));
+        }
+
+        let mut overflow_graph = Graph::default();
+        let huge_input = overflow_graph
+            .input([usize::MAX], PcuScalarType::U64)
+            .unwrap();
+        let overflow_program = overflow_graph.into_selected_program(
+            &[huge_input],
+            TensorArithmeticRewritePolicy::Disabled,
+            TensorArithmeticCapability::Strict,
+            TensorPointwiseGroupingPolicy::Disabled,
+        );
+        assert!(matches!(overflow_program, Err(TensorError::ShapeOverflow)));
+    }
+
+    #[test]
     fn prewarm_requests_deduplicate_fixed_keys_and_keep_scalar_layout_mask() {
         let mut graph = Graph::default();
-        let input = graph.input([16]).unwrap();
-        let uniform = graph.uniform([16], 2.0).unwrap();
+        let input = graph.input([16], PcuScalarType::F32).unwrap();
+        let uniform = graph
+            .uniform_value([16], TensorScalarValue::F32(2.0))
+            .unwrap();
         let first = graph.add(input, uniform).unwrap();
         let second = graph.add(first, uniform).unwrap();
         let output = graph.relu(second).unwrap();
@@ -7733,6 +9032,7 @@ mod tests {
             requests[0],
             TensorDispatchRequest::Fixed {
                 kind: TensorDispatchKind::Add,
+                scalar_type: TensorPointwiseScalarType::F32,
                 logical_count: 16,
                 scalar_mask: 0b10,
             }
@@ -7741,6 +9041,7 @@ mod tests {
             requests[1],
             TensorDispatchRequest::Fixed {
                 kind: TensorDispatchKind::Relu,
+                scalar_type: TensorPointwiseScalarType::F32,
                 logical_count: 16,
                 scalar_mask: 0,
             }
@@ -7748,10 +9049,100 @@ mod tests {
     }
 
     #[test]
+    fn f64_fixed_pointwise_factories_keep_bindings_values_and_cache_identity_typed() {
+        let kinds = [
+            TensorDispatchKind::Add,
+            TensorDispatchKind::Sub,
+            TensorDispatchKind::Mul,
+            TensorDispatchKind::AddRelu,
+            TensorDispatchKind::Relu,
+        ];
+        let mut ids = std::collections::HashSet::new();
+        for kind in kinds {
+            for mask in 0..=3 {
+                if kind == TensorDispatchKind::Relu && mask != 0 {
+                    continue;
+                }
+                let kernel = pointwise::kernel(kind, 17, mask).unwrap();
+                assert!(ids.insert(kernel.id));
+                assert_eq!(kernel.entry.logical_shape, [17, 1, 1]);
+                assert!(kernel.type_caps.contains(PcuValueTypeCaps::FLOAT64));
+                assert!(kernel.bindings.iter().all(|binding| {
+                    binding.binding_type == PcuBindingType::Value(fusion_pcu::PcuValueType::f64())
+                }));
+                assert!(kernel.ops.iter().all(|op| match op {
+                    PcuDispatchOp::Data(PcuDispatchDataOp::Alu { value_type, .. }) => {
+                        *value_type == fusion_pcu::PcuValueType::f64()
+                    }
+                    _ => true,
+                }));
+                if kind == TensorDispatchKind::AddRelu || kind == TensorDispatchKind::Relu {
+                    assert!(kernel.ops.iter().any(|op| {
+                        matches!(op, PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                            value: fusion_pcu::PcuParameterValue::F64(bits), ..
+                        }) if *bits == 0.0_f64.to_bits())
+                    }));
+                }
+            }
+        }
+        assert_eq!(ids.len(), 17);
+
+        let f32_key = TensorDispatchCacheKey::Fixed(
+            TensorDispatchKind::Add,
+            TensorPointwiseScalarType::F32,
+            17,
+            0,
+        );
+        let f64_key = TensorDispatchCacheKey::Fixed(
+            TensorDispatchKind::Add,
+            TensorPointwiseScalarType::F64,
+            17,
+            0,
+        );
+        assert_ne!(f32_key, f64_key);
+        assert_ne!(
+            add_kernel(17, 0).id,
+            pointwise::kernel(TensorDispatchKind::Add, 17, 0)
+                .unwrap()
+                .id
+        );
+
+        let mut graph = Graph::default();
+        let left = graph.input([17], PcuScalarType::F64).unwrap();
+        let right = graph.input([17], PcuScalarType::F64).unwrap();
+        let output = graph.add(left, right).unwrap();
+        let descriptor = graph.node(output).unwrap();
+        assert_eq!(
+            TensorPointwiseScalarType::try_from(descriptor.scalar_type).unwrap(),
+            TensorPointwiseScalarType::F64
+        );
+    }
+
+    #[test]
+    fn f64_fixed_pointwise_factory_rejects_unsupported_profiles_and_uniform_masks() {
+        assert!(matches!(
+            pointwise::kernel(TensorDispatchKind::SquaredDifference, 17, 0),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(
+                PcuScalarType::F64
+            ))
+        ));
+        assert!(matches!(
+            pointwise::kernel(TensorDispatchKind::Relu, 17, 1),
+            Err(RocmTensorExecutionError::InvalidPointwiseProfile)
+        ));
+        assert!(matches!(
+            TensorPointwiseScalarType::try_from(PcuScalarType::I32),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(
+                PcuScalarType::I32
+            ))
+        ));
+    }
+
+    #[test]
     fn prewarm_request_collects_one_dynamic_key_for_bounded_group() {
         let mut graph = Graph::default();
-        let left = graph.input([32]).unwrap();
-        let right = graph.input([32]).unwrap();
+        let left = graph.input([32], PcuScalarType::F32).unwrap();
+        let right = graph.input([32], PcuScalarType::F32).unwrap();
         let sum = graph.add(left, right).unwrap();
         let difference = graph.sub(sum, right).unwrap();
         let output = graph.relu(difference).unwrap();
@@ -7780,8 +9171,8 @@ mod tests {
     #[test]
     fn prewarm_request_collects_identity_group_at_the_terminal_arithmetic_node() {
         let mut graph = Graph::default();
-        let left = graph.input([32]).unwrap();
-        let right = graph.input([32]).unwrap();
+        let left = graph.input([32], PcuScalarType::F32).unwrap();
+        let right = graph.input([32], PcuScalarType::F32).unwrap();
         let sum = graph.add(left, right).unwrap();
         let output = graph.sub(sum, right).unwrap();
         let prepared = prepared_for_request_test(
@@ -7810,7 +9201,14 @@ mod tests {
     #[test]
     fn prewarm_retained_count_tracks_fifo_capacity_truncation() {
         let requested = (0..35)
-            .map(|count| TensorDispatchCacheKey::Fixed(TensorDispatchKind::Add, count, 0))
+            .map(|count| {
+                TensorDispatchCacheKey::Fixed(
+                    TensorDispatchKind::Add,
+                    TensorPointwiseScalarType::F32,
+                    count,
+                    0,
+                )
+            })
             .collect::<Vec<_>>();
         let retained_fifo = requested[3..].to_vec();
 
@@ -7824,11 +9222,11 @@ mod tests {
     #[test]
     fn preflight_selects_only_requested_output_dependencies() {
         let mut graph = Graph::default();
-        let left = graph.input([2, 2]).unwrap();
-        let right = graph.input([2, 2]).unwrap();
+        let left = graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let right = graph.input([2, 2], PcuScalarType::F32).unwrap();
         let result = graph.matmul(left, right).unwrap();
-        let unrelated_left = graph.input([2, 2]).unwrap();
-        let unrelated_right = graph.input([2, 2]).unwrap();
+        let unrelated_left = graph.input([2, 2], PcuScalarType::F64).unwrap();
+        let unrelated_right = graph.input([2, 2], PcuScalarType::F64).unwrap();
         let _unsupported_but_unreachable = graph.add(unrelated_left, unrelated_right).unwrap();
         let inputs = [
             (left, Tensor::new([2, 2], vec![1.0; 4]).unwrap()),
@@ -7846,9 +9244,9 @@ mod tests {
     #[test]
     fn rocm_preflight_defaults_to_strict_unrewritten_selected_schedule() {
         let mut graph = Graph::default();
-        let weights = graph.input([1]).unwrap();
-        let gradient = graph.input([1]).unwrap();
-        let rate = graph.constant(Tensor::new([1], vec![0.125]).unwrap());
+        let weights = graph.input([1], PcuScalarType::F32).unwrap();
+        let gradient = graph.input([1], PcuScalarType::F32).unwrap();
+        let rate = graph.constant_value(TensorValue::F32(Tensor::new([1], vec![0.125]).unwrap()));
         let scaled = graph.mul(rate, gradient).unwrap();
         let updated = graph.sub(weights, scaled).unwrap();
         let prepared = prepare_graph(&graph, updated, &PureRocmAssessor).unwrap();
@@ -7868,8 +9266,10 @@ mod tests {
     #[test]
     fn compact_uniform_storage_is_limited_to_elementwise_consumers() {
         let mut graph = Graph::default();
-        let input = graph.input([4]).unwrap();
-        let uniform = graph.uniform([4], 0.25).unwrap();
+        let input = graph.input([4], PcuScalarType::F32).unwrap();
+        let uniform = graph
+            .uniform_value([4], TensorScalarValue::F32(0.25))
+            .unwrap();
         let output = graph.add(input, uniform).unwrap();
         let prepared = prepare_graph_outputs_plan(&graph, &[output], &PureRocmAssessor).unwrap();
 
@@ -7883,7 +9283,9 @@ mod tests {
         }));
 
         let mut graph = Graph::default();
-        let uniform = graph.uniform([4], 0.25).unwrap();
+        let uniform = graph
+            .uniform_value([4], TensorScalarValue::F32(0.25))
+            .unwrap();
         let output = graph.relu(uniform).unwrap();
         let prepared = prepare_graph_outputs_plan(&graph, &[output], &PureRocmAssessor).unwrap();
 
@@ -7897,8 +9299,10 @@ mod tests {
         }));
 
         let mut graph = Graph::default();
-        let input = graph.input([4]).unwrap();
-        let uniform = graph.uniform([4], 0.25).unwrap();
+        let input = graph.input([4], PcuScalarType::F32).unwrap();
+        let uniform = graph
+            .uniform_value([4], TensorScalarValue::F32(0.25))
+            .unwrap();
         let output = graph.add(input, uniform).unwrap();
         let prepared = prepare_graph_outputs_plan(&graph, &[output], &DenseOnlyAssessor).unwrap();
         assert_eq!(
@@ -7914,11 +9318,44 @@ mod tests {
     #[test]
     fn resource_input_requirement_covers_dense_input_extent() {
         let mut graph = Graph::default();
-        let value = graph.input([16]).unwrap();
-        let requirement = input_storage_requirement(value, &[16]).unwrap();
+        let value = graph.input([16], PcuScalarType::F32).unwrap();
+        let requirement = input_storage_requirement(value, &[16], PcuScalarType::F32).unwrap();
         assert_eq!(requirement.output_bytes, 64);
         assert_eq!(requirement.access, fusion_pcu::PcuMemoryAccess::ReadOnly);
         assert_eq!(graph.shape(value).unwrap(), &[16]);
+    }
+
+    #[test]
+    fn owned_f64_storage_and_scalar_profiles_use_double_precision_extents() {
+        assert_eq!(byte_len_for::<f64>(&[3, 5]).unwrap(), 120);
+        let mut graph = Graph::default();
+        let value = graph.input([3, 5], PcuScalarType::F64).unwrap();
+        let requirement = input_storage_requirement(value, &[3, 5], PcuScalarType::F64).unwrap();
+        assert_eq!(requirement.scalar_type, PcuScalarType::F64);
+        assert_eq!(requirement.alignment_bytes, 8);
+        assert_eq!(requirement.output_bytes, 120);
+        assert!(alignment_satisfies(16, 8));
+        assert!(!alignment_satisfies(12, 8));
+        assert!(!alignment_satisfies(4, 8));
+        assert!(validate_owned_scalar_profile::<f64>(Some(PcuScalarType::F64)).is_ok());
+        assert!(matches!(
+            validate_owned_scalar_profile::<f64>(Some(PcuScalarType::F32)),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(
+                PcuScalarType::F32
+            ))
+        ));
+        assert!(matches!(
+            validate_owned_scalar_profile::<f32>(Some(PcuScalarType::F64)),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(
+                PcuScalarType::F64
+            ))
+        ));
+        assert!(matches!(
+            validate_tensor_scalar_tag::<f64>(PcuScalarType::F32),
+            Err(RocmTensorExecutionError::UnsupportedScalarType(
+                PcuScalarType::F32
+            ))
+        ));
     }
 
     #[test]
@@ -7960,8 +9397,8 @@ mod tests {
         }
 
         let mut graph = Graph::default();
-        let left = graph.input([]).unwrap();
-        let right = graph.input([]).unwrap();
+        let left = graph.input([], PcuScalarType::F32).unwrap();
+        let right = graph.input([], PcuScalarType::F32).unwrap();
         let constraints = [TensorStorageConstraint {
             left,
             right,
@@ -8020,8 +9457,10 @@ mod tests {
     #[test]
     fn compact_uniform_fans_out_across_selected_elementwise_outputs() {
         let mut graph = Graph::default();
-        let input = graph.input([4]).unwrap();
-        let uniform = graph.uniform([4], 0.25).unwrap();
+        let input = graph.input([4], PcuScalarType::F32).unwrap();
+        let uniform = graph
+            .uniform_value([4], TensorScalarValue::F32(0.25))
+            .unwrap();
         let added = graph.add(input, uniform).unwrap();
         let subtracted = graph.sub(added, uniform).unwrap();
         let multiplied = graph.mul(subtracted, uniform).unwrap();
@@ -8069,8 +9508,8 @@ mod tests {
     #[test]
     fn fused_add_relu_preflight_omits_add_resource_and_overlap_facts() {
         let mut graph = Graph::default();
-        let left = graph.input([4]).unwrap();
-        let right = graph.input([4]).unwrap();
+        let left = graph.input([4], PcuScalarType::F32).unwrap();
+        let right = graph.input([4], PcuScalarType::F32).unwrap();
         let added = graph.add(left, right).unwrap();
         let output = graph.relu(added).unwrap();
         let prepared = prepare_graph_outputs_plan_with_policies(
@@ -8099,7 +9538,9 @@ mod tests {
     #[test]
     fn selected_uniform_output_stays_dense_and_mixed_fanout_stays_dense() {
         let mut graph = Graph::default();
-        let uniform = graph.uniform([4], 0.25).unwrap();
+        let uniform = graph
+            .uniform_value([4], TensorScalarValue::F32(0.25))
+            .unwrap();
         let prepared = prepare_graph_outputs_plan(&graph, &[uniform], &PureRocmAssessor).unwrap();
         assert_eq!(
             prepared.physical_layouts[&uniform],
@@ -8107,8 +9548,10 @@ mod tests {
         );
 
         let mut graph = Graph::default();
-        let input = graph.input([4]).unwrap();
-        let uniform = graph.uniform([4], 0.25).unwrap();
+        let input = graph.input([4], PcuScalarType::F32).unwrap();
+        let uniform = graph
+            .uniform_value([4], TensorScalarValue::F32(0.25))
+            .unwrap();
         let added = graph.add(input, uniform).unwrap();
         let relu = graph.relu(uniform).unwrap();
         let prepared =
@@ -8126,7 +9569,9 @@ mod tests {
     #[test]
     fn empty_uniform_is_rejected_before_rocm_allocation() {
         let mut graph = Graph::default();
-        let uniform = graph.uniform([0], 0.25).unwrap();
+        let uniform = graph
+            .uniform_value([0], TensorScalarValue::F32(0.25))
+            .unwrap();
         assert!(matches!(
             prepare_graph_outputs_plan(&graph, &[uniform], &PureRocmAssessor),
             Err(RocmTensorExecutionError::Unsupported {
@@ -8139,9 +9584,9 @@ mod tests {
     #[test]
     fn rocm_preflight_only_selects_contracted_sgd_when_policy_is_explicit_and_candidate_is_safe() {
         let mut graph = Graph::default();
-        let weights = graph.input([1]).unwrap();
-        let gradient = graph.input([1]).unwrap();
-        let rate = graph.constant(Tensor::new([1], vec![0.125]).unwrap());
+        let weights = graph.input([1], PcuScalarType::F32).unwrap();
+        let gradient = graph.input([1], PcuScalarType::F32).unwrap();
+        let rate = graph.constant_value(TensorValue::F32(Tensor::new([1], vec![0.125]).unwrap()));
         let scaled = graph.mul(rate, gradient).unwrap();
         let updated = graph.sub(weights, scaled).unwrap();
         let explicit = prepare_graph_outputs_plan_with_arithmetic(
@@ -8182,10 +9627,12 @@ mod tests {
     #[test]
     fn multi_output_preflight_unions_dependencies_and_pins_requested_values() {
         let mut graph = Graph::default();
-        let input = graph.input([2]).unwrap();
-        let first_constant = graph.constant(Tensor::new([2], vec![1.0; 2]).unwrap());
+        let input = graph.input([2], PcuScalarType::F32).unwrap();
+        let first_constant =
+            graph.constant_value(TensorValue::F32(Tensor::new([2], vec![1.0; 2]).unwrap()));
         let first = graph.add(input, first_constant).unwrap();
-        let second_constant = graph.constant(Tensor::new([2], vec![2.0; 2]).unwrap());
+        let second_constant =
+            graph.constant_value(TensorValue::F32(Tensor::new([2], vec![2.0; 2]).unwrap()));
         let second = graph.mul(first, second_constant).unwrap();
 
         let plan = prepare_graph_outputs_plan(&graph, &[second, first], &PureRocmAssessor)
@@ -8204,7 +9651,7 @@ mod tests {
     #[test]
     fn multi_output_preflight_rejects_empty_and_duplicate_outputs() {
         let mut graph = Graph::default();
-        let input = graph.input([2]).unwrap();
+        let input = graph.input([2], PcuScalarType::F32).unwrap();
 
         assert!(matches!(
             prepare_graph_outputs_plan(&graph, &[], &PureRocmAssessor),
@@ -8219,8 +9666,8 @@ mod tests {
     #[test]
     fn preflight_accepts_supported_mse_reduction() {
         let mut graph = Graph::default();
-        let left = graph.input([2, 2]).unwrap();
-        let right = graph.input([2, 2]).unwrap();
+        let left = graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let right = graph.input([2, 2], PcuScalarType::F32).unwrap();
         let output = graph.mean_squared_error(left, right).unwrap();
 
         let prepared = prepare_graph(&graph, output, &PureRocmAssessor).unwrap();
@@ -8231,11 +9678,11 @@ mod tests {
     #[test]
     fn mse_scratch_capacity_covers_largest_reduction_in_multi_output_plan() {
         let mut graph = Graph::default();
-        let left = graph.input([2, 3]).unwrap();
-        let right = graph.input([2, 3]).unwrap();
+        let left = graph.input([2, 3], PcuScalarType::F32).unwrap();
+        let right = graph.input([2, 3], PcuScalarType::F32).unwrap();
         let first_loss = graph.mean_squared_error(left, right).unwrap();
-        let next_left = graph.input([4]).unwrap();
-        let next_right = graph.input([4]).unwrap();
+        let next_left = graph.input([4], PcuScalarType::F32).unwrap();
+        let next_right = graph.input([4], PcuScalarType::F32).unwrap();
         let second_loss = graph.mean_squared_error(next_left, next_right).unwrap();
         let plan =
             prepare_graph_outputs_plan(&graph, &[first_loss, second_loss], &PureRocmAssessor)
@@ -8326,8 +9773,8 @@ mod tests {
     #[test]
     fn sgd_update_preflight_is_native_and_tracks_both_operands() {
         let mut graph = Graph::default();
-        let weights = graph.input([3]).unwrap();
-        let gradient = graph.input([3]).unwrap();
+        let weights = graph.input([3], PcuScalarType::F32).unwrap();
+        let gradient = graph.input([3], PcuScalarType::F32).unwrap();
         let updated = graph.sgd_update(weights, gradient, 0.25).unwrap();
 
         let plan = prepare_graph(&graph, updated, &PureRocmAssessor).unwrap();
@@ -8352,8 +9799,9 @@ mod tests {
     #[test]
     fn scratch_retains_constants_and_non_output_computations_only() {
         let mut graph = Graph::default();
-        let input = graph.input([2]).unwrap();
-        let constant = graph.constant(Tensor::new([2], vec![1.0; 2]).unwrap());
+        let input = graph.input([2], PcuScalarType::F32).unwrap();
+        let constant =
+            graph.constant_value(TensorValue::F32(Tensor::new([2], vec![1.0; 2]).unwrap()));
         let computed = graph.add(input, constant).unwrap();
         let input_node = graph.nodes().find(|node| node.value == input).unwrap();
         let constant_node = graph.nodes().find(|node| node.value == constant).unwrap();
@@ -8372,8 +9820,8 @@ mod tests {
     #[test]
     fn preflight_checks_all_reachable_inputs_before_execution() {
         let mut graph = Graph::default();
-        let left = graph.input([2, 2]).unwrap();
-        let right = graph.input([2, 2]).unwrap();
+        let left = graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let right = graph.input([2, 2], PcuScalarType::F32).unwrap();
         let output = graph.matmul(left, right).unwrap();
         let inputs = [(left, Tensor::new([2, 2], vec![1.0; 4]).unwrap())];
 
@@ -8387,7 +9835,7 @@ mod tests {
     #[test]
     fn preflight_rejects_wrong_shaped_input() {
         let mut graph = Graph::default();
-        let input = graph.input([2, 2]).unwrap();
+        let input = graph.input([2, 2], PcuScalarType::F32).unwrap();
         let inputs = [(input, Tensor::new([4], vec![1.0; 4]).unwrap())];
 
         assert!(matches!(
@@ -8403,10 +9851,111 @@ mod tests {
     }
 
     #[test]
+    fn assessor_rejects_unimplemented_tensor_scalar_representations() {
+        let mut graph = Graph::default();
+        let input = graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let sum = graph.add(input, input).unwrap();
+        let product = graph.matmul(input, input).unwrap();
+        for scalar_type in fusion_pcu::PcuScalarType::ALL {
+            if matches!(scalar_type, PcuScalarType::F32 | PcuScalarType::F64) {
+                continue;
+            }
+            for value in [input, sum, product] {
+                let mut node = graph.nodes().find(|node| node.value == value).unwrap();
+                node.scalar_type = scalar_type;
+                let is_transport_input =
+                    matches!(node.op, OpDescriptor::Input) && is_transport_scalar(scalar_type);
+                assert_eq!(
+                    rocm_supports_operand_representation(node, TensorOperandRepresentation::Dense),
+                    is_transport_input
+                );
+                assert!(!rocm_supports_operand_representation(
+                    node,
+                    TensorOperandRepresentation::UniformScalar
+                ));
+                assert_eq!(
+                    assess_tensor_node(&graph, node),
+                    if is_transport_input {
+                        TensorOperationSupport::Supported {
+                            route: TensorExecutionRoute::Native,
+                            workspace_bytes: Some(0),
+                        }
+                    } else {
+                        TensorOperationSupport::Unsupported {
+                            reason: TensorUnsupportedReason::ElementType,
+                        }
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assessor_limits_f64_to_owned_dense_arithmetic_and_rejects_training_sources() {
+        let mut graph = Graph::default();
+        let input = graph.input_typed::<f64>([2, 2]).unwrap();
+        let constant = graph.constant_typed(Tensor::<f64>::splat([2, 2], 1.0).unwrap());
+        let uniform = graph.uniform_typed([2, 2], 2.0_f64).unwrap();
+        let sum = graph.add_typed(input, constant).unwrap();
+        let product = graph.matmul_typed(sum, uniform).unwrap();
+        for (value, expected) in [
+            (
+                input.erase(),
+                TensorOperationSupport::Supported {
+                    route: TensorExecutionRoute::Native,
+                    workspace_bytes: Some(0),
+                },
+            ),
+            (
+                sum.erase(),
+                TensorOperationSupport::Supported {
+                    route: TensorExecutionRoute::Synthesized,
+                    workspace_bytes: Some(0),
+                },
+            ),
+            (
+                product.erase(),
+                TensorOperationSupport::Supported {
+                    route: TensorExecutionRoute::Library,
+                    workspace_bytes: None,
+                },
+            ),
+        ] {
+            let node = graph.nodes().find(|node| node.value == value).unwrap();
+            assert_eq!(node.scalar_type, PcuScalarType::F64);
+            assert_eq!(assess_tensor_node(&graph, node), expected);
+            assert!(rocm_supports_operand_representation(
+                node,
+                TensorOperandRepresentation::Dense
+            ));
+            assert!(!rocm_supports_operand_representation(
+                node,
+                TensorOperandRepresentation::UniformScalar
+            ));
+        }
+        for value in [constant.erase(), uniform.erase()] {
+            let node = graph.nodes().find(|node| node.value == value).unwrap();
+            assert_eq!(
+                assess_tensor_node(&graph, node),
+                TensorOperationSupport::Unsupported {
+                    reason: TensorUnsupportedReason::ElementType,
+                }
+            );
+        }
+        assert!(matches!(
+            prepare_graph(&graph, product.erase(), &PureRocmAssessor),
+            Err(RocmTensorExecutionError::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn assessor_selects_library_for_dense_rank_two_matmul() {
         let mut graph = Graph::default();
-        let left = graph.input([2, 3]).unwrap();
-        let right = graph.input([3, 4]).unwrap();
+        let left = graph.input([2, 3], PcuScalarType::F32).unwrap();
+        let right = graph.input([3, 4], PcuScalarType::F32).unwrap();
         let result = graph.matmul(left, right).unwrap();
         let node = graph.nodes().find(|node| node.value == result).unwrap();
 
@@ -8422,8 +9971,8 @@ mod tests {
     #[test]
     fn assessor_synthesizes_add_relu_and_mse() {
         let mut graph = Graph::default();
-        let first = graph.input([2, 2]).unwrap();
-        let second = graph.input([2, 2]).unwrap();
+        let first = graph.input([2, 2], PcuScalarType::F32).unwrap();
+        let second = graph.input([2, 2], PcuScalarType::F32).unwrap();
         let add = graph.add(first, second).unwrap();
         let relu = graph.relu(first).unwrap();
         let loss = graph.mean_squared_error(first, second).unwrap();
@@ -8459,8 +10008,8 @@ mod tests {
     #[test]
     fn assessor_rejects_zero_sized_matmul_output() {
         let mut graph = Graph::default();
-        let left = graph.input([0, 3]).unwrap();
-        let right = graph.input([3, 2]).unwrap();
+        let left = graph.input([0, 3], PcuScalarType::F32).unwrap();
+        let right = graph.input([3, 2], PcuScalarType::F32).unwrap();
         let result = graph.matmul(left, right).unwrap();
         let node = graph.nodes().find(|node| node.value == result).unwrap();
 
@@ -8475,8 +10024,8 @@ mod tests {
     #[test]
     fn assessor_rejects_zero_inner_dimension_even_with_nonzero_output() {
         let mut graph = Graph::default();
-        let left = graph.input([2, 0]).unwrap();
-        let right = graph.input([0, 3]).unwrap();
+        let left = graph.input([2, 0], PcuScalarType::F32).unwrap();
+        let right = graph.input([0, 3], PcuScalarType::F32).unwrap();
         let result = graph.matmul(left, right).unwrap();
         let node = graph.nodes().find(|node| node.value == result).unwrap();
 
@@ -8491,8 +10040,10 @@ mod tests {
     #[test]
     fn assessor_rejects_dimensions_outside_rocblas_integer_range() {
         let mut graph = Graph::default();
-        let left = graph.input([i32::MAX as usize + 1, 1]).unwrap();
-        let right = graph.input([1, 1]).unwrap();
+        let left = graph
+            .input([i32::MAX as usize + 1, 1], PcuScalarType::F32)
+            .unwrap();
+        let right = graph.input([1, 1], PcuScalarType::F32).unwrap();
         let result = graph.matmul(left, right).unwrap();
         let node = graph.nodes().find(|node| node.value == result).unwrap();
 

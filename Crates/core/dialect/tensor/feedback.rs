@@ -238,12 +238,15 @@ mod tests {
         Graph,
         Tensor,
     };
+    use crate::PcuScalarType;
 
     #[test]
     fn feedback_validates_selected_values_and_schedules_two_banks() {
         let mut graph = Graph::default();
-        let state = graph.input(vec![2]).unwrap();
-        let increment = graph.constant(Tensor::new(vec![2], vec![1.0, 1.0]).unwrap());
+        let state = graph.input(vec![2], PcuScalarType::F32).unwrap();
+        let increment = graph
+            .constant_typed::<f32>(Tensor::new(vec![2], vec![1.0, 1.0]).unwrap())
+            .erase();
         let next = graph.add(state, increment).unwrap();
         let plan = graph.execution_plan_for_outputs(&[next]).unwrap();
         let feedback = plan.feedback_plan(&[(next, state)]).unwrap();
@@ -282,13 +285,17 @@ mod tests {
     #[test]
     fn feedback_rejects_shape_mismatch_duplicate_bindings_and_unselected_output() {
         let mut graph = Graph::default();
-        let state = graph.input(vec![2]).unwrap();
-        let other_state = graph.input(vec![3]).unwrap();
-        let increment = graph.constant(Tensor::new(vec![2], vec![0.0; 2]).unwrap());
+        let state = graph.input(vec![2], PcuScalarType::F32).unwrap();
+        let other_state = graph.input(vec![3], PcuScalarType::F32).unwrap();
+        let increment = graph
+            .constant_typed::<f32>(Tensor::new(vec![2], vec![0.0; 2]).unwrap())
+            .erase();
         let next = graph.add(state, increment).unwrap();
-        let other_increment = graph.constant(Tensor::new(vec![3], vec![0.0; 3]).unwrap());
+        let other_increment = graph
+            .constant_typed::<f32>(Tensor::new(vec![3], vec![0.0; 3]).unwrap())
+            .erase();
         let other_output = graph.add(other_state, other_increment).unwrap();
-        let unselected = graph.constant(Tensor::scalar(1.0));
+        let unselected = graph.constant_typed::<f32>(Tensor::scalar(1.0)).erase();
         let plan = graph
             .execution_plan_for_outputs(&[next, other_output])
             .unwrap();
@@ -320,8 +327,10 @@ mod tests {
     #[test]
     fn feedback_supports_n_bank_rotation_and_rejects_one_bank() {
         let mut graph = Graph::default();
-        let state = graph.input(vec![1]).unwrap();
-        let increment = graph.constant(Tensor::new(vec![1], vec![1.0]).unwrap());
+        let state = graph.input(vec![1], PcuScalarType::F32).unwrap();
+        let increment = graph
+            .constant_typed::<f32>(Tensor::new(vec![1], vec![1.0]).unwrap())
+            .erase();
         let next = graph.add(state, increment).unwrap();
         let plan = graph.execution_plan_for_outputs(&[next]).unwrap();
         let one = NonZeroUsize::new(1).unwrap();

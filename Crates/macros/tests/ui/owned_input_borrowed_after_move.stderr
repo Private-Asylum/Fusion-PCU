@@ -1,0 +1,5 @@
+error: use of consumed PCU owner after move
+ --> tests/ui/owned_input_borrowed_after_move.rs:8:25
+  |
+8 |     Ok(pcu::add(first, &input)?)
+  |                         ^^^^^

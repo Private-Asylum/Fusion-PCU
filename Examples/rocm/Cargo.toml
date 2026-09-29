@@ -273,6 +273,38 @@ harness = false
 name = "owned_binary"
 harness = false
 
+[[bench]]
+name = "owned_matmul"
+harness = false
+
+[[bench]]
+name = "owned_multi_consuming"
+harness = false
+
 [[bin]]
 name = "fusion-rocm-ownership"
 path = "ownership.rs"
+
+[[bin]]
+name = "fusion-rocm-ownership-matrix"
+path = "ownership_matrix.rs"
+
+[[bench]]
+name = "owned_relu"
+path = "benches/owned_relu.rs"
+harness = false
+
+[[bench]]
+name = "owned_identity_transfer"
+path = "benches/owned_identity_transfer.rs"
+harness = false
+
+[[bench]]
+name = "owned_binary_donor"
+path = "benches/owned_binary_donor.rs"
+harness = false
+
+[[bench]]
+name = "owned_selected_owners"
+path = "benches/owned_selected_owners.rs"
+harness = false

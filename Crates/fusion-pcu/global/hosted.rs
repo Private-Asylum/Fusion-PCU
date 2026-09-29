@@ -151,7 +151,7 @@ impl Preparation {
                 session
                     .backend()
                     .prepare_host_kernel(kernel)
-                    .map_err(|error| PcuExecutionError::KernelBuildDetails(error.to_string()))
+                    .map_err(PcuExecutionError::Execution)
             },
         )?;
         self.session = Some(session);
@@ -210,14 +210,14 @@ fn prepare_in_arena<R>(
                     session
                 }
                 Err(error) => {
-                    rejected.push((device.id, error.to_string()));
+                    rejected.push((device.id, PcuExecutionError::BackendInitialization(error)));
                     continue;
                 }
             }
         };
         match prepare(&session) {
             Ok(prepared) => return Ok((session, prepared)),
-            Err(error) => rejected.push((device.id, error.to_string())),
+            Err(error) => rejected.push((device.id, error)),
         }
     }
     Err(PcuExecutionError::NoCompatibleDevice(rejected))

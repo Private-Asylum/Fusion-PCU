@@ -4,6 +4,7 @@
 use fusion_pcu::{
     PcuMemoryAccess,
     PcuMemoryAllocationRequest,
+    PcuMemoryBackingOwnership,
     PcuMemoryDisposition,
     PcuMemoryHostAccess,
     PcuMemoryImportDescriptor,
@@ -127,6 +128,10 @@ impl PcuMemoryResource for RocmMemoryResource {
         )
     }
 
+    fn backing_ownership(&self) -> PcuMemoryBackingOwnership {
+        rocm_backing_ownership(std::rc::Rc::strong_count(&self.buffer.allocation))
+    }
+
     fn overlap(
         &self,
         other: &Self,
@@ -153,7 +158,20 @@ impl PcuMemoryResource for RocmMemoryResource {
     }
 }
 
+const fn rocm_backing_ownership(strong_count: usize) -> PcuMemoryBackingOwnership {
+    match strong_count {
+        0 => PcuMemoryBackingOwnership::Unknown,
+        1 => PcuMemoryBackingOwnership::Exclusive,
+        _ => PcuMemoryBackingOwnership::Shared,
+    }
+}
+
 impl RocmMemoryResource {
+    #[cfg(all(test, feature = "tensor"))]
+    pub(crate) fn allocation_identity_for_test(&self) -> usize {
+        std::rc::Rc::as_ptr(&self.buffer.allocation) as usize
+    }
+
     /// Whether two provider resources refer to the same allocation with identical metadata.
     #[cfg(feature = "tensor")]
     pub(crate) fn same_binding(&self, other: &Self) -> bool {
@@ -594,6 +612,151 @@ const fn hip_failure_classification(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rustfmt::skip]
+    use fusion_pcu::{
+        PcuDeviceClass,
+        PcuDeviceDescriptor,
+        PcuMemoryPoolId,
+        PcuObjectKind,
+        PcuObjectRef,
+        PcuProviderDescriptor,
+        PcuProviderId,
+        PcuProviderReadiness,
+        PcuProviderStatus,
+        PcuRuntimeDiscovery,
+        PcuTargetDescriptor,
+    };
+
+    fn selected_rocm_session() -> crate::RocmOwnedDispatchBackend {
+        let discovery = crate::RocmDiscovery::new();
+        let invalid = PcuObjectRef {
+            provider: PcuProviderId(0),
+            generation: 0,
+            kind: PcuObjectKind::Device,
+            id: 0,
+        };
+        let mut providers = [PcuProviderDescriptor {
+            id: PcuProviderId(0),
+            generation: 0,
+            backend: "",
+            readiness: PcuProviderReadiness {
+                status: PcuProviderStatus::Unavailable,
+                reason: None,
+            },
+        }];
+        assert_eq!(discovery.providers(&mut providers).unwrap(), 1);
+        let mut targets = [PcuTargetDescriptor {
+            reference: invalid,
+            name: "",
+            readiness: PcuProviderReadiness {
+                status: PcuProviderStatus::Unavailable,
+                reason: None,
+            },
+        }];
+        assert_eq!(
+            discovery
+                .targets(providers[0].id, providers[0].generation, &mut targets)
+                .unwrap(),
+            1
+        );
+        let target = targets[0].reference;
+        let device_count = discovery.devices(target, &mut []).unwrap();
+        assert!(device_count > 0, "test requires a visible ROCm device");
+        let mut devices = vec![
+            PcuDeviceDescriptor {
+                reference: invalid,
+                target: invalid,
+                name: "",
+                class: PcuDeviceClass::Other,
+                vendor: None,
+                architecture: None,
+                generation: None,
+                location: None,
+            };
+            device_count
+        ];
+        discovery.devices(target, &mut devices).unwrap();
+        crate::RocmOwnedDispatchBackend::open(&discovery, devices[0].reference, 64)
+            .expect("open selected ROCm device")
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly visible ROCm device"]
+    fn rocm_resource_ownership_tracks_alias_and_access_leases() {
+        let session = selected_rocm_session();
+
+        let pool = PcuMemoryPoolId(0x524f_434d);
+        let mut provider = session.memory_provider(pool);
+        let resource = provider
+            .allocate(PcuMemoryAllocationRequest {
+                pool,
+                size_bytes: 64,
+                alignment_bytes: 8,
+                access: PcuMemoryAccess::ReadWrite,
+                host_access: PcuMemoryHostAccess::TransferOnly,
+                require_device_local: false,
+            })
+            .expect("allocate ownership-test resource");
+        assert_eq!(
+            resource.backing_ownership(),
+            PcuMemoryBackingOwnership::Exclusive
+        );
+
+        // Ownership exists without the tensor feature; clone the private allocation carrier
+        // directly so this resource-law test does not depend on a tensor-only adapter.
+        let alias = RocmMemoryResource {
+            pool: resource.pool,
+            buffer: resource.buffer.clone(),
+            alignment: resource.alignment,
+            access: resource.access,
+        };
+        assert_eq!(
+            resource.backing_ownership(),
+            PcuMemoryBackingOwnership::Shared
+        );
+        assert_eq!(alias.backing_ownership(), PcuMemoryBackingOwnership::Shared);
+        drop(alias);
+        assert_eq!(
+            resource.backing_ownership(),
+            PcuMemoryBackingOwnership::Exclusive
+        );
+
+        resource
+            .device_buffer()
+            .with_access_lease_for_test(|| {
+                assert_eq!(
+                    resource.backing_ownership(),
+                    PcuMemoryBackingOwnership::Shared
+                );
+                assert!(matches!(
+                    resource.validate_access_available(),
+                    Err(HipError::Busy)
+                ));
+            })
+            .expect("acquire test operation lease");
+        assert_eq!(
+            resource.backing_ownership(),
+            PcuMemoryBackingOwnership::Exclusive
+        );
+        resource
+            .validate_access_available()
+            .expect("completed operation lease releases quiescence");
+    }
+
+    #[test]
+    fn backing_ownership_requires_one_observable_allocation_lease() {
+        assert_eq!(
+            rocm_backing_ownership(0),
+            PcuMemoryBackingOwnership::Unknown
+        );
+        assert_eq!(
+            rocm_backing_ownership(1),
+            PcuMemoryBackingOwnership::Exclusive
+        );
+        assert_eq!(rocm_backing_ownership(2), PcuMemoryBackingOwnership::Shared);
+        assert_eq!(rocm_backing_ownership(8), PcuMemoryBackingOwnership::Shared);
+    }
 
     #[test]
     fn hip_memory_failures_keep_retry_and_device_loss_distinct() {

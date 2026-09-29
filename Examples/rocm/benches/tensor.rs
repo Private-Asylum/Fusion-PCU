@@ -1,5 +1,7 @@
 //! Criterion benchmarks for resident tensor `MatMul` and composed `MatMul` graphs.
 
+#[path = "../reference.rs"]
+mod reference;
 mod support;
 
 use std::error::Error;
@@ -209,9 +211,9 @@ fn graph_matmul(
             .ok_or("matrix size overflow")?;
         let (a_values, b_values, c_values) = graph_inputs(size);
         let mut graph = Graph::default();
-        let a = graph.input([size, size])?;
-        let b = graph.input([size, size])?;
-        let c = graph.input([size, size])?;
+        let a = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
+        let b = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
+        let c = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
         let first = graph.matmul(a, b)?;
         let output = graph.matmul(first, c)?;
         let inputs = [
@@ -219,7 +221,10 @@ fn graph_matmul(
             (b, Tensor::new([size, size], b_values.clone())?),
             (c, Tensor::new([size, size], c_values.clone())?),
         ];
-        let reference = graph.evaluate(&inputs)?.value(output)?.clone();
+        let reference = graph
+            .evaluate(&reference::f32_inputs(&inputs))?
+            .value_typed::<f32>(output)?
+            .clone();
         let mut memory =
             PcuOwnedDispatchMemorySession::memory_provider(&device.session, device.candidate.pool);
         let prepared = support::cold_once(&format!("{size}x{size} graph preparation"), || {
@@ -289,10 +294,10 @@ fn graph_elementwise_batch(
     for size in [8_usize, 256] {
         let (a_values, b_values, c_values) = graph_inputs(size);
         let mut graph = Graph::default();
-        let a = graph.input([size, size])?;
-        let b = graph.input([size, size])?;
-        let bias = graph.input([size, size])?;
-        let c = graph.input([size, size])?;
+        let a = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
+        let b = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
+        let bias = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
+        let c = graph.input([size, size], fusion_pcu::PcuScalarType::F32)?;
         let product = graph.matmul(a, b)?;
         let biased = graph.add(product, bias)?;
         let activated = graph.relu(biased)?;
@@ -306,7 +311,10 @@ fn graph_elementwise_batch(
             ),
             (c, Tensor::new([size, size], c_values.clone())?),
         ];
-        let reference = graph.evaluate(&inputs)?.value(output)?.clone();
+        let reference = graph
+            .evaluate(&reference::f32_inputs(&inputs))?
+            .value_typed::<f32>(output)?
+            .clone();
         let prepared =
             support::cold_once(&format!("{size}x{size} batched graph preparation"), || {
                 assessor.prepare_graph(&graph, output)

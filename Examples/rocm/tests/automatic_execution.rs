@@ -358,8 +358,12 @@ fn bound_feedback_matches_cpu_for_one_through_four_steps() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let mut graph = Graph::default();
-    let state = graph.input([1]).expect("input");
-    let increment = graph.constant(Tensor::new([1], vec![2.0]).expect("constant"));
+    let state = graph
+        .input([1], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
+    let increment = graph.constant_value(fusion_pcu::dialect::tensor::TensorValue::F32(
+        Tensor::new([1], vec![2.0]).expect("constant"),
+    ));
     let output = graph.add(state, increment).expect("add");
     let prepared = assessor
         .prepare_graph(&graph, output)
@@ -406,7 +410,9 @@ fn plain_bind_and_generic_trait_default_execute_work() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let mut graph = Graph::default();
-    let input_value = graph.input([1]).expect("input");
+    let input_value = graph
+        .input([1], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
     let output = graph.relu(input_value).expect("relu");
     let prepared = assessor
         .prepare_graph(&graph, output)
@@ -432,7 +438,9 @@ fn tensor_output_moves_into_typed_device_call_without_intermediate_readback() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let mut graph = Graph::default();
-    let input_value = graph.input([N]).expect("input");
+    let input_value = graph
+        .input([N], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
     let output_value = graph.relu(input_value).expect("relu");
     let prepared = assessor
         .prepare_graph(&graph, output_value)
@@ -481,8 +489,12 @@ fn scratch_reuses_slots_after_fanout_lifetimes_end() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let mut graph = Graph::default();
-    let left = graph.input([16]).expect("left input");
-    let right = graph.input([16]).expect("right input");
+    let left = graph
+        .input([16], fusion_pcu::PcuScalarType::F32)
+        .expect("left input");
+    let right = graph
+        .input([16], fusion_pcu::PcuScalarType::F32)
+        .expect("right input");
     let fanout = graph.add(left, right).expect("fanout producer");
     let first_output = graph.relu(fanout).expect("first branch");
     let later = graph.mul(fanout, right).expect("second fanout consumer");
@@ -513,7 +525,9 @@ fn valid_replacement_is_revalidated_and_provider_errors_are_preserved() {
         let (_discovery, session, pool) = open_device();
         let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
         let mut graph = Graph::default();
-        let state = graph.input([1]).expect("input");
+        let state = graph
+            .input([1], fusion_pcu::PcuScalarType::F32)
+            .expect("input");
         let output = graph.relu(state).expect("relu");
         let prepared = assessor
             .prepare_graph(&graph, output)
@@ -557,7 +571,9 @@ fn invalid_replacement_is_rejected_and_rebind_recovers() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let mut graph = Graph::default();
-    let state = graph.input([1]).expect("input");
+    let state = graph
+        .input([1], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
     let output = graph.relu(state).expect("relu");
     let prepared = assessor
         .prepare_graph(&graph, output)
@@ -612,7 +628,9 @@ fn failed_update_without_replacement_clears_outputs_and_can_retry() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let mut graph = Graph::default();
-    let state = graph.input([1]).expect("input");
+    let state = graph
+        .input([1], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
     let output = graph.relu(state).expect("relu");
     let prepared = assessor
         .prepare_graph(&graph, output)
@@ -656,8 +674,12 @@ fn second_step_failure_publishes_no_partial_output() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let mut graph = Graph::default();
-    let state = graph.input([1]).expect("input");
-    let leaf = graph.constant(Tensor::new([1], vec![3.0]).expect("constant"));
+    let state = graph
+        .input([1], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
+    let leaf = graph.constant_value(fusion_pcu::dialect::tensor::TensorValue::F32(
+        Tensor::new([1], vec![3.0]).expect("constant"),
+    ));
     let output = graph.add(state, leaf).expect("add");
     let prepared = assessor
         .prepare_graph_outputs(&graph, &[output, leaf])
@@ -702,11 +724,20 @@ fn selected_constant_or_uniform_output_replacement_is_rejected() {
             let (_discovery, session, pool) = open_device();
             let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
             let mut graph = Graph::default();
-            let state = graph.input([1]).expect("input");
+            let state = graph
+                .input([1], fusion_pcu::PcuScalarType::F32)
+                .expect("input");
             let leaf = if uniform {
-                graph.uniform([1], 3.0).expect("uniform")
+                graph
+                    .uniform_value(
+                        [1],
+                        fusion_pcu::dialect::tensor::TensorScalarValue::F32(3.0),
+                    )
+                    .expect("uniform")
             } else {
-                graph.constant(Tensor::new([1], vec![3.0]).expect("constant"))
+                graph.constant_value(fusion_pcu::dialect::tensor::TensorValue::F32(
+                    Tensor::new([1], vec![3.0]).expect("constant"),
+                ))
             };
             let output = graph.add(state, leaf).expect("add");
             let prepared = assessor
@@ -748,7 +779,9 @@ fn selected_input_copy_replacement_is_rejected_and_poisoned() {
         let (_discovery, session, pool) = open_device();
         let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
         let mut graph = Graph::default();
-        let state = graph.input([1]).expect("input");
+        let state = graph
+            .input([1], fusion_pcu::PcuScalarType::F32)
+            .expect("input");
         let output = graph.relu(state).expect("relu");
         let prepared = assessor
             .prepare_graph_outputs(&graph, &[state, output])
@@ -810,7 +843,9 @@ fn typed_device_owner_is_borrowed_by_graph_without_transfer_or_mutation() {
             .is_err()
     );
     let mut graph = Graph::default();
-    let input_value = graph.input([4]).expect("input shape");
+    let input_value = graph
+        .input([4], fusion_pcu::PcuScalarType::F32)
+        .expect("input shape");
     let output_value = graph.relu(input_value).expect("relu");
     let prepared = assessor
         .prepare_graph(&graph, output_value)
@@ -853,7 +888,9 @@ fn escaping_identity_output_is_independent_of_its_borrowed_source() {
         .borrow_device_input(&owner, pool)
         .expect("resident borrow");
     let mut graph = Graph::default();
-    let value = graph.input([4]).expect("input shape");
+    let value = graph
+        .input([4], fusion_pcu::PcuScalarType::F32)
+        .expect("input shape");
     // Selecting the input itself as an escaping result cannot export a hidden alias of owner.
     let prepared = assessor
         .prepare_graph(&graph, value)
@@ -897,7 +934,9 @@ fn owned_program_reuses_schedule_without_overwriting_escaped_results() {
     let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
     let (input, positive, prepared) = {
         let mut graph = Graph::default();
-        let input = graph.input([4]).expect("input shape");
+        let input = graph
+            .input([4], fusion_pcu::PcuScalarType::F32)
+            .expect("input shape");
         let positive = graph.relu(input).expect("relu");
         let program = graph
             .into_selected_program(
@@ -967,7 +1006,9 @@ fn retained_session_reuses_warm_state_after_outer_handles_drop() {
     drop(backend);
     assert!(weak_backend.upgrade().is_some());
     let mut graph = Graph::default();
-    let input = graph.input([4]).expect("input");
+    let input = graph
+        .input([4], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
     let positive = graph.relu(input).expect("relu");
     {
         let view = root.assessor();
@@ -1044,7 +1085,9 @@ fn shared_captured_program_retains_identity_across_candidate_preparations() {
     let (_discovery, session, pool) = open_device();
     let assessor = RocmTensorAssessor::new(&session).expect("assessor");
     let mut graph = Graph::default();
-    let input = graph.input([4]).expect("input");
+    let input = graph
+        .input([4], fusion_pcu::PcuScalarType::F32)
+        .expect("input");
     let output = graph.relu(input).expect("relu");
     let program = Arc::new(
         graph

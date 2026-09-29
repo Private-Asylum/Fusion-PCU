@@ -2,6 +2,8 @@
 
 #[path = "support/alloc.rs"]
 pub mod alloc;
+#[path = "../reference.rs"]
+mod reference;
 mod support;
 
 #[rustfmt::skip]
@@ -128,10 +130,10 @@ macro_rules! record_node_timings {
 
 fn program(rows: usize, features: usize) -> Result<Program, Box<dyn Error>> {
     let mut graph = Graph::default();
-    let samples = graph.input([rows, features])?;
-    let weights = graph.input([features, 1])?;
-    let target = graph.input([rows, 1])?;
-    let rate = graph.input([features, 1])?;
+    let samples = graph.input([rows, features], fusion_pcu::PcuScalarType::F32)?;
+    let weights = graph.input([features, 1], fusion_pcu::PcuScalarType::F32)?;
+    let target = graph.input([rows, 1], fusion_pcu::PcuScalarType::F32)?;
+    let rate = graph.input([features, 1], fusion_pcu::PcuScalarType::F32)?;
     let prediction = graph.matmul(samples, weights)?;
     let loss = graph.mean_squared_error(prediction, target)?;
     let gradients = graph.backward_mse(loss)?;
@@ -158,9 +160,9 @@ fn program(rows: usize, features: usize) -> Result<Program, Box<dyn Error>> {
 
 fn strict_program(rows: usize, features: usize) -> Result<StrictProgram, Box<dyn Error>> {
     let mut graph = Graph::default();
-    let samples = graph.input([rows, features])?;
-    let weights = graph.input([features, 1])?;
-    let target = graph.input([rows, 1])?;
+    let samples = graph.input([rows, features], fusion_pcu::PcuScalarType::F32)?;
+    let weights = graph.input([features, 1], fusion_pcu::PcuScalarType::F32)?;
+    let target = graph.input([rows, 1], fusion_pcu::PcuScalarType::F32)?;
     let prediction = graph.matmul(samples, weights)?;
     let loss = graph.mean_squared_error(prediction, target)?;
     let gradients = graph.backward_mse(loss)?;

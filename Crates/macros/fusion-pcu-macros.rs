@@ -874,10 +874,14 @@ pub fn pcu_dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// callable on the CPU, while its hidden companion lowers the same expression into kernel IR.
 /// Helpers may call nested or module-qualified helpers, including through import aliases.
 /// Helper recursion and total IR size are bounded and report `PcuError` during IR construction.
-/// An explicit `Result<PcuTensor<f32>, PcuExecutionError>` return instead selects the initial
-/// owned-tensor profile: immutable let-bound chains of `pcu::relu` and `pcu::identity`, followed
-/// by one operation or a previously bound value. The same source name accepts a host slice borrow
-/// or a resident tensor borrow.
+/// An explicit `Result<PcuTensor<T>, PcuExecutionError>` return selects the bounded owned-tensor
+/// profile: homogeneous builtin operations, immutable graph temporaries and marked helper
+/// composition. Scalars may be concrete or generic under `T: PcuScalar`; operation coverage is
+/// checked by the backend. Borrowed source signatures accept RAM or resident storage.
+/// A sole by-value resident input supports builtin composition with lexical moves and borrows;
+/// references may precede its final bare use, but any use after that move is rejected. Consuming
+/// marked helpers and owner/reference alias locals are not yet supported. Internal graph values
+/// describe non-escaping SSA temporaries, rather than independent physical Rust owners.
 ///
 /// `#[pcu(invocations = N)]` or `#[pcu(invocations: N)]` defines a kernel. It keeps
 /// `<name>_bindings`, `<name>_ir`, and typed `<name>_prepare` / `<name>_prepare_device` APIs, and

@@ -1,0 +1,5 @@
+error: use of consumed PCU owner after move
+  --> tests/ui/owned_helper_use_after_move.rs:15:24
+   |
+15 |     Ok(pcu::add(moved, input)?)
+   |                        ^^^^^

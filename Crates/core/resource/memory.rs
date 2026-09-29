@@ -389,6 +389,23 @@ pub enum PcuMemoryOverlap {
     Unknown,
 }
 
+/// Provider knowledge about whether a resource's backing has any other observable handles.
+///
+/// This is a point-in-time query, not an ownership lease. `Exclusive` is only useful when the
+/// caller also owns the resource carrier, has established quiescence, and can prevent new
+/// observable aliases for the duration of a destructive operation. Unknown must never be treated
+/// as exclusive. This is independent of [`PcuMemoryResourceCapability::ReusableStorage`], which
+/// only describes reuse after prior users are quiescent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuMemoryBackingOwnership {
+    /// The provider cannot establish whether another resource handle aliases this backing.
+    Unknown,
+    /// The provider knows that one or more other handles may alias this backing.
+    Shared,
+    /// The provider currently proves that no other observable resource handle aliases this backing.
+    Exclusive,
+}
+
 /// Optional storage behavior a provider can affirm for a resource.
 ///
 /// Capabilities are opt-in: a missing implementation never implies that an operation is safe.
@@ -616,6 +633,15 @@ pub trait PcuMemoryResource {
     /// Whether the provider explicitly supports an optional storage behavior.
     fn supports(&self, _capability: PcuMemoryResourceCapability) -> bool {
         false
+    }
+
+    /// Returns the provider's current knowledge of aliases to this resource's backing.
+    ///
+    /// This snapshot is not a lease and does not itself prevent another alias from appearing.
+    /// The conservative default is `Unknown`; reusable-storage support does not imply exclusive
+    /// ownership.
+    fn backing_ownership(&self) -> PcuMemoryBackingOwnership {
+        PcuMemoryBackingOwnership::Unknown
     }
 
     /// Classifies overlap between two byte ranges in resources of this provider's type.
@@ -1239,6 +1265,17 @@ mod tests {
             reusable: true,
             overlap,
         }
+    }
+
+    #[test]
+    fn reusable_storage_does_not_imply_exclusive_backing_ownership() {
+        let resource = bank_resource(1, 64, PcuMemoryOverlap::Disjoint);
+
+        assert!(resource.supports(PcuMemoryResourceCapability::ReusableStorage));
+        assert_eq!(
+            resource.backing_ownership(),
+            PcuMemoryBackingOwnership::Unknown
+        );
     }
 
     #[test]

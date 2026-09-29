@@ -23,8 +23,10 @@ pub fn cpu_strict_two_steps(
             (program.weights, weights.clone()),
             (program.target, target.clone()),
         ];
-        let execution = program.graph.evaluate(&inputs)?;
-        weights = execution.value(program.output)?.clone();
+        let execution = program
+            .graph
+            .evaluate(&crate::reference::f32_inputs(&inputs))?;
+        weights = execution.value_typed::<f32>(program.output)?.clone();
     }
     Ok(weights.data().to_vec())
 }
@@ -44,8 +46,10 @@ pub fn cpu_two_steps(
             (program.target, target.clone()),
             (program.rate, rate.clone()),
         ];
-        let execution = program.graph.evaluate(&inputs)?;
-        weights = execution.value(program.output)?.clone();
+        let execution = program
+            .graph
+            .evaluate(&crate::reference::f32_inputs(&inputs))?;
+        weights = execution.value_typed::<f32>(program.output)?.clone();
     }
     Ok(weights.data().to_vec())
 }

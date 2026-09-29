@@ -1,5 +1,7 @@
 //! Compare PCU tensor mean-squared error with the equivalent HIP and rocBLAS route.
 
+#[path = "../reference.rs"]
+mod reference;
 mod support;
 
 #[rustfmt::skip]
@@ -169,14 +171,17 @@ fn run_on(
             .collect::<Vec<_>>();
         let target = vec![0.5_f32; count];
         let mut graph = Graph::default();
-        let prediction_id = graph.input([count])?;
-        let target_id = graph.input([count])?;
+        let prediction_id = graph.input([count], fusion_pcu::PcuScalarType::F32)?;
+        let target_id = graph.input([count], fusion_pcu::PcuScalarType::F32)?;
         let loss = graph.mean_squared_error(prediction_id, target_id)?;
         let inputs = [
             (prediction_id, Tensor::new([count], prediction.clone())?),
             (target_id, Tensor::new([count], target.clone())?),
         ];
-        let reference = graph.evaluate(&inputs)?.value(loss)?.clone();
+        let reference = graph
+            .evaluate(&reference::f32_inputs(&inputs))?
+            .value_typed::<f32>(loss)?
+            .clone();
         let mut memory = PcuOwnedDispatchMemorySession::memory_provider(&session, selected.pool);
         let prepared = assessor.prepare_graph(&graph, loss)?;
         let resident_prediction =

@@ -126,6 +126,7 @@ pub use tensor::{
     RocmTensorFeedbackReleaseError,
     RocmTensorFeedbackResources,
     RocmTensorInput,
+    RocmTensorInputRef,
     RocmTensorNodeTiming,
     RocmTensorOutputBank,
     RocmTensorOwnedOutput,
@@ -1316,6 +1317,17 @@ impl DeviceBuffer {
             allocation: Rc::clone(&self.allocation),
             guard,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_access_lease_for_test<R>(
+        &self,
+        inspect: impl FnOnce() -> R,
+    ) -> Result<R, HipError> {
+        let lease = self.acquire_access()?;
+        let result = inspect();
+        drop(lease);
+        Ok(result)
     }
 
     pub(crate) fn validate_access_available(&self) -> Result<(), HipError> {

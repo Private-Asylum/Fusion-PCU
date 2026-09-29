@@ -2,6 +2,9 @@
 
 use std::process::ExitCode;
 
+#[path = "reference.rs"]
+mod reference;
+
 #[path = "selection.rs"]
 mod selection;
 
@@ -50,10 +53,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let discovery = RocmDiscovery::new();
     let candidates = selection::ranked_devices(&discovery, selection::preferred_device()?, false)?;
     let mut graph = Graph::default();
-    let samples = graph.input([2, 3])?;
-    let hidden_weights = graph.input([3, 2])?;
-    let bias = graph.input([2, 2])?;
-    let output_weights = graph.input([2, 2])?;
+    let samples = graph.input([2, 3], fusion_pcu::PcuScalarType::F32)?;
+    let hidden_weights = graph.input([3, 2], fusion_pcu::PcuScalarType::F32)?;
+    let bias = graph.input([2, 2], fusion_pcu::PcuScalarType::F32)?;
+    let output_weights = graph.input([2, 2], fusion_pcu::PcuScalarType::F32)?;
     let hidden = graph.matmul(samples, hidden_weights)?;
     let biased = graph.add(hidden, bias)?;
     let activated = graph.relu(biased)?;
@@ -73,7 +76,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Tensor::new([2, 2], vec![1.0, 2.0, -1.0, 3.0])?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let mut failures = Vec::new();
     for candidate in candidates {
         let session =
@@ -217,8 +223,11 @@ fn verify_uniform_storage(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let input = graph.input([8])?;
-    let uniform = graph.uniform([8], 0.5)?;
+    let input = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let uniform = graph.uniform_value(
+        [8],
+        fusion_pcu::dialect::tensor::TensorScalarValue::F32(0.5),
+    )?;
     let add_left = graph.add(uniform, input)?;
     let subtract_right = graph.sub(add_left, uniform)?;
     let add_both_uniform = graph.add(uniform, uniform)?;
@@ -227,9 +236,9 @@ fn verify_uniform_storage(
         input,
         Tensor::new([8], vec![1.0, -2.0, 3.5, 0.0, 8.0, -1.0, 4.0, 2.0])?,
     )];
-    let evaluated = graph.evaluate(&inputs)?;
-    let expected_subtract = evaluated.value(subtract_right)?.clone();
-    let expected_output = evaluated.value(output)?.clone();
+    let evaluated = graph.evaluate(&reference::f32_inputs(&inputs))?;
+    let expected_subtract = evaluated.value_typed::<f32>(subtract_right)?.clone();
+    let expected_output = evaluated.value_typed::<f32>(output)?.clone();
     let selected_outputs = [subtract_right, output];
     let prepared = assessor.prepare_graph_outputs(&graph, &selected_outputs)?;
     let device_input = assessor.upload_input(&inputs[0].1, pool, memory)?;
@@ -272,9 +281,12 @@ fn verify_uniform_relu_dense_fallback(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let uniform = graph.uniform([2, 2], -0.5)?;
+    let uniform = graph.uniform_value(
+        [2, 2],
+        fusion_pcu::dialect::tensor::TensorScalarValue::F32(-0.5),
+    )?;
     let output = graph.relu(uniform)?;
-    let expected = graph.evaluate(&[])?.value(output)?.clone();
+    let expected = graph.evaluate(&[])?.value_typed::<f32>(output)?.clone();
     let actual = assessor.execute_graph(&graph, &[], output, pool, memory)?;
     if actual != expected {
         return Err(format!("Uniform→ReLU produced {actual:?}, expected {expected:?}").into());
@@ -288,11 +300,17 @@ fn verify_uniform_matmul_dense_fallback(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let uniform = graph.uniform([1, 2], 0.5)?;
-    let input = graph.input([2, 1])?;
+    let uniform = graph.uniform_value(
+        [1, 2],
+        fusion_pcu::dialect::tensor::TensorScalarValue::F32(0.5),
+    )?;
+    let input = graph.input([2, 1], fusion_pcu::PcuScalarType::F32)?;
     let output = graph.matmul(uniform, input)?;
     let inputs = [(input, Tensor::new([2, 1], vec![2.0, 3.0])?)];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let actual = assessor.execute_graph(&graph, &inputs, output, pool, memory)?;
     if actual != expected {
         return Err(format!("Uniform→MatMul produced {actual:?}, expected {expected:?}").into());
@@ -306,7 +324,7 @@ fn verify_policy_feedback(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let state = graph.input([4])?;
+    let state = graph.input([4], fusion_pcu::PcuScalarType::F32)?;
     let next = graph.relu(state)?;
     let prepared = assessor.prepare_graph_outputs(&graph, &[next])?;
     let feedback = prepared.tensor_plan().feedback_plan(&[(next, state)])?;
@@ -429,7 +447,7 @@ fn verify_input_output_bank(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let input = graph.input([4])?;
+    let input = graph.input([4], fusion_pcu::PcuScalarType::F32)?;
     let expected = Tensor::new([4], vec![1.0, -2.0, 3.0, -4.0])?;
     let prepared = assessor.prepare_graph(&graph, input)?;
     let source = assessor.upload_input(&expected, pool, memory)?;
@@ -456,8 +474,8 @@ fn verify_backward_algebra(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let left = graph.input([2, 3])?;
-    let right = graph.input([2, 3])?;
+    let left = graph.input([2, 3], fusion_pcu::PcuScalarType::F32)?;
+    let right = graph.input([2, 3], fusion_pcu::PcuScalarType::F32)?;
     let difference = graph.sub(left, right)?;
     let squared = graph.mul(difference, difference)?;
     let inputs = [
@@ -478,8 +496,8 @@ fn verify_backward_algebra(
         let left_shape = if transpose_left { [3, 2] } else { [2, 3] };
         let right_shape = if transpose_right { [4, 3] } else { [3, 4] };
         let mut graph = Graph::default();
-        let left = graph.input(left_shape)?;
-        let right = graph.input(right_shape)?;
+        let left = graph.input(left_shape, fusion_pcu::PcuScalarType::F32)?;
+        let right = graph.input(right_shape, fusion_pcu::PcuScalarType::F32)?;
         let output = graph.matmul_transposed(left, right, transpose_left, transpose_right)?;
         let inputs = [
             (
@@ -507,7 +525,10 @@ fn verify_against_reference(
     inputs: &[(ValueId, Tensor)],
     output: ValueId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let expected = graph.evaluate(inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let actual = assessor.execute_graph(graph, inputs, output, pool, memory)?;
     if actual.shape() == expected.shape()
         && actual.data().len() == expected.data().len()
@@ -529,8 +550,8 @@ fn verify_mse(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let prediction = graph.input([2, 3])?;
-    let target = graph.input([2, 3])?;
+    let prediction = graph.input([2, 3], fusion_pcu::PcuScalarType::F32)?;
+    let target = graph.input([2, 3], fusion_pcu::PcuScalarType::F32)?;
     let loss = graph.mean_squared_error(prediction, target)?;
     let inputs = [
         (
@@ -542,7 +563,10 @@ fn verify_mse(
             Tensor::new([2, 3], vec![0.0, 2.0, 1.0, -0.5, 1.0, 3.0])?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(loss)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(loss)?
+        .clone();
     let actual = assessor.execute_graph(&graph, &inputs, loss, pool, memory)?;
     if (actual.data()[0] - expected.data()[0]).abs() <= 1.0e-5 {
         verify_mse_special_values(assessor, pool, memory, &graph, prediction, target, loss)
@@ -585,7 +609,10 @@ fn verify_mse_special_values(
             (prediction, Tensor::new([2, 3], prediction_values)?),
             (target, Tensor::new([2, 3], target_values)?),
         ];
-        let expected = graph.evaluate(&inputs)?.value(loss)?.data()[0];
+        let expected = graph
+            .evaluate(&reference::f32_inputs(&inputs))?
+            .value_typed::<f32>(loss)?
+            .data()[0];
         let actual = assessor
             .execute_graph(graph, &inputs, loss, pool, memory)?
             .data()[0];
@@ -611,8 +638,8 @@ fn verify_sgd_update(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let weights = graph.input([1])?;
-    let gradient = graph.input([1])?;
+    let weights = graph.input([1], fusion_pcu::PcuScalarType::F32)?;
+    let gradient = graph.input([1], fusion_pcu::PcuScalarType::F32)?;
     let rate = f32::from_bits(1.0_f32.to_bits() + 1);
     let update = graph.sgd_update(weights, gradient, rate)?;
     let inputs = [
@@ -635,10 +662,13 @@ fn verify_sgd_update(
     // Exercise the opt-in graph rewrite separately: it is permitted to contract Mul/Sub only
     // because this preparation names both the policy and the backend arithmetic capability.
     let mut graph = Graph::default();
-    let weights = graph.input([1])?;
-    let gradient = graph.input([1])?;
+    let weights = graph.input([1], fusion_pcu::PcuScalarType::F32)?;
+    let gradient = graph.input([1], fusion_pcu::PcuScalarType::F32)?;
     let rate_value = f32::from_bits(1.0_f32.to_bits() + 1);
-    let rate = graph.constant(Tensor::new([1], vec![rate_value])?);
+    let rate = graph.constant_value(fusion_pcu::dialect::tensor::TensorValue::F32(Tensor::new(
+        [1],
+        vec![rate_value],
+    )?));
     let scaled = graph.mul(rate, gradient)?;
     let updated = graph.sub(weights, scaled)?;
     let inputs = [
@@ -718,7 +748,7 @@ fn verify_relu_edges(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let input = graph.input([6])?;
+    let input = graph.input([6], fusion_pcu::PcuScalarType::F32)?;
     let output = graph.relu(input)?;
     let inputs = [(
         input,
@@ -744,8 +774,8 @@ fn verify_fused_add_relu_edges(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let left = graph.input([6])?;
-    let right = graph.input([6])?;
+    let left = graph.input([6], fusion_pcu::PcuScalarType::F32)?;
+    let right = graph.input([6], fusion_pcu::PcuScalarType::F32)?;
     let added = graph.add(left, right)?;
     let output = graph.relu(added)?;
     let inputs = [
@@ -761,7 +791,10 @@ fn verify_fused_add_relu_edges(
             Tensor::new([6], vec![1.0, -0.0, f32::NEG_INFINITY, f32::MAX, 1.0, 0.5])?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let fused = assessor.prepare_graph_outputs_with_policies(
         &graph,
         &[output],
@@ -787,9 +820,9 @@ fn verify_bounded_add_sub_relu_edges(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let a = graph.input([8])?;
-    let b = graph.input([8])?;
-    let c = graph.input([8])?;
+    let a = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let b = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let c = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
     let first = graph.add(a, b)?;
     let second = graph.sub(first, c)?;
     let third = graph.add(second, a)?;
@@ -832,7 +865,10 @@ fn verify_bounded_add_sub_relu_edges(
             Tensor::new([8], vec![0.0, 0.0, 0.0, f32::MAX, -1.0, 0.25, 0.0, -1.0])?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let grouped = assessor.prepare_graph_outputs_with_policies(
         &graph,
         &[output],
@@ -866,9 +902,12 @@ fn verify_bounded_uniform_right_sub_edges(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let left = graph.input([8])?;
-    let right = graph.input([8])?;
-    let uniform = graph.uniform([8], 0.25)?;
+    let left = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let right = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let uniform = graph.uniform_value(
+        [8],
+        fusion_pcu::dialect::tensor::TensorScalarValue::F32(0.25),
+    )?;
     let first = graph.add(left, uniform)?;
     let second = graph.sub(right, first)?;
     let third = graph.add(second, uniform)?;
@@ -889,7 +928,10 @@ fn verify_bounded_uniform_right_sub_edges(
             )?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let grouped = assessor.prepare_graph_outputs_with_policies(
         &graph,
         &[output],
@@ -921,9 +963,12 @@ fn verify_bounded_identity_edges(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let left = graph.input([8])?;
-    let right = graph.input([8])?;
-    let uniform = graph.uniform([8], 0.25)?;
+    let left = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let right = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let uniform = graph.uniform_value(
+        [8],
+        fusion_pcu::dialect::tensor::TensorScalarValue::F32(0.25),
+    )?;
     let first = graph.add(left, uniform)?;
     let second = graph.sub(right, first)?;
     let output = graph.add(second, uniform)?;
@@ -943,7 +988,10 @@ fn verify_bounded_identity_edges(
             )?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let grouped = assessor.prepare_graph_outputs_with_policies(
         &graph,
         &[output],
@@ -995,9 +1043,12 @@ fn verify_bounded_mul_edges(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let left = graph.input([8])?;
-    let right = graph.input([8])?;
-    let uniform = graph.uniform([8], 0.25)?;
+    let left = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let right = graph.input([8], fusion_pcu::PcuScalarType::F32)?;
+    let uniform = graph.uniform_value(
+        [8],
+        fusion_pcu::dialect::tensor::TensorScalarValue::F32(0.25),
+    )?;
     let first = graph.mul(left, uniform)?;
     let second = graph.mul(right, first)?;
     let output = graph.mul(second, uniform)?;
@@ -1017,7 +1068,10 @@ fn verify_bounded_mul_edges(
             )?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let grouped = assessor.prepare_graph_outputs_with_policies(
         &graph,
         &[output],
@@ -1069,8 +1123,8 @@ fn verify_relu_backward(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let input = graph.input([6])?;
-    let upstream = graph.input([6])?;
+    let input = graph.input([6], fusion_pcu::PcuScalarType::F32)?;
+    let upstream = graph.input([6], fusion_pcu::PcuScalarType::F32)?;
     let output = graph.relu_backward(input, upstream)?;
     let inputs = [
         (
@@ -1082,7 +1136,10 @@ fn verify_relu_backward(
             Tensor::new([6], vec![2.0, 3.0, 4.0, 5.0, -6.0, -7.0])?,
         ),
     ];
-    let expected = graph.evaluate(&inputs)?.value(output)?.clone();
+    let expected = graph
+        .evaluate(&reference::f32_inputs(&inputs))?
+        .value_typed::<f32>(output)?
+        .clone();
     let actual = assessor.execute_graph(&graph, &inputs, output, pool, memory)?;
     let prepared = assessor.prepare_graph(&graph, output)?;
     let batched = assessor.execute_prepared_batched(&prepared, &inputs, pool, memory)?;
@@ -1109,11 +1166,11 @@ fn verify_relu_autograd(
     memory: &mut impl PcuMemoryProvider<Resource = RocmMemoryResource>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut graph = Graph::default();
-    let samples = graph.input([2, 2])?;
-    let w1 = graph.input([2, 2])?;
-    let w2 = graph.input([2, 2])?;
-    let w3 = graph.input([2, 1])?;
-    let target = graph.input([2, 1])?;
+    let samples = graph.input([2, 2], fusion_pcu::PcuScalarType::F32)?;
+    let w1 = graph.input([2, 2], fusion_pcu::PcuScalarType::F32)?;
+    let w2 = graph.input([2, 2], fusion_pcu::PcuScalarType::F32)?;
+    let w3 = graph.input([2, 1], fusion_pcu::PcuScalarType::F32)?;
+    let target = graph.input([2, 1], fusion_pcu::PcuScalarType::F32)?;
     let hidden1 = graph.matmul(samples, w1)?;
     let activated1 = graph.relu(hidden1)?;
     let hidden2 = graph.matmul(activated1, w2)?;
@@ -1133,7 +1190,7 @@ fn verify_relu_autograd(
         (w3, Tensor::new([2, 1], vec![0.5, -1.0])?),
         (target, Tensor::new([2, 1], vec![0.25, -0.75])?),
     ];
-    let execution = graph.evaluate(&inputs)?;
+    let execution = graph.evaluate(&reference::f32_inputs(&inputs))?;
     let expected = execution.gradients(&graph, loss)?[w1_index]
         .as_ref()
         .ok_or("CPU weight gradient missing")?

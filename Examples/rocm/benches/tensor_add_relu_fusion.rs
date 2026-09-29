@@ -74,8 +74,8 @@ fn run_on(
         let (left_values, right_values) = values(elements);
         let expected = expected(&left_values, &right_values);
         let mut graph = Graph::default();
-        let left_id = graph.input([elements])?;
-        let right_id = graph.input([elements])?;
+        let left_id = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
+        let right_id = graph.input([elements], fusion_pcu::PcuScalarType::F32)?;
         let added = graph.add(left_id, right_id)?;
         let output = graph.relu(added)?;
 
