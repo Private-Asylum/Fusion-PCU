@@ -22,7 +22,7 @@ quote.workspace = true
 syn = { workspace = true, features = ["full", "visit-mut"] }
 
 [dev-dependencies]
-pcu_alias.workspace = true
+pcu_alias = { package = "fusion-pcu", path = "../fusion-pcu", default-features = false }
 fusion-pcu-rocm.workspace = true
 fusion-pcu-cpu.workspace = true
 fusion-pcu-spirv.workspace = true
