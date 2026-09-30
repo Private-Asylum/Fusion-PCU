@@ -20,7 +20,7 @@ use libloading::Library;
 /// The caller must ensure any resolved symbols are used only while this library remains alive.
 pub unsafe fn load_uncached_library(candidate: &std::ffi::OsStr) -> Result<Library, String> {
     // SAFETY: the caller owns the returned handle and controls its symbol lifetimes.
-    unsafe { Library::new(candidate) }.map_err(|error| error.to_string())
+    unsafe { super::open_library(candidate) }.map_err(|error| error.to_string())
 }
 
 type LibraryCache = Mutex<HashMap<OsString, Arc<Library>>>;
@@ -45,7 +45,7 @@ pub fn load_library(candidate: &std::ffi::OsStr) -> Result<Arc<Library>, String>
 
     // SAFETY: callers resolve and invoke symbols only while holding an Arc to this Library.
     // Successful loads are also retained by the process-wide cache, preventing HIP teardown.
-    let library = unsafe { Library::new(candidate) }.map_err(|error| error.to_string())?;
+    let library = unsafe { super::open_library(candidate) }.map_err(|error| error.to_string())?;
     let library = Arc::new(library);
     cache.insert(candidate.to_os_string(), Arc::clone(&library));
     drop(cache);

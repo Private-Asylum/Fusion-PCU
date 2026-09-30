@@ -10,7 +10,11 @@ use std::{
     ptr,
 };
 
-use crate::ffi::{Library, load_uncached_library};
+#[rustfmt::skip]
+use crate::ffi::{
+    Library,
+    load_uncached_library,
+};
 
 #[rustfmt::skip]
 use crate::{
@@ -21,9 +25,6 @@ use crate::{
 #[rustfmt::skip]
 use crate::ffi::hiprtc::{
     Program,
-    ResultCode,
-    CreateProgram,
-    DestroyProgram,
     CompileProgram,
     GetProgramLogSize,
     GetProgramLog,
@@ -94,14 +95,14 @@ pub fn compile_hip_source_for_device(
     let source = CString::new(source).map_err(|_| HipRtcError::InvalidSource)?;
     let name = c"fusion-kernel.hip";
     let library = load_hiprtc()?;
-    let create = symbol::<CreateProgram>(&library, "hiprtcCreateProgram")?;
-    let destroy = symbol::<DestroyProgram>(&library, "hiprtcDestroyProgram")?;
-    let compile = symbol::<CompileProgram>(&library, "hiprtcCompileProgram")?;
-    let log_size = symbol::<GetProgramLogSize>(&library, "hiprtcGetProgramLogSize")?;
-    let get_log = symbol::<GetProgramLog>(&library, "hiprtcGetProgramLog")?;
-    let code_size = symbol::<GetCodeSize>(&library, "hiprtcGetCodeSize")?;
-    let get_code = symbol::<GetCode>(&library, "hiprtcGetCode")?;
-    let error_string = symbol::<GetErrorString>(&library, "hiprtcGetErrorString")?;
+    let create = crate::ffi::require_hiprtcCreateProgram(&library)?;
+    let destroy = crate::ffi::require_hiprtcDestroyProgram(&library)?;
+    let compile = crate::ffi::require_hiprtcCompileProgram(&library)?;
+    let log_size = crate::ffi::require_hiprtcGetProgramLogSize(&library)?;
+    let get_log = crate::ffi::require_hiprtcGetProgramLog(&library)?;
+    let code_size = crate::ffi::require_hiprtcGetCodeSize(&library)?;
+    let get_code = crate::ffi::require_hiprtcGetCode(&library)?;
+    let error_string = crate::ffi::require_hiprtcGetErrorString(&library)?;
 
     // HIPRTC documents that it infers the architecture from the current HIP device when no
     // --gpu-architecture option is supplied. HipRuntime's own selection helper also handles
@@ -112,7 +113,8 @@ pub fn compile_hip_source_for_device(
 
     let mut program = ptr::null_mut();
     let status = unsafe {
-        create(
+        crate::ffi::invoke_hiprtcCreateProgram(
+            &create,
             &raw mut program,
             source.as_ptr(),
             name.as_ptr(),
@@ -121,7 +123,7 @@ pub fn compile_hip_source_for_device(
             ptr::null(),
         )
     };
-    check("hiprtcCreateProgram", status, error_string)?;
+    crate::ffi::check_hiprtc("hiprtcCreateProgram", status, error_string)?;
     let result = compile_program(
         program,
         compile,
@@ -131,10 +133,11 @@ pub fn compile_hip_source_for_device(
         get_code,
         error_string,
     );
-    let destroy_status = unsafe { destroy(&raw mut program) };
+    let destroy_status =
+        unsafe { crate::ffi::invoke_hiprtcDestroyProgram(&destroy, &raw mut program) };
     match result {
         Ok(code) => {
-            check("hiprtcDestroyProgram", destroy_status, error_string)?;
+            crate::ffi::check_hiprtc("hiprtcDestroyProgram", destroy_status, error_string)?;
             Ok(code)
         }
         Err(error) => Err(error),
@@ -150,12 +153,17 @@ fn compile_program(
     get_code: GetCode,
     error_string: GetErrorString,
 ) -> Result<Vec<u8>, HipRtcError> {
-    let status = unsafe { compile(program, 0, ptr::null()) };
+    let status =
+        unsafe { crate::ffi::invoke_hiprtcCompileProgram(&compile, program, 0, ptr::null()) };
     if status != 0 {
         let mut size = 0;
-        let _ = unsafe { log_size(program, &raw mut size) };
+        let _ = unsafe {
+            crate::ffi::invoke_hiprtcGetProgramLogSize(&log_size, program, &raw mut size)
+        };
         let mut log = vec![0_u8; size.max(1)];
-        let _ = unsafe { get_log(program, log.as_mut_ptr().cast()) };
+        let _ = unsafe {
+            crate::ffi::invoke_hiprtcGetProgramLog(&get_log, program, log.as_mut_ptr().cast())
+        };
         let log = CStr::from_bytes_until_nul(&log).map_or_else(
             |_| String::from_utf8_lossy(&log).into_owned(),
             |s| s.to_string_lossy().into_owned(),
@@ -164,18 +172,18 @@ fn compile_program(
     }
 
     let mut size = 0;
-    check(
+    crate::ffi::check_hiprtc(
         "hiprtcGetCodeSize",
-        unsafe { code_size(program, &raw mut size) },
+        unsafe { crate::ffi::invoke_hiprtcGetCodeSize(&code_size, program, &raw mut size) },
         error_string,
     )?;
     if size == 0 {
         return Err(HipRtcError::EmptyCodeObject);
     }
     let mut code = vec![0_u8; size];
-    check(
+    crate::ffi::check_hiprtc(
         "hiprtcGetCode",
-        unsafe { get_code(program, code.as_mut_ptr().cast()) },
+        unsafe { crate::ffi::invoke_hiprtcGetCode(&get_code, program, code.as_mut_ptr().cast()) },
         error_string,
     )?;
     Ok(code)
@@ -204,47 +212,13 @@ fn load_hiprtc() -> Result<Library, HipRtcError> {
 /// Returns a typed library or symbol error when the runtime compiler cannot be used.
 pub fn hiprtc_available() -> Result<(), HipRtcError> {
     let library = load_hiprtc()?;
-    let _ = symbol::<CreateProgram>(&library, "hiprtcCreateProgram")?;
-    let _ = symbol::<DestroyProgram>(&library, "hiprtcDestroyProgram")?;
-    let _ = symbol::<CompileProgram>(&library, "hiprtcCompileProgram")?;
-    let _ = symbol::<GetProgramLogSize>(&library, "hiprtcGetProgramLogSize")?;
-    let _ = symbol::<GetProgramLog>(&library, "hiprtcGetProgramLog")?;
-    let _ = symbol::<GetCodeSize>(&library, "hiprtcGetCodeSize")?;
-    let _ = symbol::<GetCode>(&library, "hiprtcGetCode")?;
-    let _ = symbol::<GetErrorString>(&library, "hiprtcGetErrorString")?;
+    let _ = crate::ffi::require_hiprtcCreateProgram(&library)?;
+    let _ = crate::ffi::require_hiprtcDestroyProgram(&library)?;
+    let _ = crate::ffi::require_hiprtcCompileProgram(&library)?;
+    let _ = crate::ffi::require_hiprtcGetProgramLogSize(&library)?;
+    let _ = crate::ffi::require_hiprtcGetProgramLog(&library)?;
+    let _ = crate::ffi::require_hiprtcGetCodeSize(&library)?;
+    let _ = crate::ffi::require_hiprtcGetCode(&library)?;
+    let _ = crate::ffi::require_hiprtcGetErrorString(&library)?;
     Ok(())
-}
-
-fn symbol<T: Copy>(library: &Library, name: &'static str) -> Result<T, HipRtcError> {
-    let mut bytes = name.as_bytes().to_vec();
-    bytes.push(0);
-    unsafe { crate::ffi::symbol::<T>(library, &bytes) }
-        .map(|symbol| *symbol)
-        .map_err(|error| HipRtcError::MissingSymbol {
-            symbol: name,
-            detail: error.to_string(),
-        })
-}
-
-fn check(
-    operation: &'static str,
-    code: ResultCode,
-    error_string: GetErrorString,
-) -> Result<(), HipRtcError> {
-    if code == 0 {
-        return Ok(());
-    }
-    let detail = unsafe {
-        let pointer = error_string(code);
-        if pointer.is_null() {
-            "unknown HIPRTC error".into()
-        } else {
-            CStr::from_ptr(pointer).to_string_lossy().into_owned()
-        }
-    };
-    Err(HipRtcError::Api {
-        operation,
-        code,
-        detail,
-    })
 }

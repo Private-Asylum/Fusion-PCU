@@ -21,3 +21,10 @@ fusion-pcu-core.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+fusion-pcu-macros.workspace = true
+
+[[test]]
+name = "checked_float_rejection"
+path = "tests/checked_float_rejection/checked_float_rejection.rs"

@@ -120,6 +120,11 @@ impl Preparation {
         &mut self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<(), PcuExecutionError> {
+        if self.policy.numerical_options.reproducibility != crate::PcuReproducibility::Unspecified {
+            return Err(PcuExecutionError::UnsupportedNumericalOptions(
+                self.policy.numerical_options,
+            ));
+        }
         let (session, prepared) = prepare_in_arena(
             &mut self.arena,
             self.policy,
@@ -371,7 +376,7 @@ fn with_entry<R>(
                 }
                 let mut context = PcuHostPreparation {
                     #[cfg(feature = "cuda")]
-                    cuda: None,
+                    shared: None,
                     inner: Some(Preparation {
                         policy,
                         prepared: None,
@@ -515,6 +520,44 @@ fn candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unproved_portable_invocation_rejects_before_provider_discovery() {
+        let options = crate::PcuNumericalOptions {
+            reproducibility: crate::PcuReproducibility::PortableV1,
+            ..crate::PcuNumericalOptions::default()
+        };
+        let mut preparation = Preparation {
+            policy: PcuExecutionPolicy {
+                numerical_options: options,
+                ..PcuExecutionPolicy::default()
+            },
+            prepared: None,
+            session: None,
+            affinity: None,
+            arena: SessionArena::default(),
+        };
+        let kernel = crate::PcuDispatchKernelIr {
+            id: crate::PcuKernelId(1),
+            entry: crate::PcuDispatchEntryPoint {
+                name: "portable_probe",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &[],
+            type_caps: crate::PcuValueTypeCaps::default(),
+            feature_caps: crate::PcuDispatchFeatureCaps::default(),
+        };
+        assert!(matches!(
+            preparation.prepare(&kernel),
+            Err(PcuExecutionError::UnsupportedNumericalOptions(rejected)) if rejected == options
+        ));
+        assert!(preparation.prepared.is_none());
+        assert!(preparation.session.is_none());
+        assert!(preparation.arena.sessions.is_empty());
+    }
 
     #[test]
     fn invalid_hints_never_select_another_specialization() {

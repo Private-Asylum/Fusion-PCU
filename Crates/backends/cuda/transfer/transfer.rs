@@ -18,13 +18,10 @@ use crate::{
     DeviceBuffer,
     ensure_batch_open,
     validate_buffer_range,
+    ffi::require_free_host,
     ffi::runtime::{
         CUDA_MEMCPY_DEVICE_TO_HOST,
         CUDA_MEMCPY_HOST_TO_DEVICE,
-        FreeHost,
-        MallocHost,
-        MemcpyAsync,
-        require_free_host,
     },
 };
 
@@ -40,9 +37,9 @@ impl Drop for PinnedAllocation {
             // SAFETY: this allocation is exclusively owned here after every retained DMA owner
             // has been released. Runtime ownership keeps the library loaded through this call.
             // An activation/free error deliberately leaks the pinned allocation.
-            let _ = self.runtime.call("cudaFreeHost", |free: FreeHost| unsafe {
-                free(self.pointer.as_ptr().cast())
-            });
+            let _ = unsafe {
+                crate::ffi::invoke_cudaFreeHost(&self.runtime, self.pointer.as_ptr().cast())
+            };
         }
     }
 }
@@ -72,9 +69,7 @@ impl CudaRuntime {
             // Resolve deallocation before allocating storage. This probe has no GPU side effect.
             require_free_host(&self.0.library)?;
             // SAFETY: CUDA initializes the pointer to a live allocation of the requested size.
-            self.call("cudaMallocHost", |allocate: MallocHost| unsafe {
-                allocate(&raw mut pointer, bytes)
-            })?;
+            unsafe { crate::ffi::invoke_cudaMallocHost(self, &raw mut pointer, bytes) }?;
         }
         let pointer = if bytes == 0 {
             NonNull::dangling()
@@ -185,19 +180,16 @@ impl CudaPinnedBuffer {
             let owner: Rc<dyn Any> = self.allocation.clone();
             batch.retain_external_operation(&[source], owner)?;
             // SAFETY: exclusive host storage and source lease are retained before submission.
-            let enqueue =
-                stream
-                    .inner
-                    .runtime
-                    .call("cudaMemcpyAsync", |copy: MemcpyAsync| unsafe {
-                        copy(
-                            self.allocation.pointer.as_ptr().cast(),
-                            source.allocation.pointer,
-                            self.allocation.bytes,
-                            CUDA_MEMCPY_DEVICE_TO_HOST,
-                            stream.inner.raw,
-                        )
-                    });
+            let enqueue = unsafe {
+                crate::ffi::invoke_cudaMemcpyAsync(
+                    &stream.inner.runtime,
+                    self.allocation.pointer.as_ptr().cast(),
+                    source.allocation.pointer,
+                    self.allocation.bytes,
+                    CUDA_MEMCPY_DEVICE_TO_HOST,
+                    stream.inner.raw,
+                )
+            };
             if let Err(error) = enqueue {
                 batch.failed = true;
                 batch.release_after_stream_sync();
@@ -245,24 +237,21 @@ impl CudaCompletionBatch {
         self.retain_external_operation(&[destination], owner)?;
         // SAFETY: source is consumed and retained; the destination lease is held through final
         // completion. Checked ranges and the selected runtime establish pointer validity.
-        let enqueue =
-            self.stream
-                .inner
-                .runtime
-                .call("cudaMemcpyAsync", |copy: MemcpyAsync| unsafe {
-                    copy(
-                        destination
-                            .allocation
-                            .pointer
-                            .cast::<u8>()
-                            .wrapping_add(offset)
-                            .cast(),
-                        allocation.pointer.as_ptr().cast(),
-                        allocation.bytes,
-                        CUDA_MEMCPY_HOST_TO_DEVICE,
-                        self.stream.inner.raw,
-                    )
-                });
+        let enqueue = unsafe {
+            crate::ffi::invoke_cudaMemcpyAsync(
+                &self.stream.inner.runtime,
+                destination
+                    .allocation
+                    .pointer
+                    .cast::<u8>()
+                    .wrapping_add(offset)
+                    .cast(),
+                allocation.pointer.as_ptr().cast(),
+                allocation.bytes,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                self.stream.inner.raw,
+            )
+        };
         if let Err(error) = enqueue {
             self.failed = true;
             self.release_after_stream_sync();

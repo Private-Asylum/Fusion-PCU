@@ -30,8 +30,6 @@ use crate::{
         DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED,
         DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
         DEVICE_ATTRIBUTE_WARP_SIZE,
-        DriverDeviceGetAttribute,
-        DriverDeviceGetUuid,
         DriverUuid,
     },
 };
@@ -115,9 +113,7 @@ impl CudaRuntime {
     /// Returns a missing stable Driver symbol, CUDA query error, or malformed attribute value.
     pub fn physical_device_facts(&self) -> Result<CudaPhysicalDeviceFacts, CudaError> {
         let mut uuid = DriverUuid { bytes: [0; 16] };
-        self.driver_call("cuDeviceGetUuid_v2", |f: DriverDeviceGetUuid| unsafe {
-            f(&raw mut uuid, self.0.device)
-        })?;
+        unsafe { crate::ffi::invoke_cuDeviceGetUuid_v2(self, &raw mut uuid, self.0.device) }?;
         let numeric = |attribute| checked_nonnegative(self.physical_attribute(attribute)?);
         let mut flags = 0;
         for (attribute, flag) in [
@@ -174,10 +170,9 @@ impl CudaRuntime {
 
     fn physical_attribute(&self, attribute: i32) -> Result<i32, CudaError> {
         let mut value = 0;
-        self.driver_call(
-            "cuDeviceGetAttribute",
-            |f: DriverDeviceGetAttribute| unsafe { f(&raw mut value, attribute, self.0.device) },
-        )?;
+        unsafe {
+            crate::ffi::invoke_cuDeviceGetAttribute(self, &raw mut value, attribute, self.0.device)
+        }?;
         Ok(value)
     }
 }

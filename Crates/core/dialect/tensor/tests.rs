@@ -1,4 +1,164 @@
 use super::*;
+
+#[test]
+fn typed_sgd_preserves_rate_bits_and_rejects_invalid_rate_type_shape_and_graph() {
+    let mut graph = Graph::default();
+    let weights = graph.input_typed::<f32>([3]).unwrap();
+    let gradient = graph.input_typed::<f32>([3]).unwrap();
+    let updated = graph.sgd_update_typed(weights, gradient, -0.0).unwrap();
+    let node = graph.node(updated.erase()).unwrap();
+    assert_eq!(node.shape, [3]);
+    assert_eq!(node.numerical_mode, Some(PcuNumericalMode::Boundary));
+    let OpDescriptor::SgdUpdate { learning_rate, .. } = node.op else {
+        panic!("typed operation must retain the SGD descriptor");
+    };
+    assert_eq!(learning_rate.to_bits(), (-0.0_f32).to_bits());
+    for rate in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(
+            graph.sgd_update_typed(weights, gradient, rate),
+            Err(TensorError::InvalidLearningRate)
+        );
+    }
+    let wrong_shape = graph.input_typed::<f32>([2]).unwrap();
+    assert!(matches!(
+        graph.sgd_update_typed(weights, wrong_shape, 0.25),
+        Err(TensorError::ShapeMismatch { .. })
+    ));
+    let wide = graph.input_typed::<f64>([3]).unwrap();
+    assert!(matches!(
+        graph.sgd_update_typed(wide, wide, 0.25),
+        Err(TensorError::UnsupportedScalarType { .. })
+    ));
+    let foreign = Graph::default().input_typed::<f32>([3]).unwrap();
+    assert!(matches!(
+        graph.sgd_update_typed(weights, foreign, 0.25),
+        Err(TensorError::UnknownValue(_))
+    ));
+}
+
+#[test]
+fn typed_loss_keeps_scalar_shape_policy_and_rejects_other_types_and_foreign_values() {
+    let mut graph = Graph::default();
+    let prediction = graph.input_typed::<f32>([3, 5]).unwrap();
+    let target = graph.input_typed::<f32>([3, 5]).unwrap();
+    let options = crate::PcuNumericalOptions {
+        compound_arithmetic: crate::PcuCompoundArithmeticPolicy::BackendDefined,
+        ..crate::PcuNumericalOptions::default()
+    };
+    graph.set_numerical_options(options);
+    let loss = graph.mean_squared_error_typed(prediction, target).unwrap();
+    let node = graph.node(loss.erase()).unwrap();
+    assert_eq!(loss.scalar_type(), PcuScalarType::F32);
+    assert!(node.shape.is_empty());
+    assert_eq!(node.numerical_options, options);
+    assert_eq!(node.numerical_mode, Some(PcuNumericalMode::Boundary));
+
+    let mut other = Graph::default();
+    let foreign = other.input_typed::<f32>([3, 5]).unwrap();
+    assert!(matches!(
+        graph.mean_squared_error_typed(prediction, foreign),
+        Err(TensorError::UnknownValue(_))
+    ));
+    let wide = graph.input_typed::<f64>([1]).unwrap();
+    assert!(matches!(
+        graph.mean_squared_error_typed(wide, wide),
+        Err(TensorError::UnsupportedScalarType {
+            scalar_type: PcuScalarType::F64,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn checked_reference_admission_matches_unsupported_numerical_execution() {
+    for options in [
+        crate::PcuNumericalOptions {
+            compound_arithmetic: crate::PcuCompoundArithmeticPolicy::BackendDefined,
+            ..crate::PcuNumericalOptions::default()
+        },
+        crate::PcuNumericalOptions {
+            precision: crate::PcuPrecisionPolicy::BackendOptimized,
+            ..crate::PcuNumericalOptions::default()
+        },
+        crate::PcuNumericalOptions {
+            reproducibility: crate::PcuReproducibility::PortableV1,
+            ..crate::PcuNumericalOptions::default()
+        },
+    ] {
+        let mut graph = Graph::default();
+        let lhs = graph.input([1, 1], PcuScalarType::F32).unwrap();
+        let rhs = graph.input([1, 1], PcuScalarType::F32).unwrap();
+        graph.set_numerical_mode(PcuNumericalMode::Strict);
+        graph.set_numerical_options(options);
+        let result = graph.matmul(lhs, rhs).unwrap();
+        assert!(matches!(
+            TensorCheckedReferenceAssessor.assess_node(&graph, graph.node(result).unwrap()),
+            TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::NumericalPolicy { .. },
+            }
+        ));
+        assert!(matches!(
+            graph.evaluate_checked(&[]),
+            Err(TensorError::UnsupportedNumericalOptions { value, options: rejected })
+                if value == result && rejected == options
+        ));
+    }
+}
+
+#[test]
+fn numerical_options_freeze_independently_from_checking_and_prior_nodes() {
+    let mut graph = Graph::default();
+    let lhs = graph.input([1, 1], PcuScalarType::F32).unwrap();
+    let rhs = graph.input([1, 1], PcuScalarType::F32).unwrap();
+    let checked = graph.matmul(lhs, rhs).unwrap();
+    let options = crate::PcuNumericalOptions {
+        compound_arithmetic: crate::PcuCompoundArithmeticPolicy::BackendDefined,
+        precision: crate::PcuPrecisionPolicy::BackendOptimized,
+        reproducibility: crate::PcuReproducibility::PortableV1,
+    };
+    graph.set_numerical_options(options);
+    graph.set_numerical_mode(PcuNumericalMode::Strict);
+    let requested = graph.matmul(lhs, rhs).unwrap();
+    assert_eq!(
+        graph.node(checked).unwrap().numerical_options,
+        crate::PcuNumericalOptions::default()
+    );
+    assert_eq!(
+        graph.node(checked).unwrap().numerical_mode,
+        Some(PcuNumericalMode::Boundary)
+    );
+    assert_eq!(graph.node(requested).unwrap().numerical_options, options);
+    assert_eq!(
+        graph.node(requested).unwrap().numerical_mode,
+        Some(PcuNumericalMode::Strict)
+    );
+    assert!(matches!(
+        TensorReferenceAssessor.assess_node(&graph, graph.node(requested).unwrap()),
+        TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::NumericalPolicy {
+                requirement: crate::PcuNumericalRequirement::Reproducibility,
+                options: rejected,
+            }
+        } if rejected == options
+    ));
+    let mut other = Graph::default();
+    assert_eq!(
+        other.set_value_numerical_options(requested, options),
+        Err(TensorError::UnknownValue(requested))
+    );
+    let selected = graph
+        .into_selected_program(
+            &[requested],
+            TensorArithmeticRewritePolicy::Disabled,
+            TensorArithmeticCapability::Strict,
+            TensorPointwiseGroupingPolicy::Disabled,
+        )
+        .unwrap();
+    assert_eq!(
+        selected.graph().node(requested).unwrap().numerical_options,
+        options
+    );
+}
 #[rustfmt::skip]
 use crate::{
     PcuBf16Bits,

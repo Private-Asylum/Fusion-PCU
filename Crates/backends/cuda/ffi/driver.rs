@@ -76,21 +76,3 @@ pub type DriverModuleGetFunction =
 pub type DriverModuleUnload = unsafe extern "C" fn(ModuleHandle) -> CudaResult;
 pub type DriverModuleLaunchKernel = ModuleLaunchKernel;
 pub type DriverGetErrorString = unsafe extern "C" fn(CudaResult, *mut *const c_char) -> CudaResult;
-
-pub fn driver_symbol(name: &str) -> Option<&'static [u8]> {
-    Some(match name {
-        "cuInit" => b"cuInit\0",
-        "cuDeviceGet" => b"cuDeviceGet\0",
-        "cuDeviceGetName" => b"cuDeviceGetName\0",
-        "cuDeviceTotalMem_v2" => b"cuDeviceTotalMem_v2\0",
-        "cuDeviceGetPCIBusId" => b"cuDeviceGetPCIBusId\0",
-        "cuDeviceGetAttribute" => b"cuDeviceGetAttribute\0",
-        "cuDeviceGetUuid_v2" => b"cuDeviceGetUuid_v2\0",
-        "cuModuleLoadData" => b"cuModuleLoadData\0",
-        "cuModuleGetFunction" => b"cuModuleGetFunction\0",
-        "cuModuleUnload" => b"cuModuleUnload\0",
-        "cuLaunchKernel" => b"cuLaunchKernel\0",
-        "cuGetErrorString" => b"cuGetErrorString\0",
-        _ => return None,
-    })
-}

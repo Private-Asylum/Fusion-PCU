@@ -780,11 +780,6 @@ pub(super) fn kernel(
             ("tensor_relu_f64", 0x4644_0040, RELU_BINDINGS, RELU_OPS)
         }
         TensorDispatchKind::Relu => return Err(RocmTensorExecutionError::InvalidPointwiseProfile),
-        TensorDispatchKind::SquaredDifference => {
-            return Err(RocmTensorExecutionError::UnsupportedScalarType(
-                fusion_pcu::PcuScalarType::F64,
-            ));
-        }
         TensorDispatchKind::CheckedIntegerAdd
         | TensorDispatchKind::CheckedIntegerSub
         | TensorDispatchKind::CheckedIntegerMul

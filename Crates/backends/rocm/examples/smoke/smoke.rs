@@ -1,0 +1,127 @@
+extern crate pcu_facade as fusion_pcu;
+
+use std::env;
+use std::error::Error;
+use std::ffi::OsString;
+use std::path::Path;
+#[rustfmt::skip]
+use std::process::{
+    Command,
+    ExitCode,
+};
+
+use fusion_pcu_rocm::RocmDiscovery;
+
+#[path = "../support/selection/selection.rs"]
+mod selection;
+
+const HIP_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/smoke/smoke.hip");
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("ERROR fusion-rocm-smoke: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), RunError> {
+    if !Path::new(HIP_SOURCE).is_file() {
+        return Err(RunError::Failure(format!(
+            "HIP source not found: {HIP_SOURCE}"
+        )));
+    }
+
+    let discovery = RocmDiscovery::new();
+    let candidates = selection::ranked_devices(
+        &discovery,
+        selection::preferred_device().map_err(|error| RunError::Failure(error.to_string()))?,
+        true,
+    )
+    .map_err(|error| RunError::Failure(error.to_string()))?;
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        let Some(architecture) = candidate.architecture.as_deref() else {
+            failures.push(format!(
+                "device {} has no native hipcc architecture",
+                candidate.device.id
+            ));
+            continue;
+        };
+        match run_compiled(architecture, candidate.device.id) {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(format!("device {}: {error}", candidate.device.id)),
+        }
+    }
+    Err(RunError::Failure(format!(
+        "no capable ROCm device passed the HIP/rocBLAS probe: {}",
+        failures.join("; ")
+    )))
+}
+
+fn run_compiled(arch: &str, device: u32) -> Result<(), RunError> {
+    let output = env::temp_dir().join(format!("fusion-rocm-smoke-{}", std::process::id()));
+    let mut compiler =
+        Command::new(env::var_os("HIPCC").unwrap_or_else(|| OsString::from("hipcc")));
+    compiler
+        .arg("-O2")
+        .arg(format!("--offload-arch={arch}"))
+        .arg(HIP_SOURCE)
+        .arg("-lrocblas")
+        .arg("-o")
+        .arg(&output);
+    let compile = compiler.output().map_err(|error| {
+        RunError::Failure(format!(
+            "failed to start hipcc (set HIPCC to its path): {error}"
+        ))
+    })?;
+    if !compile.status.success() {
+        return Err(RunError::Failure(format!(
+            "hipcc failed for {arch}:\n{}{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        )));
+    }
+
+    let execution = Command::new(&output)
+        .arg(device.to_string())
+        .output()
+        .map_err(|error| {
+            RunError::Failure(format!("could not launch compiled HIP probe: {error}"))
+        });
+    let _ = std::fs::remove_file(&output);
+    let execution = execution?;
+    if !execution.status.success() {
+        return Err(RunError::Failure(format!(
+            "HIP/rocBLAS probe exited with {}:\n{}{}",
+            execution.status,
+            String::from_utf8_lossy(&execution.stdout),
+            String::from_utf8_lossy(&execution.stderr)
+        )));
+    }
+    print!("{}", String::from_utf8_lossy(&execution.stdout));
+    eprint!("{}", String::from_utf8_lossy(&execution.stderr));
+    Ok(())
+}
+
+enum RunError {
+    Failure(String),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failure(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::fmt::Debug for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl Error for RunError {}

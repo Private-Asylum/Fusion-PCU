@@ -26,6 +26,7 @@ pub use global::{
     PcuArgumentError,
     PcuCallArgument,
     PcuReadStorage,
+    PcuResidentBufferOwner,
     PcuSourceShape,
     PcuTensorInput,
     PcuTensorSource,
@@ -39,3 +40,6 @@ pub use global::{
     PcuExecutionError,
     PcuTensor,
 };
+
+#[cfg(feature = "metal")]
+pub use fusion_pcu_metal as metal;

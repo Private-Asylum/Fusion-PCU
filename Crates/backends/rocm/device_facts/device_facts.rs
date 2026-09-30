@@ -50,14 +50,21 @@ pub fn query(info: &HipDeviceInfo) -> Result<PcuDeviceFacts, HipError> {
                 actual,
             });
         }
-        let Some(function) = ffi::hip::device_get_attribute(&library) else {
+        let Some(function) = ffi::device_get_attribute(&library) else {
             return Ok(PcuDeviceFacts::default());
         };
         return Ok(map_attributes(|attribute| {
             let mut value = 0;
             // SAFETY: HIP writes one int to a valid output pointer. The retained library backs
             // the documented function ABI, and discovery validated this device before querying.
-            let status = unsafe { function(ptr::from_mut(&mut value), attribute, info.index) };
+            let status = unsafe {
+                ffi::raw_hipDeviceGetAttribute(
+                    &function,
+                    ptr::from_mut(&mut value),
+                    attribute,
+                    info.index,
+                )
+            };
             (status == HIP_SUCCESS).then_some(value)
         }));
     }

@@ -8,7 +8,6 @@ use std::ffi::{
 
 pub type RocblasStatus = c_int;
 pub type RocblasHandle = *mut c_void;
-pub type NoArgStatus = unsafe extern "C" fn() -> c_int;
 pub type CreateHandle = unsafe extern "C" fn(*mut RocblasHandle) -> RocblasStatus;
 pub type DestroyHandle = unsafe extern "C" fn(RocblasHandle) -> RocblasStatus;
 pub type Sgemm = unsafe extern "C" fn(

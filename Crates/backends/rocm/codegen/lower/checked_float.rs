@@ -90,10 +90,12 @@ pub(super) fn emit_helpers(source: &mut String, kernel: &fusion_pcu::PcuDispatch
     if has_f32 {
         source.push_str(CHECKED_F32_HELPERS);
         source.push_str(CHECKED_F32_RELU_HELPER);
+        source.push_str(CHECKED_F32_NEG_HELPER);
     }
     if has_f64 {
         source.push_str(f64::CHECKED_F64_HELPERS);
         source.push_str(CHECKED_F64_RELU_HELPER);
+        source.push_str(CHECKED_F64_NEG_HELPER);
     }
     if has_narrow {
         source.push_str(CHECKED_F64_TO_F32_HELPER);
@@ -149,11 +151,12 @@ pub(super) fn emit_checked_float_unary(
         ),
         _ => return Err(RocmLowerError::UnsupportedKernelInterface),
     };
-    match op {
-        PcuDispatchFloatUnaryOp::Relu => {}
-    }
+    let operation = match op {
+        PcuDispatchFloatUnaryOp::Relu => "relu",
+        PcuDispatchFloatUnaryOp::Neg => "neg",
+    };
     writeln!(source,
-        "{indent}const Fusion{upper}CheckedResult fusion_{prefix}_checked_{} = fusion_checked_{prefix}_relu(__builtin_bit_cast({bits_type}, v{}), {policy_tag}u);",
+        "{indent}const Fusion{upper}CheckedResult fusion_{prefix}_checked_{} = fusion_checked_{prefix}_{operation}(__builtin_bit_cast({bits_type}, v{}), {policy_tag}u);",
         result.0, value.0
     ).map_err(|_| RocmLowerError::FormattingFailure)?;
     emit_checked_result(
@@ -496,6 +499,27 @@ __device__ __forceinline__ FusionF64CheckedResult fusion_checked_f64_relu(unsign
         return {bits, 0u};
     }
     return {0ull, 0u};
+}
+";
+
+// Negation reverses the encoding's sign, including signed zero and exact subnormals.
+// PCU's finite-input and explicit subnormal-rejection policies are additional checks;
+// subtraction from zero would incorrectly change the sign of positive zero.
+const CHECKED_F32_NEG_HELPER: &str = r"
+__device__ __forceinline__ FusionF32CheckedResult fusion_checked_f32_neg(unsigned int bits, unsigned int policy) {
+    if ((bits & 0x7f800000u) == 0x7f800000u) return {bits, 5u};
+    unsigned int result = bits ^ 0x80000000u;
+    if ((bits & 0x7f800000u) == 0u && (bits & 0x007fffffu) != 0u && policy == 1u) return {result, 4u};
+    return {result, 0u};
+}
+";
+
+const CHECKED_F64_NEG_HELPER: &str = r"
+__device__ __forceinline__ FusionF64CheckedResult fusion_checked_f64_neg(unsigned long long bits, unsigned int policy) {
+    if ((bits & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) return {bits, 5u};
+    unsigned long long result = bits ^ 0x8000000000000000ull;
+    if ((bits & 0x7ff0000000000000ull) == 0ull && (bits & 0x000fffffffffffffull) != 0ull && policy == 1u) return {result, 4u};
+    return {result, 0u};
 }
 ";
 

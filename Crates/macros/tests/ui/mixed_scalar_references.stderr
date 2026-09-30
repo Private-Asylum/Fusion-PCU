@@ -1,4 +1,4 @@
-error: PCU floating arithmetic requires matching f32 or f64 operands
+error: PCU arithmetic requires matching fixed-width operands
  --> tests/ui/mixed_scalar_references.rs:8:18
   |
 8 |     output[id] = input[id] * *factor;

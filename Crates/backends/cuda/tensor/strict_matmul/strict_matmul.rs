@@ -230,11 +230,8 @@ impl Profile {
     }}
     output[id] = __builtin_bit_cast({ty}, accumulator);
 }}", self.output_count(), self.columns, self.columns, self.inner, self.inner).expect("String formatting cannot fail");
-        // CUDA intrinsics are available in both NVCC and standalone NVRTC.
-        // The shared integer checker uses Clang spellings in its portable source.
+        // The CUDA integer helpers use intrinsics available in both NVCC and standalone NVRTC.
         source
-            .replace("__builtin_clzll(", "__clzll(")
-            .replace("__builtin_clz(", "__clz(")
     }
 }
 

@@ -7,17 +7,17 @@ use crate::{
     PcuDeviceArgument,
     PcuDeviceTensor,
     PcuMemoryResource,
-    PcuOwnedDispatchBackend,
     PcuScalar,
 };
-#[cfg(feature = "tensor")]
+#[cfg(any(feature = "tensor", feature = "cuda", feature = "metal"))]
+use crate::PcuOwnedDispatchBackend;
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 #[rustfmt::skip]
 use crate::{
     PcuMemoryPoolId,
     PcuMemoryProvider,
 };
 use super::PcuExecutionError;
-#[cfg(feature = "tensor")]
 use super::PcuArgumentError;
 use std::rc::Rc;
 #[cfg(all(feature = "cuda", feature = "tensor"))]
@@ -25,12 +25,16 @@ use std::cell::OnceCell;
 
 #[cfg_attr(not(feature = "tensor"), allow(dead_code))] // Only successful graph outputs construct storage.
 pub(super) enum DeviceTensor<T: PcuScalar> {
+    #[cfg(feature = "metal")]
+    Metal(PcuDeviceTensor<T, fusion_pcu_metal::MetalMemoryResource>),
     #[cfg(feature = "rocm")]
     Rocm(PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource>),
     #[cfg(feature = "cuda")]
     Cuda(PcuDeviceTensor<T, fusion_pcu_cuda::CudaMemoryResource>),
 }
 pub(super) enum DeviceArgument<'a> {
+    #[cfg(feature = "metal")]
+    Metal(PcuDeviceArgument<'a, fusion_pcu_metal::MetalMemoryResource>),
     #[cfg(feature = "rocm")]
     Rocm(PcuDeviceArgument<'a, fusion_pcu_rocm::RocmMemoryResource>),
     #[cfg(feature = "cuda")]
@@ -38,19 +42,26 @@ pub(super) enum DeviceArgument<'a> {
 }
 #[cfg_attr(not(feature = "tensor"), allow(dead_code))] // Only resident graphs construct execution roots.
 pub(super) enum Session {
+    #[cfg(feature = "metal")]
+    Metal(Rc<MetalSession>),
     #[cfg(feature = "rocm")]
     Rocm(Rc<super::session::RocmSession>),
     #[cfg(feature = "cuda")]
     Cuda(Rc<CudaSession>),
 }
+#[cfg(feature = "metal")]
+pub(super) struct MetalSession {
+    backend: Rc<fusion_pcu_metal::MetalOwnedDispatchBackend>,
+    block_size: u32,
+}
 #[cfg(feature = "cuda")]
 pub(super) struct CudaSession {
     backend: Rc<fusion_pcu_cuda::CudaOwnedDispatchBackend>,
     block_size: u32,
-    #[cfg(feature = "tensor")]
+    #[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
     tensor: OnceCell<fusion_pcu_cuda::CudaOwnedTensorAssessor>,
 }
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 const fn mismatch() -> PcuExecutionError {
     PcuExecutionError::Argument(PcuArgumentError::SessionMismatch)
 }
@@ -61,6 +72,8 @@ impl<T: PcuScalar> DeviceTensor<T> {
             Self::Rocm(tensor) => tensor.shape(),
             #[cfg(feature = "cuda")]
             Self::Cuda(tensor) => tensor.shape(),
+            #[cfg(feature = "metal")]
+            Self::Metal(tensor) => tensor.shape(),
         }
     }
     pub(super) const fn len(&self) -> usize {
@@ -69,11 +82,18 @@ impl<T: PcuScalar> DeviceTensor<T> {
             Self::Rocm(tensor) => tensor.buffer().len(),
             #[cfg(feature = "cuda")]
             Self::Cuda(tensor) => tensor.buffer().len(),
+            #[cfg(feature = "metal")]
+            Self::Metal(tensor) => tensor.buffer().len(),
         }
     }
-    #[cfg(feature = "tensor")]
     pub(super) fn validate_access_available(&self) -> Result<(), PcuArgumentError> {
         match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(tensor) => tensor
+                .buffer()
+                .resource()
+                .validate_access_available()
+                .map_err(|_| PcuArgumentError::ResidentCompletionUncertain),
             #[cfg(feature = "rocm")]
             Self::Rocm(tensor) => tensor
                 .buffer()
@@ -94,6 +114,8 @@ impl<T: PcuScalar> DeviceTensor<T> {
             Self::Rocm(tensor) => DeviceArgument::Rocm(tensor.read_argument(target)),
             #[cfg(feature = "cuda")]
             Self::Cuda(tensor) => DeviceArgument::Cuda(tensor.read_argument(target)),
+            #[cfg(feature = "metal")]
+            Self::Metal(tensor) => DeviceArgument::Metal(tensor.read_argument(target)),
         }
     }
     pub(super) const fn read_write_argument(
@@ -105,24 +127,32 @@ impl<T: PcuScalar> DeviceTensor<T> {
             Self::Rocm(tensor) => DeviceArgument::Rocm(tensor.read_write_argument(target)),
             #[cfg(feature = "cuda")]
             Self::Cuda(tensor) => DeviceArgument::Cuda(tensor.read_write_argument(target)),
+            #[cfg(feature = "metal")]
+            Self::Metal(tensor) => DeviceArgument::Metal(tensor.read_write_argument(target)),
         }
     }
 }
 impl Session {
+    #[cfg(any(feature = "tensor", feature = "cuda", feature = "metal"))]
     pub(super) fn device_id(&self) -> u32 {
         match self {
             #[cfg(feature = "rocm")]
             Self::Rocm(session) => session.backend().device_identity().device_id(),
             #[cfg(feature = "cuda")]
             Self::Cuda(session) => session.backend.device_identity().device_id(),
+            #[cfg(feature = "metal")]
+            Self::Metal(session) => session.backend.device_identity().device_id(),
         }
     }
+    #[cfg(any(feature = "tensor", feature = "cuda", feature = "metal"))]
     pub(super) fn block_size(&self) -> u32 {
         match self {
             #[cfg(feature = "rocm")]
             Self::Rocm(session) => session.block_size(),
             #[cfg(feature = "cuda")]
             Self::Cuda(session) => session.block_size,
+            #[cfg(feature = "metal")]
+            Self::Metal(session) => session.block_size,
         }
     }
     pub(super) fn download<T: PcuScalar>(
@@ -131,6 +161,15 @@ impl Session {
         destination: &mut [T],
     ) -> Result<(), PcuExecutionError> {
         match (self, tensor) {
+            #[cfg(feature = "metal")]
+            (Self::Metal(session), DeviceTensor::Metal(tensor)) => session
+                .backend
+                .download_buffer(
+                    tensor.buffer().resource().pool(),
+                    tensor.buffer(),
+                    destination,
+                )
+                .map_err(PcuExecutionError::from),
             #[cfg(feature = "rocm")]
             (Self::Rocm(session), DeviceTensor::Rocm(tensor)) => session
                 .backend()
@@ -149,8 +188,13 @@ impl Session {
                     destination,
                 )
                 .map_err(PcuExecutionError::from),
-            #[cfg(all(feature = "rocm", feature = "cuda"))]
-            _ => Err(mismatch()),
+            #[cfg(any(
+                all(feature = "rocm", feature = "cuda"),
+                all(feature = "metal", any(feature = "rocm", feature = "cuda"))
+            ))]
+            _ => Err(PcuExecutionError::Argument(
+                super::PcuArgumentError::SessionMismatch,
+            )),
         }
     }
 }
@@ -183,7 +227,7 @@ impl From<crate::PcuDeviceTensorError> for PcuExecutionError {
     }
 }
 
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 mod graph {
     #[rustfmt::skip]
     use super::{
@@ -250,7 +294,7 @@ mod graph {
                 (Self::Cuda(memory), Resource::Cuda(resource)) => {
                     memory.transfer_to(resource, offset, bytes)
                 }
-                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
                 _ => unreachable!("staging resources are allocated by their entry memory provider"),
             }
         }
@@ -258,6 +302,10 @@ mod graph {
     impl Session {
         pub(in crate::global) fn memory_provider(&self, pool: PcuMemoryPoolId) -> Memory {
             match self {
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    unreachable!("Metal tensor assessor rejects before obtaining graph memory")
+                }
                 #[cfg(feature = "rocm")]
                 Self::Rocm(session) => Memory::Rocm(session.backend().memory_provider(pool)),
                 #[cfg(feature = "cuda")]
@@ -270,6 +318,8 @@ mod graph {
             values: &[T],
         ) -> Result<Resource, PcuExecutionError> {
             match self {
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => Err(PcuExecutionError::TensorExecutionUnavailable),
                 #[cfg(feature = "rocm")]
                 Self::Rocm(session) => session
                     .backend()
@@ -286,6 +336,8 @@ mod graph {
         }
         pub(in crate::global) fn tensor_assessor(&self) -> Result<Assessor<'_>, PcuExecutionError> {
             match self {
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => Err(PcuExecutionError::TensorExecutionUnavailable),
                 #[cfg(feature = "rocm")]
                 Self::Rocm(session) => session
                     .tensor_assessor()
@@ -353,7 +405,7 @@ mod graph {
                     .borrow_resource_input_ref(resource, dimensions, scalar_type, pool)
                     .map(InputRef::Cuda)
                     .map_err(PcuExecutionError::from),
-                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
                 _ => Err(mismatch()),
             }
         }
@@ -373,7 +425,7 @@ mod graph {
                     .borrow_device_input_ref(tensor, pool)
                     .map(InputRef::Cuda)
                     .map_err(PcuExecutionError::from),
-                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
                 _ => Err(mismatch()),
             }
         }
@@ -419,7 +471,7 @@ mod graph {
                         .map(DeviceTensor::Cuda)
                         .map_err(PcuExecutionError::from)
                 }
-                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
                 _ => Err(mismatch()),
             }
         }
@@ -451,7 +503,7 @@ mod graph {
                     .execute_owned_program_consuming_input(prepared, tensor, pool, memory)
                     .map(DeviceTensor::Cuda)
                     .map_err(PcuExecutionError::from),
-                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
                 _ => Err(mismatch()),
             }
         }
@@ -523,7 +575,7 @@ mod graph {
                         .map(DeviceTensor::Cuda)
                         .map_err(PcuExecutionError::from)
                 }
-                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
                 _ => Err(mismatch()),
             }
         }
@@ -571,13 +623,13 @@ mod graph {
                     )
                     .map(DeviceTensor::Cuda)
                     .map_err(PcuExecutionError::from),
-                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
                 _ => Err(mismatch()),
             }
         }
     }
 }
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 #[rustfmt::skip]
 pub(super) use graph::{
     Assessor,
@@ -587,7 +639,7 @@ pub(super) use graph::{
     Resource,
 };
 
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 #[derive(Default)]
 struct Roots {
     generation: u64,
@@ -595,12 +647,12 @@ struct Roots {
     realm: Vec<Option<std::ffi::OsString>>,
     sessions: Vec<Rc<Session>>,
 }
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 std::thread_local! {
     static ROOTS: std::cell::RefCell<Roots> = std::cell::RefCell::new(Roots::default());
 }
 
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 pub(super) fn prepare_tensor<R>(
     snapshot: super::policy::PolicySnapshot,
     affinity: Option<&Rc<Session>>,
@@ -609,6 +661,8 @@ pub(super) fn prepare_tensor<R>(
     let policy = snapshot.policy;
     if let Some(session) = affinity {
         let provider_conflict = match session.as_ref() {
+            #[cfg(feature = "metal")]
+            Session::Metal(_) => return Err(PcuExecutionError::TensorExecutionUnavailable),
             #[cfg(feature = "rocm")]
             Session::Rocm(_) => !matches!(
                 policy.backend,
@@ -693,7 +747,7 @@ pub(super) fn prepare_tensor<R>(
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Session {
     pub(super) fn validate_policy(
         &self,
@@ -705,9 +759,15 @@ impl Session {
                 policy.backend,
                 super::PcuBackendChoice::Automatic | super::PcuBackendChoice::Rocm
             ),
+            #[cfg(feature = "cuda")]
             Self::Cuda(_) => !matches!(
                 policy.backend,
                 super::PcuBackendChoice::Automatic | super::PcuBackendChoice::Cuda
+            ),
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => !matches!(
+                policy.backend,
+                super::PcuBackendChoice::Automatic | super::PcuBackendChoice::Metal
             ),
         };
         if provider_conflict
@@ -724,21 +784,30 @@ impl Session {
     pub(super) fn prepare_host_kernel(
         &self,
         kernel: &crate::PcuDispatchKernelIr<'_>,
-    ) -> Result<super::cuda_hosted::Prepared, PcuExecutionError> {
+    ) -> Result<super::provider_hosted::Prepared, PcuExecutionError> {
         use crate::PcuHostKernelBackend;
         match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(session) => session
+                .backend
+                .prepare_host_kernel(kernel)
+                .map(super::provider_hosted::Prepared::Metal)
+                .map_err(|error| {
+                    PcuExecutionError::BackendFailure(format!("Metal preparation: {error:?}"))
+                }),
             #[cfg(feature = "rocm")]
             Self::Rocm(session) => session
                 .backend()
                 .prepare_host_kernel(kernel)
-                .map(super::cuda_hosted::Prepared::Rocm)
+                .map(super::provider_hosted::Prepared::Rocm)
                 .map_err(|error| {
                     PcuExecutionError::BackendFailure(format!("ROCm preparation: {error}"))
                 }),
+            #[cfg(feature = "cuda")]
             Self::Cuda(session) => session
                 .backend
                 .prepare_host_kernel(kernel)
-                .map(super::cuda_hosted::Prepared::Cuda)
+                .map(super::provider_hosted::Prepared::Cuda)
                 .map_err(|error| {
                     PcuExecutionError::BackendFailure(format!("CUDA preparation: {error}"))
                 }),
@@ -746,7 +815,7 @@ impl Session {
     }
 }
 
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 pub(super) fn clear_roots() -> Result<(), PcuExecutionError> {
     ROOTS
         .try_with(|roots| {
@@ -767,7 +836,7 @@ fn prepare_candidates<R>(
     mut prepare: impl FnMut(&Rc<Session>) -> Result<R, PcuExecutionError>,
 ) -> Result<(Rc<Session>, R, u64, usize), PcuExecutionError> {
     #[rustfmt::skip]
-    use super::cuda_hosted::{
+    use super::provider_hosted::{
         Provider,
         collect_cuda_candidates,
         rank_candidates,
@@ -794,7 +863,7 @@ fn prepare_candidates<R>(
         policy.backend,
         super::PcuBackendChoice::Automatic | super::PcuBackendChoice::Rocm
     ) && let Err(error) =
-        super::cuda_hosted::collect_rocm_candidates(&rocm, policy, &mut candidates)
+        super::provider_hosted::collect_rocm_candidates(&rocm, policy, &mut candidates)
     {
         discovery_errors.push(format!("ROCm discovery: {error}"));
     }
@@ -860,13 +929,15 @@ fn prepare_candidates<R>(
 
 #[cfg(all(feature = "cuda", feature = "tensor"))]
 fn open_candidate(
-    candidate: &super::cuda_hosted::Candidate,
+    candidate: &super::provider_hosted::Candidate,
     policy: super::PcuExecutionPolicy,
     cuda: &fusion_pcu_cuda::CudaDiscovery,
     #[cfg(feature = "rocm")] rocm: &fusion_pcu_rocm::RocmDiscovery,
 ) -> Result<Session, PcuExecutionError> {
-    use super::cuda_hosted::Provider;
+    use super::provider_hosted::Provider;
     match candidate.provider {
+        #[cfg(feature = "metal")]
+        Provider::Metal => Err(PcuExecutionError::TensorExecutionUnavailable),
         Provider::Cuda => fusion_pcu_cuda::CudaOwnedDispatchBackend::open(
             cuda,
             candidate.device,
@@ -932,4 +1003,71 @@ mod tests {
             )
         ));
     }
+}
+
+#[cfg(feature = "metal")]
+impl From<fusion_pcu_metal::MetalOwnedDispatchError> for PcuExecutionError {
+    fn from(error: fusion_pcu_metal::MetalOwnedDispatchError) -> Self {
+        match error {
+            fusion_pcu_metal::MetalOwnedDispatchError::Metal(
+                fusion_pcu_metal::MetalError::Arithmetic(fault),
+            ) => Self::ArithmeticFault(fault),
+            fusion_pcu_metal::MetalOwnedDispatchError::Memory(error) => Self::Memory(error),
+            other => Self::BackendFailure(format!("Metal resident execution: {other}")),
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+pub(super) fn from_metal_buffer<T: PcuScalar>(
+    backend: fusion_pcu_metal::MetalOwnedDispatchBackend,
+    buffer: crate::PcuDeviceBuffer<T, fusion_pcu_metal::MetalMemoryResource>,
+    dimensions: &[usize],
+) -> Result<super::PcuTensor<T>, PcuExecutionError> {
+    use crate::PcuOwnedDispatchMemorySession;
+    // Initialization proof is specific to this sealed adapter: MetalMemoryResource fields are
+    // private, native Metal allocation zero-clears every byte, and resource import is unsupported.
+    // Apple documents this guarantee for makeBuffer(length:options:):
+    // https://developer.apple.com/documentation/metal/mtldevice/makebuffer(length:options:)
+    // Generic PcuDeviceBufferAllocator does not promise initialization; future adapters must
+    // establish their own initialized payload before constructing a Ready logical owner.
+    let scalar = match T::TYPE {
+        crate::PcuScalarType::U32 => crate::PcuValueType::u32(),
+        crate::PcuScalarType::F32 => crate::PcuValueType::f32(),
+        _ => {
+            return Err(PcuExecutionError::BackendFailure(
+                "unsupported Metal resident scalar".into(),
+            ));
+        }
+    };
+    if buffer.is_empty() {
+        return Err(PcuExecutionError::EmptyTensorInput);
+    }
+    backend
+        .bind(
+            crate::PcuBindingRef::new(0, 0),
+            crate::PcuBindingAccess::ReadOnly,
+            crate::PcuBindingType::Value(scalar),
+            buffer.resource(),
+        )
+        .map_err(PcuExecutionError::from)?;
+    let bytes = buffer
+        .len()
+        .checked_mul(4)
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?;
+    if buffer.resource().size_bytes() < bytes {
+        return Err(PcuExecutionError::InvalidTensorSourcePlan);
+    }
+    let tensor =
+        PcuDeviceTensor::new(dimensions, buffer).map_err(PcuExecutionError::TensorStorage)?;
+    let block_size = super::policy::snapshot()?.policy.block_size;
+    let session = Session::Metal(Rc::new(MetalSession {
+        backend: Rc::new(backend),
+        block_size,
+    }));
+    Ok(super::PcuTensor::from_successful_output(
+        DeviceTensor::Metal(tensor),
+        Rc::new(session),
+    ))
 }

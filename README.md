@@ -249,20 +249,43 @@ transfer-only comparisons are omitted here because they describe different or
 superseded boundaries. The two GPUs were measured separately; these tables do
 not establish cross-vendor throughput rankings.
 
+## Run the examples
+
+Ordinary PCU examples belong to the facade and use its public API:
+
+```sh
+cargo run -p fusion-pcu --example scalar-composition \
+    --features rocm --release
+cargo run -p fusion-pcu --example owned-tensor-borrows \
+    --features rocm,tensor --release
+cargo run -p fusion-pcu --example owned-tensor-composition \
+    --features rocm,tensor --release
+cargo run -p fusion-pcu --example cuda-transform \
+    --features cuda --release
+```
+
+Backend-specific discovery, compilation and native utilities belong to their
+backend packages. See the [example guide](Crates/fusion-pcu/examples/README.md).
+The independent Snake application remains under `Examples/ai/`.
+
 ## Run the comparisons
 
 From the repository root, with the appropriate toolkit installed and the GPU
 available:
 
 ```sh
-cargo bench -p fusion-pcu-example-rocm --bench strict_matmul
-cargo bench -p fusion-pcu-example-cuda --bench strict_matmul
+cargo bench -p fusion-pcu-rocm --bench strict_matmul --features tensor
+cargo bench -p fusion-pcu-cuda --bench strict_matmul --features tensor
 ```
 
 The canonical Cargo `benches/` targets use Criterion, with workload composition
 separated from setup, native controls, numerical oracles and allocation
-diagnostics. See the [ROCm example](Examples/rocm/README.md) and [CUDA
-example](Examples/cuda/README.md) for supporting workloads and execution
+diagnostics. See the [ROCm benchmarks](Crates/backends/rocm/README.md) and [CUDA
+benchmarks](Crates/backends/cuda/README.md) for supporting workloads and execution
 controls.
+
+Run these comparisons from the repository checkout. Backend development targets
+use an in-tree facade dependency that is omitted from registry manifests to
+avoid a publication cycle; ordinary consumer dependencies remain versioned.
 
 Licensed under Apache-2.0 © Private Asylum LLC.

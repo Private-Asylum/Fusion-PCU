@@ -441,14 +441,14 @@ fn checked_float_unary_profile(kernel: &PcuDispatchKernelIr<'_>) -> Option<PcuVa
     kernel.ops.iter().find_map(|op| match op {
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
             value_type,
-            op: PcuDispatchFloatUnaryOp::Relu,
+            op: PcuDispatchFloatUnaryOp::Relu | PcuDispatchFloatUnaryOp::Neg,
             ..
         }) => Some(*value_type),
         PcuDispatchOp::GridStrideLoop { body, .. } => {
             body.iter().find_map(|body_op| match body_op {
                 PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
                     value_type,
-                    op: PcuDispatchFloatUnaryOp::Relu,
+                    op: PcuDispatchFloatUnaryOp::Relu | PcuDispatchFloatUnaryOp::Neg,
                     ..
                 }) => Some(*value_type),
                 _ => None,

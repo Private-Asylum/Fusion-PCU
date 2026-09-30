@@ -5,23 +5,14 @@ use crate::{
     CudaDeviceInfo,
     CudaError,
     ffi::{
-        Library,
         load_library,
-        symbol,
         driver::{
             CUDA_ERROR_INVALID_VALUE,
             CUDA_ERROR_NOT_SUPPORTED,
-            DriverDeviceGetAttribute,
-            DriverDeviceGetUuid,
-            DriverGetDevice,
-            DriverInit,
             DriverUuid,
-            driver_symbol,
         },
     },
-    CUDA_SUCCESS,
     query_pci_bus_id,
-    raw_driver_error,
 };
 #[rustfmt::skip]
 use fusion_pcu::{
@@ -45,29 +36,6 @@ use super::{
 };
 
 const UUID_NAMESPACE: &str = "cuda-driver-uuid-v2";
-
-fn driver_call<T: Copy>(
-    library: &Library,
-    operation: &'static str,
-    invoke: impl FnOnce(T) -> i32,
-) -> Result<(), CudaError> {
-    let name = driver_symbol(operation).ok_or_else(|| CudaError::MissingSymbol {
-        symbol: operation,
-        detail: "facts symbol is not declared in the Driver ABI table".into(),
-    })?;
-    // SAFETY: all private callers use the declared Driver API ABI and retain this library.
-    let function =
-        unsafe { symbol::<T>(library, name) }.map_err(|error| CudaError::MissingSymbol {
-            symbol: operation,
-            detail: error.to_string(),
-        })?;
-    let status = invoke(*function);
-    if status == CUDA_SUCCESS {
-        Ok(())
-    } else {
-        Err(raw_driver_error(library, operation, status))
-    }
-}
 
 fn optional_fact<T>(result: Result<T, CudaError>) -> Result<Option<T>, CudaError> {
     match result {
@@ -139,11 +107,9 @@ pub fn query_snapshot(snapshot: &CudaDeviceInfo) -> Result<PcuDeviceFacts, CudaE
     let candidate =
         std::env::var_os("CUDA_DRIVER_LIBRARY").unwrap_or_else(|| "libcuda.so.1".into());
     let library = load_library(&candidate).map_err(CudaError::RuntimeUnavailable)?;
-    driver_call(&library, "cuInit", |f: DriverInit| unsafe { f(0) })?;
+    crate::ffi::facts_init(&library)?;
     let mut device = 0;
-    driver_call(&library, "cuDeviceGet", |f: DriverGetDevice| unsafe {
-        f(&raw mut device, snapshot.index)
-    })?;
+    crate::ffi::facts_device(&library, &mut device, snapshot.index)?;
     let actual =
         query_pci_bus_id(&library, device).ok_or(CudaError::MissingStableDeviceIdentity)?;
     if actual != *expected {
@@ -153,23 +119,12 @@ pub fn query_snapshot(snapshot: &CudaDeviceInfo) -> Result<PcuDeviceFacts, CudaE
         });
     }
     let mut uuid = DriverUuid { bytes: [0; 16] };
-    let uuid = optional_fact(
-        driver_call(
-            &library,
-            "cuDeviceGetUuid_v2",
-            |f: DriverDeviceGetUuid| unsafe { f(&raw mut uuid, device) },
-        )
-        .map(|()| uuid.bytes),
-    )?;
+    let uuid =
+        optional_fact(crate::ffi::facts_uuid(&library, &mut uuid, device).map(|()| uuid.bytes))?;
     map_facts(uuid, |kind| {
         let mut value = 0;
         optional_fact(
-            driver_call(
-                &library,
-                "cuDeviceGetAttribute",
-                |f: DriverDeviceGetAttribute| unsafe { f(&raw mut value, kind, device) },
-            )
-            .map(|()| value),
+            crate::ffi::facts_attribute(&library, &mut value, kind, device).map(|()| value),
         )
     })
 }

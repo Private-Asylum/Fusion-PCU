@@ -16,6 +16,7 @@ use fusion_pcu::{
     PcuDispatchCheckedFloatConversion,
     PcuDispatchDataOp,
     PcuDispatchFloatBinaryOp,
+    PcuDispatchFloatUnaryOp,
     PcuDispatchIndex,
     PcuDispatchOp,
     PcuDispatchOpCaps,
@@ -221,13 +222,14 @@ fn execute(
                 )),
                 PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
                     result,
+                    op,
                     value,
                     underflow_policy,
                     range_policy,
                     ..
                 }) => Some((
                     result,
-                    unary(get(&values, value)?, underflow_policy, range_policy),
+                    unary(op, get(&values, value)?, underflow_policy, range_policy),
                 )),
                 PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
                     result,
@@ -364,19 +366,44 @@ fn binary(
         _ => unreachable!("typed SSA preflight validates operand widths"),
     }
 }
-fn unary(value: Value, underflow: PcuFloatUnderflowPolicy, range: PcuRangePolicy) -> Evaluation {
+fn unary(
+    op: PcuDispatchFloatUnaryOp,
+    value: Value,
+    underflow: PcuFloatUnderflowPolicy,
+    range: PcuRangePolicy,
+) -> Evaluation {
+    fn apply<T: PcuCheckedFloat + PcuClampedFloat>(
+        op: PcuDispatchFloatUnaryOp,
+        value: T,
+        underflow: PcuFloatUnderflowPolicy,
+        range: PcuRangePolicy,
+        wrap: fn(T) -> Value,
+    ) -> Evaluation {
+        if range == PcuRangePolicy::Clamp {
+            clamped(
+                match op {
+                    PcuDispatchFloatUnaryOp::Relu => value.pcu_clamped_relu_with_policy(underflow),
+                    PcuDispatchFloatUnaryOp::Neg => value.pcu_clamped_neg_with_policy(underflow),
+                },
+                wrap,
+            )
+        } else {
+            checked(
+                match op {
+                    PcuDispatchFloatUnaryOp::Relu => value.pcu_checked_relu_with_policy(underflow),
+                    PcuDispatchFloatUnaryOp::Neg => value.pcu_checked_neg_with_policy(underflow),
+                },
+                wrap,
+            )
+        }
+    }
     match value {
-        Value::F32(value) if range == PcuRangePolicy::Clamp => {
-            clamped(value.pcu_clamped_relu_with_policy(underflow), Value::F32)
-        }
-        Value::F64(value) if range == PcuRangePolicy::Clamp => {
-            clamped(value.pcu_clamped_relu_with_policy(underflow), Value::F64)
-        }
-        Value::F32(value) => checked(value.pcu_checked_relu_with_policy(underflow), Value::F32),
-        Value::F64(value) => checked(value.pcu_checked_relu_with_policy(underflow), Value::F64),
+        Value::F32(value) => apply(op, value, underflow, range, Value::F32),
+        Value::F64(value) => apply(op, value, underflow, range, Value::F64),
         _ => unreachable!("typed SSA preflight validates unary width"),
     }
 }
+
 fn convert(
     value: Value,
     conversion: PcuDispatchCheckedFloatConversion,

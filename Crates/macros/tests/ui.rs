@@ -25,7 +25,7 @@ fn dispatch_macro_ui() {
     tests.compile_fail("tests/ui/scalar_mutable_reference.rs");
     tests.compile_fail("tests/ui/mixed_scalar_references.rs");
     tests.pass("tests/ui/u32_wrapping_arithmetic.rs");
-    tests.compile_fail("tests/ui/u32_plain_arithmetic.rs");
+    tests.pass("tests/ui/u32_plain_arithmetic.rs");
     tests.pass("tests/ui/u32_checked_div_rem.rs");
     tests.compile_fail("tests/ui/u32_checked_div_rem_bad.rs");
     tests.compile_fail("tests/ui/generic_identity_arithmetic.rs");

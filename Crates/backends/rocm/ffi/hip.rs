@@ -72,11 +72,3 @@ pub const ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 56;
 pub const ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 63;
 pub const ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: c_int = 74;
 pub const ATTRIBUTE_WARP_SIZE: c_int = 87;
-
-/// Load the optional stable attribute query without extending ordinary runtime initialization.
-pub fn device_get_attribute(library: &super::Library) -> Option<DeviceGetAttribute> {
-    // SAFETY: HIP documents this exact C signature; the caller retains the loaded library.
-    unsafe { super::symbol::<DeviceGetAttribute>(library, b"hipDeviceGetAttribute\0") }
-        .ok()
-        .map(|function| *function)
-}

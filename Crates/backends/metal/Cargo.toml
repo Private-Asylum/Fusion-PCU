@@ -1,6 +1,6 @@
 [package]
 name = "fusion-pcu-metal"
-description = "Metal backend scaffold for Fusion PCU"
+description = "Bounded checked Metal runtime for Fusion PCU"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -18,9 +18,28 @@ path = "metal.rs"
 
 [features]
 default = []
+allocation-census = []
 
 [dependencies]
 fusion-pcu-core.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+pcu-facade = { workspace = true, features = ["std", "metal"] }
+
+[[test]]
+name = "source"
+path = "tests/source/source.rs"
+
+[[bench]]
+name = "checked_neg"
+path = "benches/checked_neg/checked_neg.rs"
+harness = false
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true

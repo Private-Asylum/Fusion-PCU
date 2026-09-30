@@ -35,7 +35,8 @@ pub fn load_library(candidate: &std::ffi::OsStr) -> Result<Arc<Library>, String>
 
     // SAFETY: callers resolve and invoke symbols only while holding an Arc to this Library.
     // Successful loads are also retained by the process-wide cache, preventing CUDA teardown.
-    let library = unsafe { Library::new(candidate) }.map_err(|error| error.to_string())?;
+    let library =
+        unsafe { super::open_sdk_library(candidate) }.map_err(|error| error.to_string())?;
     let library = Arc::new(library);
     cache.insert(candidate.to_os_string(), Arc::clone(&library));
     drop(cache);
@@ -70,5 +71,5 @@ pub unsafe fn load_uncached_library<P: AsRef<std::ffi::OsStr>>(
     candidate: P,
 ) -> Result<Library, libloading::Error> {
     // SAFETY: the caller upholds the loading and resource-retention contract above.
-    unsafe { Library::new(candidate) }
+    unsafe { super::open_sdk_library(candidate.as_ref()) }
 }

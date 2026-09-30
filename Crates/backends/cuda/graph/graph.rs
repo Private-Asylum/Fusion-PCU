@@ -24,14 +24,6 @@ use crate::{
 use crate::ffi::runtime::{
     CudaGraph,
     CudaGraphExec,
-    GraphDestroy,
-    GraphExecDestroy,
-    GraphInstantiateWithFlags,
-    GraphLaunch,
-    Memcpy,
-    MemsetAsync,
-    StreamBeginCapture,
-    StreamEndCapture,
 };
 #[rustfmt::skip]
 use fusion_pcu::{
@@ -125,9 +117,7 @@ impl CudaRuntime {
             None
         };
         // Thread-local capture is sufficient: the private stream never escapes this owner.
-        self.call("cudaStreamBeginCapture", |f: StreamBeginCapture| unsafe {
-            f(stream.raw_stream(), 1)
-        })?;
+        unsafe { crate::ffi::invoke_cudaStreamBeginCapture(self, stream.raw_stream(), 1) }?;
         let submission = if let Some(fault_word) = fault_word.as_ref() {
             retained
                 .graph_reset_fault_word(fault_word)
@@ -148,9 +138,9 @@ impl CudaRuntime {
         // Always end capture before dropping the retained batch; synchronization during capture
         // is forbidden. A failed submission may invalidate capture and leave a null graph.
         let mut graph: CudaGraph = ptr::null_mut();
-        let ended = self.call("cudaStreamEndCapture", |f: StreamEndCapture| unsafe {
-            f(stream.raw_stream(), &raw mut graph)
-        });
+        let ended = unsafe {
+            crate::ffi::invoke_cudaStreamEndCapture(self, stream.raw_stream(), &raw mut graph)
+        };
         if let Err(error) = submission {
             destroy_graph(self, graph);
             return Err(CudaNativeGraphError::Dispatch(error));
@@ -160,10 +150,9 @@ impl CudaRuntime {
             return Err(error.into());
         }
         let mut executable: CudaGraphExec = ptr::null_mut();
-        let instantiated = self.call(
-            "cudaGraphInstantiateWithFlags",
-            |f: GraphInstantiateWithFlags| unsafe { f(&raw mut executable, graph, 0) },
-        );
+        let instantiated = unsafe {
+            crate::ffi::invoke_cudaGraphInstantiateWithFlags(self, &raw mut executable, graph, 0)
+        };
         destroy_graph(self, graph);
         instantiated?;
         Ok(CudaNativeGraph {
@@ -211,7 +200,7 @@ const fn validate_replay(
 
 fn destroy_graph(runtime: &CudaRuntime, graph: CudaGraph) {
     if !graph.is_null() {
-        let _ = runtime.call("cudaGraphDestroy", |f: GraphDestroy| unsafe { f(graph) });
+        let _ = unsafe { crate::ffi::invoke_cudaGraphDestroy(runtime, graph) };
     }
 }
 
@@ -321,11 +310,13 @@ impl CudaNativeGraph {
             .retained
             .as_ref()
             .ok_or(CudaNativeGraphError::Poisoned)?;
-        let launch = self
-            .runtime
-            .call("cudaGraphLaunch", |f: GraphLaunch| unsafe {
-                f(self.executable, retained.stream.raw_stream())
-            });
+        let launch = unsafe {
+            crate::ffi::invoke_cudaGraphLaunch(
+                &self.runtime,
+                self.executable,
+                retained.stream.raw_stream(),
+            )
+        };
         let completion = retained.stream.synchronize();
         if launch.is_err() || completion.is_err() {
             self.poisoned = true;
@@ -359,18 +350,15 @@ impl CudaCompletionBatch {
             access_leases,
             stream: self.stream.clone(),
         });
-        let result = self
-            .stream
-            .inner
-            .runtime
-            .call("cudaMemsetAsync", |f: MemsetAsync| unsafe {
-                f(
-                    buffer.allocation.pointer,
-                    0xff,
-                    size_of::<u64>(),
-                    self.stream.raw_stream(),
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_cudaMemsetAsync(
+                &self.stream.inner.runtime,
+                buffer.allocation.pointer,
+                0xff,
+                size_of::<u64>(),
+                self.stream.raw_stream(),
+            )
+        };
         // During capture, do not synchronize on error; caller must end capture first.
         if result.is_err() {
             self.failed = true;
@@ -408,23 +396,20 @@ impl CudaCompletionBatch {
     ) -> Result<(), CudaError> {
         self.graph_validate_transfer(buffer, offset, bytes.len())?;
         let lease = buffer.acquire_stream_access(&self.stream)?;
-        let result = self
-            .stream
-            .inner
-            .runtime
-            .call("cudaMemcpy", |f: Memcpy| unsafe {
-                f(
-                    buffer
-                        .allocation
-                        .pointer
-                        .cast::<u8>()
-                        .wrapping_add(offset)
-                        .cast(),
-                    bytes.as_ptr().cast(),
-                    bytes.len(),
-                    CUDA_MEMCPY_HOST_TO_DEVICE,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_cudaMemcpy(
+                &self.stream.inner.runtime,
+                buffer
+                    .allocation
+                    .pointer
+                    .cast::<u8>()
+                    .wrapping_add(offset)
+                    .cast(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
         lease.finish_synchronous(result)
     }
 
@@ -436,23 +421,20 @@ impl CudaCompletionBatch {
     ) -> Result<(), CudaError> {
         self.graph_validate_transfer(buffer, offset, bytes.len())?;
         let lease = buffer.acquire_stream_access(&self.stream)?;
-        let result = self
-            .stream
-            .inner
-            .runtime
-            .call("cudaMemcpy", |f: Memcpy| unsafe {
-                f(
-                    bytes.as_mut_ptr().cast(),
-                    buffer
-                        .allocation
-                        .pointer
-                        .cast::<u8>()
-                        .wrapping_add(offset)
-                        .cast(),
-                    bytes.len(),
-                    CUDA_MEMCPY_DEVICE_TO_HOST,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_cudaMemcpy(
+                &self.stream.inner.runtime,
+                bytes.as_mut_ptr().cast(),
+                buffer
+                    .allocation
+                    .pointer
+                    .cast::<u8>()
+                    .wrapping_add(offset)
+                    .cast(),
+                bytes.len(),
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
         lease.finish_synchronous(result)
     }
 }
@@ -472,11 +454,7 @@ impl Drop for CudaNativeGraph {
         } else if self.poisoned {
             return;
         }
-        let _ = self
-            .runtime
-            .call("cudaGraphExecDestroy", |f: GraphExecDestroy| unsafe {
-                f(self.executable)
-            });
+        let _ = unsafe { crate::ffi::invoke_cudaGraphExecDestroy(&self.runtime, self.executable) };
     }
 }
 
@@ -612,10 +590,7 @@ extern "C" __global__ void increment(unsigned int* value) {
         buffer.copy_from(&0_u32.to_ne_bytes()).expect("initialize");
         let stream = runtime.create_stream().expect("stream");
         let mut retained = CudaCompletionBatch::new(&stream);
-        runtime
-            .call("cudaStreamBeginCapture", |f: StreamBeginCapture| unsafe {
-                f(stream.raw_stream(), 1)
-            })
+        unsafe { crate::ffi::invoke_cudaStreamBeginCapture(&runtime, stream.raw_stream(), 1) }
             .expect("begin capture");
         // SAFETY: the compiled kernel takes exactly one pointer to a live u32 allocation.
         unsafe {
@@ -630,18 +605,20 @@ extern "C" __global__ void increment(unsigned int* value) {
                 .expect("capture launch");
         }
         let mut graph = ptr::null_mut();
-        runtime
-            .call("cudaStreamEndCapture", |f: StreamEndCapture| unsafe {
-                f(stream.raw_stream(), &raw mut graph)
-            })
-            .expect("end capture");
+        unsafe {
+            crate::ffi::invoke_cudaStreamEndCapture(&runtime, stream.raw_stream(), &raw mut graph)
+        }
+        .expect("end capture");
         let mut executable = ptr::null_mut();
-        runtime
-            .call(
-                "cudaGraphInstantiateWithFlags",
-                |f: GraphInstantiateWithFlags| unsafe { f(&raw mut executable, graph, 0) },
+        unsafe {
+            crate::ffi::invoke_cudaGraphInstantiateWithFlags(
+                &runtime,
+                &raw mut executable,
+                graph,
+                0,
             )
-            .expect("instantiate");
+        }
+        .expect("instantiate");
         destroy_graph(&runtime, graph);
         let mut executable = CudaNativeGraph {
             runtime,

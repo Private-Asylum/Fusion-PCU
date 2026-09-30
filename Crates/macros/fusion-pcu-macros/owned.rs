@@ -26,6 +26,9 @@ use syn::{
 #[path = "owned/consumption.rs"]
 mod consumption;
 
+#[path = "owned/constants/constants.rs"]
+mod constants;
+
 /// Identifies an explicit resident-owner return profile before scalar-helper lowering.
 pub fn declares_owned_tensor_return(output: &ReturnType) -> bool {
     let ReturnType::Type(_, ty) = output else {
@@ -62,7 +65,13 @@ pub fn expand_owned_return_with_flag(
     crate_path: &Path,
     underflow_flag: Option<super::PcuOwnedFlag>,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    expand_owned_return_with_policies(function, crate_path, underflow_flag, None)
+    expand_owned_return_with_policies(
+        function,
+        crate_path,
+        underflow_flag,
+        None,
+        super::numerical::NumericalFlags::default(),
+    )
 }
 
 pub fn expand_owned_return_with_policies(
@@ -70,6 +79,7 @@ pub fn expand_owned_return_with_policies(
     crate_path: &Path,
     underflow_flag: Option<super::PcuOwnedFlag>,
     numerical_mode: Option<bool>,
+    numerical_options: super::numerical::NumericalFlags,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let (parameters, const_params) = validate_owned_function(function)?;
     if underflow_flag.is_some() {
@@ -159,6 +169,7 @@ pub fn expand_owned_return_with_policies(
         program: &parsed,
         underflow_flag,
         numerical_mode,
+        numerical_options,
     };
     Ok(emit_owned_items(&emission))
 }
@@ -176,6 +187,7 @@ struct OwnedEmission<'a> {
     program: &'a CapturedProgram,
     underflow_flag: Option<super::PcuOwnedFlag>,
     numerical_mode: Option<bool>,
+    numerical_options: super::numerical::NumericalFlags,
 }
 
 // This builds one wrapper and its matching cold companion from the same names and signatures;
@@ -195,6 +207,7 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
         program: parsed,
         underflow_flag,
         numerical_mode,
+        numerical_options,
     } = emission;
     let input_count = parameters.len();
     // Signature validation guarantees the concrete scalar and matching input profile.
@@ -469,6 +482,7 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
         }
         None => quote! { ::core::option::Option::None },
     };
+    let independent_options = numerical_options.overrides(companion_crate_path);
     let float_policy = match underflow_flag {
         Some(super::PcuOwnedFlag::IeeeUnderflow) => quote! {
             ::core::option::Option::Some(
@@ -535,6 +549,8 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
                     ::core::any::TypeId::of::<#capture_marker_type>(),
                     |#capture_ident| #capture_ident.with_numerical_mode(
                         #numerical_policy,
+                        |#capture_ident| #capture_ident.with_numerical_options(
+                        #independent_options,
                         |#capture_ident| #capture_ident.with_float_underflow_policy(
                         #float_policy,
                         |#capture_ident| (|| -> ::core::result::Result<
@@ -546,6 +562,7 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
                             #(#capture_body)*
                             ::core::result::Result::Ok(#output_tokens)
                         })(),
+                        ),
                         ),
                     ),
                 )?;
@@ -929,6 +946,8 @@ enum Operation {
     Mul,
     Div,
     Matmul,
+    MeanSquaredError,
+    SgdUpdate(Expr),
     Helper(Path),
 }
 
@@ -1330,6 +1349,18 @@ impl LoweringState<'_> {
         {
             return Err(composition_body_error(&call.func));
         }
+        if is_pcu_builtin(&path.path, "sgd_update") {
+            if call.args.len() != 3 {
+                return Err(Error::new_spanned(
+                    &call.args,
+                    "pcu::sgd_update requires weights, gradient and a finite F32 literal rate",
+                ));
+            }
+            let learning_rate = constants::finite_f32_literal(&call.args[2])?;
+            let weights = self.lower(&call.args[0], depth + 1)?;
+            let gradient = self.lower(&call.args[1], depth + 1)?;
+            return Ok(self.emit(Operation::SgdUpdate(learning_rate), &[weights, gradient]));
+        }
         let operation = operation_for_path(
             &path.path,
             &call.func,
@@ -1344,7 +1375,9 @@ impl LoweringState<'_> {
             | Operation::Sub
             | Operation::Mul
             | Operation::Div
-            | Operation::Matmul => Some(2),
+            | Operation::Matmul
+            | Operation::MeanSquaredError => Some(2),
+            Operation::SgdUpdate(_) => Some(3),
             Operation::Helper(_) => None,
         };
         if expected.is_some_and(|expected| call.args.len() != expected)
@@ -1376,6 +1409,10 @@ impl LoweringState<'_> {
             Operation::Mul => quote! { #capture.mul(#(#values),*)? },
             Operation::Div => quote! { #capture.div(#(#values),*)? },
             Operation::Matmul => quote! { #capture.matmul(#(#values),*)? },
+            Operation::MeanSquaredError => quote! { #capture.mean_squared_error(#(#values),*)? },
+            Operation::SgdUpdate(learning_rate) => {
+                quote! { #capture.sgd_update(#(#values),*, #learning_rate)? }
+            }
             Operation::Helper(path) => quote! { #path(#capture, #(#values),*)? },
         };
         let crate_path = self.crate_path;
@@ -1418,6 +1455,7 @@ fn operation_for_path(
             "mul" => Ok(Operation::Mul),
             "div" => Ok(Operation::Div),
             "matmul" => Ok(Operation::Matmul),
+            "mean_squared_error" => Ok(Operation::MeanSquaredError),
             _ => Err(composition_body_error(span)),
         };
     }
@@ -1610,7 +1648,7 @@ fn value_tokens(
 fn composition_body_error(span: &impl quote::ToTokens) -> Error {
     Error::new_spanned(
         span,
-        "owned tensor body accepts immutable let bindings of pcu::relu|identity|add|sub|mul, binary `+`|`-`|`*`, or another #[pcu] helper, and a final value/Ok(value)",
+        "owned tensor body accepts immutable let bindings of pcu::relu|identity|add|sub|mul|div|matmul|mean_squared_error|sgd_update, binary `+`|`-`|`*`|`/`, or another #[pcu] helper, and a final value/Ok(value)",
     )
 }
 
@@ -1672,6 +1710,35 @@ mod tests {
         expand_owned_return(source, &syn::parse_quote!(::pcu_alias))
             .expect("owned tensor composition should expand")
             .to_string()
+    }
+
+    #[test]
+    fn owned_mean_squared_error_composes_with_matmul_and_checks_arity() {
+        let source: ItemFn = syn::parse_quote! {
+            fn loss(prediction: &[f32], target: &[f32])
+                -> Result<PcuTensor<f32>, PcuExecutionError>
+            {
+                pcu::mean_squared_error(prediction, target)
+            }
+        };
+        assert!(expand(&source).contains("mean_squared_error"));
+        let composed: ItemFn = syn::parse_quote! {
+            fn loss(left: &[[f32; 2]; 2], right: &[[f32; 2]; 2], target: &[[f32; 2]; 2])
+                -> Result<PcuTensor<f32>, PcuExecutionError>
+            {
+                let prediction = pcu::matmul(left, right)?;
+                pcu::mean_squared_error(&prediction, target)
+            }
+        };
+        let expanded = expand(&composed);
+        assert!(expanded.contains("matmul"));
+        assert!(expanded.contains("mean_squared_error"));
+        let invalid: ItemFn = syn::parse_quote! {
+            fn loss(input: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {
+                pcu::mean_squared_error(input)
+            }
+        };
+        assert!(expand_owned_return(&invalid, &syn::parse_quote!(::pcu_alias)).is_err());
     }
 
     #[test]
@@ -2452,6 +2519,28 @@ mod tests {
             }
         };
         assert!(expand_owned_return(&source, &syn::parse_quote!(::pcu_alias)).is_ok());
+    }
+
+    #[test]
+    fn sgd_literal_is_a_static_parameter_not_a_tensor_or_host_computation() {
+        let source: ItemFn = syn::parse_quote! {
+            fn update(weights: &[f32], gradient: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {
+                pcu::sgd_update(weights, gradient, -0.25_f32)
+            }
+        };
+        let expanded = expand(&source);
+        assert!(expanded.contains("sgd_update (weights , gradient , - 0.25_f32)"));
+        for arguments in [
+            "weights, gradient",
+            "weights, gradient, 0.25, gradient",
+            "weights, gradient, RATE",
+            "weights, gradient, get_rate()",
+        ] {
+            let invalid: ItemFn = syn::parse_str(&format!(
+                "fn update(weights: &[f32], gradient: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {{ pcu::sgd_update({arguments}) }}"
+            )).unwrap();
+            assert!(expand_owned_return(&invalid, &syn::parse_quote!(::pcu_alias)).is_err());
+        }
     }
 
     #[test]

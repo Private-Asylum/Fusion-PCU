@@ -93,7 +93,7 @@ __device__ __forceinline__ FusionF64CheckedResult fusion_checked_f64_binary(unsi
         }
         unsigned long long lo = static_cast<unsigned long long>(product[0]) | (static_cast<unsigned long long>(product[1]) << 32);
         unsigned long long hi = static_cast<unsigned long long>(product[2]) | (static_cast<unsigned long long>(product[3]) << 32);
-        int top = hi != 0ull ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll(lo);
+        int top = hi != 0ull ? 127 - __clzll(hi) : 63 - __clzll(lo);
         unsigned long long ext = top > 55 ? fusion_f64_pair_shift_jam(lo, hi, static_cast<unsigned int>(top - 55)) : lo << static_cast<unsigned int>(55 - top);
         return fusion_f64_pack(xs != ys, ext, xexp + yexp + top - 104, policy);
     }
@@ -101,8 +101,8 @@ __device__ __forceinline__ FusionF64CheckedResult fusion_checked_f64_binary(unsi
         bool sign = xs != ys;
         if ((y << 1) == 0ull) return {0ull, 1u};
         if ((x << 1) == 0ull) return {static_cast<unsigned long long>(sign) << 63, 0u};
-        int a_shift = __builtin_clzll(xm) - 11;
-        int b_shift = __builtin_clzll(ym) - 11;
+        int a_shift = __clzll(xm) - 11;
+        int b_shift = __clzll(ym) - 11;
         xm <<= a_shift; xexp -= a_shift;
         ym <<= b_shift; yexp -= b_shift;
         unsigned long long numerator = xm;

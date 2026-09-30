@@ -11,6 +11,7 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
+autoexamples = false
 
 [lib]
 crate-type = ["rlib"]
@@ -25,13 +26,40 @@ tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor", "fusion-pcu-cuda?
 vm-reference = ["fusion-pcu-core/vm-reference"]
 rocm = ["std", "dep:fusion-pcu-rocm"]
 cuda = ["std", "dep:fusion-pcu-cuda"]
+metal = ["std", "dep:fusion-pcu-metal"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
 fusion-pcu-macros.workspace = true
 fusion-pcu-rocm = { workspace = true, optional = true }
 fusion-pcu-cuda = { workspace = true, optional = true }
+fusion-pcu-metal = { workspace = true, optional = true }
 smallvec.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "metal"
+path = "tests/metal/metal.rs"
+required-features = ["metal"]
+
+[[example]]
+name = "scalar-composition"
+path = "examples/scalar-composition/scalar-composition.rs"
+required-features = ["rocm"]
+
+[[example]]
+name = "owned-tensor-borrows"
+path = "examples/owned-tensor-borrows/owned-tensor-borrows.rs"
+required-features = ["rocm", "tensor"]
+
+[[example]]
+name = "cuda-transform"
+path = "examples/cuda_transform/cuda_transform.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "owned-tensor-composition"
+path = "examples/owned-tensor-composition/owned-tensor-composition.rs"
+required-features = ["rocm", "tensor"]

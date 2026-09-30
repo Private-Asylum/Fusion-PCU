@@ -11,6 +11,9 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
+autoexamples = false
+autobenches = false
+autotests = false
 
 [lib]
 crate-type = ["rlib"]
@@ -18,8 +21,9 @@ path = "rocm.rs"
 
 [features]
 default = []
-insights = ["fusion-pcu-core/insights"]
-tensor = ["fusion-pcu-core/tensor"]
+allocation-census = []
+insights = ["fusion-pcu-core/insights", "pcu-facade/insights"]
+tensor = ["fusion-pcu-core/tensor", "pcu-facade/tensor"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
@@ -28,3 +32,425 @@ smallvec.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+pcu-facade = { workspace = true, features = ["rocm"] }
+fusion-pcu-macros.workspace = true
+libloading.workspace = true
+libc.workspace = true
+bytemuck.workspace = true
+criterion.workspace = true
+
+[[example]]
+name = "fusion-rocm-smoke"
+path = "examples/smoke/smoke.rs"
+test = true
+
+[[example]]
+name = "fusion-rocm-pcu"
+path = "examples/dispatch/dispatch.rs"
+test = true
+
+[[example]]
+name = "fusion-rocm-discover"
+path = "examples/discovery/discovery.rs"
+test = true
+
+[[example]]
+name = "fusion-rocm-tensor"
+path = "examples/tensor/tensor.rs"
+test = true
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-rtc"
+path = "examples/rtc/rtc.rs"
+test = true
+
+[[example]]
+name = "fusion-rocm-train-step"
+path = "examples/train-step/train-step.rs"
+test = true
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-fma-witness"
+path = "examples/fma-witness/fma-witness.rs"
+test = true
+
+[[example]]
+name = "fusion-rocm-typed-kernel"
+path = "examples/typed-kernel/typed-kernel.rs"
+test = true
+
+[[bench]]
+name = "checked_float_convert"
+path = "benches/checked_float_convert/checked_float_convert.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_neg"
+path = "benches/checked_neg/checked_neg.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_relu"
+path = "benches/checked_relu/checked_relu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "clamped_float"
+path = "benches/clamped_float/clamped_float.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch"
+path = "benches/dispatch/dispatch.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_f32_f64_exact"
+path = "benches/dispatch_f32_f64_exact/dispatch_f32_f64_exact.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_f64_alu"
+path = "benches/dispatch_f64_alu/dispatch_f64_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_half_convert"
+path = "benches/dispatch_half_convert/dispatch_half_convert.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i16_alu"
+path = "benches/dispatch_i16_alu/dispatch_i16_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i16_checked_div_rem"
+path = "benches/dispatch_i16_checked_div_rem/dispatch_i16_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i32_alu"
+path = "benches/dispatch_i32_alu/dispatch_i32_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i32_checked_div_rem"
+path = "benches/dispatch_i32_checked_div_rem/dispatch_i32_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i64_alu"
+path = "benches/dispatch_i64_alu/dispatch_i64_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i64_checked_div_rem"
+path = "benches/dispatch_i64_checked_div_rem/dispatch_i64_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i8_alu"
+path = "benches/dispatch_i8_alu/dispatch_i8_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_i8_checked_div_rem"
+path = "benches/dispatch_i8_checked_div_rem/dispatch_i8_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u16_alu"
+path = "benches/dispatch_u16_alu/dispatch_u16_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u16_checked_div_rem"
+path = "benches/dispatch_u16_checked_div_rem/dispatch_u16_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u32"
+path = "benches/dispatch_u32/dispatch_u32.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u32_alu"
+path = "benches/dispatch_u32_alu/dispatch_u32_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u32_checked_div_rem"
+path = "benches/dispatch_u32_checked_div_rem/dispatch_u32_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u64_alu"
+path = "benches/dispatch_u64_alu/dispatch_u64_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u64_checked_div_rem"
+path = "benches/dispatch_u64_checked_div_rem/dispatch_u64_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u8_alu"
+path = "benches/dispatch_u8_alu/dispatch_u8_alu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_u8_checked_div_rem"
+path = "benches/dispatch_u8_checked_div_rem/dispatch_u8_checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "dispatch_widen"
+path = "benches/dispatch_widen/dispatch_widen.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "half_transport"
+path = "benches/half_transport/half_transport.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "native_matmul"
+path = "benches/native_matmul/native_matmul.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "native_mse"
+path = "benches/native_mse/native_mse.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_binary"
+path = "benches/owned_binary/owned_binary.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_binary_donor"
+path = "benches/owned_binary_donor/owned_binary_donor.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_checked_float"
+path = "benches/owned_checked_float/owned_checked_float.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_checked_float_div"
+path = "benches/owned_checked_float_div/owned_checked_float_div.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_checked_integer"
+path = "benches/owned_checked_integer/owned_checked_integer.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_identity_transfer"
+path = "benches/owned_identity_transfer/owned_identity_transfer.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_matmul"
+path = "benches/owned_matmul/owned_matmul.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_multi_consuming"
+path = "benches/owned_multi_consuming/owned_multi_consuming.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_program"
+path = "benches/owned_program/owned_program.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_relu"
+path = "benches/owned_relu/owned_relu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "owned_selected_owners"
+path = "benches/owned_selected_owners/owned_selected_owners.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "strict_matmul"
+path = "benches/strict_matmul/strict_matmul.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor"
+path = "benches/tensor/tensor.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_add"
+path = "benches/tensor_add/tensor_add.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_add_relu_fusion"
+path = "benches/tensor_add_relu_fusion/tensor_add_relu_fusion.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_add_sub_chain"
+path = "benches/tensor_add_sub_chain/tensor_add_sub_chain.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_add_sub_identity"
+path = "benches/tensor_add_sub_identity/tensor_add_sub_identity.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_mlp_train"
+path = "benches/tensor_mlp_train/tensor_mlp_train.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_mse"
+path = "benches/tensor_mse/tensor_mse.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_mul_chain"
+path = "benches/tensor_mul_chain/tensor_mul_chain.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_relu"
+path = "benches/tensor_relu/tensor_relu.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_resident"
+path = "benches/tensor_resident/tensor_resident.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_sgd_contract"
+path = "benches/tensor_sgd_contract/tensor_sgd_contract.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_train_insights"
+path = "benches/tensor_train_insights/tensor_train_insights.rs"
+harness = false
+required-features = ["tensor", "insights"]
+
+[[bench]]
+name = "tensor_train_step"
+path = "benches/tensor_train_step/tensor_train_step.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_train_volume"
+path = "benches/tensor_train_volume/tensor_train_volume.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_uniform"
+path = "benches/tensor_uniform/tensor_uniform.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "typed_kernel"
+path = "benches/typed_kernel/typed_kernel.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "automatic_execution"
+path = "tests/automatic_execution/automatic_execution.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "hip_runtime_lifecycle"
+path = "tests/hip_runtime_lifecycle/hip_runtime_lifecycle.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "train_volume_inputs"
+path = "tests/train_volume_inputs/train_volume_inputs.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "typed_kernel_host"
+path = "tests/typed_kernel_host/typed_kernel_host.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "typed_kernel_rounding"
+path = "tests/typed_kernel_rounding/typed_kernel_rounding.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "rocm_native_matmul_source"
+path = "tests/rocm_native_matmul_source/rocm_native_matmul_source.rs"
+required-features = ["tensor"]

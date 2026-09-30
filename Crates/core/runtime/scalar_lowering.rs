@@ -38,6 +38,74 @@ impl PcuFloatScalar for f64 {
     const VALUE_TYPE: PcuValueType = PcuValueType::f64();
 }
 
+mod integer_sealed {
+    pub trait Sealed {}
+}
+/// Fixed-width integer types admitted by checked arithmetic lowering.
+#[allow(private_bounds)] // Only the exact-width built-in integer contracts are admitted.
+pub trait PcuIntegerScalar: PcuScalar + integer_sealed::Sealed {
+    /// Exact IR type for this integer.
+    const VALUE_TYPE: PcuValueType;
+    /// Preserve the scalar's exact width in a constant.
+    fn parameter(self) -> PcuParameterValue;
+}
+impl integer_sealed::Sealed for u8 {}
+impl PcuIntegerScalar for u8 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::u8();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::U8(self)
+    }
+}
+impl integer_sealed::Sealed for u16 {}
+impl PcuIntegerScalar for u16 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::u16();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::U16(self)
+    }
+}
+impl integer_sealed::Sealed for u32 {}
+impl PcuIntegerScalar for u32 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::u32();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::U32(self)
+    }
+}
+impl integer_sealed::Sealed for u64 {}
+impl PcuIntegerScalar for u64 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::u64();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::U64(self)
+    }
+}
+impl integer_sealed::Sealed for i8 {}
+impl PcuIntegerScalar for i8 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::i8();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::I8(self)
+    }
+}
+impl integer_sealed::Sealed for i16 {}
+impl PcuIntegerScalar for i16 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::i16();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::I16(self)
+    }
+}
+impl integer_sealed::Sealed for i32 {}
+impl PcuIntegerScalar for i32 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::i32();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::I32(self)
+    }
+}
+impl integer_sealed::Sealed for i64 {}
+impl PcuIntegerScalar for i64 {
+    const VALUE_TYPE: PcuValueType = PcuValueType::i64();
+    fn parameter(self) -> PcuParameterValue {
+        PcuParameterValue::I64(self)
+    }
+}
+
 /// A value id paired with its Rust scalar type for generated helper boundaries.
 ///
 /// The phantom type prevents a companion lowered for one scalar profile from accepting a value
@@ -161,6 +229,42 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         Ok(PcuScalarValue::from_id(result))
     }
 
+    /// Emits an exact-width integer constant.
+    ///
+    /// # Errors
+    /// Returns `ResourceExhausted` when value or operation capacity is exhausted.
+    pub fn constant_integer_value<T: PcuIntegerScalar>(
+        &mut self,
+        value: T,
+    ) -> Result<PcuScalarValue<T>, PcuError> {
+        let result = self.fresh_value()?;
+        self.push(PcuDispatchDataOp::Constant {
+            result,
+            value: value.parameter(),
+        })?;
+        Ok(PcuScalarValue::from_id(result))
+    }
+    /// Emits checked exact-width integer addition, subtraction, or multiplication.
+    ///
+    /// # Errors
+    /// Returns `ResourceExhausted` when value or operation capacity is exhausted.
+    pub fn checked_integer_binary_value<T: PcuIntegerScalar>(
+        &mut self,
+        op: crate::PcuDispatchIntegerBinaryOp,
+        lhs: PcuScalarValue<T>,
+        rhs: PcuScalarValue<T>,
+    ) -> Result<PcuScalarValue<T>, PcuError> {
+        let result = self.fresh_value()?;
+        self.push(PcuDispatchDataOp::CheckedIntegerBinary {
+            value_type: T::VALUE_TYPE,
+            op,
+            result,
+            lhs: lhs.id(),
+            rhs: rhs.id(),
+        })?;
+        Ok(PcuScalarValue::from_id(result))
+    }
+
     /// Emits checked floating Add/Sub/Mul/Div, preserving type and both arithmetic policies.
     ///
     /// # Errors
@@ -185,7 +289,7 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         Ok(PcuScalarValue::from_id(result))
     }
 
-    /// Emits checked floating `ReLU` with the context's arithmetic policies.
+    /// Emits checked floating negation or `ReLU` with the context's arithmetic policies.
     ///
     /// # Errors
     ///
@@ -247,12 +351,12 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         Ok(PcuScalarValue::from_id(result))
     }
 
-    /// Emits an indexed floating binding load with a compile-time scalar type.
+    /// Emits an indexed scalar binding load with a compile-time scalar type.
     ///
     /// # Errors
     ///
     /// Returns `ResourceExhausted` when values or builder operations are exhausted.
-    pub fn load_value<T: PcuFloatScalar>(
+    pub fn load_value<T: PcuScalar>(
         &mut self,
         binding: crate::PcuBindingRef,
         index: PcuDispatchIndex,
@@ -260,12 +364,12 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         self.load_typed(binding, index).map(PcuScalarValue::from_id)
     }
 
-    /// Emits an indexed store of a type-tagged floating value.
+    /// Emits an indexed store of a type-tagged scalar value.
     ///
     /// # Errors
     ///
     /// Returns `ResourceExhausted` when the builder operation capacity is exhausted.
-    pub fn store_value<T: PcuFloatScalar>(
+    pub fn store_value<T: PcuScalar>(
         &mut self,
         binding: crate::PcuBindingRef,
         index: PcuDispatchIndex,

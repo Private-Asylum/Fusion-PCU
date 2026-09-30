@@ -13,7 +13,7 @@ pub(super) struct PolicySnapshot {
 }
 
 #[derive(Clone, Copy)]
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub(super) struct PolicyRoute {
     pub(super) generation: u64,
     pub(super) backend: super::PcuBackendChoice,
@@ -25,6 +25,8 @@ const fn backend_tag(backend: super::PcuBackendChoice) -> u64 {
         super::PcuBackendChoice::Rocm => 1,
         #[cfg(feature = "cuda")]
         super::PcuBackendChoice::Cuda => 2,
+        #[cfg(feature = "metal")]
+        super::PcuBackendChoice::Metal => 3,
     }
 }
 
@@ -32,12 +34,14 @@ const fn encode_route(generation: u64, backend: super::PcuBackendChoice) -> u64 
     (generation << 2) | backend_tag(backend)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const fn decode_backend(tag: u64) -> super::PcuBackendChoice {
     match tag {
         1 => super::PcuBackendChoice::Rocm,
         #[cfg(feature = "cuda")]
         2 => super::PcuBackendChoice::Cuda,
+        #[cfg(feature = "metal")]
+        3 => super::PcuBackendChoice::Metal,
         _ => super::PcuBackendChoice::Automatic,
     }
 }
@@ -53,11 +57,16 @@ static POLICY: RwLock<PolicySnapshot> = RwLock::new(PolicySnapshot {
         float_underflow: crate::PcuFloatUnderflowPolicy::IeeeAfterRounding,
         range_policy: crate::PcuRangePolicy::Reject,
         numerical_mode: crate::PcuNumericalMode::Boundary,
+        numerical_options: crate::PcuNumericalOptions {
+            compound_arithmetic: crate::PcuCompoundArithmeticPolicy::Checked,
+            precision: crate::PcuPrecisionPolicy::Preserve,
+            reproducibility: crate::PcuReproducibility::Unspecified,
+        },
         score_device: super::default_device_score,
     },
 });
 
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
 pub(super) fn snapshot() -> Result<PolicySnapshot, PcuExecutionError> {
     POLICY
         .read()
@@ -70,7 +79,7 @@ pub(super) fn generation() -> u64 {
     ROUTE.load(Ordering::Acquire) >> 2
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub(super) fn route() -> PolicyRoute {
     let packed = ROUTE.load(Ordering::Acquire);
     PolicyRoute {
@@ -116,7 +125,21 @@ mod tests {
             super::ROUTE.load(core::sync::atomic::Ordering::Acquire) >> 2,
             selected.generation
         );
+        let options = crate::PcuNumericalOptions {
+            compound_arithmetic: crate::PcuCompoundArithmeticPolicy::BackendDefined,
+            precision: crate::PcuPrecisionPolicy::BackendOptimized,
+            reproducibility: crate::PcuReproducibility::PortableV1,
+        };
+        super::configure(super::PcuExecutionPolicy {
+            numerical_options: options,
+            ..selected.policy
+        })
+        .unwrap();
+        let changed = *super::POLICY.read().unwrap();
+        assert_eq!(changed.policy.numerical_options, options);
+        assert_eq!(changed.policy.numerical_mode, mode);
+        assert!(changed.generation > selected.generation);
         super::configure(initial.policy).unwrap();
-        assert!(super::POLICY.read().unwrap().generation > selected.generation);
+        assert!(super::POLICY.read().unwrap().generation > changed.generation);
     }
 }

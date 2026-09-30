@@ -119,7 +119,8 @@ fn checked_kernel_for_type_with_range_policy(
     .expect("bounded checked float kernel")
 }
 
-fn checked_relu_kernel(
+fn checked_unary_kernel(
+    op: PcuDispatchFloatUnaryOp,
     value_type: PcuValueType,
     type_caps: PcuValueTypeCaps,
     underflow_policy: PcuFloatUnderflowPolicy,
@@ -157,7 +158,7 @@ fn checked_relu_kernel(
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
             value_type,
-            op: PcuDispatchFloatUnaryOp::Relu,
+            op,
             underflow_policy,
             range_policy,
             result: PcuDispatchValueId(2),
@@ -229,7 +230,8 @@ fn checked_relu_lowers_direct_and_grid_maps_for_f32_f64_and_each_underflow_polic
         ] {
             for range_policy in [PcuRangePolicy::Reject, PcuRangePolicy::Clamp] {
                 for grid_stride in [false, true] {
-                    let source = checked_relu_kernel(
+                    let source = checked_unary_kernel(
+                        PcuDispatchFloatUnaryOp::Relu,
                         value_type,
                         type_caps,
                         underflow_policy,
@@ -260,6 +262,63 @@ fn checked_relu_lowers_direct_and_grid_maps_for_f32_f64_and_each_underflow_polic
                     } else {
                         assert!(source.contains("binding_0_1[fusion_gid] = v2;"));
                     }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_neg_uses_sign_encoding_and_existing_terminal_fault_protocol() {
+    for (value_type, type_caps, prefix, sign_mask, ty) in [
+        (
+            PcuValueType::f32(),
+            PcuValueTypeCaps::FLOAT32,
+            "f32",
+            "0x80000000u",
+            "float",
+        ),
+        (
+            PcuValueType::f64(),
+            PcuValueTypeCaps::FLOAT64,
+            "f64",
+            "0x8000000000000000ull",
+            "double",
+        ),
+    ] {
+        for (underflow_policy, tag) in [
+            (PcuFloatUnderflowPolicy::IeeeAfterRounding, "0u"),
+            (PcuFloatUnderflowPolicy::RejectSubnormalResult, "1u"),
+            (PcuFloatUnderflowPolicy::AllowGradualUnderflow, "2u"),
+        ] {
+            for range_policy in [PcuRangePolicy::Reject, PcuRangePolicy::Clamp] {
+                for grid in [false, true] {
+                    let source = checked_unary_kernel(
+                        PcuDispatchFloatUnaryOp::Neg,
+                        value_type,
+                        type_caps,
+                        underflow_policy,
+                        range_policy,
+                        grid,
+                    );
+                    assert!(
+                        source
+                            .contains(&format!("fusion_checked_{prefix}_neg(__builtin_bit_cast("))
+                    );
+                    assert!(source.contains(&format!("), {tag});")));
+                    assert!(source.contains(&format!("result = bits ^ {sign_mask};")));
+                    assert!(source.contains("return {result, 4u};"));
+                    assert!(source.contains("return {bits, 5u};"));
+                    assert!(source.contains(&format!("{ty} v2 = __builtin_bit_cast")));
+                    assert!(source.contains("atomicMin(fusion_fault_word"));
+                    assert!(!source.contains("float v2 = 0.0"));
+                    assert!(!source.contains("double v2 = 0.0"));
+                    if range_policy == PcuRangePolicy::Clamp {
+                        assert!(source.contains("fusion_range_fault_recorded = false;"));
+                        assert!(source.contains("0x8000000000000000ull |"));
+                    }
+                    let logical_index = if grid { "fusion_idx" } else { "fusion_gid" };
+                    assert!(source.contains(&format!("binding_0_1[{logical_index}] = v2;")));
                 }
             }
         }
@@ -596,7 +655,7 @@ fn checked_f32_to_f64_widens_finite_bits_with_integer_only_logic() {
     for grid in [false, true] {
         let source = checked_f32_to_f64_kernel(grid);
         assert!(source.contains("fusion_checked_f32_to_f64(__builtin_bit_cast(unsigned int, v1))"));
-        assert!(source.contains("int top = 31 - __builtin_clz(fraction)"));
+        assert!(source.contains("int top = 31 - __clz(fraction)"));
         assert!(source.contains("exponent_field + 896u"));
         assert!(source.contains("static_cast<unsigned long long>(fraction) << 29u"));
         assert!(source.contains("| fusion_f32_to_f64_checked_2.fault"));

@@ -70,6 +70,8 @@ pub enum PcuDispatchFloatBinaryOp {
 /// Exact unary operation admitted by checked F32/F64 arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuDispatchFloatUnaryOp {
+    /// Exact finite-input negation by sign-bit inversion, preserving signed zero.
+    Neg,
     /// PCU `ReLU` selection: finite positive values pass through, while finite nonpositive values
     /// produce positive zero. Nonfinite inputs are rejected.
     Relu,

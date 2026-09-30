@@ -3,7 +3,9 @@
 //! This adapter transports typed owned inputs through selected identity graphs and synthesizes
 //! strictly ordered checked row-major f32/f64 matrix multiplication. Selected checked f32/f64
 //! pointwise operations and dense integer Add/Sub/Mul use owned PCU Dispatch. Ordinary boundary
-//! matrix multiplication and unproved compound training operations remain unsupported.
+//! checked matrix multiplication and unproved compound training operations remain unsupported.
+//! Explicit Boundary + `BackendDefined` real matrix multiplication uses immutable cuBLAS precision
+//! profiles without claiming checked numerical faults or portable reproducibility.
 
 #[path = "strict_matmul/strict_matmul.rs"]
 pub mod strict_matmul;
@@ -17,6 +19,13 @@ mod consuming;
 mod feedback_runtime;
 #[path = "integer.rs"]
 mod integer;
+#[cfg(test)]
+#[path = "native_matmul/native_matmul.rs"]
+mod native_matmul;
+#[path = "native_mse/native_mse.rs"]
+pub mod native_mse;
+#[path = "native_sgd/native_sgd.rs"]
+mod native_sgd;
 #[path = "pointwise.rs"]
 mod pointwise;
 pub use feedback_runtime::CudaTensorExecution;
@@ -164,10 +173,9 @@ extern "C" __global__ void tensor_sgd_update(
     float learning_rate, unsigned int n) {
     unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id < n) {
-        // Keep the strict SgdUpdate contract: round the product before subtracting. NVRTC's
-        // default contraction fuses this expression and disagrees with the CPU reference.
-        volatile float product = learning_rate * gradient[id];
-        output[id] = weights[id] - product;
+        // Explicit native Preserve offer: two destination-width rounded operations.
+        const float product = __fmul_rn(learning_rate, gradient[id]);
+        output[id] = __fsub_rn(weights[id], product);
     }
 }
 "#;
@@ -176,7 +184,7 @@ extern "C" __global__ void tensor_sgd_update_contracted(
     const float *weights, const float *gradient, float *output,
     float learning_rate, unsigned int n) {
     unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id < n) output[id] = fmaf(-learning_rate, gradient[id], weights[id]);
+    if (id < n) output[id] = __fmaf_rn(-learning_rate, gradient[id], weights[id]);
 }
 "#;
 
@@ -1348,7 +1356,7 @@ impl fmt::Display for CudaTensorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedNumericContract => {
-                f.write_str("CUDA MatMul requires explicit strict numerical metadata; boundary arithmetic is unsupported")
+                f.write_str("CUDA option-free MatMul retains the default checked contract; use a strict graph or explicit native compound graph")
             }
             Self::Cublas(error) => error.fmt(f),
             Self::InvalidShape => {
@@ -1455,12 +1463,17 @@ enum CudaTensorAssessorStateSource<'state> {
 }
 
 struct CudaTensorAssessorState {
-    cublas: OnceCell<Result<Cublas, CublasError>>,
+    native_cublas: Box<CudaNativeCublasState>,
     stream: CudaStreamHandle,
     add_dispatches: RefCell<TensorDispatchCache>,
     relu_backward: RefCell<Option<(CudaKernel, CudaStreamHandle)>>,
     sgd_update: RefCell<Option<(CudaKernel, CudaStreamHandle)>>,
     sgd_update_contracted: RefCell<Option<(CudaKernel, CudaStreamHandle)>>,
+}
+
+struct CudaNativeCublasState {
+    handles: [OnceCell<Result<Cublas, CublasError>>; 4],
+    environment: crate::CublasEnvironmentSnapshot,
 }
 
 /// Rc-retained backend and warm tensor-assessor state for hosted per-function execution.
@@ -1478,7 +1491,10 @@ impl CudaTensorAssessorState {
     fn new(session: &CudaOwnedDispatchBackend) -> Result<Self, CublasError> {
         let stream = session.tensor_runtime().create_stream()?;
         Ok(Self {
-            cublas: OnceCell::new(),
+            native_cublas: Box::new(CudaNativeCublasState {
+                handles: std::array::from_fn(|_| OnceCell::new()),
+                environment: crate::CublasEnvironmentSnapshot::capture(),
+            }),
             stream,
             add_dispatches: RefCell::new(VecDeque::new()),
             relu_backward: RefCell::new(None),
@@ -1689,16 +1705,63 @@ impl<'session> CudaTensorAssessor<'session> {
         }
     }
 
-    fn cublas(&self) -> Result<&Cublas, CublasError> {
-        self.state()
-            .cublas
+    fn native_cublas(
+        &self,
+        scalar_type: fusion_pcu::PcuScalarType,
+        precision: fusion_pcu::PcuPrecisionPolicy,
+    ) -> Result<&Cublas, CublasError> {
+        let scalar_index = match scalar_type {
+            fusion_pcu::PcuScalarType::F32 => 0,
+            fusion_pcu::PcuScalarType::F64 => 1,
+            _ => {
+                return Err(CublasError::UnsupportedNumericalConfiguration(
+                    "native GEMM requires F32 or F64",
+                ));
+            }
+        };
+        let precision_index =
+            usize::from(precision == fusion_pcu::PcuPrecisionPolicy::BackendOptimized);
+        self.state().native_cublas.handles[2 * scalar_index + precision_index]
             .get_or_init(|| {
-                let mut handle = Cublas::new(self.session.tensor_runtime())?;
+                let config = crate::CublasNumericalConfig::new(
+                    scalar_type,
+                    precision,
+                    self.state().native_cublas.environment.clone(),
+                )?;
+                let mut handle =
+                    Cublas::new_with_numerical_config(self.session.tensor_runtime(), config)?;
                 handle.bind_stream(&self.state().stream)?;
                 Ok(handle)
             })
             .as_ref()
             .map_err(Clone::clone)
+    }
+
+    fn validate_native_compound_handles(
+        &self,
+        prepared: &CudaPreparedGraphView<'_, '_>,
+    ) -> Result<(), CudaTensorExecutionError> {
+        for index in 0..prepared.node_values.len() {
+            let node = prepared.node(index)?;
+            if matches!(
+                node.op,
+                OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. }
+            ) && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
+                && !self
+                    .native_cublas(node.scalar_type, node.numerical_options.precision)
+                    .map_err(CudaTensorError::from)?
+                    .is_usable()
+            {
+                return Err(CudaTensorExecutionError::Unsupported {
+                    value: node.value,
+                    reason: TensorUnsupportedReason::Other(
+                        "cuBLAS completion is uncertain; selected handle cannot run more work"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn ensure_dispatch_cached(
@@ -1708,21 +1771,40 @@ impl<'session> CudaTensorAssessor<'session> {
         shape: PcuInvocationShape,
         dynamic_tensor_kernel: bool,
     ) -> Result<TensorDispatchCacheAdmission, CudaTensorExecutionError> {
+        let native_mse_count = match key {
+            TensorDispatchCacheKey::Fixed(
+                TensorDispatchKind::SquaredDifference,
+                TensorPointwiseScalarType::F32,
+                count,
+                0,
+                _,
+            ) => Some(count),
+            _ => None,
+        };
         self.cache_prepared_dispatch(key, || {
-            if dynamic_tensor_kernel {
-                self.session.prepare_dynamic_tensor_kernel_on_stream(
-                    kernel,
-                    shape,
-                    &self.state().stream,
+            native_mse_count
+                .map_or_else(
+                    || {
+                        if dynamic_tensor_kernel {
+                            self.session.prepare_dynamic_tensor_kernel_on_stream(
+                                kernel,
+                                shape,
+                                &self.state().stream,
+                            )
+                        } else {
+                            self.session.prepare_dispatch_owned_kernel_on_stream(
+                                kernel,
+                                shape,
+                                &self.state().stream,
+                            )
+                        }
+                    },
+                    |count| {
+                        self.session
+                            .prepare_native_mse_dispatch(count, &self.state().stream)
+                    },
                 )
-            } else {
-                self.session.prepare_dispatch_owned_kernel_on_stream(
-                    kernel,
-                    shape,
-                    &self.state().stream,
-                )
-            }
-            .map_err(CudaTensorExecutionError::Backend)
+                .map_err(CudaTensorExecutionError::Backend)
         })
     }
 
@@ -2018,7 +2100,9 @@ impl<'session> CudaTensorAssessor<'session> {
     /// Executes the dependency closure of `output` using this selected `CUDA` tensor route.
     ///
     /// Inputs and constants use the supplied provider. Explicitly strict dense `MatMul` uses
-    /// ordered checked synthesis; ordinary boundary `MatMul` remains unsupported. Same-shape
+    /// ordered checked synthesis; checked boundary compounds remain unsupported. Explicit
+    /// Boundary + `BackendDefined` graphs can select native F32/F64 `MatMul` and F32 MSE/SGD
+    /// under their precision, underflow and reproducibility constraints. Same-shape
     /// nonempty floating `Add` and `ReLU` use owned PCU Dispatch; dense integer
     /// `Add`, `Sub` and `Mul` nodes use checked Dispatch with a synchronous completion gate.
     /// Elementwise executables are cached by operation, type and flattened element count in a
@@ -2085,9 +2169,10 @@ impl<'session> CudaTensorAssessor<'session> {
 
     /// Prepare requested outputs with an explicit arithmetic rewrite policy.
     ///
-    /// `CUDA` declares its explicit `fmaf` implementation as supporting contracted multiply-add.
-    /// Contracted SGD is selected only when `AllowContractedArithmetic` is supplied. The ordinary
-    /// preparation methods always preserve the graph's separate Mul/Sub rounding.
+    /// Scalar rewrites do not grant native-compound permissions: a synthetic SGD descriptor
+    /// replacing ordinary checked Mul/Sub is rejected by the original graph provenance guard.
+    /// An authentic explicitly permitted native SGD preserves separate F32 product/subtraction
+    /// under `Preserve`, or selects its FMA implementation under `BackendOptimized` precision.
     ///
     /// # Errors
     ///
@@ -2132,6 +2217,7 @@ impl<'session> CudaTensorAssessor<'session> {
         let data = CudaPreparedGraphData {
             scalar_type: homogeneous_scalar_type(&plan.nodes),
             requires_blas: nodes_require_blas(&plan.nodes),
+            native_matmul_batch: nodes_use_native_matmul_batch(&plan.nodes),
             transport_only_inputs: false,
             consuming_action: None,
             node_values: plan.nodes.iter().map(|node| node.value).collect(),
@@ -2499,7 +2585,11 @@ impl<'session> CudaTensorAssessor<'session> {
         }
 
         let mut timings = NoopNodeTiming;
-        let mut result = self.execute_prepared_schedule(
+        let mut batch = prepared
+            .data
+            .native_matmul_batch
+            .then(|| CudaCompletionBatch::new(&self.state().stream));
+        let execution = self.execute_prepared_schedule(
             &view,
             &[],
             inputs,
@@ -2509,9 +2599,13 @@ impl<'session> CudaTensorAssessor<'session> {
             None,
             Some(&outputs),
             &mut timings,
+            batch.as_mut(),
             None,
-            None,
-        )?;
+        );
+        // Any queued operation establishes terminal ownership or quarantines its retained
+        // resources before fresh output owners are released on an execution error.
+        drop(batch);
+        let mut result = execution?;
         drop(outputs);
         if result.len() != prepared.data.outputs.len() {
             return Err(CudaTensorExecutionError::OutputCountMismatch {
@@ -3856,13 +3950,8 @@ impl<'session> CudaTensorAssessor<'session> {
         pool: PcuMemoryPoolId,
     ) -> Result<(), CudaTensorExecutionError> {
         validate_graph_input_sources(prepared, host_inputs, resource_inputs, self.session, pool)?;
-        if prepared.requires_blas && !self.cublas().map_err(CudaTensorError::from)?.is_usable() {
-            return Err(CudaTensorExecutionError::Unsupported {
-                value: prepared.output,
-                reason: TensorUnsupportedReason::Other(
-                    "cuBLAS completion is uncertain; selected handle cannot run more work".into(),
-                ),
-            });
+        if prepared.requires_blas {
+            self.validate_native_compound_handles(prepared)?;
         }
         Ok(())
     }
@@ -3897,14 +3986,8 @@ impl<'session> CudaTensorAssessor<'session> {
         {
             return Err(CudaTensorExecutionError::OutputResourceMismatch);
         }
-        if prepared.data.requires_blas && !self.cublas().map_err(CudaTensorError::from)?.is_usable()
-        {
-            return Err(CudaTensorExecutionError::Unsupported {
-                value: prepared.output,
-                reason: TensorUnsupportedReason::Other(
-                    "cuBLAS completion is uncertain; selected handle cannot run more work".into(),
-                ),
-            });
+        if prepared.data.requires_blas {
+            self.validate_native_compound_handles(&prepared.view())?;
         }
         Ok(())
     }
@@ -4238,6 +4321,7 @@ impl<'session> CudaTensorAssessor<'session> {
                             transpose_left,
                             transpose_right,
                             node.scalar_type,
+                            node.numerical_options.precision,
                             None,
                             Some(batch),
                         )?;
@@ -4252,6 +4336,7 @@ impl<'session> CudaTensorAssessor<'session> {
                                 transpose_left,
                                 transpose_right,
                                 node.scalar_type,
+                                node.numerical_options.precision,
                                 sgemm_timing,
                                 None,
                             )
@@ -4267,6 +4352,7 @@ impl<'session> CudaTensorAssessor<'session> {
                             transpose_left,
                             transpose_right,
                             node.scalar_type,
+                            node.numerical_options.precision,
                             None,
                             None,
                         )?;
@@ -4573,10 +4659,12 @@ impl<'session> CudaTensorAssessor<'session> {
                             .ok_or(CudaTensorExecutionError::MissingResource(gradient))?,
                         SgdUpdateMode {
                             learning_rate,
-                            contracted: plan
-                                .rewrites
-                                .iter()
-                                .any(|rewrite| rewrite.output == node.value),
+                            contracted: node.numerical_options.precision
+                                == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
+                                || plan
+                                    .rewrites
+                                    .iter()
+                                    .any(|rewrite| rewrite.output == node.value),
                         },
                         &output,
                         batch.as_deref_mut(),
@@ -4649,7 +4737,7 @@ impl<'session> CudaTensorAssessor<'session> {
                         output_bank,
                         fresh_outputs,
                     )?;
-                    self.cublas()
+                    self.native_cublas(node.scalar_type, node.numerical_options.precision)
                         .map_err(CudaTensorError::from)?
                         .sasum_scaled(
                             count,
@@ -5212,6 +5300,7 @@ impl<'session> CudaTensorAssessor<'session> {
         transpose_a: bool,
         transpose_b: bool,
         scalar_type: fusion_pcu::PcuScalarType,
+        precision: fusion_pcu::PcuPrecisionPolicy,
         sgemm_timing: Option<&mut CublasSgemmHostTiming>,
         batch: Option<&mut CudaCompletionBatch>,
     ) -> Result<(), CudaTensorError> {
@@ -5267,7 +5356,7 @@ impl<'session> CudaTensorAssessor<'session> {
             c.device_buffer(),
             m,
         );
-        let cublas = self.cublas()?;
+        let cublas = self.native_cublas(scalar_type, precision)?;
         match scalar_type {
             fusion_pcu::PcuScalarType::F32 => {
                 if let Some(batch) = batch {
@@ -5358,6 +5447,7 @@ pub struct CudaPreparedTensorGraph<'graph> {
 pub struct CudaPreparedGraphData {
     scalar_type: Option<fusion_pcu::PcuScalarType>,
     requires_blas: bool,
+    native_matmul_batch: bool,
     transport_only_inputs: bool,
     consuming_action: Option<PreparedConsumingAction>,
     fixed_dispatches: Vec<Option<PreparedFixedTensorDispatch>>,
@@ -5393,6 +5483,19 @@ fn nodes_require_blas(nodes: &[NodeDescriptor<'_>]) -> bool {
         ) || matches!(node.op, OpDescriptor::MeanSquaredError { .. }
         )
     })
+}
+
+fn nodes_use_native_matmul_batch(nodes: &[NodeDescriptor<'_>]) -> bool {
+    nodes
+        .iter()
+        .any(|node| matches!(node.op, OpDescriptor::MatMul { .. }))
+        && nodes.iter().all(|node| {
+            matches!(node.op, OpDescriptor::Input)
+                || matches!(node.op, OpDescriptor::MatMul { .. })
+                    && node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Boundary)
+                    && node.numerical_options.compound_arithmetic
+                        == fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
+        })
 }
 
 fn require_f32_graph(data: &CudaPreparedGraphData) -> Result<(), CudaTensorExecutionError> {
@@ -6990,13 +7093,14 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
             {
                 TensorExecutionRoute::Synthesized
             }
-            OpDescriptor::MatMul { .. } => TensorExecutionRoute::Library,
+            OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. } => {
+                TensorExecutionRoute::Library
+            }
             OpDescriptor::Add { .. }
             | OpDescriptor::Sub { .. }
             | OpDescriptor::Mul { .. }
             | OpDescriptor::Div { .. }
-            | OpDescriptor::Relu { .. }
-            | OpDescriptor::MeanSquaredError { .. } => TensorExecutionRoute::Synthesized,
+            | OpDescriptor::Relu { .. } => TensorExecutionRoute::Synthesized,
         };
         match assessor.assess_node(graph, *node) {
             TensorOperationSupport::Supported { route, .. } if route == expected_route => {}
@@ -7169,13 +7273,14 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
             {
                 TensorExecutionRoute::Synthesized
             }
-            OpDescriptor::MatMul { .. } => TensorExecutionRoute::Library,
+            OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. } => {
+                TensorExecutionRoute::Library
+            }
             OpDescriptor::Add { .. }
             | OpDescriptor::Sub { .. }
             | OpDescriptor::Mul { .. }
             | OpDescriptor::Div { .. }
-            | OpDescriptor::Relu { .. }
-            | OpDescriptor::MeanSquaredError { .. } => TensorExecutionRoute::Synthesized,
+            | OpDescriptor::Relu { .. } => TensorExecutionRoute::Synthesized,
         };
         match assessor.assess_node(graph, *node) {
             TensorOperationSupport::Supported { route, .. } if route == expected_route => {}
@@ -7278,6 +7383,7 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
     Ok(CudaPreparedGraphData {
         scalar_type,
         requires_blas: nodes_require_blas(&nodes),
+        native_matmul_batch: nodes_use_native_matmul_batch(&nodes),
         transport_only_inputs,
         consuming_action: prepare_consuming_action(program, &nodes)?,
         node_values: program.selected_nodes().to_vec(),
@@ -8256,8 +8362,8 @@ fn release_bounded_mul_leaves(
     Ok(())
 }
 
-// SAFETY: neutral MatMul is rejected before any device operation until its checked
-// reduction contract is defined, so no device work can outlive a returned error.
+// SAFETY: this option-free legacy entry retains the default checked compound contract and
+// rejects before any device operation. Explicit native options use the selected graph route.
 unsafe impl TensorSynchronousF32MatMulBackend for CudaTensorAssessor<'_> {
     type Resource = CudaMemoryResource;
     type Error = CudaTensorError;
@@ -8279,6 +8385,23 @@ unsafe impl TensorSynchronousF32MatMulBackend for CudaTensorAssessor<'_> {
 impl TensorOperationAssessor for CudaTensorAssessor<'_> {
     fn assess_node(&self, graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
         if matches!(node.op, OpDescriptor::MatMul { .. })
+            && let Err(reason) =
+                assess_matmul_numerical_options(node, &self.state().native_cublas.environment)
+        {
+            return TensorOperationSupport::Unsupported { reason };
+        }
+        if matches!(node.op, OpDescriptor::MeanSquaredError { .. })
+            && let Err(reason) =
+                assess_native_mse_numerical_options(node, &self.state().native_cublas.environment)
+        {
+            return TensorOperationSupport::Unsupported { reason };
+        }
+        if matches!(node.op, OpDescriptor::SgdUpdate { .. })
+            && let Err(reason) = native_sgd::assess_graph(graph, node)
+        {
+            return TensorOperationSupport::Unsupported { reason };
+        }
+        if matches!(node.op, OpDescriptor::MatMul { .. })
             && node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict)
         {
             return match strict_matmul::Profile::from_node(graph, node) {
@@ -8291,15 +8414,9 @@ impl TensorOperationAssessor for CudaTensorAssessor<'_> {
                 },
             };
         }
-        // Native compound arithmetic has no admitted PCU intermediate fault contract.
-        // NVIDIA cuBLAS 13.4 pedantic math governs precision, not checked fault reporting.
-        if matches!(
-            node.op,
-            OpDescriptor::MatMul { .. }
-                | OpDescriptor::MeanSquaredError { .. }
-                | OpDescriptor::SgdUpdate { .. }
-                | OpDescriptor::ReluBackward { .. }
-        ) {
+        // Native compound offers are individually admitted above. The derivative still has no
+        // checked or explicitly native contract in this adapter.
+        if matches!(node.op, OpDescriptor::ReluBackward { .. }) {
             return TensorOperationSupport::Unsupported {
                 reason: TensorUnsupportedReason::Other(
                     "CUDA operation requires a defined checked numerical contract".into(),
@@ -8318,6 +8435,76 @@ impl TensorOperationAssessor for CudaTensorAssessor<'_> {
     ) -> bool {
         cuda_supports_operand_representation(node, representation)
     }
+}
+
+fn assess_matmul_numerical_options(
+    node: NodeDescriptor<'_>,
+    environment: &crate::CublasEnvironmentSnapshot,
+) -> Result<(), TensorUnsupportedReason> {
+    let unsupported = |requirement| TensorUnsupportedReason::NumericalPolicy {
+        requirement,
+        options: node.numerical_options,
+    };
+    if node.numerical_options.reproducibility == fusion_pcu::PcuReproducibility::PortableV1 {
+        return Err(unsupported(
+            fusion_pcu::PcuNumericalRequirement::Reproducibility,
+        ));
+    }
+    if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) {
+        if node.numerical_options.compound_arithmetic
+            == fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
+        {
+            return Err(unsupported(
+                fusion_pcu::PcuNumericalRequirement::CompoundArithmetic,
+            ));
+        }
+        return Ok(());
+    }
+    if node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Boundary)
+        || node.numerical_options.compound_arithmetic
+            != fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
+    {
+        return Err(unsupported(
+            fusion_pcu::PcuNumericalRequirement::CompoundArithmetic,
+        ));
+    }
+    if node.float_underflow_policy
+        == Some(fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult)
+    {
+        return Err(TensorUnsupportedReason::UnderflowPolicy(
+            fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        ));
+    }
+    if !matches!(
+        node.scalar_type,
+        fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
+    ) {
+        return Err(TensorUnsupportedReason::ElementType);
+    }
+    crate::CublasNumericalConfig::new(
+        node.scalar_type,
+        node.numerical_options.precision,
+        environment.clone(),
+    )
+    .map_err(|_| unsupported(fusion_pcu::PcuNumericalRequirement::Precision))?;
+    Ok(())
+}
+
+fn assess_native_mse_numerical_options(
+    node: NodeDescriptor<'_>,
+    environment: &crate::CublasEnvironmentSnapshot,
+) -> Result<(), TensorUnsupportedReason> {
+    if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) {
+        return Err(TensorUnsupportedReason::NumericalPolicy {
+            requirement: fusion_pcu::PcuNumericalRequirement::CompoundArithmetic,
+            options: node.numerical_options,
+        });
+    }
+    assess_matmul_numerical_options(node, environment)?;
+    if node.scalar_type != fusion_pcu::PcuScalarType::F32 {
+        return Err(TensorUnsupportedReason::ElementType);
+    }
+    Ok(())
 }
 
 const fn cuda_supports_operand_representation(
@@ -8340,6 +8527,8 @@ const fn cuda_supports_operand_representation(
             node.op,
             OpDescriptor::Input
                 | OpDescriptor::MatMul { .. }
+                | OpDescriptor::MeanSquaredError { .. }
+                | OpDescriptor::SgdUpdate { .. }
                 | OpDescriptor::Add { .. }
                 | OpDescriptor::Sub { .. }
                 | OpDescriptor::Mul { .. }
@@ -8557,7 +8746,7 @@ fn assess_f32_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOper
                     let count = left.iter().try_fold(1usize, |n, d| n.checked_mul(*d));
                     if count.is_some_and(|n| n > 0 && i32::try_from(n).is_ok()) {
                         TensorOperationSupport::Supported {
-                            route: TensorExecutionRoute::Synthesized,
+                            route: TensorExecutionRoute::Library,
                             workspace_bytes: None,
                         }
                     } else {
@@ -8762,6 +8951,7 @@ mod tests {
         selected_scratch_storage_plan,
         mse_scratch_resource_fits,
         nodes_require_blas,
+        nodes_use_native_matmul_batch,
         resource_may_overlap_any,
         validate_graph_inputs,
         validate_owned_scalar_profile,
@@ -9114,6 +9304,7 @@ mod tests {
             scalar_type: fusion_pcu::PcuScalarType::F32,
             float_underflow_policy: None,
             numerical_mode: None,
+            numerical_options: fusion_pcu::PcuNumericalOptions::default(),
         };
         let sum_node = NodeDescriptor {
             value: sum,
@@ -9122,6 +9313,7 @@ mod tests {
             scalar_type: fusion_pcu::PcuScalarType::F32,
             float_underflow_policy: graph.node(sum).unwrap().float_underflow_policy,
             numerical_mode: None,
+            numerical_options: fusion_pcu::PcuNumericalOptions::default(),
         };
         let mut timings = CollectNodeTimings::default();
 
@@ -9579,6 +9771,7 @@ mod tests {
         let data = CudaPreparedGraphData {
             scalar_type: homogeneous_scalar_type(&nodes),
             requires_blas: nodes_require_blas(&nodes),
+            native_matmul_batch: nodes_use_native_matmul_batch(&nodes),
             transport_only_inputs: false,
             consuming_action: None,
             node_values: nodes.iter().map(|node| node.value).collect(),
@@ -11115,7 +11308,7 @@ mod tests {
     }
 
     #[test]
-    fn assessor_synthesizes_add_relu_and_mse() {
+    fn assessor_selects_synthesis_and_native_mse_reduction() {
         let mut graph = Graph::default();
         let first = graph.input([2, 2], PcuScalarType::F32).unwrap();
         let second = graph.input([2, 2], PcuScalarType::F32).unwrap();
@@ -11145,7 +11338,7 @@ mod tests {
         assert_eq!(
             assess_tensor_node(&graph, node),
             TensorOperationSupport::Supported {
-                route: TensorExecutionRoute::Synthesized,
+                route: TensorExecutionRoute::Library,
                 workspace_bytes: None,
             }
         );

@@ -27,3 +27,12 @@ ash = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+fusion-pcu-macros.workspace = true
+winit.workspace = true
+
+[[example]]
+name = "compute-copy"
+path = "examples/compute_copy/compute_copy.rs"
+required-features = ["hosted"]

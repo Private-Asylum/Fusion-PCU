@@ -1,0 +1,28 @@
+//! Composition for typed host and resident-device invocation benchmarks.
+
+extern crate pcu_facade as fusion_pcu;
+
+#[path = "../support/support.rs"]
+mod support;
+#[path = "../support/typed_kernel.rs"]
+mod typed_kernel_support;
+
+#[rustfmt::skip]
+use criterion::{
+    Criterion,
+    criterion_group,
+    criterion_main,
+};
+
+fn typed_kernel(criterion: &mut Criterion) {
+    if let Err(error) = typed_kernel_support::run(criterion) {
+        panic!("typed kernel benchmark setup failed: {error}");
+    }
+}
+
+criterion_group! {
+    name = benches;
+    config = support::criterion_config();
+    targets = typed_kernel
+}
+criterion_main!(benches);

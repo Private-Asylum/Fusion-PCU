@@ -26,6 +26,9 @@ use crate::{
     PcuExecutionFaultKind,
     PcuFloatUnderflowPolicy,
     PcuNumericalMode,
+    PcuNumericalOptions,
+    PcuNumericalRequirement,
+    PcuReproducibility,
     core::PcuScalarType,
 };
 use core::fmt;
@@ -232,6 +235,11 @@ pub enum TensorError {
         value: ValueId,
         mode: PcuNumericalMode,
     },
+    /// The evaluator has no certified implementation for these independent requirements.
+    UnsupportedNumericalOptions {
+        value: ValueId,
+        options: PcuNumericalOptions,
+    },
     ShapeOverflow,
     InvalidStorageAlignment {
         value: ValueId,
@@ -406,6 +414,8 @@ pub struct NodeDescriptor<'a> {
     pub scalar_type: PcuScalarType,
     /// Exception detection granularity for compound nodes; absent for scalar operations.
     pub numerical_mode: Option<PcuNumericalMode>,
+    /// Independent arithmetic/precision/reproducibility requirements frozen at capture.
+    pub numerical_options: PcuNumericalOptions,
     /// Independent checked-float underflow policy for binary and compound nodes.
     pub float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
 }
@@ -437,6 +447,13 @@ pub enum TensorUnsupportedReason {
     Layout,
     ElementType,
     Shape,
+    /// A numerical implementation cannot honor this independently selected underflow policy.
+    UnderflowPolicy(PcuFloatUnderflowPolicy),
+    /// No implementation satisfies this numerical requirement and option combination.
+    NumericalPolicy {
+        requirement: PcuNumericalRequirement,
+        options: PcuNumericalOptions,
+    },
     Other(String),
 }
 
@@ -517,6 +534,14 @@ pub struct TensorReferenceAssessor;
 
 impl TensorOperationAssessor for TensorReferenceAssessor {
     fn assess_node(&self, _graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+        if node.numerical_options.reproducibility != PcuReproducibility::Unspecified {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::NumericalPolicy {
+                    requirement: PcuNumericalRequirement::Reproducibility,
+                    options: node.numerical_options,
+                },
+            };
+        }
         if node.numerical_mode == Some(PcuNumericalMode::Strict)
             && !matches!(node.op, OpDescriptor::MatMul { .. })
         {
@@ -566,6 +591,24 @@ pub struct TensorCheckedReferenceAssessor;
 
 impl TensorOperationAssessor for TensorCheckedReferenceAssessor {
     fn assess_node(&self, graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+        if node.numerical_options != PcuNumericalOptions::default() {
+            let requirement =
+                if node.numerical_options.reproducibility != PcuReproducibility::Unspecified {
+                    PcuNumericalRequirement::Reproducibility
+                } else if node.numerical_options.compound_arithmetic
+                    != crate::PcuCompoundArithmeticPolicy::Checked
+                {
+                    PcuNumericalRequirement::CompoundArithmetic
+                } else {
+                    PcuNumericalRequirement::Precision
+                };
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::NumericalPolicy {
+                    requirement,
+                    options: node.numerical_options,
+                },
+            };
+        }
         let unsupported_compound = node.numerical_mode.is_some_and(|mode| {
             mode != PcuNumericalMode::Strict || !matches!(node.op, OpDescriptor::MatMul { .. })
         });
@@ -2946,6 +2989,7 @@ struct Node {
     scalar_type: PcuScalarType,
     float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
     numerical_mode: Option<PcuNumericalMode>,
+    numerical_options: PcuNumericalOptions,
 }
 
 /// An immutable-in-practice, append-only graph builder. Value identifiers are graph-local.
@@ -2954,6 +2998,7 @@ pub struct Graph {
     id: u64,
     nodes: Vec<Node>,
     numerical_mode: PcuNumericalMode,
+    numerical_options: PcuNumericalOptions,
 }
 
 impl Default for Graph {
@@ -2962,11 +3007,37 @@ impl Default for Graph {
             id: next_graph_id(),
             nodes: Vec::new(),
             numerical_mode: PcuNumericalMode::default(),
+            numerical_options: PcuNumericalOptions::default(),
         }
     }
 }
 
 impl Graph {
+    /// Sets independent requirements captured by subsequent values; existing nodes are unchanged.
+    pub const fn set_numerical_options(&mut self, options: PcuNumericalOptions) {
+        self.numerical_options = options;
+    }
+
+    /// Independent defaults for subsequent graph values.
+    #[must_use]
+    pub const fn numerical_options(&self) -> PcuNumericalOptions {
+        self.numerical_options
+    }
+
+    /// Freezes one value's numerical requirements without changing its checking mode.
+    ///
+    /// # Errors
+    /// Returns `UnknownValue` when the value does not belong to this graph.
+    pub fn set_value_numerical_options(
+        &mut self,
+        value: ValueId,
+        options: PcuNumericalOptions,
+    ) -> Result<(), TensorError> {
+        self.node(value)?;
+        self.nodes[value.index].numerical_options = options;
+        Ok(())
+    }
+
     /// Sets the mode captured by subsequently appended compound operations.
     pub const fn set_numerical_mode(&mut self, mode: PcuNumericalMode) {
         self.numerical_mode = mode;
@@ -3412,6 +3483,7 @@ impl Graph {
             scalar_type: node.scalar_type,
             float_underflow_policy: node.float_underflow_policy,
             numerical_mode: node.numerical_mode,
+            numerical_options: node.numerical_options,
         }
     }
 
@@ -3436,6 +3508,7 @@ impl Graph {
             scalar_type,
             float_underflow_policy,
             numerical_mode,
+            numerical_options: self.numerical_options,
         });
         id
     }
@@ -3650,6 +3723,39 @@ impl Graph {
         b: TensorValueId<T>,
     ) -> Result<TensorValueId<T>, TensorError> {
         self.matmul(a.value, b.value).map(TensorValueId::new)
+    }
+
+    /// Adds typed mean-squared error, retaining the declared scalar result identity.
+    ///
+    /// The current primitive supports F32. Other scalar representations reject explicitly;
+    /// a typed carrier alone does not establish a backend arithmetic implementation.
+    ///
+    /// # Errors
+    /// Returns graph identity, shape, or unsupported-scalar errors from [`Self::mean_squared_error`].
+    pub fn mean_squared_error_typed<T: PcuScalar>(
+        &mut self,
+        prediction: TensorValueId<T>,
+        target: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.mean_squared_error(prediction.value, target.value)
+            .map(TensorValueId::new)
+    }
+
+    /// Adds typed SGD with a finite F32 rate stored in the immutable graph descriptor.
+    ///
+    /// The initial primitive supports F32. A dynamic learning rate needs a resource binding;
+    /// callers must not snapshot a changing rate into a reusable prepared graph.
+    ///
+    /// # Errors
+    /// Returns graph identity, shape, scalar or rate errors from [`Self::sgd_update`].
+    pub fn sgd_update_typed<T: PcuScalar>(
+        &mut self,
+        weights: TensorValueId<T>,
+        gradient: TensorValueId<T>,
+        learning_rate: f32,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.sgd_update(weights.value, gradient.value, learning_rate)
+            .map(TensorValueId::new)
     }
 
     /// Adds a same-type typed matrix multiplication with logical transposes.
@@ -4226,6 +4332,12 @@ impl Graph {
         inputs: &[(ValueId, TensorValue)],
     ) -> Result<Execution, TensorError> {
         for node in self.nodes() {
+            if node.numerical_options != PcuNumericalOptions::default() {
+                return Err(TensorError::UnsupportedNumericalOptions {
+                    value: node.value,
+                    options: node.numerical_options,
+                });
+            }
             if let Some(mode) = node.numerical_mode {
                 if mode != PcuNumericalMode::Strict
                     || !matches!(node.op, OpDescriptor::MatMul { .. })
@@ -4257,6 +4369,12 @@ impl Graph {
     #[allow(clippy::too_many_lines)] // Keeps reference operation dispatch and validation together.
     pub fn evaluate(&self, inputs: &[(ValueId, TensorValue)]) -> Result<Execution, TensorError> {
         for node in self.nodes() {
+            if node.numerical_options.reproducibility != PcuReproducibility::Unspecified {
+                return Err(TensorError::UnsupportedNumericalOptions {
+                    value: node.value,
+                    options: node.numerical_options,
+                });
+            }
             if node.numerical_mode == Some(PcuNumericalMode::Strict)
                 && !matches!(node.op, OpDescriptor::MatMul { .. })
             {

@@ -95,6 +95,7 @@ fn assert_boundary_rejection(error: &PcuExecutionError) {
         PcuExecutionError::NoCompatibleDevice(rejections) => {
             rejections.iter().any(|(_, error)| unsupported(error))
         }
+        #[cfg(feature = "cuda")]
         PcuExecutionError::NoCompatibleResidentDevice(rejections) => {
             rejections.iter().any(|(_, error)| unsupported(error))
         }
@@ -114,6 +115,10 @@ fn assert_fault(
     expected_step: TensorArithmeticStep,
     expected_kind: PcuExecutionFaultKind,
 ) {
+    #[allow(
+        clippy::manual_let_else,
+        reason = "Compiled provider features select distinct structured graph error variants."
+    )]
     let graph_error = match error {
         #[cfg(feature = "rocm")]
         PcuExecutionError::TensorExecution(fusion_pcu_rocm::RocmTensorExecutionError::Graph(

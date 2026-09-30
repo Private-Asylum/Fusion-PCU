@@ -43,6 +43,7 @@ mod error;
 #[path = "ffi/ffi.rs"]
 mod ffi;
 use ffi::Library;
+use smallvec::SmallVec;
 mod host_kernel;
 mod memory;
 mod owned_dispatch;
@@ -153,40 +154,14 @@ use ffi::hip::{
     HipDevice,
     HipStream,
     HipEvent,
-    HipNoArgStatus,
     HIP_SUCCESS,
     HIP_EVENT_DEFAULT,
     HIP_EVENT_DISABLE_TIMING,
     HIP_MEMCPY_HOST_TO_DEVICE,
     HIP_MEMCPY_DEVICE_TO_HOST,
     HIP_MEMCPY_DEVICE_TO_DEVICE,
-    GetDeviceCount,
-    GetDevice,
-    SetDevice,
-    GetDeviceName,
-    GetDevicePciBusId,
-    DeviceTotalMem,
-    MemGetInfo,
-    GetErrorString,
-    Malloc,
-    Free,
-    Memcpy,
-    MemcpyAsync,
-    StreamCreate,
-    StreamDestroy,
-    StreamSynchronize,
-    StreamWaitEvent,
-    EventCreate,
-    EventDestroy,
-    EventRecord,
-    EventSynchronize,
-    EventElapsedTime,
     ModuleHandle,
     KernelHandle,
-    ModuleLoadData,
-    ModuleGetFunction,
-    ModuleUnload,
-    ModuleLaunchKernel,
 };
 
 /// Dynamically loaded HIP runtime and the selected device.
@@ -229,15 +204,21 @@ impl HipRuntime {
                 }
             };
             let get_count =
-                unsafe { crate::ffi::symbol::<GetDeviceCount>(&library, b"hipGetDeviceCount\0") }
-                    .map_err(|error| HipError::MissingSymbol {
-                    symbol: "hipGetDeviceCount",
-                    detail: error.to_string(),
+                unsafe { crate::ffi::require_hipGetDeviceCount(&library) }.map_err(|error| {
+                    HipError::MissingSymbol {
+                        symbol: "hipGetDeviceCount",
+                        detail: error.to_string(),
+                    }
                 })?;
             let mut count = 0;
-            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
+            let status =
+                unsafe { crate::ffi::raw_hipGetDeviceCount(&get_count, ptr::from_mut(&mut count)) };
             if status != HIP_SUCCESS {
-                return Err(raw_hip_error(&library, "hipGetDeviceCount", status));
+                return Err(crate::ffi::raw_hip_error(
+                    &library,
+                    "hipGetDeviceCount",
+                    status,
+                ));
             }
             return Ok(HipRuntimeProbe {
                 device_count: count.max(0).unsigned_abs(),
@@ -270,52 +251,74 @@ impl HipRuntime {
                 }
             };
             let get_count =
-                unsafe { crate::ffi::symbol::<GetDeviceCount>(&library, b"hipGetDeviceCount\0") }
-                    .map_err(|error| HipError::MissingSymbol {
-                    symbol: "hipGetDeviceCount",
-                    detail: error.to_string(),
+                unsafe { crate::ffi::require_hipGetDeviceCount(&library) }.map_err(|error| {
+                    HipError::MissingSymbol {
+                        symbol: "hipGetDeviceCount",
+                        detail: error.to_string(),
+                    }
                 })?;
             let get_device =
-                unsafe { crate::ffi::symbol::<GetDevice>(&library, b"hipDeviceGet\0") }.map_err(
-                    |error| HipError::MissingSymbol {
+                unsafe { crate::ffi::require_hipDeviceGet(&library) }.map_err(|error| {
+                    HipError::MissingSymbol {
                         symbol: "hipDeviceGet",
                         detail: error.to_string(),
-                    },
-                )?;
+                    }
+                })?;
             let get_name =
-                unsafe { crate::ffi::symbol::<GetDeviceName>(&library, b"hipDeviceGetName\0") }
-                    .map_err(|error| HipError::MissingSymbol {
+                unsafe { crate::ffi::require_hipDeviceGetName(&library) }.map_err(|error| {
+                    HipError::MissingSymbol {
                         symbol: "hipDeviceGetName",
                         detail: error.to_string(),
-                    })?;
+                    }
+                })?;
             let total_mem =
-                unsafe { crate::ffi::symbol::<DeviceTotalMem>(&library, b"hipDeviceTotalMem\0") }
-                    .map_err(|error| HipError::MissingSymbol {
-                    symbol: "hipDeviceTotalMem",
-                    detail: error.to_string(),
+                unsafe { crate::ffi::require_hipDeviceTotalMem(&library) }.map_err(|error| {
+                    HipError::MissingSymbol {
+                        symbol: "hipDeviceTotalMem",
+                        detail: error.to_string(),
+                    }
                 })?;
             let mut count = 0;
-            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
+            let status =
+                unsafe { crate::ffi::raw_hipGetDeviceCount(&get_count, ptr::from_mut(&mut count)) };
             if status != HIP_SUCCESS {
-                return Err(raw_hip_error(&library, "hipGetDeviceCount", status));
+                return Err(crate::ffi::raw_hip_error(
+                    &library,
+                    "hipGetDeviceCount",
+                    status,
+                ));
             }
             let mut devices = Vec::new();
             for index in 0..count.max(0) {
                 let mut device = 0;
-                let status = unsafe { get_device(ptr::from_mut(&mut device), index) };
+                let status = unsafe {
+                    crate::ffi::raw_hipDeviceGet(&get_device, ptr::from_mut(&mut device), index)
+                };
                 if status != HIP_SUCCESS {
-                    return Err(raw_hip_error(&library, "hipDeviceGet", status));
+                    return Err(crate::ffi::raw_hip_error(&library, "hipDeviceGet", status));
                 }
                 let mut name = [0_i8; 256];
-                let status = unsafe { get_name(name.as_mut_ptr(), 256, device) };
+                let status = unsafe {
+                    crate::ffi::raw_hipDeviceGetName(&get_name, name.as_mut_ptr(), 256, device)
+                };
                 if status != HIP_SUCCESS {
-                    return Err(raw_hip_error(&library, "hipDeviceGetName", status));
+                    return Err(crate::ffi::raw_hip_error(
+                        &library,
+                        "hipDeviceGetName",
+                        status,
+                    ));
                 }
                 let name = bounded_device_name(&name);
                 let mut total = 0_usize;
-                let status = unsafe { total_mem(&raw mut total, device) };
+                let status = unsafe {
+                    crate::ffi::raw_hipDeviceTotalMem(&total_mem, &raw mut total, device)
+                };
                 if status != HIP_SUCCESS {
-                    return Err(raw_hip_error(&library, "hipDeviceTotalMem", status));
+                    return Err(crate::ffi::raw_hip_error(
+                        &library,
+                        "hipDeviceTotalMem",
+                        status,
+                    ));
                 }
                 let pci_bus_id = query_pci_bus_id(&library, index);
                 devices.push(HipDeviceInfo {
@@ -357,13 +360,15 @@ impl HipRuntime {
             // Query availability before selecting a device. hipSetDevice(0) can fail when no GPU
             // is visible, hiding the useful zero-device result.
             let get_count =
-                unsafe { crate::ffi::symbol::<GetDeviceCount>(&library, b"hipGetDeviceCount\0") }
-                    .map_err(|error| HipError::MissingSymbol {
-                    symbol: "hipGetDeviceCount",
-                    detail: error.to_string(),
+                unsafe { crate::ffi::require_hipGetDeviceCount(&library) }.map_err(|error| {
+                    HipError::MissingSymbol {
+                        symbol: "hipGetDeviceCount",
+                        detail: error.to_string(),
+                    }
                 })?;
             let mut count: c_int = 0;
-            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
+            let status =
+                unsafe { crate::ffi::raw_hipGetDeviceCount(&get_count, ptr::from_mut(&mut count)) };
             let runtime = Self(Arc::new(RuntimeInner {
                 library,
                 device: 0,
@@ -406,9 +411,7 @@ impl HipRuntime {
     /// Returns an error when HIP cannot query the visible device count.
     pub fn device_count(&self) -> Result<u32, HipError> {
         let mut count = 0;
-        self.call("hipGetDeviceCount", |f: GetDeviceCount| unsafe {
-            f(&raw mut count)
-        })?;
+        unsafe { crate::ffi::invoke_hipGetDeviceCount(self, &raw mut count) }?;
         Ok(count.max(0).unsigned_abs())
     }
 
@@ -419,9 +422,7 @@ impl HipRuntime {
     /// Returns an error when HIP cannot query device memory information.
     pub fn device_info(&self) -> Result<HipDeviceInfo, HipError> {
         let mut total = 0_usize;
-        self.call("hipDeviceTotalMem", |f: DeviceTotalMem| unsafe {
-            f(&raw mut total, self.0.device)
-        })?;
+        unsafe { crate::ffi::invoke_hipDeviceTotalMem(self, &raw mut total, self.0.device) }?;
         let pci_bus_id = query_pci_bus_id(&self.0.library, self.0.device);
         Ok(HipDeviceInfo {
             index: self.0.device,
@@ -445,9 +446,7 @@ impl HipRuntime {
     pub fn memory_info(&self) -> Result<HipMemoryInfo, HipError> {
         let mut free = 0_usize;
         let mut total = 0_usize;
-        self.call("hipMemGetInfo", |f: MemGetInfo| unsafe {
-            f(&raw mut free, &raw mut total)
-        })?;
+        unsafe { crate::ffi::invoke_hipMemGetInfo(self, &raw mut free, &raw mut total) }?;
         Ok(HipMemoryInfo {
             free_bytes: free as u64,
             total_bytes: total as u64,
@@ -485,9 +484,7 @@ impl HipRuntime {
     /// Returns the HIP allocation error if the device cannot allocate the requested size.
     pub fn allocate(&self, bytes: usize) -> Result<DeviceBuffer, HipError> {
         let mut pointer = ptr::null_mut();
-        self.call("hipMalloc", |f: Malloc| unsafe {
-            f(&raw mut pointer, bytes)
-        })?;
+        unsafe { crate::ffi::invoke_hipMalloc(self, &raw mut pointer, bytes) }?;
         Ok(DeviceBuffer {
             allocation: Rc::new(DeviceAllocation {
                 runtime: self.clone(),
@@ -507,9 +504,7 @@ impl HipRuntime {
     /// Returns an error when HIP cannot load the module.
     pub fn load_module(&self, image: &[u8]) -> Result<HipModule, HipError> {
         let mut raw = ptr::null_mut();
-        self.call("hipModuleLoadData", |f: ModuleLoadData| unsafe {
-            f(&raw mut raw, image.as_ptr().cast())
-        })?;
+        unsafe { crate::ffi::invoke_hipModuleLoadData(self, &raw mut raw, image.as_ptr().cast()) }?;
         Ok(HipModule {
             inner: Rc::new(ModuleInner {
                 runtime: self.clone(),
@@ -528,9 +523,7 @@ impl HipRuntime {
     /// Returns an error when HIP cannot create the stream.
     pub fn create_stream(&self) -> Result<HipStreamHandle, HipError> {
         let mut stream = ptr::null_mut();
-        self.call("hipStreamCreate", |f: StreamCreate| unsafe {
-            f(&raw mut stream)
-        })?;
+        unsafe { crate::ffi::invoke_hipStreamCreate(self, &raw mut stream) }?;
         Ok(HipStreamHandle {
             inner: Rc::new(StreamInner {
                 runtime: self.clone(),
@@ -548,9 +541,13 @@ impl HipRuntime {
     /// Returns an error when HIP cannot create the event.
     pub fn create_event(&self) -> Result<HipEventHandle, HipError> {
         let mut event = ptr::null_mut();
-        self.call("hipEventCreateWithFlags", |f: EventCreate| unsafe {
-            f(&raw mut event, HIP_EVENT_DISABLE_TIMING)
-        })?;
+        unsafe {
+            crate::ffi::invoke_hipEventCreateWithFlags(
+                self,
+                &raw mut event,
+                HIP_EVENT_DISABLE_TIMING,
+            )
+        }?;
         Ok(HipEventHandle {
             inner: Rc::new(EventInner {
                 runtime: self.clone(),
@@ -569,9 +566,9 @@ impl HipRuntime {
     /// Returns an error when HIP cannot create the event.
     pub fn create_timing_event(&self) -> Result<HipTimingEventHandle, HipError> {
         let mut event = ptr::null_mut();
-        self.call("hipEventCreateWithFlags", |f: EventCreate| unsafe {
-            f(&raw mut event, HIP_EVENT_DEFAULT)
-        })?;
+        unsafe {
+            crate::ffi::invoke_hipEventCreateWithFlags(self, &raw mut event, HIP_EVENT_DEFAULT)
+        }?;
         Ok(HipTimingEventHandle {
             inner: Rc::new(EventInner {
                 runtime: self.clone(),
@@ -599,98 +596,42 @@ impl HipRuntime {
         start.synchronize()?;
         end.synchronize()?;
         let mut milliseconds = 0.0_f32;
-        self.call("hipEventElapsedTime", |f: EventElapsedTime| unsafe {
-            f(&raw mut milliseconds, start.inner.raw, end.inner.raw)
-        })?;
+        unsafe {
+            crate::ffi::invoke_hipEventElapsedTime(
+                self,
+                &raw mut milliseconds,
+                start.inner.raw,
+                end.inner.raw,
+            )
+        }?;
         Ok(milliseconds)
     }
 
     fn device_name(&self, device: HipDevice) -> Result<String, HipError> {
         let mut name = [0_i8; 256];
-        self.call("hipDeviceGetName", |f: GetDeviceName| unsafe {
-            f(
+        unsafe {
+            crate::ffi::invoke_hipDeviceGetName(
+                self,
                 name.as_mut_ptr(),
                 c_int::try_from(name.len()).expect("fixed name buffer fits c_int"),
                 device,
             )
-        })?;
+        }?;
         Ok(bounded_device_name(&name))
     }
 
     fn hip_get_device(&self, index: c_int) -> Result<HipDevice, HipError> {
         let mut device = 0;
-        self.call("hipDeviceGet", |f: GetDevice| unsafe {
-            f(ptr::from_mut(&mut device), index)
-        })?;
+        unsafe { crate::ffi::invoke_hipDeviceGet(self, ptr::from_mut(&mut device), index) }?;
         Ok(device)
     }
 
     fn hip_set_device(&self, device: HipDevice) -> Result<(), HipError> {
-        self.call("hipSetDevice", |f: SetDevice| unsafe { f(device) })
-    }
-
-    fn call<T: Copy>(
-        &self,
-        symbol: &'static str,
-        invoke: impl FnOnce(T) -> HipResult,
-    ) -> Result<(), HipError> {
-        if symbol != "hipSetDevice" {
-            // HIP's current device is thread-local, so select this runtime's device before each
-            // operation. This keeps cloned handles valid when used from another host thread.
-            let setter =
-                unsafe { crate::ffi::symbol::<SetDevice>(&self.0.library, b"hipSetDevice\0") }
-                    .map_err(|error| HipError::MissingSymbol {
-                        symbol: "hipSetDevice",
-                        detail: error.to_string(),
-                    })?;
-            let status = unsafe { setter(self.0.device) };
-            if status != HIP_SUCCESS {
-                return Err(self.error("hipSetDevice", status));
-            }
-        }
-        // libloading allocates a CString when the supplied symbol lacks a trailing NUL. All
-        // ordinary HIP symbols fit in this stack buffer; retain an overflow path for future ABI
-        // names rather than making symbol length an undocumented runtime limit.
-        let mut inline_symbol = [0_u8; 64];
-        let mut overflow_symbol = Vec::new();
-        let symbol_bytes = if symbol.len() < inline_symbol.len() {
-            inline_symbol[..symbol.len()].copy_from_slice(symbol.as_bytes());
-            &inline_symbol[..=symbol.len()]
-        } else {
-            overflow_symbol.extend_from_slice(symbol.as_bytes());
-            overflow_symbol.push(0);
-            &overflow_symbol
-        };
-        // SAFETY: `symbol` is loaded from the retained HIP runtime and `T` matches the named C ABI.
-        let function =
-            unsafe { ffi::symbol::<T>(&self.0.library, symbol_bytes) }.map_err(|error| {
-                HipError::MissingSymbol {
-                    symbol,
-                    detail: error.to_string(),
-                }
-            })?;
-        let status = invoke(*function);
-        if status == HIP_SUCCESS {
-            Ok(())
-        } else {
-            Err(self.error(symbol, status))
-        }
+        unsafe { crate::ffi::invoke_hipSetDevice(self, device) }
     }
 
     fn error(&self, operation: &'static str, code: HipResult) -> HipError {
-        // Error-string lookup is optional; preserve numeric status even if the symbol is absent.
-        let detail = unsafe {
-            crate::ffi::symbol::<GetErrorString>(&self.0.library, b"hipGetErrorString\0")
-        }
-        .ok()
-        .map(|f| unsafe { f(code) })
-        .filter(|p| !p.is_null())
-        .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
-        HipError::Runtime {
-            operation,
-            code,
-            detail,
-        }
+        crate::ffi::hip_error(self, operation, code)
     }
 
     fn ensure_same_runtime(&self, other: &Self) -> Result<(), HipError> {
@@ -723,12 +664,12 @@ pub struct HipDeviceInfo {
 /// Query PCI location through HIP's standalone C API, which avoids `hipDeviceProp_t` ABI layout.
 /// Older runtimes may not export this symbol; discovery remains useful without the location.
 fn query_pci_bus_id(library: &Library, ordinal: c_int) -> Option<String> {
-    let function =
-        unsafe { crate::ffi::symbol::<GetDevicePciBusId>(library, b"hipDeviceGetPCIBusId\0") }
-            .ok()?;
+    let function = unsafe { crate::ffi::require_hipDeviceGetPCIBusId(library) }.ok()?;
     let mut buffer = [0_i8; 64];
     let capacity = c_int::try_from(buffer.len()).expect("fixed PCI bus buffer fits c_int");
-    let status = unsafe { function(buffer.as_mut_ptr(), capacity, ordinal) };
+    let status = unsafe {
+        crate::ffi::raw_hipDeviceGetPCIBusId(&function, buffer.as_mut_ptr(), capacity, ordinal)
+    };
     if status != HIP_SUCCESS {
         return None;
     }
@@ -810,23 +751,6 @@ fn bounded_device_name(buffer: &[c_char]) -> String {
         .map(|&byte| byte.to_ne_bytes()[0])
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn raw_hip_error(library: &Library, operation: &'static str, code: HipResult) -> HipError {
-    let detail = unsafe { crate::ffi::symbol::<GetErrorString>(library, b"hipGetErrorString\0") }
-        .ok()
-        .map(|function| unsafe { function(code) })
-        .filter(|pointer| !pointer.is_null())
-        .map(|pointer| {
-            unsafe { CStr::from_ptr(pointer) }
-                .to_string_lossy()
-                .into_owned()
-        });
-    HipError::Runtime {
-        operation,
-        code,
-        detail,
-    }
 }
 
 /// Point-in-time device memory telemetry from HIP.
@@ -1174,9 +1098,7 @@ impl HipReadbackStorage {
 
 impl Drop for DeviceAllocation {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .call("hipFree", |f: Free| unsafe { f(self.pointer) });
+        let _ = unsafe { crate::ffi::invoke_hipFree(&self.runtime, self.pointer) };
     }
 }
 
@@ -1215,17 +1137,15 @@ impl DeviceBuffer {
             return Ok(());
         }
         let lease = self.acquire_access()?;
-        let result = self
-            .allocation
-            .runtime
-            .call("hipMemcpy", |f: Memcpy| unsafe {
-                f(
-                    (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
-                    source.as_ptr().cast(),
-                    source.len(),
-                    HIP_MEMCPY_HOST_TO_DEVICE,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_hipMemcpy(
+                &self.allocation.runtime,
+                (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
+                source.as_ptr().cast(),
+                source.len(),
+                HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
         lease.finish_synchronous(result)
     }
     /// Copy this allocation into host memory.
@@ -1249,17 +1169,15 @@ impl DeviceBuffer {
             return Ok(());
         }
         let lease = self.acquire_access()?;
-        let result = self
-            .allocation
-            .runtime
-            .call("hipMemcpy", |f: Memcpy| unsafe {
-                f(
-                    destination.as_mut_ptr().cast(),
-                    (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
-                    destination.len(),
-                    HIP_MEMCPY_DEVICE_TO_HOST,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_hipMemcpy(
+                &self.allocation.runtime,
+                destination.as_mut_ptr().cast(),
+                (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
+                destination.len(),
+                HIP_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
         lease.finish_synchronous(result)
     }
     /// Copy bytes from another device allocation.
@@ -1280,17 +1198,15 @@ impl DeviceBuffer {
         }
         let destination_lease = self.acquire_access()?;
         let source_lease = source.acquire_access()?;
-        let result = self
-            .allocation
-            .runtime
-            .call("hipMemcpy", |f: Memcpy| unsafe {
-                f(
-                    self.allocation.pointer,
-                    source.allocation.pointer,
-                    bytes,
-                    HIP_MEMCPY_DEVICE_TO_DEVICE,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_hipMemcpy(
+                &self.allocation.runtime,
+                self.allocation.pointer,
+                source.allocation.pointer,
+                bytes,
+                HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )
+        };
         destination_lease.finish_synchronous_with(source_lease, result)
     }
     fn check_length(&self, bytes: usize) -> Result<(), HipError> {
@@ -1365,10 +1281,7 @@ impl DeviceAccessLease {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                if self
-                    .allocation
-                    .runtime
-                    .call("hipDeviceSynchronize", |f: HipNoArgStatus| unsafe { f() })
+                if unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.allocation.runtime) }
                     .is_err()
                 {
                     std::mem::forget(self);
@@ -1386,10 +1299,7 @@ impl DeviceAccessLease {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                if self
-                    .allocation
-                    .runtime
-                    .call("hipDeviceSynchronize", |f: HipNoArgStatus| unsafe { f() })
+                if unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.allocation.runtime) }
                     .is_err()
                 {
                     std::mem::forget(self);
@@ -1407,11 +1317,7 @@ struct StreamInner {
 }
 impl Drop for StreamInner {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .call("hipStreamDestroy", |f: StreamDestroy| unsafe {
-                f(self.raw)
-            });
+        let _ = unsafe { crate::ffi::invoke_hipStreamDestroy(&self.runtime, self.raw) };
     }
 }
 /// Shared owner for a HIP stream.
@@ -1437,11 +1343,7 @@ impl HipStreamHandle {
     ///
     /// Returns the HIP synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), HipError> {
-        self.inner
-            .runtime
-            .call("hipStreamSynchronize", |f: StreamSynchronize| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_hipStreamSynchronize(&self.inner.runtime, self.inner.raw) }
     }
     /// Record an event after all work already queued on this stream.
     ///
@@ -1452,11 +1354,9 @@ impl HipStreamHandle {
         self.inner
             .runtime
             .ensure_same_runtime(&event.inner.runtime)?;
-        self.inner
-            .runtime
-            .call("hipEventRecord", |f: EventRecord| unsafe {
-                f(event.inner.raw, self.inner.raw)
-            })
+        unsafe {
+            crate::ffi::invoke_hipEventRecord(&self.inner.runtime, event.inner.raw, self.inner.raw)
+        }
     }
 
     /// Record a timing-enabled event after all work already queued on this stream.
@@ -1468,11 +1368,9 @@ impl HipStreamHandle {
         self.inner
             .runtime
             .ensure_same_runtime(&event.inner.runtime)?;
-        self.inner
-            .runtime
-            .call("hipEventRecord", |f: EventRecord| unsafe {
-                f(event.inner.raw, self.inner.raw)
-            })
+        unsafe {
+            crate::ffi::invoke_hipEventRecord(&self.inner.runtime, event.inner.raw, self.inner.raw)
+        }
     }
 }
 
@@ -1482,9 +1380,7 @@ struct EventInner {
 }
 impl Drop for EventInner {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .call("hipEventDestroy", |f: EventDestroy| unsafe { f(self.raw) });
+        let _ = unsafe { crate::ffi::invoke_hipEventDestroy(&self.runtime, self.raw) };
     }
 }
 /// Shared owner for a HIP event.
@@ -1499,11 +1395,7 @@ impl HipEventHandle {
     ///
     /// Returns the HIP synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), HipError> {
-        self.inner
-            .runtime
-            .call("hipEventSynchronize", |f: EventSynchronize| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_hipEventSynchronize(&self.inner.runtime, self.inner.raw) }
     }
 }
 
@@ -1519,11 +1411,7 @@ impl HipTimingEventHandle {
     ///
     /// Returns the HIP synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), HipError> {
-        self.inner
-            .runtime
-            .call("hipEventSynchronize", |f: EventSynchronize| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_hipEventSynchronize(&self.inner.runtime, self.inner.raw) }
     }
 }
 
@@ -1533,9 +1421,7 @@ struct ModuleInner {
 }
 impl Drop for ModuleInner {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .call("hipModuleUnload", |f: ModuleUnload| unsafe { f(self.raw) });
+        let _ = unsafe { crate::ffi::invoke_hipModuleUnload(&self.runtime, self.raw) };
     }
 }
 /// Loaded HIP code object.
@@ -1551,11 +1437,14 @@ impl HipModule {
     /// Returns an error when HIP cannot resolve the named function.
     pub fn function(&self, name: &CStr) -> Result<HipKernel, HipError> {
         let mut raw = ptr::null_mut();
-        self.inner
-            .runtime
-            .call("hipModuleGetFunction", |f: ModuleGetFunction| unsafe {
-                f(&raw mut raw, self.inner.raw, name.as_ptr())
-            })?;
+        unsafe {
+            crate::ffi::invoke_hipModuleGetFunction(
+                &self.inner.runtime,
+                &raw mut raw,
+                self.inner.raw,
+                name.as_ptr(),
+            )
+        }?;
         Ok(HipKernel {
             module: self.inner.clone(),
             raw,
@@ -1829,10 +1718,11 @@ impl Drop for HipCompletion {
 pub struct HipCompletionBatch {
     stream: HipStreamHandle,
     launch_events: Vec<HipEventHandle>,
-    resources: Vec<LaunchResources>,
+    // Single-operation batches retain their owners inline; longer batches spill.
+    resources: SmallVec<[LaunchResources; 1]>,
     dependencies: Vec<HipProducerCompletion>,
     readbacks: HipReadbackStorage,
-    queue_markers: Vec<Rc<dyn Any>>,
+    queue_markers: SmallVec<[Rc<dyn Any>; 1]>,
     failed: bool,
     timing: Option<HipBatchTiming>,
 }
@@ -1862,10 +1752,10 @@ impl HipCompletionBatch {
         Self {
             stream: stream.clone(),
             launch_events: Vec::new(),
-            resources: Vec::new(),
+            resources: SmallVec::new(),
             dependencies: Vec::new(),
             readbacks: HipReadbackStorage::new(),
-            queue_markers: Vec::new(),
+            queue_markers: SmallVec::new(),
             failed: false,
             timing: None,
         }
@@ -1878,10 +1768,10 @@ impl HipCompletionBatch {
         Self {
             stream: stream.clone(),
             launch_events: Vec::new(),
-            resources: Vec::new(),
+            resources: SmallVec::new(),
             dependencies: Vec::new(),
             readbacks: HipReadbackStorage::new(),
-            queue_markers: Vec::new(),
+            queue_markers: SmallVec::new(),
             failed: false,
             timing: Some(HipBatchTiming {
                 start: None,
@@ -1929,17 +1819,13 @@ impl HipCompletionBatch {
         }
 
         let mut access_leases = LaunchAccessLeases::new();
-        let mut unique = Vec::<&DeviceBuffer>::with_capacity(buffers.len());
         for buffer in buffers {
-            if unique
-                .iter()
-                .any(|known| Rc::ptr_eq(&known.allocation, &buffer.allocation))
-            {
+            // The retained leases already identify every acquired allocation, including spills.
+            if access_leases.contains(&buffer.allocation) {
                 continue;
             }
             // If an acquisition fails, already acquired leases drop here and restore their gates.
             access_leases.push(buffer.acquire_stream_access(&self.stream)?);
-            unique.push(buffer);
         }
         self.resources.push(LaunchResources {
             _module: None,
@@ -1973,7 +1859,8 @@ impl HipCompletionBatch {
     }
 
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    // This runtime query follows owned inline/spilled resources; batches cannot be const-built.
+    pub fn is_empty(&self) -> bool {
         self.resources.is_empty() && self.launch_events.is_empty() && self.dependencies.is_empty()
     }
 
@@ -2049,19 +1936,16 @@ impl HipCompletionBatch {
             access_leases,
             stream: self.stream.clone(),
         });
-        let enqueue = self
-            .stream
-            .inner
-            .runtime
-            .call("hipMemcpyAsync", |f: MemcpyAsync| unsafe {
-                f(
-                    destination.allocation.pointer,
-                    source.allocation.pointer,
-                    bytes,
-                    HIP_MEMCPY_DEVICE_TO_DEVICE,
-                    self.stream.inner.raw,
-                )
-            });
+        let enqueue = unsafe {
+            crate::ffi::invoke_hipMemcpyAsync(
+                &self.stream.inner.runtime,
+                destination.allocation.pointer,
+                source.allocation.pointer,
+                bytes,
+                HIP_MEMCPY_DEVICE_TO_DEVICE,
+                self.stream.inner.raw,
+            )
+        };
         if let Err(error) = enqueue {
             self.failed = true;
             self.release_after_stream_sync();
@@ -2131,24 +2015,21 @@ impl HipCompletionBatch {
             access_leases,
             stream: self.stream.clone(),
         });
-        let enqueue = self
-            .stream
-            .inner
-            .runtime
-            .call("hipMemcpyAsync", |f: MemcpyAsync| unsafe {
-                f(
-                    destination.cast(),
-                    source
-                        .allocation
-                        .pointer
-                        .cast::<u8>()
-                        .wrapping_add(source_offset)
-                        .cast(),
-                    bytes,
-                    HIP_MEMCPY_DEVICE_TO_HOST,
-                    self.stream.inner.raw,
-                )
-            });
+        let enqueue = unsafe {
+            crate::ffi::invoke_hipMemcpyAsync(
+                &self.stream.inner.runtime,
+                destination.cast(),
+                source
+                    .allocation
+                    .pointer
+                    .cast::<u8>()
+                    .wrapping_add(source_offset)
+                    .cast(),
+                bytes,
+                HIP_MEMCPY_DEVICE_TO_HOST,
+                self.stream.inner.raw,
+            )
+        };
         if let Err(error) = enqueue {
             self.failed = true;
             self.release_after_stream_sync();
@@ -2207,24 +2088,21 @@ impl HipCompletionBatch {
         let source_pointer = source.as_ptr().cast::<c_void>();
         let owner: Rc<dyn Any> = Rc::new(source);
         self.retain_external_operation(&[destination], owner)?;
-        let enqueue = self
-            .stream
-            .inner
-            .runtime
-            .call("hipMemcpyAsync", |f: MemcpyAsync| unsafe {
-                f(
-                    destination
-                        .allocation
-                        .pointer
-                        .cast::<u8>()
-                        .wrapping_add(offset)
-                        .cast(),
-                    source_pointer,
-                    bytes,
-                    HIP_MEMCPY_HOST_TO_DEVICE,
-                    self.stream.inner.raw,
-                )
-            });
+        let enqueue = unsafe {
+            crate::ffi::invoke_hipMemcpyAsync(
+                &self.stream.inner.runtime,
+                destination
+                    .allocation
+                    .pointer
+                    .cast::<u8>()
+                    .wrapping_add(offset)
+                    .cast(),
+                source_pointer,
+                bytes,
+                HIP_MEMCPY_HOST_TO_DEVICE,
+                self.stream.inner.raw,
+            )
+        };
         if let Err(error) = enqueue {
             self.failed = true;
             self.release_after_stream_sync();
@@ -2374,14 +2252,14 @@ impl HipCompletionBatch {
             .handoff_accesses_to_stream(&self.stream)
             .map_err(|()| HipError::Busy)?;
         self.dependencies.push(completion);
-        if let Err(error) = self
-            .stream
-            .inner
-            .runtime
-            .call("hipStreamWaitEvent", |f: StreamWaitEvent| unsafe {
-                f(self.stream.inner.raw, raw_event, 0)
-            })
-        {
+        if let Err(error) = unsafe {
+            crate::ffi::invoke_hipStreamWaitEvent(
+                &self.stream.inner.runtime,
+                self.stream.inner.raw,
+                raw_event,
+                0,
+            )
+        } {
             // Even a failed enqueue may leave the consumer's queue state uncertain. Establish
             // consumer quiescence before releasing the retained producer token.
             if self.stream.synchronize().is_err() {
@@ -2553,10 +2431,11 @@ pub struct HipBatchCompletion {
     stream: HipStreamHandle,
     final_event: Option<HipEventHandle>,
     launch_events: Vec<HipEventHandle>,
-    resources: Vec<LaunchResources>,
+    // Single-operation batches retain their owners inline; longer batches spill.
+    resources: SmallVec<[LaunchResources; 1]>,
     dependencies: Vec<HipProducerCompletion>,
     readbacks: HipReadbackStorage,
-    queue_markers: Vec<Rc<dyn Any>>,
+    queue_markers: SmallVec<[Rc<dyn Any>; 1]>,
     timing_events: Option<HipBatchTimingSegment>,
     handed_off: bool,
     wait_error_observed: bool,
@@ -2716,7 +2595,7 @@ fn has_queue_marker(markers: &[Rc<dyn Any>], marker: &Rc<dyn Any>) -> bool {
     markers.iter().any(|known| Rc::ptr_eq(known, marker))
 }
 
-fn register_queue_marker(markers: &mut Vec<Rc<dyn Any>>, marker: Rc<dyn Any>) {
+fn register_queue_marker(markers: &mut SmallVec<[Rc<dyn Any>; 1]>, marker: Rc<dyn Any>) {
     if !has_queue_marker(markers, &marker) {
         markers.push(marker);
     }
@@ -3091,24 +2970,22 @@ impl HipKernel {
             }
             timing.start = Some(start);
         }
-        let launch_result =
-            self.module
-                .runtime
-                .call("hipModuleLaunchKernel", |f: ModuleLaunchKernel| unsafe {
-                    f(
-                        self.raw,
-                        grid[0],
-                        grid[1],
-                        grid[2],
-                        block[0],
-                        block[1],
-                        block[2],
-                        shared_memory_bytes,
-                        stream.inner.raw,
-                        params,
-                        ptr::null_mut(),
-                    )
-                });
+        let launch_result = unsafe {
+            crate::ffi::invoke_hipModuleLaunchKernel(
+                &self.module.runtime,
+                self.raw,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_memory_bytes,
+                stream.inner.raw,
+                params,
+                ptr::null_mut(),
+            )
+        };
         if let Err(error) = launch_result {
             if let Some(batch) = batch {
                 batch.failed = true;
@@ -3197,7 +3074,7 @@ mod memory_snapshot_tests {
         let marker = Rc::new(()) as Rc<dyn Any>;
         let marker_clone = Rc::clone(&marker);
         let unrelated = Rc::new(()) as Rc<dyn Any>;
-        let mut markers = Vec::new();
+        let mut markers = SmallVec::new();
         register_queue_marker(&mut markers, Rc::clone(&marker));
         register_queue_marker(&mut markers, marker_clone);
 
@@ -3205,6 +3082,30 @@ mod memory_snapshot_tests {
         assert!(completion_has_queue_marker(&markers, false, &marker));
         assert!(!completion_has_queue_marker(&markers, true, &marker));
         assert!(!completion_has_queue_marker(&markers, false, &unrelated));
+    }
+
+    #[test]
+    fn spilled_queue_markers_retain_distinct_owners_until_release() {
+        let first = Rc::new(()) as Rc<dyn Any>;
+        let second = Rc::new(()) as Rc<dyn Any>;
+        let first_owner = Rc::downgrade(&first);
+        let second_owner = Rc::downgrade(&second);
+        let mut markers = SmallVec::new();
+        register_queue_marker(&mut markers, Rc::clone(&first));
+        register_queue_marker(&mut markers, Rc::clone(&second));
+        register_queue_marker(&mut markers, Rc::clone(&first));
+        drop(first);
+        drop(second);
+
+        assert_eq!(markers.len(), 2);
+        assert!(first_owner.upgrade().is_some());
+        assert!(second_owner.upgrade().is_some());
+        let transferred = std::mem::take(&mut markers);
+        assert!(markers.is_empty());
+        assert!(first_owner.upgrade().is_some());
+        drop(transferred);
+        assert!(first_owner.upgrade().is_none());
+        assert!(second_owner.upgrade().is_none());
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub struct PcuTensorGraphCapture {
     base_float_underflow_policy: crate::PcuFloatUnderflowPolicy,
     float_underflow_policy: Rc<Cell<crate::PcuFloatUnderflowPolicy>>,
     numerical_mode: Rc<Cell<crate::PcuNumericalMode>>,
+    numerical_options: Rc<Cell<crate::PcuNumericalOptions>>,
     marker: PhantomData<fn() -> ()>,
 }
 
@@ -122,6 +123,17 @@ impl Drop for NumericalModeRestore {
     }
 }
 
+struct NumericalOptionsRestore {
+    options: Rc<Cell<crate::PcuNumericalOptions>>,
+    previous: crate::PcuNumericalOptions,
+}
+
+impl Drop for NumericalOptionsRestore {
+    fn drop(&mut self) {
+        self.options.set(self.previous);
+    }
+}
+
 #[cfg(feature = "tensor")]
 struct ActiveMarkerRestore {
     markers: Rc<RefCell<Vec<TypeId>>>,
@@ -138,6 +150,23 @@ impl Drop for ActiveMarkerRestore {
 #[cfg_attr(not(feature = "tensor"), allow(clippy::missing_const_for_fn))]
 // Executable configurations mutate the graph and recursion stack; disabled stubs are constant.
 impl PcuTensorGraphCapture {
+    /// Applies independent helper overrides and restores the caller's options on every exit.
+    #[doc(hidden)]
+    pub fn with_numerical_options<R>(
+        &mut self,
+        overrides: crate::PcuNumericalOverrides,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let selected = self.numerical_options.get().with_overrides(overrides);
+        let restore = NumericalOptionsRestore {
+            options: Rc::clone(&self.numerical_options),
+            previous: self.numerical_options.replace(selected),
+        };
+        let result = operation(self);
+        drop(restore);
+        result
+    }
+
     /// Runs a helper under its explicit mode, or inherits its caller's active mode.
     /// Restores the previous mode on errors and unwinding panics.
     #[doc(hidden)]
@@ -237,6 +266,7 @@ impl PcuTensorGraphCapture {
                 base_float_underflow_policy,
                 float_underflow_policy: Rc::new(Cell::new(base_float_underflow_policy)),
                 numerical_mode: Rc::new(Cell::new(crate::PcuNumericalMode::Boundary)),
+                numerical_options: Rc::new(Cell::new(crate::PcuNumericalOptions::default())),
                 marker: PhantomData,
             },
             values,
@@ -261,6 +291,9 @@ impl PcuTensorGraphCapture {
             let value = self
                 .graph
                 .input_typed::<T>(dimensions)
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
                 .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
@@ -363,6 +396,9 @@ impl PcuTensorGraphCapture {
                 .graph
                 .relu_typed(value.value)
                 .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -427,6 +463,9 @@ impl PcuTensorGraphCapture {
                 self.graph.add_typed(lhs.value, rhs.value)
             }
             .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -462,6 +501,9 @@ impl PcuTensorGraphCapture {
                 self.graph.sub_typed(lhs.value, rhs.value)
             }
             .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -497,6 +539,9 @@ impl PcuTensorGraphCapture {
                 self.graph.mul_typed(lhs.value, rhs.value)
             }
             .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -544,6 +589,9 @@ impl PcuTensorGraphCapture {
                     self.float_underflow_policy.get(),
                 )
                 .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -578,6 +626,9 @@ impl PcuTensorGraphCapture {
             self.graph
                 .set_value_float_underflow_policy(value.erase(), self.float_underflow_policy.get())
                 .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -587,6 +638,93 @@ impl PcuTensorGraphCapture {
         #[cfg(not(feature = "tensor"))]
         {
             let _ = (lhs, rhs);
+            Err(PcuExecutionError::TensorExecutionUnavailable)
+        }
+    }
+
+    /// Captures one compound mean-squared-error primitive with caller/helper numerical policy.
+    ///
+    /// The current primitive supports F32 and returns a rank-zero value. Default checked and
+    /// strict admission remain separate from an explicitly permitted native implementation.
+    ///
+    /// # Errors
+    /// Returns source provenance, shape, unsupported scalar or unavailable-execution errors.
+    #[doc(hidden)]
+    pub fn mean_squared_error<T: PcuScalar>(
+        &mut self,
+        prediction: PcuTensorGraphValue<T>,
+        target: PcuTensorGraphValue<T>,
+    ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError> {
+        #[cfg(feature = "tensor")]
+        {
+            self.validate_value(prediction)?;
+            self.validate_value(target)?;
+            let value = self
+                .graph
+                .mean_squared_error_typed(prediction.value, target.value)
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_mode(value.erase(), self.numerical_mode.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_float_underflow_policy(value.erase(), self.float_underflow_policy.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
+            Ok(PcuTensorGraphValue {
+                value,
+                capture_id: self.capture_id,
+                marker: PhantomData,
+            })
+        }
+        #[cfg(not(feature = "tensor"))]
+        {
+            let _ = (prediction, target);
+            Err(PcuExecutionError::TensorExecutionUnavailable)
+        }
+    }
+
+    /// Captures SGD with a finite F32 constant rate and inherited numerical options.
+    ///
+    /// Source lowering currently admits a finite F32 literal, never a changing host expression.
+    /// Backend admission still decides whether the complete selected contract is implemented.
+    ///
+    /// # Errors
+    /// Returns provenance, shape, scalar, learning-rate or unavailable-execution errors.
+    #[doc(hidden)]
+    pub fn sgd_update<T: PcuScalar>(
+        &mut self,
+        weights: PcuTensorGraphValue<T>,
+        gradient: PcuTensorGraphValue<T>,
+        learning_rate: f32,
+    ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError> {
+        #[cfg(feature = "tensor")]
+        {
+            self.validate_value(weights)?;
+            self.validate_value(gradient)?;
+            let value = self
+                .graph
+                .sgd_update_typed(weights.value, gradient.value, learning_rate)
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_mode(value.erase(), self.numerical_mode.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_float_underflow_policy(value.erase(), self.float_underflow_policy.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value.erase(), self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
+            Ok(PcuTensorGraphValue {
+                value,
+                capture_id: self.capture_id,
+                marker: PhantomData,
+            })
+        }
+        #[cfg(not(feature = "tensor"))]
+        {
+            let _ = (weights, gradient, learning_rate);
             Err(PcuExecutionError::TensorExecutionUnavailable)
         }
     }
@@ -969,7 +1107,7 @@ impl<T: PcuScalar> core::fmt::Debug for PcuTensor<T> {
 
 // Provider-disabled builds retain the same instance API, although no owner can be minted.
 #[cfg_attr(
-    not(any(feature = "rocm", feature = "cuda")),
+    not(any(feature = "rocm", feature = "cuda", feature = "metal")),
     allow(clippy::unused_self)
 )]
 impl<T: PcuScalar> PcuTensor<T> {
@@ -977,11 +1115,11 @@ impl<T: PcuScalar> PcuTensor<T> {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Provider configurations borrow dynamic shape metadata.
     pub fn shape(&self) -> &[usize] {
-        #[cfg(any(feature = "rocm", feature = "cuda"))]
+        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
         {
             self.device_tensor().shape()
         }
-        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
         {
             &[]
         } // No safe constructor exists when no execution provider is compiled.
@@ -991,11 +1129,11 @@ impl<T: PcuScalar> PcuTensor<T> {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Provider metadata comes through its typed storage view.
     pub fn len(&self) -> usize {
-        #[cfg(any(feature = "rocm", feature = "cuda"))]
+        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
         {
             self.device_tensor().len()
         }
-        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
         {
             0
         } // The disabled-provider owner is not constructible by consumers.
@@ -1016,12 +1154,12 @@ impl<T: PcuScalar> PcuTensor<T> {
     /// or backend transfer failure. No implicit CPU computation or backend migration occurs.
     #[allow(clippy::missing_const_for_fn)] // Executable configurations perform validated device IO.
     pub fn read_into(&self, destination: &mut [T]) -> Result<(), PcuExecutionError> {
-        #[cfg(any(feature = "rocm", feature = "cuda"))]
+        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
         {
             self.validate_initialized().map_err(super::argument_error)?;
             self.session().download(self.device_tensor(), destination)
         }
-        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
         {
             let _ = destination;
             Err(PcuExecutionError::NoBackendEnabled)
@@ -1397,6 +1535,7 @@ mod execution {
         shapes: [PcuTensorShapeWitness<'_>; N],
         base_float_underflow_policy: crate::PcuFloatUnderflowPolicy,
         numerical_mode: crate::PcuNumericalMode,
+        numerical_options: crate::PcuNumericalOptions,
         build: F,
     ) -> Result<BuiltProgram, PcuExecutionError>
     where
@@ -1411,6 +1550,7 @@ mod execution {
             N,
         >(shapes, base_float_underflow_policy)?;
         capture.numerical_mode.set(numerical_mode);
+        capture.numerical_options.set(numerical_options);
         let captured_input_ids = input_values.map(|value| value.value.erase());
         let output_value = build(&mut capture, input_values)?;
         let (graph, output_id) = capture.finish(output_value)?;
@@ -2449,6 +2589,7 @@ mod execution {
             shapes,
             snapshot.policy.float_underflow,
             snapshot.policy.numerical_mode,
+            snapshot.policy.numerical_options,
             build,
         )?;
         let affinity = preflight_selected_inputs(inputs, &selected_program.input_indices)?;
@@ -2524,6 +2665,10 @@ mod execution {
         }
     }
 }
+
+#[cfg(all(test, feature = "tensor"))]
+#[path = "tensor/numerical_tests.rs"]
+mod numerical_tests;
 
 #[cfg(all(test, feature = "tensor"))]
 mod capture_tests {

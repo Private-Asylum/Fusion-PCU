@@ -3,6 +3,12 @@
 //! This uses cuBLAS' public `cublasSgemm_v2` ABI directly and does not require cuBLASLt.
 
 #[rustfmt::skip]
+use crate::{
+    CublasConfiguredModes,
+    CublasNumericalConfig,
+};
+
+#[rustfmt::skip]
 use std::{
     any::Any,
     cell::{
@@ -34,39 +40,15 @@ use super::{
 
 #[rustfmt::skip]
 use crate::ffi::cublas::{
-    CUBLAS_ATOMICS_NOT_ALLOWED,
     CUBLAS_OPERATION_NONE,
     CUBLAS_OPERATION_TRANSPOSE,
-    CUBLAS_PEDANTIC_MATH,
     CUBLAS_POINTER_MODE_DEVICE,
     CUBLAS_POINTER_MODE_HOST,
     CUBLAS_SUCCESS,
-    CreateHandle,
     CublasHandle,
-    DestroyHandle,
     Dgemm,
-    GetPointerMode,
-    SYM_CUBLAS_CREATE_V2,
-    SYM_CUBLAS_DESTROY_V2,
-    SYM_CUBLAS_DGEMM_V2,
-    SYM_CUBLAS_GET_POINTER_MODE_V2,
-    SYM_CUBLAS_SASUM_V2,
-    SYM_CUBLAS_SDOT_V2,
-    SYM_CUBLAS_SET_ATOMICS_MODE,
-    SYM_CUBLAS_SET_MATH_MODE,
-    SYM_CUBLAS_SET_POINTER_MODE_V2,
-    SYM_CUBLAS_SET_STREAM_V2,
-    SYM_CUBLAS_SGEMM_V2,
-    SYM_CUBLAS_SSCAL_V2,
-    Sasum,
-    Sdot,
-    SetMathMode,
-    SetPointerMode,
-    SetStream,
     Sgemm,
-    Sscal,
 };
-use crate::ffi::runtime::DeviceSynchronize;
 
 /// Failures returned by the cuBLAS GEMM and vector adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +76,17 @@ pub enum CublasError {
         required: usize,
     },
     InvalidVector(&'static str),
+    UnsupportedNumericalConfiguration(&'static str),
+    UnsupportedLibraryVersion {
+        major: i32,
+        minor: i32,
+        patch: i32,
+    },
+    ConfigurationMismatch {
+        operation: &'static str,
+        requested: i32,
+        observed: i32,
+    },
 }
 
 /// Host-side phase durations for one explicitly profiled SGEMM call.
@@ -191,6 +184,25 @@ impl fmt::Display for CublasError {
                 "cuBLAS GEMM {matrix} needs {required} bytes, allocation has {allocation}"
             ),
             Self::InvalidVector(why) => write!(f, "invalid cuBLAS vector reduction: {why}"),
+            Self::UnsupportedNumericalConfiguration(why) => {
+                write!(f, "unsupported cuBLAS numerical configuration: {why}")
+            }
+            Self::UnsupportedLibraryVersion {
+                major,
+                minor,
+                patch,
+            } => write!(
+                f,
+                "unsupported cuBLAS component contract {major}.{minor}.{patch}; native compound adapter admits CUDA Toolkit13.4 cuBLAS13.7/13.8"
+            ),
+            Self::ConfigurationMismatch {
+                operation,
+                requested,
+                observed,
+            } => write!(
+                f,
+                "cuBLAS {operation} configuration mismatch: requested {requested}, observed {observed}"
+            ),
         }
     }
 }
@@ -215,7 +227,9 @@ struct CublasHandleOwner {
     library: Arc<Library>,
     handle: CublasHandle,
     poisoned: Cell<bool>,
+    sgemm: Sgemm,
     dgemm: OnceCell<Result<Dgemm, CublasError>>,
+    numerical_config: Option<(CublasNumericalConfig, CublasConfiguredModes)>,
 }
 
 struct CublasAsyncOperationOwner {
@@ -260,58 +274,6 @@ const fn queue_extension_allowed(
     has_reservation_marker: bool,
 ) -> bool {
     !poisoned && same_stream && has_reservation_marker
-}
-
-fn configure_math_modes(library: &Library, handle: CublasHandle) -> Result<(), CublasError> {
-    // NVIDIA cuBLAS 13.4 §2.4.20/22: prescribed precision and no alternate
-    // atomic reductions. These settings do not establish PCU checked intermediate faults.
-    for (operation, mode, symbol) in [
-        (
-            "cublasSetMathMode",
-            CUBLAS_PEDANTIC_MATH,
-            SYM_CUBLAS_SET_MATH_MODE,
-        ),
-        (
-            "cublasSetAtomicsMode",
-            CUBLAS_ATOMICS_NOT_ALLOWED,
-            SYM_CUBLAS_SET_ATOMICS_MODE,
-        ),
-    ] {
-        // SAFETY: both documented setters take (handle, enum represented as c_int).
-        let setter = match unsafe { crate::ffi::symbol::<SetMathMode>(library, symbol) } {
-            Ok(setter) => setter,
-            Err(error) => {
-                // SAFETY: this freshly created handle has not escaped or queued work.
-                if let Ok(destroy) =
-                    unsafe { crate::ffi::symbol::<DestroyHandle>(library, SYM_CUBLAS_DESTROY_V2) }
-                {
-                    unsafe {
-                        destroy(handle);
-                    }
-                }
-                return Err(CublasError::MissingSymbol {
-                    symbol: operation,
-                    detail: error.to_string(),
-                });
-            }
-        };
-        let status = unsafe { setter(handle, mode) };
-        if status != CUBLAS_SUCCESS {
-            // SAFETY: the handle was created above and has not escaped.
-            if let Ok(destroy) =
-                unsafe { crate::ffi::symbol::<DestroyHandle>(library, SYM_CUBLAS_DESTROY_V2) }
-            {
-                unsafe {
-                    destroy(handle);
-                }
-            }
-            return Err(CublasError::Status {
-                operation,
-                code: status,
-            });
-        }
-    }
-    Ok(())
 }
 
 impl Cublas {
@@ -486,7 +448,7 @@ impl Cublas {
             .get_or_init(|| {
                 // SAFETY: Dgemm matches the installed public cuBLAS C ABI. The owning library
                 // outlives this cached function pointer and every operation that invokes it.
-                unsafe { crate::ffi::symbol::<Dgemm>(&self.owner.library, SYM_CUBLAS_DGEMM_V2) }
+                crate::ffi::resolve_cublas_dgemm_v2(&self.owner.library)
                     .map(|symbol| *symbol)
                     .map_err(|error| CublasError::MissingSymbol {
                         symbol: "cublasDgemm_v2",
@@ -548,6 +510,38 @@ impl Cublas {
     /// Returns an error when cuBLAS cannot be loaded, a required symbol is missing, or CUDA/cuBLAS
     /// fails to create the handle.
     pub fn new(runtime: &CudaRuntime) -> Result<Self, CublasError> {
+        Self::new_configured(runtime, None)
+    }
+
+    /// Creates an immutable native-compound handle with an explicitly admitted precision choice.
+    ///
+    /// Preserve uses documented real SGEMM/DGEMM default precision; optimized F32 explicitly
+    /// enables TF32 tensor arithmetic. Atomics are permitted because this configuration makes
+    /// no reproducibility promise. This constructor does not establish checked numerical faults.
+    ///
+    /// # Errors
+    ///
+    /// Returns library, CUDA, setup status, unsupported library-version or mode-verification errors.
+    pub fn new_with_numerical_config(
+        runtime: &CudaRuntime,
+        config: CublasNumericalConfig,
+    ) -> Result<Self, CublasError> {
+        Self::new_configured(runtime, Some(config))
+    }
+
+    /// Reports the native compound configuration and observed library modes, when selected.
+    #[must_use]
+    pub fn numerical_config(&self) -> Option<(&CublasNumericalConfig, CublasConfiguredModes)> {
+        self.owner
+            .numerical_config
+            .as_ref()
+            .map(|(config, modes)| (config, *modes))
+    }
+
+    fn new_configured(
+        runtime: &CudaRuntime,
+        numerical_config: Option<CublasNumericalConfig>,
+    ) -> Result<Self, CublasError> {
         let candidates: Vec<OsString> = std::env::var_os("CUBLAS_LIBRARY").map_or_else(
             || {
                 vec![
@@ -572,16 +566,16 @@ impl Cublas {
             runtime.cuda_set_device(runtime.0.ordinal)?;
             let mut handle = ptr::null_mut();
             // SAFETY: symbol type matches cublasCreate_v2's C declaration.
-            let create =
-                unsafe { crate::ffi::symbol::<CreateHandle>(&library, SYM_CUBLAS_CREATE_V2) }
-                    .map_err(|e| CublasError::MissingSymbol {
-                        symbol: "cublasCreate_v2",
-                        detail: e.to_string(),
-                    })?;
+            let create = crate::ffi::resolve_cublas_create_v2(&library).map_err(|e| {
+                CublasError::MissingSymbol {
+                    symbol: "cublasCreate_v2",
+                    detail: e.to_string(),
+                }
+            })?;
             // An opened handle is only useful to the tensor adapter when the required operation
             // is present. Validate the symbol during setup so assessment cannot claim Library
             // support and defer a missing-symbol failure until execution.
-            unsafe { crate::ffi::symbol::<Sgemm>(&library, SYM_CUBLAS_SGEMM_V2) }.map_err(|e| {
+            let sgemm = *crate::ffi::resolve_cublas_sgemm_v2(&library).map_err(|e| {
                 CublasError::MissingSymbol {
                     symbol: "cublasSgemm_v2",
                     detail: e.to_string(),
@@ -590,37 +584,23 @@ impl Cublas {
             for (symbol, result) in [
                 (
                     "cublasSdot_v2",
-                    unsafe { crate::ffi::symbol::<Sdot>(&library, SYM_CUBLAS_SDOT_V2) }.map(|_| ()),
+                    crate::ffi::resolve_cublas_sdot_v2(&library).map(|_| ()),
                 ),
                 (
                     "cublasSasum_v2",
-                    unsafe { crate::ffi::symbol::<Sasum>(&library, SYM_CUBLAS_SASUM_V2) }
-                        .map(|_| ()),
+                    crate::ffi::resolve_cublas_sasum_v2(&library).map(|_| ()),
                 ),
                 (
                     "cublasSscal_v2",
-                    unsafe { crate::ffi::symbol::<Sscal>(&library, SYM_CUBLAS_SSCAL_V2) }
-                        .map(|_| ()),
+                    crate::ffi::resolve_cublas_sscal_v2(&library).map(|_| ()),
                 ),
                 (
                     "cublasGetPointerMode_v2",
-                    unsafe {
-                        crate::ffi::symbol::<GetPointerMode>(
-                            &library,
-                            SYM_CUBLAS_GET_POINTER_MODE_V2,
-                        )
-                    }
-                    .map(|_| ()),
+                    crate::ffi::resolve_cublas_get_pointer_mode_v2(&library).map(|_| ()),
                 ),
                 (
                     "cublasSetPointerMode_v2",
-                    unsafe {
-                        crate::ffi::symbol::<SetPointerMode>(
-                            &library,
-                            SYM_CUBLAS_SET_POINTER_MODE_V2,
-                        )
-                    }
-                    .map(|_| ()),
+                    crate::ffi::resolve_cublas_set_pointer_mode_v2(&library).map(|_| ()),
                 ),
             ] {
                 result.map_err(|e| CublasError::MissingSymbol {
@@ -628,21 +608,32 @@ impl Cublas {
                     detail: e.to_string(),
                 })?;
             }
-            let status = unsafe { create(&raw mut handle) };
+            let status = unsafe { crate::ffi::call_cublas_CreateHandle(*create, &raw mut handle) };
             if status != CUBLAS_SUCCESS {
                 return Err(CublasError::Status {
                     operation: "cublasCreate_v2",
                     code: status,
                 });
             }
-            configure_math_modes(&library, handle)?;
+            let configured_modes = if let Some(config) = &numerical_config {
+                Some(crate::ffi::configure_native_math_modes(
+                    &library,
+                    handle,
+                    config.math_mode(),
+                )?)
+            } else {
+                crate::ffi::configure_math_modes(&library, handle)?;
+                None
+            };
             return Ok(Self {
                 owner: Rc::new(CublasHandleOwner {
                     runtime: runtime.clone(),
                     library,
                     handle,
                     poisoned: Cell::new(false),
+                    sgemm,
                     dgemm: OnceCell::new(),
+                    numerical_config: numerical_config.zip(configured_modes),
                 }),
                 in_flight: Rc::new(Cell::new(0)),
                 queue_marker: Rc::new(()) as Rc<dyn Any>,
@@ -674,14 +665,16 @@ impl Cublas {
             .runtime
             .cuda_set_device(self.owner.runtime.0.ordinal)?;
         // SAFETY: cublasSetStream_v2 has the documented C ABI in cublas-auxiliary.h.
-        let set_stream = unsafe {
-            crate::ffi::symbol::<SetStream>(&self.owner.library, SYM_CUBLAS_SET_STREAM_V2)
-        }
-        .map_err(|error| CublasError::MissingSymbol {
-            symbol: "cublasSetStream_v2",
-            detail: error.to_string(),
-        })?;
-        let status = unsafe { set_stream(self.owner.handle, stream.inner.raw) };
+        let set_stream =
+            crate::ffi::resolve_cublas_set_stream_v2(&self.owner.library).map_err(|error| {
+                CublasError::MissingSymbol {
+                    symbol: "cublasSetStream_v2",
+                    detail: error.to_string(),
+                }
+            })?;
+        let status = unsafe {
+            crate::ffi::call_cublas_SetStream(*set_stream, self.owner.handle, stream.inner.raw)
+        };
         if status != CUBLAS_SUCCESS {
             return Err(CublasError::Status {
                 operation: "cublasSetStream_v2",
@@ -769,14 +762,9 @@ impl Cublas {
         self.owner
             .runtime
             .cuda_set_device(self.owner.runtime.0.ordinal)?;
-        // SAFETY: signature matches cublasSgemm_v2; runtime, dimensions, stream, and allocations
-        // have been checked before loading or invoking the C ABI.
-        let sgemm =
-            unsafe { crate::ffi::symbol::<Sgemm>(&self.owner.library, SYM_CUBLAS_SGEMM_V2) }
-                .map_err(|error| CublasError::MissingSymbol {
-                    symbol: "cublasSgemm_v2",
-                    detail: error.to_string(),
-                })?;
+        // The required typed symbol was resolved during cold handle creation. The owner keeps
+        // its exact library loaded until every external operation and completion has released it.
+        let sgemm = self.owner.sgemm;
 
         reserve_async_operation(&self.in_flight)?;
         let owner = Rc::new(CublasAsyncOperationOwner {
@@ -796,7 +784,8 @@ impl Cublas {
         // completion. cuBLAS may enqueue work even when it reports an error, so do not release
         // the owner or leases on that path.
         let status = unsafe {
-            sgemm(
+            crate::ffi::call_cublas_Sgemm(
+                sgemm,
                 self.owner.handle,
                 if transpose_a {
                     CUBLAS_OPERATION_TRANSPOSE
@@ -910,7 +899,8 @@ impl Cublas {
         // validated; the batch retains all three leases, the handle, and both scalar addresses
         // until terminal completion, including when cuBLAS reports a submission error.
         let status = unsafe {
-            dgemm(
+            crate::ffi::call_cublas_Dgemm(
+                dgemm,
                 self.owner.handle,
                 if transpose_a {
                     CUBLAS_OPERATION_TRANSPOSE
@@ -1106,7 +1096,8 @@ impl Cublas {
         // all buffers are leased and alpha/beta remain stable until the synchronous call and
         // terminal device wait have both returned.
         let status = unsafe {
-            dgemm(
+            crate::ffi::call_cublas_Dgemm(
+                dgemm,
                 self.owner.handle,
                 if transpose_a {
                     CUBLAS_OPERATION_TRANSPOSE
@@ -1131,12 +1122,7 @@ impl Cublas {
                 ldc,
             )
         };
-        let sync = self
-            .owner
-            .runtime
-            .call("cudaDeviceSynchronize", |f: DeviceSynchronize| unsafe {
-                f()
-            });
+        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
         if let Err(error) = sync {
             self.owner.poisoned.set(true);
             std::mem::forget(a_lease);
@@ -1221,19 +1207,25 @@ impl Cublas {
                 .cuda_set_device(self.owner.runtime.0.ordinal)?;
             // SAFETY: signature follows cublasSgemm_v2 in cublas.h; buffers are validated allocations
             // from this runtime/device and the scalar pointers remain live through the call.
-            let sgemm =
-                unsafe { crate::ffi::symbol::<Sgemm>(&self.owner.library, SYM_CUBLAS_SGEMM_V2) }
-                    .map_err(|e| CublasError::MissingSymbol {
-                        symbol: "cublasSgemm_v2",
-                        detail: e.to_string(),
-                    })?;
-            Ok((a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, *sgemm))
+            Ok((
+                a_lease,
+                b_lease,
+                c_lease,
+                m,
+                n,
+                k,
+                lda,
+                ldb,
+                ldc,
+                self.owner.sgemm,
+            ))
         })();
         timing.finish(SgemmPhase::Preflight, preflight_mark);
         let (a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, sgemm) = preflight?;
         let call_mark = timing.begin(SgemmPhase::CublasCall);
         let status = unsafe {
-            sgemm(
+            crate::ffi::call_cublas_Sgemm(
+                sgemm,
                 self.owner.handle,
                 if transpose_a {
                     CUBLAS_OPERATION_TRANSPOSE
@@ -1263,12 +1255,7 @@ impl Cublas {
         // synchronous and ensures all borrowed buffer owners remain valid until completion. Even a
         // cuBLAS error is followed by synchronization because the call may have partially queued.
         let sync_mark = timing.begin(SgemmPhase::DeviceSynchronize);
-        let sync = self
-            .owner
-            .runtime
-            .call("cudaDeviceSynchronize", |f: DeviceSynchronize| unsafe {
-                f()
-            });
+        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
         timing.finish(SgemmPhase::DeviceSynchronize, sync_mark);
         let cleanup_mark = timing.begin(SgemmPhase::Cleanup);
         if let Err(error) = sync {
@@ -1370,46 +1357,49 @@ impl Cublas {
             .cuda_set_device(self.owner.runtime.0.ordinal)?;
         // SAFETY: symbols match cuBLAS public declarations; live validated device allocations
         // remain leased until synchronization confirms completion.
-        let get_mode = unsafe {
-            crate::ffi::symbol::<GetPointerMode>(
-                &self.owner.library,
-                SYM_CUBLAS_GET_POINTER_MODE_V2,
-            )
-        }
-        .map_err(|e| CublasError::MissingSymbol {
-            symbol: "cublasGetPointerMode_v2",
-            detail: e.to_string(),
-        })?;
-        let set_mode = unsafe {
-            crate::ffi::symbol::<SetPointerMode>(
-                &self.owner.library,
-                SYM_CUBLAS_SET_POINTER_MODE_V2,
-            )
-        }
-        .map_err(|e| CublasError::MissingSymbol {
-            symbol: "cublasSetPointerMode_v2",
-            detail: e.to_string(),
-        })?;
-        let sdot = unsafe { crate::ffi::symbol::<Sdot>(&self.owner.library, SYM_CUBLAS_SDOT_V2) }
+        let get_mode = crate::ffi::resolve_cublas_get_pointer_mode_v2(&self.owner.library)
             .map_err(|e| CublasError::MissingSymbol {
-            symbol: "cublasSdot_v2",
-            detail: e.to_string(),
+                symbol: "cublasGetPointerMode_v2",
+                detail: e.to_string(),
+            })?;
+        let set_mode = crate::ffi::resolve_cublas_set_pointer_mode_v2(&self.owner.library)
+            .map_err(|e| CublasError::MissingSymbol {
+                symbol: "cublasSetPointerMode_v2",
+                detail: e.to_string(),
+            })?;
+        let sdot = crate::ffi::resolve_cublas_sdot_v2(&self.owner.library).map_err(|e| {
+            CublasError::MissingSymbol {
+                symbol: "cublasSdot_v2",
+                detail: e.to_string(),
+            }
         })?;
-        let sscal =
-            unsafe { crate::ffi::symbol::<Sscal>(&self.owner.library, SYM_CUBLAS_SSCAL_V2) }
-                .map_err(|e| CublasError::MissingSymbol {
-                    symbol: "cublasSscal_v2",
-                    detail: e.to_string(),
-                })?;
+        let sscal = crate::ffi::resolve_cublas_sscal_v2(&self.owner.library).map_err(|e| {
+            CublasError::MissingSymbol {
+                symbol: "cublasSscal_v2",
+                detail: e.to_string(),
+            }
+        })?;
         let mut prior_mode = CUBLAS_POINTER_MODE_HOST;
-        let get_status = unsafe { get_mode(self.owner.handle, &raw mut prior_mode) };
+        let get_status = unsafe {
+            crate::ffi::call_cublas_GetPointerMode(
+                *get_mode,
+                self.owner.handle,
+                &raw mut prior_mode,
+            )
+        };
         if get_status != CUBLAS_SUCCESS {
             return Err(CublasError::Status {
                 operation: "cublasGetPointerMode_v2",
                 code: get_status,
             });
         }
-        let set_status = unsafe { set_mode(self.owner.handle, CUBLAS_POINTER_MODE_DEVICE) };
+        let set_status = unsafe {
+            crate::ffi::call_cublas_SetPointerMode(
+                *set_mode,
+                self.owner.handle,
+                CUBLAS_POINTER_MODE_DEVICE,
+            )
+        };
         if set_status != CUBLAS_SUCCESS {
             return Err(CublasError::Status {
                 operation: "cublasSetPointerMode_v2",
@@ -1417,7 +1407,8 @@ impl Cublas {
             });
         }
         let dot_status = unsafe {
-            sdot(
+            crate::ffi::call_cublas_Sdot(
+                *sdot,
                 self.owner.handle,
                 n,
                 x.allocation.pointer.cast(),
@@ -1430,10 +1421,17 @@ impl Cublas {
         let scale_status = if dot_status == CUBLAS_SUCCESS {
             // cublasSscal_v2's alpha is a host scalar. Restore host mode for this call, then
             // restore the mode observed on entry after it has captured alpha.
-            let host_status = unsafe { set_mode(self.owner.handle, CUBLAS_POINTER_MODE_HOST) };
+            let host_status = unsafe {
+                crate::ffi::call_cublas_SetPointerMode(
+                    *set_mode,
+                    self.owner.handle,
+                    CUBLAS_POINTER_MODE_HOST,
+                )
+            };
             if host_status == CUBLAS_SUCCESS {
                 unsafe {
-                    sscal(
+                    crate::ffi::call_cublas_Sscal(
+                        *sscal,
                         self.owner.handle,
                         1,
                         std::ptr::from_ref(&scale),
@@ -1447,13 +1445,10 @@ impl Cublas {
         } else {
             CUBLAS_SUCCESS
         };
-        let restore_status = unsafe { set_mode(self.owner.handle, prior_mode) };
-        let sync = self
-            .owner
-            .runtime
-            .call("cudaDeviceSynchronize", |f: DeviceSynchronize| unsafe {
-                f()
-            });
+        let restore_status = unsafe {
+            crate::ffi::call_cublas_SetPointerMode(*set_mode, self.owner.handle, prior_mode)
+        };
+        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
         if let Err(error) = sync {
             self.owner.poisoned.set(true);
             std::mem::forget(x_lease);
@@ -1546,47 +1541,49 @@ impl Cublas {
             .cuda_set_device(self.owner.runtime.0.ordinal)?;
         // SAFETY: symbols match cuBLAS public declarations; leased allocations remain alive
         // until synchronization confirms the operation has completed.
-        let get_mode = unsafe {
-            crate::ffi::symbol::<GetPointerMode>(
-                &self.owner.library,
-                SYM_CUBLAS_GET_POINTER_MODE_V2,
-            )
-        }
-        .map_err(|e| CublasError::MissingSymbol {
-            symbol: "cublasGetPointerMode_v2",
-            detail: e.to_string(),
+        let get_mode = crate::ffi::resolve_cublas_get_pointer_mode_v2(&self.owner.library)
+            .map_err(|e| CublasError::MissingSymbol {
+                symbol: "cublasGetPointerMode_v2",
+                detail: e.to_string(),
+            })?;
+        let set_mode = crate::ffi::resolve_cublas_set_pointer_mode_v2(&self.owner.library)
+            .map_err(|e| CublasError::MissingSymbol {
+                symbol: "cublasSetPointerMode_v2",
+                detail: e.to_string(),
+            })?;
+        let sasum = crate::ffi::resolve_cublas_sasum_v2(&self.owner.library).map_err(|e| {
+            CublasError::MissingSymbol {
+                symbol: "cublasSasum_v2",
+                detail: e.to_string(),
+            }
         })?;
-        let set_mode = unsafe {
-            crate::ffi::symbol::<SetPointerMode>(
-                &self.owner.library,
-                SYM_CUBLAS_SET_POINTER_MODE_V2,
-            )
-        }
-        .map_err(|e| CublasError::MissingSymbol {
-            symbol: "cublasSetPointerMode_v2",
-            detail: e.to_string(),
+        let sscal = crate::ffi::resolve_cublas_sscal_v2(&self.owner.library).map_err(|e| {
+            CublasError::MissingSymbol {
+                symbol: "cublasSscal_v2",
+                detail: e.to_string(),
+            }
         })?;
-        let sasum =
-            unsafe { crate::ffi::symbol::<Sasum>(&self.owner.library, SYM_CUBLAS_SASUM_V2) }
-                .map_err(|e| CublasError::MissingSymbol {
-                    symbol: "cublasSasum_v2",
-                    detail: e.to_string(),
-                })?;
-        let sscal =
-            unsafe { crate::ffi::symbol::<Sscal>(&self.owner.library, SYM_CUBLAS_SSCAL_V2) }
-                .map_err(|e| CublasError::MissingSymbol {
-                    symbol: "cublasSscal_v2",
-                    detail: e.to_string(),
-                })?;
         let mut prior_mode = CUBLAS_POINTER_MODE_HOST;
-        let get_status = unsafe { get_mode(self.owner.handle, &raw mut prior_mode) };
+        let get_status = unsafe {
+            crate::ffi::call_cublas_GetPointerMode(
+                *get_mode,
+                self.owner.handle,
+                &raw mut prior_mode,
+            )
+        };
         if get_status != CUBLAS_SUCCESS {
             return Err(CublasError::Status {
                 operation: "cublasGetPointerMode_v2",
                 code: get_status,
             });
         }
-        let set_status = unsafe { set_mode(self.owner.handle, CUBLAS_POINTER_MODE_DEVICE) };
+        let set_status = unsafe {
+            crate::ffi::call_cublas_SetPointerMode(
+                *set_mode,
+                self.owner.handle,
+                CUBLAS_POINTER_MODE_DEVICE,
+            )
+        };
         if set_status != CUBLAS_SUCCESS {
             return Err(CublasError::Status {
                 operation: "cublasSetPointerMode_v2",
@@ -1594,7 +1591,8 @@ impl Cublas {
             });
         }
         let reduction_status = unsafe {
-            sasum(
+            crate::ffi::call_cublas_Sasum(
+                *sasum,
                 self.owner.handle,
                 n,
                 x.allocation.pointer.cast(),
@@ -1603,10 +1601,17 @@ impl Cublas {
             )
         };
         let scale_status = if reduction_status == CUBLAS_SUCCESS {
-            let host_status = unsafe { set_mode(self.owner.handle, CUBLAS_POINTER_MODE_HOST) };
+            let host_status = unsafe {
+                crate::ffi::call_cublas_SetPointerMode(
+                    *set_mode,
+                    self.owner.handle,
+                    CUBLAS_POINTER_MODE_HOST,
+                )
+            };
             if host_status == CUBLAS_SUCCESS {
                 unsafe {
-                    sscal(
+                    crate::ffi::call_cublas_Sscal(
+                        *sscal,
                         self.owner.handle,
                         1,
                         std::ptr::from_ref(&scale),
@@ -1620,13 +1625,10 @@ impl Cublas {
         } else {
             CUBLAS_SUCCESS
         };
-        let restore_status = unsafe { set_mode(self.owner.handle, prior_mode) };
-        let sync = self
-            .owner
-            .runtime
-            .call("cudaDeviceSynchronize", |f: DeviceSynchronize| unsafe {
-                f()
-            });
+        let restore_status = unsafe {
+            crate::ffi::call_cublas_SetPointerMode(*set_mode, self.owner.handle, prior_mode)
+        };
+        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
         if let Err(error) = sync {
             self.owner.poisoned.set(true);
             std::mem::forget(x_lease);
@@ -1671,10 +1673,8 @@ impl Drop for CublasHandleOwner {
             return;
         }
         // SAFETY: handle came from cublasCreate_v2 and library is retained until this drop.
-        if let Ok(destroy) =
-            unsafe { crate::ffi::symbol::<DestroyHandle>(&self.library, SYM_CUBLAS_DESTROY_V2) }
-        {
-            let _ = unsafe { destroy(self.handle) };
+        if let Ok(destroy) = crate::ffi::resolve_cublas_destroy_v2(&self.library) {
+            let _ = unsafe { crate::ffi::call_cublas_DestroyHandle(*destroy, self.handle) };
         }
     }
 }

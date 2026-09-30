@@ -104,10 +104,12 @@ pub(super) fn emit_helpers(source: &mut String, kernel: &fusion_pcu::PcuDispatch
     if has_f32 {
         source.push_str(CHECKED_F32_HELPERS);
         source.push_str(CHECKED_F32_RELU_HELPER);
+        source.push_str(CHECKED_F32_NEG_HELPER);
     }
     if has_f64 {
         source.push_str(f64::CHECKED_F64_HELPERS);
         source.push_str(CHECKED_F64_RELU_HELPER);
+        source.push_str(CHECKED_F64_NEG_HELPER);
     }
     if has_narrow {
         source.push_str(CHECKED_F64_TO_F32_HELPER);
@@ -153,12 +155,13 @@ pub(super) fn emit_checked_float_unary(
         ),
         _ => return Err(CudaLowerError::UnsupportedKernelInterface),
     };
-    match op {
-        PcuDispatchFloatUnaryOp::Relu => {}
-    }
+    let operation = match op {
+        PcuDispatchFloatUnaryOp::Relu => "relu",
+        PcuDispatchFloatUnaryOp::Neg => "neg",
+    };
     writeln!(
         source,
-        "{indent}const Fusion{upper}CheckedResult fusion_{prefix}_checked_{} = fusion_checked_{prefix}_relu(__builtin_bit_cast({bits_type}, v{}), {policy_tag}u);",
+        "{indent}const Fusion{upper}CheckedResult fusion_{prefix}_checked_{} = fusion_checked_{prefix}_{operation}(__builtin_bit_cast({bits_type}, v{}), {policy_tag}u);",
         result.0,
         value.0,
     )
@@ -445,8 +448,8 @@ __device__ __forceinline__ FusionF32CheckedResult fusion_checked_f32_binary(unsi
         unsigned int sign = xs ^ ys;
         if ((y << 1) == 0u) return {0u, 1u};
         if ((x << 1) == 0u) return {sign << 31, 0u};
-        int a_shift = __builtin_clz(xm) - 8;
-        int b_shift = __builtin_clz(ym) - 8;
+        int a_shift = __clz(xm) - 8;
+        int b_shift = __clz(ym) - 8;
         xm <<= a_shift; xexp -= a_shift;
         ym <<= b_shift; yexp -= b_shift;
         unsigned long long numerator = xm;
@@ -510,7 +513,7 @@ __device__ __forceinline__ FusionF64ToF32Result fusion_checked_f64_to_f32(unsign
     int exponent;
     if (exponent_field == 0u) { significand = fraction; exponent = -1022; }
     else { significand = fraction | (1ull << 52u); exponent = static_cast<int>(exponent_field) - 1023; }
-    int top = 63 - __builtin_clzll(significand);
+    int top = 63 - __clzll(significand);
     int unbiased = exponent - 52 + top;
     unsigned int precision_shift = top > 23 ? static_cast<unsigned int>(top - 23) : 0u;
     bool precision_inexact = false;
@@ -561,7 +564,7 @@ __device__ __forceinline__ FusionF32ToF64Result fusion_checked_f32_to_f64(unsign
         exponent64 = exponent_field + 896u;
         fraction64 = static_cast<unsigned long long>(fraction) << 29u;
     } else {
-        int top = 31 - __builtin_clz(fraction);
+        int top = 31 - __clz(fraction);
         exponent64 = static_cast<unsigned int>(top + 874);
         unsigned long long normalized = static_cast<unsigned long long>(fraction) << static_cast<unsigned int>(52 - top);
         fraction64 = normalized & 0x000fffffffffffffull;
@@ -589,5 +592,26 @@ __device__ __forceinline__ FusionF64CheckedResult fusion_checked_f64_relu(unsign
         return {bits, 0u};
     }
     return {0ull, 0u};
+}
+";
+
+// Negation changes only the sign encoding. Finite results are exact, including signed zero
+// and subnormals; only the explicit reject-subnormal policy introduces a range fault here.
+// The fault retains the negated encoding so explicit clamp can publish the complete result.
+const CHECKED_F32_NEG_HELPER: &str = r"
+__device__ __forceinline__ FusionF32CheckedResult fusion_checked_f32_neg(unsigned int bits, unsigned int policy) {
+    if ((bits & 0x7f800000u) == 0x7f800000u) return {bits, 5u};
+    unsigned int result = bits ^ 0x80000000u;
+    if ((bits & 0x7f800000u) == 0u && (bits & 0x007fffffu) != 0u && policy == 1u) return {result, 4u};
+    return {result, 0u};
+}
+";
+
+const CHECKED_F64_NEG_HELPER: &str = r"
+__device__ __forceinline__ FusionF64CheckedResult fusion_checked_f64_neg(unsigned long long bits, unsigned int policy) {
+    if ((bits & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) return {bits, 5u};
+    unsigned long long result = bits ^ 0x8000000000000000ull;
+    if ((bits & 0x7ff0000000000000ull) == 0ull && (bits & 0x000fffffffffffffull) != 0ull && policy == 1u) return {result, 4u};
+    return {result, 0u};
 }
 ";

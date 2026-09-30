@@ -53,6 +53,20 @@ pub trait PcuCheckedFloat: PcuScalar + sealed::Sealed + Sized + Copy {
     /// # Errors
     /// Returns invalid operand, divide by zero, overflow, or policy-rejected underflow.
     fn pcu_checked_div(self, rhs: Self) -> Result<Self, PcuExecutionFaultKind>;
+    /// Inverts the sign bit of a finite value, preserving exact subnormals and signed zero.
+    ///
+    /// # Errors
+    /// Returns invalid operand or policy-rejected subnormal output.
+    fn pcu_checked_neg(self) -> Result<Self, PcuExecutionFaultKind>;
+    /// Exact finite-input sign inversion with the selected underflow policy.
+    ///
+    /// # Errors
+    /// Returns invalid operand or policy-rejected subnormal output.
+    fn pcu_checked_neg_with_policy(
+        self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuExecutionFaultKind>;
+
     /// Applies PCU `ReLU` selection to a finite value, canonicalizing nonpositive values to +0.
     ///
     /// This is a PCU selection contract, not an IEEE 754 arithmetic operation: NaNs and
@@ -136,6 +150,20 @@ pub trait PcuClampedFloat: PcuCheckedFloat + sealed::Sealed {
     /// # Errors
     /// Returns a fatal operand/division error or a range fault with its clamped value.
     fn pcu_clamped_div(self, rhs: Self) -> Result<Self, PcuClampedError<Self>>;
+    /// Inverts a finite value's sign, retaining policy-rejected exact subnormals as range faults.
+    ///
+    /// # Errors
+    /// Returns a fatal invalid operand or an observable subnormal range fault.
+    fn pcu_clamped_neg(self) -> Result<Self, PcuClampedError<Self>>;
+    /// Exact finite-input sign inversion with the selected underflow policy.
+    ///
+    /// # Errors
+    /// Returns invalid operand or policy-rejected subnormal output.
+    fn pcu_clamped_neg_with_policy(
+        self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuClampedError<Self>>;
+
     /// Applies PCU `ReLU` selection, retaining a policy-rejected subnormal result as a range fault.
     ///
     /// # Errors
@@ -185,6 +213,40 @@ pub trait PcuClampedFloat: PcuCheckedFloat + sealed::Sealed {
         self,
         policy: PcuFloatUnderflowPolicy,
     ) -> Result<Self, PcuClampedError<Self>>;
+}
+
+fn neg_f32<const CLAMP: bool>(
+    value: f32,
+    policy: PcuFloatUnderflowPolicy,
+) -> Result<f32, PcuClampedError<f32>> {
+    let bits = value.to_bits();
+    if bits & 0x7f80_0000 == 0x7f80_0000 {
+        return Err(PcuClampedError::Fatal(
+            PcuExecutionFaultKind::InvalidFloatingOperand,
+        ));
+    }
+    let result_bits = bits ^ 0x8000_0000;
+    let subnormal = result_bits & !0x8000_0000 != 0 && result_bits & 0x7f80_0000 == 0;
+    let class = PcuFloatUnderflowClassification {
+        is_tiny_after_rounding: subnormal,
+        is_inexact: false,
+        result_is_subnormal: subnormal,
+    };
+    let result = f32::from_bits(result_bits);
+    if policy.rejects(class) {
+        if CLAMP {
+            Err(PcuClampedError::Range(PcuClampedFault::new(
+                PcuExecutionFaultKind::ArithmeticUnderflow,
+                result,
+            )))
+        } else {
+            Err(PcuClampedError::Fatal(
+                PcuExecutionFaultKind::ArithmeticUnderflow,
+            ))
+        }
+    } else {
+        Ok(result)
+    }
 }
 
 fn relu_f32<const CLAMP: bool>(
@@ -549,6 +611,16 @@ fn divide<const CLAMP: bool>(
 }
 
 impl PcuCheckedFloat for f32 {
+    fn pcu_checked_neg(self) -> Result<Self, PcuExecutionFaultKind> {
+        self.pcu_checked_neg_with_policy(PcuFloatUnderflowPolicy::default())
+    }
+    fn pcu_checked_neg_with_policy(
+        self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuExecutionFaultKind> {
+        neg_f32::<false>(self, policy).map_err(|fault| fault.kind())
+    }
+
     fn pcu_checked_relu(self) -> Result<Self, PcuExecutionFaultKind> {
         self.pcu_checked_relu_with_policy(PcuFloatUnderflowPolicy::default())
     }
@@ -601,6 +673,16 @@ impl PcuCheckedFloat for f32 {
 }
 
 impl PcuClampedFloat for f32 {
+    fn pcu_clamped_neg(self) -> Result<Self, PcuClampedError<Self>> {
+        self.pcu_clamped_neg_with_policy(PcuFloatUnderflowPolicy::default())
+    }
+    fn pcu_clamped_neg_with_policy(
+        self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuClampedError<Self>> {
+        neg_f32::<true>(self, policy)
+    }
+
     fn pcu_clamped_relu(self) -> Result<Self, PcuClampedError<Self>> {
         self.pcu_clamped_relu_with_policy(PcuFloatUnderflowPolicy::default())
     }
@@ -665,3 +747,7 @@ mod clamped_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "scalar_checked_float/neg_tests.rs"]
+mod neg_tests;

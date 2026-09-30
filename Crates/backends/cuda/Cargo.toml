@@ -18,8 +18,9 @@ path = "cuda.rs"
 
 [features]
 default = []
+allocation-census = []
 insights = ["fusion-pcu-core/insights"]
-tensor = ["fusion-pcu-core/tensor"]
+tensor = ["fusion-pcu-core/tensor", "pcu-facade/tensor"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
@@ -31,6 +32,7 @@ workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+pcu-facade = { workspace = true, features = ["cuda"] }
 
 [[bench]]
 name = "checked_dispatch"
@@ -39,3 +41,49 @@ harness = false
 [[bench]]
 name = "pinned_transfer"
 harness = false
+
+[[bench]]
+name = "source_facade"
+path = "benches/source_facade/source_facade.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "strict_matmul"
+path = "benches/strict_matmul/strict_matmul.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_neg"
+path = "benches/checked_neg/checked_neg.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "native_matmul"
+path = "benches/native_matmul/native_matmul.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "native_mse"
+path = "benches/native_mse/native_mse.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "native_sgd"
+path = "benches/native_sgd/native_sgd.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "allocation_census"
+path = "tests/allocation_census/allocation_census.rs"
+required-features = ["allocation-census"]
+
+[[test]]
+name = "native_sgd_source"
+path = "tests/native_sgd_source/native_sgd_source.rs"
+required-features = ["tensor"]

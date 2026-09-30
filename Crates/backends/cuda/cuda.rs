@@ -6,6 +6,15 @@
 
 extern crate fusion_pcu_core as fusion_pcu;
 #[rustfmt::skip]
+use crate::ffi::{
+    query_pci_bus_id,
+    driver_architecture,
+    enumerate_driver_devices,
+    raw_cuda_error,
+    raw_driver_error,
+};
+
+#[rustfmt::skip]
 use std::{
     any::Any,
     cell::{
@@ -24,22 +33,10 @@ use std::{
 };
 
 use crate::ffi::Library;
+use smallvec::SmallVec;
 #[rustfmt::skip]
 use crate::ffi::{
     driver::{
-        DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        DriverDeviceGetAttribute,
-        DriverDeviceGetName,
-        DriverDeviceGetPciBusId,
-        DriverDeviceTotalMem,
-        DriverGetDevice,
-        DriverGetErrorString,
-        DriverInit,
-        DriverModuleGetFunction,
-        DriverModuleLaunchKernel,
-        DriverModuleLoadData,
-        DriverModuleUnload,
         KernelHandle,
         ModuleHandle,
     },
@@ -52,27 +49,7 @@ use crate::ffi::{
         CUDA_SUCCESS,
         CudaDevice,
         CudaEvent,
-        CudaResult,
         CudaStream,
-        DeviceSynchronize,
-        EventCreate,
-        EventDestroy,
-        EventElapsedTime,
-        EventRecord,
-        EventSynchronize,
-        Free,
-        GetDeviceCount,
-        GetErrorString,
-        Malloc,
-        MemGetInfo,
-        Memcpy,
-        MemcpyAsync,
-        RuntimeFree,
-        SetDevice,
-        StreamCreate,
-        StreamDestroy,
-        StreamSynchronize,
-        StreamWaitEvent,
     },
 };
 #[rustfmt::skip]
@@ -85,6 +62,8 @@ use fusion_pcu::{
 #[path = "admission/admission.rs"]
 mod admission;
 mod blas;
+#[path = "blas_policy/blas_policy.rs"]
+mod blas_policy;
 #[path = "codegen/codegen.rs"]
 mod codegen;
 #[path = "control/control.rs"]
@@ -114,6 +93,12 @@ pub use blas::{
     Cublas,
     CublasError,
     CublasSgemmHostTiming,
+};
+#[rustfmt::skip]
+pub use blas_policy::{
+    CublasConfiguredModes,
+    CublasEnvironmentSnapshot,
+    CublasNumericalConfig,
 };
 #[rustfmt::skip]
 pub use codegen::compiler::{
@@ -274,18 +259,17 @@ impl CudaRuntime {
                     continue;
                 }
             };
-            let get_count = unsafe {
-                crate::ffi::symbol::<GetDeviceCount>(
-                    &library,
-                    crate::ffi::runtime::runtime_symbol("cudaGetDeviceCount").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cudaGetDeviceCount",
-                detail: error.to_string(),
-            })?;
+            let get_count =
+                crate::ffi::resolve_cuda_get_device_count(&library).map_err(|error| {
+                    CudaError::MissingSymbol {
+                        symbol: "cudaGetDeviceCount",
+                        detail: error.to_string(),
+                    }
+                })?;
             let mut count = 0;
-            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
+            let status = unsafe {
+                crate::ffi::call_runtime_GetDeviceCount(*get_count, ptr::from_mut(&mut count))
+            };
             if status != CUDA_SUCCESS {
                 return Err(raw_cuda_error(&library, "cudaGetDeviceCount", status));
             }
@@ -326,18 +310,17 @@ impl CudaRuntime {
                     continue;
                 }
             };
-            let get_count = unsafe {
-                crate::ffi::symbol::<GetDeviceCount>(
-                    &library,
-                    crate::ffi::runtime::runtime_symbol("cudaGetDeviceCount").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cudaGetDeviceCount",
-                detail: error.to_string(),
-            })?;
+            let get_count =
+                crate::ffi::resolve_cuda_get_device_count(&library).map_err(|error| {
+                    CudaError::MissingSymbol {
+                        symbol: "cudaGetDeviceCount",
+                        detail: error.to_string(),
+                    }
+                })?;
             let mut count = 0;
-            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
+            let status = unsafe {
+                crate::ffi::call_runtime_GetDeviceCount(*get_count, ptr::from_mut(&mut count))
+            };
             if status != CUDA_SUCCESS {
                 return Err(raw_cuda_error(&library, "cudaGetDeviceCount", status));
             }
@@ -345,50 +328,34 @@ impl CudaRuntime {
                 std::env::var_os("CUDA_DRIVER_LIBRARY").unwrap_or_else(|| "libcuda.so.1".into());
             let driver =
                 ffi::load_library(&driver_candidate).map_err(CudaError::RuntimeUnavailable)?;
-            let cu_init = unsafe {
-                crate::ffi::symbol::<DriverInit>(
-                    &driver,
-                    crate::ffi::driver::driver_symbol("cuInit").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cuInit",
-                detail: error.to_string(),
-            })?;
-            let status = unsafe { cu_init(0) };
+            let cu_init =
+                crate::ffi::resolve_cu_init(&driver).map_err(|error| CudaError::MissingSymbol {
+                    symbol: "cuInit",
+                    detail: error.to_string(),
+                })?;
+            let status = unsafe { crate::ffi::call_driver_DriverInit(*cu_init, 0) };
             if status != CUDA_SUCCESS {
                 return Err(raw_driver_error(&driver, "cuInit", status));
             }
-            let get_device = unsafe {
-                crate::ffi::symbol::<DriverGetDevice>(
-                    &driver,
-                    crate::ffi::driver::driver_symbol("cuDeviceGet").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cuDeviceGet",
-                detail: error.to_string(),
+            let get_device = crate::ffi::resolve_cu_device_get(&driver).map_err(|error| {
+                CudaError::MissingSymbol {
+                    symbol: "cuDeviceGet",
+                    detail: error.to_string(),
+                }
             })?;
-            let get_name = unsafe {
-                crate::ffi::symbol::<DriverDeviceGetName>(
-                    &driver,
-                    crate::ffi::driver::driver_symbol("cuDeviceGetName").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cuDeviceGetName",
-                detail: error.to_string(),
+            let get_name = crate::ffi::resolve_cu_device_get_name(&driver).map_err(|error| {
+                CudaError::MissingSymbol {
+                    symbol: "cuDeviceGetName",
+                    detail: error.to_string(),
+                }
             })?;
-            let total_mem = unsafe {
-                crate::ffi::symbol::<DriverDeviceTotalMem>(
-                    &driver,
-                    crate::ffi::driver::driver_symbol("cuDeviceTotalMem_v2").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cuDeviceTotalMem_v2",
-                detail: error.to_string(),
-            })?;
+            let total_mem =
+                crate::ffi::resolve_cu_device_total_mem_v2(&driver).map_err(|error| {
+                    CudaError::MissingSymbol {
+                        symbol: "cuDeviceTotalMem_v2",
+                        detail: error.to_string(),
+                    }
+                })?;
             return enumerate_driver_devices(&driver, count, &get_device, &get_name, &total_mem);
         }
         Err(CudaError::RuntimeUnavailable(
@@ -424,18 +391,17 @@ impl CudaRuntime {
             };
             // Query availability before selecting a device. cudaSetDevice(0) can fail when no GPU
             // is visible, hiding the useful zero-device result.
-            let get_count = unsafe {
-                crate::ffi::symbol::<GetDeviceCount>(
-                    &library,
-                    crate::ffi::runtime::runtime_symbol("cudaGetDeviceCount").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cudaGetDeviceCount",
-                detail: error.to_string(),
-            })?;
+            let get_count =
+                crate::ffi::resolve_cuda_get_device_count(&library).map_err(|error| {
+                    CudaError::MissingSymbol {
+                        symbol: "cudaGetDeviceCount",
+                        detail: error.to_string(),
+                    }
+                })?;
             let mut count: c_int = 0;
-            let status = unsafe { get_count(ptr::from_mut(&mut count)) };
+            let status = unsafe {
+                crate::ffi::call_runtime_GetDeviceCount(*get_count, ptr::from_mut(&mut count))
+            };
             let driver_candidate =
                 std::env::var_os("CUDA_DRIVER_LIBRARY").unwrap_or_else(|| "libcuda.so.1".into());
             let driver =
@@ -457,17 +423,13 @@ impl CudaRuntime {
                     count,
                 });
             }
-            let init = unsafe {
-                crate::ffi::symbol::<DriverInit>(
-                    &runtime.0.driver,
-                    crate::ffi::driver::driver_symbol("cuInit").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cuInit",
-                detail: error.to_string(),
+            let init = crate::ffi::resolve_cu_init(&runtime.0.driver).map_err(|error| {
+                CudaError::MissingSymbol {
+                    symbol: "cuInit",
+                    detail: error.to_string(),
+                }
             })?;
-            let status = unsafe { init(0) };
+            let status = unsafe { crate::ffi::call_driver_DriverInit(*init, 0) };
             if status != CUDA_SUCCESS {
                 return Err(raw_driver_error(&runtime.0.driver, "cuInit", status));
             }
@@ -479,11 +441,9 @@ impl CudaRuntime {
             runtime.cuda_set_device(ordinal)?;
             // cudaSetDevice establishes the device's primary context; cudaFree(NULL) forces
             // initialization before any driver API module operation uses that context.
-            runtime.call("cudaFree", |f: RuntimeFree| unsafe { f(ptr::null_mut()) })?;
+            unsafe { crate::ffi::invoke_cudaFree(&runtime, ptr::null_mut()) }?;
             let mut device = 0;
-            runtime.driver_call("cuDeviceGet", |f: DriverGetDevice| unsafe {
-                f(&raw mut device, ordinal)
-            })?;
+            unsafe { crate::ffi::invoke_cuDeviceGet(&runtime, &raw mut device, ordinal) }?;
             let name = runtime.device_name(device)?;
             return Ok(Self(Arc::new(RuntimeInner {
                 library: runtime.0.library.clone(),
@@ -505,9 +465,7 @@ impl CudaRuntime {
     /// Returns an error when CUDA cannot query the visible device count.
     pub fn device_count(&self) -> Result<u32, CudaError> {
         let mut count = 0;
-        self.call("cudaGetDeviceCount", |f: GetDeviceCount| unsafe {
-            f(&raw mut count)
-        })?;
+        unsafe { crate::ffi::invoke_cudaGetDeviceCount(self, &raw mut count) }?;
         Ok(count.max(0).unsigned_abs())
     }
 
@@ -518,9 +476,7 @@ impl CudaRuntime {
     /// Returns an error when CUDA cannot query device memory information.
     pub fn device_info(&self) -> Result<CudaDeviceInfo, CudaError> {
         let mut total = 0_usize;
-        self.driver_call("cuDeviceTotalMem_v2", |f: DriverDeviceTotalMem| unsafe {
-            f(&raw mut total, self.0.device)
-        })?;
+        unsafe { crate::ffi::invoke_cuDeviceTotalMem_v2(self, &raw mut total, self.0.device) }?;
         let pci_bus_id = query_pci_bus_id(&self.0.driver, self.0.device);
         Ok(CudaDeviceInfo {
             index: self.0.ordinal,
@@ -544,9 +500,7 @@ impl CudaRuntime {
     pub fn memory_info(&self) -> Result<CudaMemoryInfo, CudaError> {
         let mut free = 0_usize;
         let mut total = 0_usize;
-        self.call("cudaMemGetInfo", |f: MemGetInfo| unsafe {
-            f(&raw mut free, &raw mut total)
-        })?;
+        unsafe { crate::ffi::invoke_cudaMemGetInfo(self, &raw mut free, &raw mut total) }?;
         Ok(CudaMemoryInfo {
             free_bytes: free as u64,
             total_bytes: total as u64,
@@ -584,9 +538,7 @@ impl CudaRuntime {
     /// Returns the CUDA allocation error if the device cannot allocate the requested size.
     pub fn allocate(&self, bytes: usize) -> Result<DeviceBuffer, CudaError> {
         let mut pointer = ptr::null_mut();
-        self.call("cudaMalloc", |f: Malloc| unsafe {
-            f(&raw mut pointer, bytes)
-        })?;
+        unsafe { crate::ffi::invoke_cudaMalloc(self, &raw mut pointer, bytes) }?;
         Ok(DeviceBuffer {
             allocation: Rc::new(DeviceAllocation {
                 runtime: self.clone(),
@@ -613,9 +565,9 @@ impl CudaRuntime {
         let mut terminated = image.to_vec();
         terminated.push(0);
         let mut raw = ptr::null_mut();
-        self.driver_call("cuModuleLoadData", |f: DriverModuleLoadData| unsafe {
-            f(&raw mut raw, terminated.as_ptr().cast())
-        })?;
+        unsafe {
+            crate::ffi::invoke_cuModuleLoadData(self, &raw mut raw, terminated.as_ptr().cast())
+        }?;
         Ok(CudaModule {
             inner: Rc::new(ModuleInner {
                 runtime: self.clone(),
@@ -634,9 +586,7 @@ impl CudaRuntime {
     /// Returns an error when CUDA cannot create the stream.
     pub fn create_stream(&self) -> Result<CudaStreamHandle, CudaError> {
         let mut stream = ptr::null_mut();
-        self.call("cudaStreamCreate", |f: StreamCreate| unsafe {
-            f(&raw mut stream)
-        })?;
+        unsafe { crate::ffi::invoke_cudaStreamCreate(self, &raw mut stream) }?;
         Ok(CudaStreamHandle {
             inner: Rc::new(StreamInner {
                 runtime: self.clone(),
@@ -654,9 +604,13 @@ impl CudaRuntime {
     /// Returns an error when CUDA cannot create the event.
     pub fn create_event(&self) -> Result<CudaEventHandle, CudaError> {
         let mut event = ptr::null_mut();
-        self.call("cudaEventCreateWithFlags", |f: EventCreate| unsafe {
-            f(&raw mut event, CUDA_EVENT_DISABLE_TIMING)
-        })?;
+        unsafe {
+            crate::ffi::invoke_cudaEventCreateWithFlags(
+                self,
+                &raw mut event,
+                CUDA_EVENT_DISABLE_TIMING,
+            )
+        }?;
         Ok(CudaEventHandle {
             inner: Rc::new(EventInner {
                 runtime: self.clone(),
@@ -675,9 +629,9 @@ impl CudaRuntime {
     /// Returns an error when CUDA cannot create the event.
     pub fn create_timing_event(&self) -> Result<CudaTimingEventHandle, CudaError> {
         let mut event = ptr::null_mut();
-        self.call("cudaEventCreateWithFlags", |f: EventCreate| unsafe {
-            f(&raw mut event, CUDA_EVENT_DEFAULT)
-        })?;
+        unsafe {
+            crate::ffi::invoke_cudaEventCreateWithFlags(self, &raw mut event, CUDA_EVENT_DEFAULT)
+        }?;
         Ok(CudaTimingEventHandle {
             inner: Rc::new(EventInner {
                 runtime: self.clone(),
@@ -705,141 +659,32 @@ impl CudaRuntime {
         start.synchronize()?;
         end.synchronize()?;
         let mut milliseconds = 0.0_f32;
-        self.call("cudaEventElapsedTime", |f: EventElapsedTime| unsafe {
-            f(&raw mut milliseconds, start.inner.raw, end.inner.raw)
-        })?;
+        unsafe {
+            crate::ffi::invoke_cudaEventElapsedTime(
+                self,
+                &raw mut milliseconds,
+                start.inner.raw,
+                end.inner.raw,
+            )
+        }?;
         Ok(milliseconds)
     }
 
     fn device_name(&self, device: CudaDevice) -> Result<String, CudaError> {
         let mut name = [0_i8; 256];
-        self.driver_call("cuDeviceGetName", |f: DriverDeviceGetName| unsafe {
-            f(
+        unsafe {
+            crate::ffi::invoke_cuDeviceGetName(
+                self,
                 name.as_mut_ptr(),
                 c_int::try_from(name.len()).expect("fixed name buffer fits c_int"),
                 device,
             )
-        })?;
+        }?;
         Ok(bounded_device_name(&name))
     }
 
     fn cuda_set_device(&self, device: CudaDevice) -> Result<(), CudaError> {
-        self.call("cudaSetDevice", |f: SetDevice| unsafe { f(device) })
-    }
-
-    fn driver_call<T: Copy>(
-        &self,
-        symbol: &'static str,
-        invoke: impl FnOnce(T) -> CudaResult,
-    ) -> Result<(), CudaError> {
-        self.cuda_set_device(self.0.ordinal)?;
-        let symbol_bytes =
-            crate::ffi::driver::driver_symbol(symbol).ok_or_else(|| CudaError::MissingSymbol {
-                symbol,
-                detail: "symbol is not declared in the CUDA driver ABI table".into(),
-            })?;
-        // SAFETY: this symbol is resolved from retained libcuda and T matches its C ABI.
-        let function =
-            unsafe { crate::ffi::symbol::<T>(&self.0.driver, symbol_bytes) }.map_err(|error| {
-                CudaError::MissingSymbol {
-                    symbol,
-                    detail: error.to_string(),
-                }
-            })?;
-        let status = invoke(*function);
-        if status == CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(self.driver_error(symbol, status))
-        }
-    }
-
-    fn driver_error(&self, operation: &'static str, code: CudaResult) -> CudaError {
-        let mut message = ptr::null();
-        let detail = unsafe {
-            crate::ffi::symbol::<DriverGetErrorString>(
-                &self.0.driver,
-                crate::ffi::driver::driver_symbol("cuGetErrorString").unwrap_or(&[]),
-            )
-        }
-        .ok()
-        .filter(|f| unsafe { f(code, &raw mut message) } == CUDA_SUCCESS)
-        .and_then(|_| {
-            (!message.is_null()).then(|| {
-                unsafe { CStr::from_ptr(message) }
-                    .to_string_lossy()
-                    .into_owned()
-            })
-        });
-        CudaError::Runtime {
-            operation,
-            code,
-            detail,
-        }
-    }
-
-    fn call<T: Copy>(
-        &self,
-        symbol: &'static str,
-        invoke: impl FnOnce(T) -> CudaResult,
-    ) -> Result<(), CudaError> {
-        if symbol != "cudaSetDevice" {
-            // CUDA's current device is thread-local, so select this runtime's device before each
-            // operation. This keeps cloned handles valid when used from another host thread.
-            let setter = unsafe {
-                crate::ffi::symbol::<SetDevice>(
-                    &self.0.library,
-                    crate::ffi::runtime::runtime_symbol("cudaSetDevice").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cudaSetDevice",
-                detail: error.to_string(),
-            })?;
-            let status = unsafe { setter(self.0.ordinal) };
-            if status != CUDA_SUCCESS {
-                return Err(self.error("cudaSetDevice", status));
-            }
-        }
-        let symbol_bytes = crate::ffi::runtime::runtime_symbol(symbol).ok_or_else(|| {
-            CudaError::MissingSymbol {
-                symbol,
-                detail: "symbol is not declared in the CUDA runtime ABI table".into(),
-            }
-        })?;
-        // SAFETY: `symbol` is selected from the runtime ABI table and T matches its C ABI.
-        let function =
-            unsafe { crate::ffi::symbol::<T>(&self.0.library, symbol_bytes) }.map_err(|error| {
-                CudaError::MissingSymbol {
-                    symbol,
-                    detail: error.to_string(),
-                }
-            })?;
-        let status = invoke(*function);
-        if status == CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(self.error(symbol, status))
-        }
-    }
-
-    fn error(&self, operation: &'static str, code: CudaResult) -> CudaError {
-        // Error-string lookup is optional; preserve numeric status even if the symbol is absent.
-        let detail = unsafe {
-            crate::ffi::symbol::<GetErrorString>(
-                &self.0.library,
-                crate::ffi::runtime::runtime_symbol("cudaGetErrorString").unwrap_or(&[]),
-            )
-        }
-        .ok()
-        .map(|f| unsafe { f(code) })
-        .filter(|p| !p.is_null())
-        .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
-        CudaError::Runtime {
-            operation,
-            code,
-            detail,
-        }
+        crate::ffi::invoke_cudaSetDevice(self, device)
     }
 
     fn ensure_same_runtime(&self, other: &Self) -> Result<(), CudaError> {
@@ -872,98 +717,6 @@ pub struct CudaDeviceInfo {
     pub total_memory: u64,
 }
 
-/// Query PCI location through CUDA's standalone C API, which avoids `cudaDeviceProp_t` ABI layout.
-/// Older runtimes may not export this symbol; discovery remains useful without the location.
-fn query_pci_bus_id(library: &Library, ordinal: c_int) -> Option<String> {
-    let function = unsafe {
-        crate::ffi::symbol::<DriverDeviceGetPciBusId>(
-            library,
-            crate::ffi::driver::driver_symbol("cuDeviceGetPCIBusId").unwrap_or(&[]),
-        )
-    }
-    .ok()?;
-    let mut buffer = [0_i8; 64];
-    let capacity = c_int::try_from(buffer.len()).expect("fixed PCI bus buffer fits c_int");
-    let status = unsafe { function(buffer.as_mut_ptr(), capacity, ordinal) };
-    if status != CUDA_SUCCESS {
-        return None;
-    }
-    let value = bounded_device_name(&buffer);
-    (!value.is_empty()).then_some(value)
-}
-
-fn driver_architecture(library: &Library, device: CudaDevice) -> Option<String> {
-    let get_attribute = unsafe {
-        crate::ffi::symbol::<DriverDeviceGetAttribute>(
-            library,
-            crate::ffi::driver::driver_symbol("cuDeviceGetAttribute").unwrap_or(&[]),
-        )
-    }
-    .ok()?;
-    let mut major = 0;
-    let mut minor = 0;
-    if unsafe {
-        get_attribute(
-            &raw mut major,
-            DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-            device,
-        )
-    } != CUDA_SUCCESS
-        || unsafe {
-            get_attribute(
-                &raw mut minor,
-                DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                device,
-            )
-        } != CUDA_SUCCESS
-        || major <= 0
-        || minor < 0
-    {
-        return None;
-    }
-    Some(format!("sm_{major}{minor}"))
-}
-
-fn enumerate_driver_devices(
-    driver: &Library,
-    count: c_int,
-    get_device: &DriverGetDevice,
-    get_name: &DriverDeviceGetName,
-    total_mem: &DriverDeviceTotalMem,
-) -> Result<Vec<CudaDeviceInfo>, CudaError> {
-    let mut devices = Vec::new();
-    for index in 0..count.max(0) {
-        let mut device = 0;
-        let status = unsafe { get_device(ptr::from_mut(&mut device), index) };
-        if status != CUDA_SUCCESS {
-            return Err(raw_driver_error(driver, "cuDeviceGet", status));
-        }
-        let mut name = [0_i8; 256];
-        let status = unsafe { get_name(name.as_mut_ptr(), 256, device) };
-        if status != CUDA_SUCCESS {
-            return Err(raw_driver_error(driver, "cuDeviceGetName", status));
-        }
-        let name = bounded_device_name(&name);
-        let mut total = 0_usize;
-        let status = unsafe { total_mem(&raw mut total, device) };
-        if status != CUDA_SUCCESS {
-            return Err(raw_driver_error(driver, "cuDeviceTotalMem_v2", status));
-        }
-        let pci_bus_id = query_pci_bus_id(driver, device);
-        let architecture = driver_architecture(driver, device);
-        devices.push(CudaDeviceInfo {
-            index,
-            name,
-            vendor: "NVIDIA".into(),
-            architecture,
-            generation: None,
-            pci_bus_id,
-            total_memory: total as u64,
-        });
-    }
-    Ok(devices)
-}
-
 fn bounded_device_name(buffer: &[c_char]) -> String {
     let bytes: Vec<u8> = buffer
         .iter()
@@ -971,52 +724,6 @@ fn bounded_device_name(buffer: &[c_char]) -> String {
         .map(|&byte| byte.to_ne_bytes()[0])
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn raw_cuda_error(library: &Library, operation: &'static str, code: CudaResult) -> CudaError {
-    let detail = unsafe {
-        crate::ffi::symbol::<GetErrorString>(
-            library,
-            crate::ffi::runtime::runtime_symbol("cudaGetErrorString").unwrap_or(&[]),
-        )
-    }
-    .ok()
-    .map(|function| unsafe { function(code) })
-    .filter(|pointer| !pointer.is_null())
-    .map(|pointer| {
-        unsafe { CStr::from_ptr(pointer) }
-            .to_string_lossy()
-            .into_owned()
-    });
-    CudaError::Runtime {
-        operation,
-        code,
-        detail,
-    }
-}
-
-fn raw_driver_error(library: &Library, operation: &'static str, code: CudaResult) -> CudaError {
-    let mut message = ptr::null();
-    let detail = unsafe {
-        crate::ffi::symbol::<DriverGetErrorString>(
-            library,
-            crate::ffi::driver::driver_symbol("cuGetErrorString").unwrap_or(&[]),
-        )
-    }
-    .ok()
-    .filter(|function| unsafe { function(code, &raw mut message) } == CUDA_SUCCESS)
-    .and_then(|_| {
-        (!message.is_null()).then(|| {
-            unsafe { CStr::from_ptr(message) }
-                .to_string_lossy()
-                .into_owned()
-        })
-    });
-    CudaError::Runtime {
-        operation,
-        code,
-        detail,
-    }
 }
 
 /// Point-in-time device memory telemetry from CUDA.
@@ -1364,9 +1071,7 @@ impl CudaReadbackStorage {
 
 impl Drop for DeviceAllocation {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .call("cudaFree", |f: Free| unsafe { f(self.pointer) });
+        let _ = unsafe { crate::ffi::invoke_cudaFree(&self.runtime, self.pointer) };
     }
 }
 
@@ -1405,17 +1110,15 @@ impl DeviceBuffer {
             return Ok(());
         }
         let lease = self.acquire_access()?;
-        let result = self
-            .allocation
-            .runtime
-            .call("cudaMemcpy", |f: Memcpy| unsafe {
-                f(
-                    (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
-                    source.as_ptr().cast(),
-                    source.len(),
-                    CUDA_MEMCPY_HOST_TO_DEVICE,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_cudaMemcpy(
+                &self.allocation.runtime,
+                (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
+                source.as_ptr().cast(),
+                source.len(),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
         lease.finish_synchronous(result)
     }
     /// Copy this allocation into host memory.
@@ -1439,17 +1142,15 @@ impl DeviceBuffer {
             return Ok(());
         }
         let lease = self.acquire_access()?;
-        let result = self
-            .allocation
-            .runtime
-            .call("cudaMemcpy", |f: Memcpy| unsafe {
-                f(
-                    destination.as_mut_ptr().cast(),
-                    (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
-                    destination.len(),
-                    CUDA_MEMCPY_DEVICE_TO_HOST,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_cudaMemcpy(
+                &self.allocation.runtime,
+                destination.as_mut_ptr().cast(),
+                (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
+                destination.len(),
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
         lease.finish_synchronous(result)
     }
     /// Copy bytes from another device allocation.
@@ -1470,17 +1171,15 @@ impl DeviceBuffer {
         }
         let destination_lease = self.acquire_access()?;
         let source_lease = source.acquire_access()?;
-        let result = self
-            .allocation
-            .runtime
-            .call("cudaMemcpy", |f: Memcpy| unsafe {
-                f(
-                    self.allocation.pointer,
-                    source.allocation.pointer,
-                    bytes,
-                    CUDA_MEMCPY_DEVICE_TO_DEVICE,
-                )
-            });
+        let result = unsafe {
+            crate::ffi::invoke_cudaMemcpy(
+                &self.allocation.runtime,
+                self.allocation.pointer,
+                source.allocation.pointer,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_DEVICE,
+            )
+        };
         destination_lease.finish_synchronous_with(source_lease, result)
     }
     fn check_length(&self, bytes: usize) -> Result<(), CudaError> {
@@ -1555,14 +1254,7 @@ impl DeviceAccessLease {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                if self
-                    .allocation
-                    .runtime
-                    .call("cudaDeviceSynchronize", |f: DeviceSynchronize| unsafe {
-                        f()
-                    })
-                    .is_err()
-                {
+                if crate::ffi::invoke_cudaDeviceSynchronize(&self.allocation.runtime).is_err() {
                     std::mem::forget(self);
                 }
                 Err(error)
@@ -1578,14 +1270,7 @@ impl DeviceAccessLease {
         match result {
             Ok(()) => Ok(()),
             Err(error) => {
-                if self
-                    .allocation
-                    .runtime
-                    .call("cudaDeviceSynchronize", |f: DeviceSynchronize| unsafe {
-                        f()
-                    })
-                    .is_err()
-                {
+                if crate::ffi::invoke_cudaDeviceSynchronize(&self.allocation.runtime).is_err() {
                     std::mem::forget(self);
                     std::mem::forget(other);
                 }
@@ -1601,11 +1286,7 @@ struct StreamInner {
 }
 impl Drop for StreamInner {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .call("cudaStreamDestroy", |f: StreamDestroy| unsafe {
-                f(self.raw)
-            });
+        let _ = unsafe { crate::ffi::invoke_cudaStreamDestroy(&self.runtime, self.raw) };
     }
 }
 /// Shared owner for a CUDA stream.
@@ -1631,11 +1312,7 @@ impl CudaStreamHandle {
     ///
     /// Returns the CUDA synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), CudaError> {
-        self.inner
-            .runtime
-            .call("cudaStreamSynchronize", |f: StreamSynchronize| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_cudaStreamSynchronize(&self.inner.runtime, self.inner.raw) }
     }
     /// Record an event after all work already queued on this stream.
     ///
@@ -1646,11 +1323,9 @@ impl CudaStreamHandle {
         self.inner
             .runtime
             .ensure_same_runtime(&event.inner.runtime)?;
-        self.inner
-            .runtime
-            .call("cudaEventRecord", |f: EventRecord| unsafe {
-                f(event.inner.raw, self.inner.raw)
-            })
+        unsafe {
+            crate::ffi::invoke_cudaEventRecord(&self.inner.runtime, event.inner.raw, self.inner.raw)
+        }
     }
 
     /// Record a timing-enabled event after all work already queued on this stream.
@@ -1662,11 +1337,9 @@ impl CudaStreamHandle {
         self.inner
             .runtime
             .ensure_same_runtime(&event.inner.runtime)?;
-        self.inner
-            .runtime
-            .call("cudaEventRecord", |f: EventRecord| unsafe {
-                f(event.inner.raw, self.inner.raw)
-            })
+        unsafe {
+            crate::ffi::invoke_cudaEventRecord(&self.inner.runtime, event.inner.raw, self.inner.raw)
+        }
     }
 }
 
@@ -1676,9 +1349,7 @@ struct EventInner {
 }
 impl Drop for EventInner {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .call("cudaEventDestroy", |f: EventDestroy| unsafe { f(self.raw) });
+        let _ = unsafe { crate::ffi::invoke_cudaEventDestroy(&self.runtime, self.raw) };
     }
 }
 /// Shared owner for a CUDA event.
@@ -1693,11 +1364,7 @@ impl CudaEventHandle {
     ///
     /// Returns the CUDA synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), CudaError> {
-        self.inner
-            .runtime
-            .call("cudaEventSynchronize", |f: EventSynchronize| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_cudaEventSynchronize(&self.inner.runtime, self.inner.raw) }
     }
 }
 
@@ -1713,11 +1380,7 @@ impl CudaTimingEventHandle {
     ///
     /// Returns the CUDA synchronization error, if any.
     pub fn synchronize(&self) -> Result<(), CudaError> {
-        self.inner
-            .runtime
-            .call("cudaEventSynchronize", |f: EventSynchronize| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_cudaEventSynchronize(&self.inner.runtime, self.inner.raw) }
     }
 }
 
@@ -1727,11 +1390,7 @@ struct ModuleInner {
 }
 impl Drop for ModuleInner {
     fn drop(&mut self) {
-        let _ = self
-            .runtime
-            .driver_call("cuModuleUnload", |f: DriverModuleUnload| unsafe {
-                f(self.raw)
-            });
+        let _ = unsafe { crate::ffi::invoke_cuModuleUnload(&self.runtime, self.raw) };
     }
 }
 /// Loaded CUDA code object.
@@ -1747,11 +1406,14 @@ impl CudaModule {
     /// Returns an error when CUDA cannot resolve the named function.
     pub fn function(&self, name: &CStr) -> Result<CudaKernel, CudaError> {
         let mut raw = ptr::null_mut();
-        self.inner
-            .runtime
-            .driver_call("cuModuleGetFunction", |f: DriverModuleGetFunction| unsafe {
-                f(&raw mut raw, self.inner.raw, name.as_ptr())
-            })?;
+        unsafe {
+            crate::ffi::invoke_cuModuleGetFunction(
+                &self.inner.runtime,
+                &raw mut raw,
+                self.inner.raw,
+                name.as_ptr(),
+            )
+        }?;
         Ok(CudaKernel {
             module: self.inner.clone(),
             raw,
@@ -2028,7 +1690,7 @@ pub struct CudaCompletionBatch {
     resources: Vec<LaunchResources>,
     dependencies: Vec<CudaProducerCompletion>,
     readbacks: CudaReadbackStorage,
-    queue_markers: Vec<Rc<dyn Any>>,
+    queue_markers: SmallVec<[Rc<dyn Any>; 1]>,
     failed: bool,
     timing: Option<CudaBatchTiming>,
 }
@@ -2061,7 +1723,7 @@ impl CudaCompletionBatch {
             resources: Vec::new(),
             dependencies: Vec::new(),
             readbacks: CudaReadbackStorage::new(),
-            queue_markers: Vec::new(),
+            queue_markers: SmallVec::new(),
             failed: false,
             timing: None,
         }
@@ -2077,7 +1739,7 @@ impl CudaCompletionBatch {
             resources: Vec::new(),
             dependencies: Vec::new(),
             readbacks: CudaReadbackStorage::new(),
-            queue_markers: Vec::new(),
+            queue_markers: SmallVec::new(),
             failed: false,
             timing: Some(CudaBatchTiming {
                 start: None,
@@ -2125,7 +1787,7 @@ impl CudaCompletionBatch {
         }
 
         let mut access_leases = LaunchAccessLeases::new();
-        let mut unique = Vec::<&DeviceBuffer>::with_capacity(buffers.len());
+        let mut unique = SmallVec::<[&DeviceBuffer; 8]>::with_capacity(buffers.len());
         for buffer in buffers {
             if unique
                 .iter()
@@ -2245,19 +1907,16 @@ impl CudaCompletionBatch {
             access_leases,
             stream: self.stream.clone(),
         });
-        let enqueue = self
-            .stream
-            .inner
-            .runtime
-            .call("cudaMemcpyAsync", |f: MemcpyAsync| unsafe {
-                f(
-                    destination.allocation.pointer,
-                    source.allocation.pointer,
-                    bytes,
-                    CUDA_MEMCPY_DEVICE_TO_DEVICE,
-                    self.stream.inner.raw,
-                )
-            });
+        let enqueue = unsafe {
+            crate::ffi::invoke_cudaMemcpyAsync(
+                &self.stream.inner.runtime,
+                destination.allocation.pointer,
+                source.allocation.pointer,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                self.stream.inner.raw,
+            )
+        };
         if let Err(error) = enqueue {
             self.failed = true;
             self.release_after_stream_sync();
@@ -2327,24 +1986,21 @@ impl CudaCompletionBatch {
             access_leases,
             stream: self.stream.clone(),
         });
-        let enqueue = self
-            .stream
-            .inner
-            .runtime
-            .call("cudaMemcpyAsync", |f: MemcpyAsync| unsafe {
-                f(
-                    destination.cast(),
-                    source
-                        .allocation
-                        .pointer
-                        .cast::<u8>()
-                        .wrapping_add(source_offset)
-                        .cast(),
-                    bytes,
-                    CUDA_MEMCPY_DEVICE_TO_HOST,
-                    self.stream.inner.raw,
-                )
-            });
+        let enqueue = unsafe {
+            crate::ffi::invoke_cudaMemcpyAsync(
+                &self.stream.inner.runtime,
+                destination.cast(),
+                source
+                    .allocation
+                    .pointer
+                    .cast::<u8>()
+                    .wrapping_add(source_offset)
+                    .cast(),
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+                self.stream.inner.raw,
+            )
+        };
         if let Err(error) = enqueue {
             self.failed = true;
             self.release_after_stream_sync();
@@ -2403,24 +2059,21 @@ impl CudaCompletionBatch {
         let source_pointer = source.as_ptr().cast::<c_void>();
         let owner: Rc<dyn Any> = Rc::new(source);
         self.retain_external_operation(&[destination], owner)?;
-        let enqueue = self
-            .stream
-            .inner
-            .runtime
-            .call("cudaMemcpyAsync", |f: MemcpyAsync| unsafe {
-                f(
-                    destination
-                        .allocation
-                        .pointer
-                        .cast::<u8>()
-                        .wrapping_add(offset)
-                        .cast(),
-                    source_pointer,
-                    bytes,
-                    CUDA_MEMCPY_HOST_TO_DEVICE,
-                    self.stream.inner.raw,
-                )
-            });
+        let enqueue = unsafe {
+            crate::ffi::invoke_cudaMemcpyAsync(
+                &self.stream.inner.runtime,
+                destination
+                    .allocation
+                    .pointer
+                    .cast::<u8>()
+                    .wrapping_add(offset)
+                    .cast(),
+                source_pointer,
+                bytes,
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                self.stream.inner.raw,
+            )
+        };
         if let Err(error) = enqueue {
             self.failed = true;
             self.release_after_stream_sync();
@@ -2573,14 +2226,14 @@ impl CudaCompletionBatch {
             .handoff_accesses_to_stream(&self.stream)
             .map_err(|()| CudaError::Busy)?;
         self.dependencies.push(completion);
-        if let Err(error) = self
-            .stream
-            .inner
-            .runtime
-            .call("cudaStreamWaitEvent", |f: StreamWaitEvent| unsafe {
-                f(self.stream.inner.raw, raw_event, 0)
-            })
-        {
+        if let Err(error) = unsafe {
+            crate::ffi::invoke_cudaStreamWaitEvent(
+                &self.stream.inner.runtime,
+                self.stream.inner.raw,
+                raw_event,
+                0,
+            )
+        } {
             // Even a failed enqueue may leave the consumer's queue state uncertain. Establish
             // consumer quiescence before releasing the retained producer token.
             if self.stream.synchronize().is_err() {
@@ -2755,7 +2408,7 @@ pub struct CudaBatchCompletion {
     resources: Vec<LaunchResources>,
     dependencies: Vec<CudaProducerCompletion>,
     readbacks: CudaReadbackStorage,
-    queue_markers: Vec<Rc<dyn Any>>,
+    queue_markers: SmallVec<[Rc<dyn Any>; 1]>,
     timing_events: Option<CudaBatchTimingSegment>,
     handed_off: bool,
     wait_error_observed: bool,
@@ -2915,7 +2568,7 @@ fn has_queue_marker(markers: &[Rc<dyn Any>], marker: &Rc<dyn Any>) -> bool {
     markers.iter().any(|known| Rc::ptr_eq(known, marker))
 }
 
-fn register_queue_marker(markers: &mut Vec<Rc<dyn Any>>, marker: Rc<dyn Any>) {
+fn register_queue_marker(markers: &mut SmallVec<[Rc<dyn Any>; 1]>, marker: Rc<dyn Any>) {
     if !has_queue_marker(markers, &marker) {
         markers.push(marker);
     }
@@ -3290,24 +2943,22 @@ impl CudaKernel {
             }
             timing.start = Some(start);
         }
-        let launch_result = self.module.runtime.driver_call(
-            "cuLaunchKernel",
-            |f: DriverModuleLaunchKernel| unsafe {
-                f(
-                    self.raw,
-                    grid[0],
-                    grid[1],
-                    grid[2],
-                    block[0],
-                    block[1],
-                    block[2],
-                    shared_memory_bytes,
-                    stream.inner.raw,
-                    params,
-                    ptr::null_mut(),
-                )
-            },
-        );
+        let launch_result = unsafe {
+            crate::ffi::invoke_cuLaunchKernel(
+                &self.module.runtime,
+                self.raw,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_memory_bytes,
+                stream.inner.raw,
+                params,
+                ptr::null_mut(),
+            )
+        };
         if let Err(error) = launch_result {
             if let Some(batch) = batch {
                 batch.failed = true;
@@ -3396,7 +3047,7 @@ mod memory_snapshot_tests {
         let marker = Rc::new(()) as Rc<dyn Any>;
         let marker_clone = Rc::clone(&marker);
         let unrelated = Rc::new(()) as Rc<dyn Any>;
-        let mut markers = Vec::new();
+        let mut markers = SmallVec::new();
         register_queue_marker(&mut markers, Rc::clone(&marker));
         register_queue_marker(&mut markers, marker_clone);
 

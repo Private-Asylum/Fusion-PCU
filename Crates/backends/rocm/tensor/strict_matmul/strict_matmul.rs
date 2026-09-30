@@ -54,7 +54,11 @@ impl StrictMatMulSpec {
         else {
             return None;
         };
-        if node.numerical_mode != Some(PcuNumericalMode::Strict) {
+        if node.numerical_mode != Some(PcuNumericalMode::Strict)
+            || node.numerical_options.compound_arithmetic
+                != fusion_pcu::PcuCompoundArithmeticPolicy::Checked
+            || node.numerical_options.reproducibility != fusion_pcu::PcuReproducibility::Unspecified
+        {
             return None;
         }
         let actual = graph.node(node.value).ok()?;
@@ -62,6 +66,7 @@ impl StrictMatMulSpec {
             || actual.scalar_type != node.scalar_type
             || actual.shape != node.shape
             || actual.numerical_mode != node.numerical_mode
+            || actual.numerical_options != node.numerical_options
             || actual.float_underflow_policy != node.float_underflow_policy
             || graph.node(left).ok()?.scalar_type != node.scalar_type
             || graph.node(right).ok()?.scalar_type != node.scalar_type

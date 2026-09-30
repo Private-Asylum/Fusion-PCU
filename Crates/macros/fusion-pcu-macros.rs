@@ -2,6 +2,8 @@
 mod checked_div_rem;
 #[path = "fusion-pcu-macros/hosted.rs"]
 mod hosted;
+#[path = "fusion-pcu-macros/numerical/numerical.rs"]
+mod numerical;
 #[path = "fusion-pcu-macros/owned.rs"]
 mod owned;
 #[path = "fusion-pcu-macros/prepared.rs"]
@@ -58,6 +60,7 @@ struct PcuDispatchArgs {
     underflow_flag: Option<PcuOwnedFlag>,
     clamp_range: bool,
     numerical_mode: Option<bool>,
+    numerical_options: numerical::NumericalFlags,
 }
 
 struct PcuScalarHelperArgs {
@@ -65,6 +68,7 @@ struct PcuScalarHelperArgs {
     underflow_flag: Option<PcuOwnedFlag>,
     clamp_range: bool,
     numerical_mode: Option<bool>,
+    numerical_options: numerical::NumericalFlags,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +84,7 @@ impl Parse for PcuScalarHelperArgs {
         let mut underflow_flag = None;
         let mut clamp_range = false;
         let mut numerical_mode = None;
+        let mut numerical_options = numerical::NumericalFlags::default();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             if key == "flag" {
@@ -88,6 +93,13 @@ impl Parse for PcuScalarHelperArgs {
                 let flag: Ident = content.parse()?;
                 if !content.is_empty() {
                     return Err(content.error("a `pcu` float flag takes exactly one name"));
+                }
+                if numerical_options.parse_flag(&flag)? {
+                    if input.is_empty() {
+                        break;
+                    }
+                    let _: Token![,] = input.parse()?;
+                    continue;
                 }
                 let parsed = match flag.to_string().as_str() {
                     "strict" | "non_strict" => {
@@ -159,6 +171,7 @@ impl Parse for PcuScalarHelperArgs {
             underflow_flag,
             clamp_range,
             numerical_mode,
+            numerical_options,
         })
     }
 }
@@ -173,6 +186,7 @@ impl Parse for PcuDispatchArgs {
         let mut underflow_flag = None;
         let mut clamp_range = false;
         let mut numerical_mode = None;
+        let mut numerical_options = numerical::NumericalFlags::default();
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -182,6 +196,13 @@ impl Parse for PcuDispatchArgs {
                 let flag: Ident = content.parse()?;
                 if !content.is_empty() {
                     return Err(content.error("a `pcu` float flag takes exactly one name"));
+                }
+                if numerical_options.parse_flag(&flag)? {
+                    if input.is_empty() {
+                        break;
+                    }
+                    let _: Token![,] = input.parse()?;
+                    continue;
                 }
                 let parsed = match flag.to_string().as_str() {
                     "strict" | "non_strict" => {
@@ -289,6 +310,7 @@ impl Parse for PcuDispatchArgs {
             underflow_flag,
             clamp_range,
             numerical_mode,
+            numerical_options,
         })
     }
 }
@@ -475,13 +497,74 @@ impl<'a> RuntimeExprEmitter<'a> {
                 });
                 Ok((quote! { #result }, target_kind))
             }
+            Expr::Unary(unary)
+                if matches!(unary.op, syn::UnOp::Neg(_))
+                    && matches!(
+                        unary.expr.as_ref(),
+                        Expr::Lit(ExprLit {
+                            lit: Lit::Int(_),
+                            ..
+                        })
+                    ) =>
+            {
+                let Expr::Lit(ExprLit {
+                    lit: Lit::Int(literal),
+                    ..
+                }) = unary.expr.as_ref()
+                else {
+                    unreachable!("integer literal pattern checked")
+                };
+                let kind = match literal.suffix() {
+                    "" => self.expected_scalar,
+                    "u8" => ScalarKind::U8,
+                    "u16" => ScalarKind::U16,
+                    "u32" => ScalarKind::U32,
+                    "u64" => ScalarKind::U64,
+                    "i8" => ScalarKind::I8,
+                    "i16" => ScalarKind::I16,
+                    "i32" => ScalarKind::I32,
+                    "i64" => ScalarKind::I64,
+                    _ => {
+                        return Err(Error::new(
+                            literal.span(),
+                            "unsupported PCU integer literal type",
+                        ));
+                    }
+                };
+                if !matches!(
+                    kind,
+                    ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32 | ScalarKind::I64
+                ) {
+                    return Err(Error::new(
+                        literal.span(),
+                        "PCU integer literal requires a fixed-width integer context",
+                    ));
+                }
+                let result = self.fresh_local();
+                let ty = kind.rust_type();
+                self.statements.push(quote! { let #result = __pcu_context.constant_integer_value::<#ty>(-#literal)?; });
+                Ok((quote! { #result }, kind))
+            }
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+                let (value, kind) = self.emit_expr(&unary.expr)?;
+                if !matches!(kind, ScalarKind::F32 | ScalarKind::F64) {
+                    return Err(Error::new(
+                        unary.span(),
+                        "PCU unary negation requires f32 or f64",
+                    ));
+                }
+                let result = self.fresh_local();
+                let pcu = self.crate_path;
+                self.statements.push(quote! { let #result = __pcu_context.checked_unary_value(#pcu::PcuDispatchFloatUnaryOp::Neg, #value)?; });
+                Ok((quote! { #result }, kind))
+            }
             Expr::Binary(binary) => {
                 let (lhs, lhs_type) = self.emit_expr(&binary.left)?;
                 let (rhs, rhs_type) = self.emit_expr(&binary.right)?;
-                if lhs_type != rhs_type || !matches!(lhs_type, ScalarKind::F32 | ScalarKind::F64) {
+                if lhs_type != rhs_type || lhs_type == ScalarKind::Generic {
                     return Err(Error::new(
                         binary.span(),
-                        "PCU floating arithmetic requires matching f32 or f64 operands",
+                        "PCU arithmetic requires matching fixed-width operands",
                     ));
                 }
                 let op = match &binary.op {
@@ -498,9 +581,17 @@ impl<'a> RuntimeExprEmitter<'a> {
                 };
                 let result = self.fresh_local();
                 let pcu = self.crate_path;
-                self.statements.push(quote! {
-                    let #result = __pcu_context.checked_binary_value(#pcu::PcuDispatchFloatBinaryOp::#op, #lhs, #rhs)?;
-                });
+                if matches!(lhs_type, ScalarKind::F32 | ScalarKind::F64) {
+                    self.statements.push(quote! { let #result = __pcu_context.checked_binary_value(#pcu::PcuDispatchFloatBinaryOp::#op, #lhs, #rhs)?; });
+                } else {
+                    if matches!(binary.op, BinOp::Div(_)) {
+                        return Err(Error::new(
+                            binary.op.span(),
+                            "PCU ordinary integer division is unsupported; use the explicit checked division API",
+                        ));
+                    }
+                    self.statements.push(quote! { let #result = __pcu_context.checked_integer_binary_value(#pcu::PcuDispatchIntegerBinaryOp::#op, #lhs, #rhs)?; });
+                }
                 Ok((quote! { #result }, lhs_type))
             }
             Expr::Index(index) => {
@@ -539,7 +630,7 @@ impl<'a> RuntimeExprEmitter<'a> {
                     let binding = self.binding(binding_ident, BindingAccess::ReadOnly)?;
                     (binding.binding, binding.scalar)
                 };
-                if !matches!(scalar, ScalarKind::F32 | ScalarKind::F64) {
+                if scalar == ScalarKind::Generic {
                     return Err(Error::new(
                         index.span(),
                         "floating scalar helper calls support only f32 or f64 bindings",
@@ -560,6 +651,41 @@ impl<'a> RuntimeExprEmitter<'a> {
                     )?;
                 });
                 Ok((quote! { #result }, scalar))
+            }
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(literal),
+                ..
+            }) => {
+                let kind = match literal.suffix() {
+                    "" => self.expected_scalar,
+                    "u8" => ScalarKind::U8,
+                    "u16" => ScalarKind::U16,
+                    "u32" => ScalarKind::U32,
+                    "u64" => ScalarKind::U64,
+                    "i8" => ScalarKind::I8,
+                    "i16" => ScalarKind::I16,
+                    "i32" => ScalarKind::I32,
+                    "i64" => ScalarKind::I64,
+                    _ => {
+                        return Err(Error::new(
+                            literal.span(),
+                            "unsupported PCU integer literal type",
+                        ));
+                    }
+                };
+                if matches!(
+                    kind,
+                    ScalarKind::F32 | ScalarKind::F64 | ScalarKind::Generic
+                ) {
+                    return Err(Error::new(
+                        literal.span(),
+                        "PCU integer literal requires a fixed-width integer context",
+                    ));
+                }
+                let result = self.fresh_local();
+                let ty = kind.rust_type();
+                self.statements.push(quote! { let #result = __pcu_context.constant_integer_value::<#ty>(#literal)?; });
+                Ok((quote! { #result }, kind))
             }
             Expr::Lit(literal) => {
                 let Lit::Float(float) = &literal.lit else {
@@ -1144,6 +1270,15 @@ pub fn pcu_dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// the global numerical mode providing the outer default. Scalar helper and invocation operators
 /// are already checked in either mode. Raw `_ir` and `_prepare` builders use their documented
 /// fixed defaults and do not consult the process policy.
+/// Owned tensor functions may independently request `flag(native_compound)` or
+/// `flag(checked_compound)`, `flag(backend_precision)` or `flag(preserve_precision)`, and
+/// `flag(deterministic)` or `flag(non_deterministic)`. Absent flags inherit the caller's
+/// effective options. Native compound permission accepts documented library reduction and
+/// exceptional numerical results; ordinary scalar operators and operational errors remain
+/// checked. Backend precision permission allows documented intermediate precision changes.
+/// Determinism requires portable-profile admission; implementations without that proof reject
+/// before submission. These flags do not imply strictness, and currently require the owned
+/// tensor function profile rather than scalar helpers or invocation kernels.
 /// Invocation kernels may select one underflow policy with `flag(ieee_underflow)`,
 /// `flag(allow_gradual_underflow)`, or `flag(reject_subnormal_result)`. The selected policy
 /// applies to every checked floating operation in that compiled kernel, including nested scalar
@@ -1169,12 +1304,16 @@ pub fn pcu(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &helper_args.crate_path,
                 helper_args.underflow_flag,
                 helper_args.numerical_mode,
+                helper_args.numerical_options,
             ) {
                 Ok(tokens) => tokens.into(),
                 Err(error) => error.into_compile_error().into(),
             };
         }
-        if helper_args.underflow_flag.is_some() || helper_args.clamp_range {
+        if helper_args.underflow_flag.is_some()
+            || helper_args.clamp_range
+            || !helper_args.numerical_options.is_empty()
+        {
             return Error::new_spanned(
                 &function.sig,
                 "float policy flags are supported only on owned tensor composition helpers; `clamp_range` is currently invocation-only",
@@ -1427,6 +1566,12 @@ fn expand_pcu_dispatch_inner(
     let crate_path = args.crate_path;
     let underflow_flag = args.underflow_flag;
     // Invocation operators already enforce the strict scalar contract.
+    if !args.numerical_options.is_empty() {
+        return Err(Error::new_spanned(
+            &function.sig,
+            "compound arithmetic, precision and reproducibility flags currently require an owned tensor function",
+        ));
+    }
     let _numerical_mode = args.numerical_mode;
     let clamp_range = args.clamp_range;
     let const_generics = validate_const_generics(function)?;
@@ -1539,8 +1684,11 @@ fn expand_pcu_dispatch_inner(
         } else {
             if expr_contains_call(&assignment.right)
                 || matches!(output_binding.scalar, ScalarKind::F32 | ScalarKind::F64)
+                || integer_checked_expression(&assignment.right)
             {
-                if !matches!(output_binding.scalar, ScalarKind::F32 | ScalarKind::F64) {
+                if expr_contains_call(&assignment.right)
+                    && !matches!(output_binding.scalar, ScalarKind::F32 | ScalarKind::F64)
+                {
                     return Err(Error::new(
                         assignment.right.span(),
                         "PCU scalar helper calls require f32 or f64 output bindings",
@@ -2351,6 +2499,15 @@ fn validate_generic_identity(
         ));
     }
     Ok(())
+}
+
+fn integer_checked_expression(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(_) | Expr::Lit(_) => true,
+        Expr::Paren(value) => integer_checked_expression(&value.expr),
+        Expr::Group(value) => integer_checked_expression(&value.expr),
+        _ => false,
+    }
 }
 
 fn lower_invocation_expr(expr: &Expr, const_generics: &[Ident]) -> Result<TokenStream2, Error> {
@@ -3340,6 +3497,7 @@ mod tests {
                 &syn::parse_quote!(::fusion_pcu),
                 None,
                 mode,
+                super::numerical::NumericalFlags::default(),
             )
             .unwrap()
             .to_string();
@@ -3564,7 +3722,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_u16_wrapping_arithmetic_and_rejects_plain_operators() {
+    fn lowers_u16_wrapping_and_checked_plain_arithmetic() {
         for (method, op) in [
             ("wrapping_add", "Add"),
             ("wrapping_sub", "Sub"),
@@ -3588,8 +3746,7 @@ mod tests {
         }
         assert!(expand_u16(
             "let invocation = context.global_invocation_id; output[invocation] = input[invocation] + rhs[invocation];"
-        )
-        .is_err());
+        ).unwrap().to_string().contains("checked_integer_binary_value"));
     }
 
     #[test]
@@ -3622,7 +3779,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_u8_wrapping_arithmetic_and_rejects_plain_operators() {
+    fn lowers_u8_wrapping_and_checked_plain_arithmetic() {
         for (method, op) in [
             ("wrapping_add", "Add"),
             ("wrapping_sub", "Sub"),
@@ -3646,8 +3803,7 @@ mod tests {
         }
         assert!(expand_u8(
             "let invocation = context.global_invocation_id; output[invocation] = input[invocation] + rhs[invocation];"
-        )
-        .is_err());
+        ).unwrap().to_string().contains("checked_integer_binary_value"));
     }
 
     #[test]
@@ -3680,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_i8_wrapping_arithmetic_and_rejects_plain_operators() {
+    fn lowers_i8_wrapping_and_checked_plain_arithmetic() {
         for (method, op) in [
             ("wrapping_add", "Add"),
             ("wrapping_sub", "Sub"),
@@ -3704,8 +3860,7 @@ mod tests {
         }
         assert!(expand_i8(
             "let invocation = context.global_invocation_id; output[invocation] = input[invocation] + rhs[invocation];"
-        )
-        .is_err());
+        ).unwrap().to_string().contains("checked_integer_binary_value"));
     }
 
     #[test]
@@ -3812,6 +3967,7 @@ mod tests {
                 crate_path: syn::parse_quote!(::fusion_pcu),
                 underflow_flag: None,
                 numerical_mode: None,
+                numerical_options: super::numerical::NumericalFlags::default(),
                 clamp_range: false,
             },
             &function,
@@ -3832,6 +3988,7 @@ mod tests {
                 crate_path: syn::parse_quote!(::fusion_pcu),
                 underflow_flag: None,
                 numerical_mode: None,
+                numerical_options: super::numerical::NumericalFlags::default(),
                 clamp_range: false,
             },
             &function,
@@ -3859,13 +4016,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_plain_u32_arithmetic_as_overflow_mode_dependent() {
+    fn lowers_plain_u32_arithmetic_with_observable_overflow() {
         for operator in ["+", "-", "*"] {
             let body = format!(
                 "let invocation = context.global_invocation_id; output[invocation] = input[invocation] {operator} rhs[invocation];"
             );
-            let error = expand_u32(&body).expect_err("plain u32 arithmetic is rejected");
-            assert!(error.to_string().contains("matching f32 or f64 operands"));
+            let generated = expand_u32(&body)
+                .expect("plain u32 emits checked arithmetic")
+                .to_string();
+            assert!(
+                generated.contains("checked_integer_binary_value"),
+                "{generated}"
+            );
         }
     }
 
@@ -4052,7 +4214,7 @@ mod tests {
             ),
             (
                 "fn kernel(input: &[i32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f32; }",
-                "f32 or f64 bindings",
+                "concrete f64 source",
             ),
             (
                 "fn kernel(input: &[f64], output: &mut [f64]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f64; }",
@@ -4292,5 +4454,46 @@ mod tests {
         let error = expand("let invocation = context.global_invocation_id; if invocation > 0 { output[invocation] = 1.0; }")
             .expect_err("control flow must be rejected in this subset");
         assert!(error.to_string().contains("second PCU dispatch statement"));
+    }
+    #[test]
+    fn ordinary_integer_arithmetic_uses_checked_exact_width_ir() {
+        for scalar in ["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64"] {
+            for operation in ["+", "-", "*"] {
+                let function=syn::parse_str::<ItemFn>(&format!("fn kernel(input: &[{scalar}], output: &mut [{scalar}]) {{ let invocation=context.global_invocation_id; output[invocation]=input[invocation] {operation} 1; }}")).unwrap();
+                let args = syn::parse_str::<PcuDispatchArgs>("invocations=4").unwrap();
+                let generated = expand_pcu_dispatch(args, &function).unwrap().to_string();
+                assert!(
+                    generated.contains("checked_integer_binary_value"),
+                    "{generated}"
+                );
+                assert!(generated.contains("constant_integer_value"), "{generated}");
+                assert!(
+                    !generated.contains("PcuDispatchDataOp :: Alu"),
+                    "{generated}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn ordinary_integer_division_and_mixed_widths_stay_rejected() {
+        for expression in ["input[invocation] / 2", "input[invocation] + 1u64"] {
+            let function=syn::parse_str::<ItemFn>(&format!("fn kernel(input: &[u32], output: &mut [u32]) {{ let invocation=context.global_invocation_id; output[invocation]={expression}; }}")).unwrap();
+            let args = syn::parse_str::<PcuDispatchArgs>("invocations=4").unwrap();
+            assert!(expand_pcu_dispatch(args, &function).is_err());
+        }
+    }
+    #[test]
+    fn unary_neg_source_and_helpers_emit_checked_sign_operation() {
+        let function=syn::parse_str::<ItemFn>("fn kernel(input: &[f32], output: &mut [f32]) { let invocation=context.global_invocation_id; output[invocation]=-input[invocation]; }").unwrap();
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations=4").unwrap();
+        let generated = expand_pcu_dispatch(args, &function).unwrap().to_string();
+        assert!(generated.contains("checked_unary_value"));
+        assert!(generated.contains("PcuDispatchFloatUnaryOp :: Neg"));
+        let function = syn::parse_str::<ItemFn>("fn flip(value:f64)->f64 { -value }").unwrap();
+        let generated = expand_pcu_scalar_helper(function, &syn::parse_quote!(::fusion_pcu))
+            .unwrap()
+            .to_string();
+        assert!(generated.contains("checked_unary_value"));
+        assert!(generated.contains("PcuDispatchFloatUnaryOp :: Neg"));
     }
 }

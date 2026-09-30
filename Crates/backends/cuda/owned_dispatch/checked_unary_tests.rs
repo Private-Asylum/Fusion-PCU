@@ -1,4 +1,4 @@
-//! Mixed-width host-call CUDA acceptance against the checked core oracle.
+//! Checked unary CUDA acceptance, including exact encodings and terminal publication.
 
 use super::*;
 #[rustfmt::skip]
@@ -21,6 +21,7 @@ use fusion_pcu::{
 
 fn prepare_unary(
     backend: &CudaOwnedDispatchBackend,
+    op: PcuDispatchFloatUnaryOp,
     value_type: PcuValueType,
     policy: PcuFloatUnderflowPolicy,
     grid: bool,
@@ -57,7 +58,7 @@ fn prepare_unary(
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
             value_type,
-            op: PcuDispatchFloatUnaryOp::Relu,
+            op,
             underflow_policy: policy,
             range_policy,
             result: PcuDispatchValueId(2),
@@ -118,6 +119,7 @@ fn checked_relu_direct_and_grid_preserve_finite_bits_discard_faults_and_retry() 
         ] {
             let mut kernel = prepare_unary(
                 &backend,
+                PcuDispatchFloatUnaryOp::Relu,
                 PcuValueType::f32(),
                 policy,
                 grid,
@@ -163,6 +165,7 @@ fn checked_relu_direct_and_grid_preserve_finite_bits_discard_faults_and_retry() 
             }
             let mut wide = prepare_unary(
                 &backend,
+                PcuDispatchFloatUnaryOp::Relu,
                 PcuValueType::f64(),
                 policy,
                 grid,
@@ -190,6 +193,7 @@ fn checked_f64_relu_range_clamp_and_fatal_priority_preserve_terminal_output_cont
     for grid in [false, true] {
         let mut strict = prepare_unary(
             &backend,
+            PcuDispatchFloatUnaryOp::Relu,
             PcuValueType::f64(),
             PcuFloatUnderflowPolicy::RejectSubnormalResult,
             grid,
@@ -208,6 +212,7 @@ fn checked_f64_relu_range_clamp_and_fatal_priority_preserve_terminal_output_cont
         assert_eq!(output.map(f64::to_bits), [13.0_f64.to_bits(); 4]);
         let mut clamp = prepare_unary(
             &backend,
+            PcuDispatchFloatUnaryOp::Relu,
             PcuValueType::f64(),
             PcuFloatUnderflowPolicy::RejectSubnormalResult,
             grid,
@@ -257,3 +262,217 @@ fn checked_f64_relu_range_clamp_and_fatal_priority_preserve_terminal_output_cont
         assert_eq!(output.map(f64::to_bits), [2.0_f64.to_bits(); 4]);
     }
 }
+
+macro_rules! neg_acceptance {
+    ($name:ident, $float:ty, $bits:ty, $ty:expr, $sign:expr) => {
+        #[test]
+        #[ignore = "requires a working CUDA device"]
+        #[allow(clippy::too_many_lines)] // Keep each width's fault, recovery and retry sequence together.
+        fn $name() {
+            let (_discovery, backend) = super::checked_integer_tests::selected_device();
+            for grid in [false, true] {
+                for policy in [
+                    PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                    PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+                    PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                ] {
+                    let mut kernel = prepare_unary(
+                        &backend,
+                        PcuDispatchFloatUnaryOp::Neg,
+                        $ty,
+                        policy,
+                        grid,
+                        PcuRangePolicy::Reject,
+                    );
+                    let mut output = [13.0 as $float; 4];
+                    let input = [0.0 as $float, -0.0 as $float, <$float>::MAX, -<$float>::MAX];
+                    kernel
+                        .call(&mut [
+                            PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+                            PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                        ])
+                        .unwrap();
+                    assert_eq!(
+                        output.map(<$float>::to_bits),
+                        input.map(|value| value.to_bits() ^ $sign)
+                    );
+
+                    let subnormal = <$float>::from_bits(1);
+                    let tiny_input = [
+                        subnormal,
+                        -subnormal,
+                        <$float>::MIN_POSITIVE,
+                        -<$float>::MIN_POSITIVE,
+                    ];
+                    output.fill(13.0);
+                    let result = kernel.call(&mut [
+                        PcuHostArgument::read(PcuBindingRef::new(0, 0), &tiny_input),
+                        PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                    ]);
+                    if policy == PcuFloatUnderflowPolicy::RejectSubnormalResult {
+                        assert!(matches!(
+                            result,
+                            Err(crate::CudaHostKernelError::CheckedExecutionFault(
+                                fusion_pcu::PcuExecutionFault {
+                                    kind: fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow,
+                                    invocation_id: 0,
+                                    recovered: false,
+                                }
+                            ))
+                        ));
+                        assert_eq!(
+                            output.map(<$float>::to_bits),
+                            [13.0 as $float; 4].map(<$float>::to_bits)
+                        );
+                    } else {
+                        result.unwrap();
+                        assert_eq!(
+                            output.map(<$float>::to_bits),
+                            tiny_input.map(|value| value.to_bits() ^ $sign)
+                        );
+                    }
+                    for bad in [<$float>::NAN, <$float>::INFINITY, <$float>::NEG_INFINITY] {
+                        let bad_input = [1.0 as $float, bad, bad, 2.0 as $float];
+                        output.fill(13.0);
+                        let error = kernel
+                            .call(&mut [
+                                PcuHostArgument::read(PcuBindingRef::new(0, 0), &bad_input),
+                                PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                            ])
+                            .unwrap_err();
+                        assert!(matches!(
+                            error,
+                            crate::CudaHostKernelError::CheckedExecutionFault(
+                                fusion_pcu::PcuExecutionFault {
+                                    kind: fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand,
+                                    invocation_id: 1,
+                                    recovered: false,
+                                }
+                            )
+                        ));
+                        assert_eq!(
+                            output.map(<$float>::to_bits),
+                            [13.0 as $float; 4].map(<$float>::to_bits)
+                        );
+                        kernel
+                            .call(&mut [
+                                PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+                                PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                            ])
+                            .unwrap();
+                        assert_eq!(
+                            output.map(<$float>::to_bits),
+                            input.map(|value| value.to_bits() ^ $sign)
+                        );
+                    }
+                }
+                let mut clamp = prepare_unary(
+                    &backend,
+                    PcuDispatchFloatUnaryOp::Neg,
+                    $ty,
+                    PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                    grid,
+                    PcuRangePolicy::Clamp,
+                );
+                let tiny = <$float>::from_bits(1);
+                let input = [tiny, -tiny, -0.0 as $float, 3.0 as $float];
+                let mut output = [13.0 as $float; 4];
+                let error = clamp
+                    .call(&mut [
+                        PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+                        PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                    ])
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::CudaHostKernelError::CheckedExecutionFault(
+                        fusion_pcu::PcuExecutionFault {
+                            kind: fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow,
+                            invocation_id: 0,
+                            recovered: true,
+                        }
+                    )
+                ));
+                assert_eq!(
+                    output.map(<$float>::to_bits),
+                    input.map(|value| value.to_bits() ^ $sign)
+                );
+                let input = [tiny, 1.0 as $float, <$float>::INFINITY, 2.0 as $float];
+                output.fill(13.0);
+                let error = clamp
+                    .call(&mut [
+                        PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+                        PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                    ])
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::CudaHostKernelError::CheckedExecutionFault(
+                        fusion_pcu::PcuExecutionFault {
+                            kind: fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand,
+                            invocation_id: 2,
+                            recovered: false,
+                        }
+                    )
+                ));
+                assert_eq!(
+                    output.map(<$float>::to_bits),
+                    [13.0 as $float; 4].map(<$float>::to_bits)
+                );
+
+                // Encoding oracle is independent of arithmetic helpers. The deterministic corpus
+                // spans signs/exponents/mantissas, with nonfinite values replaced before admission.
+                let mut kernel = prepare_unary(
+                    &backend,
+                    PcuDispatchFloatUnaryOp::Neg,
+                    $ty,
+                    PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                    grid,
+                    PcuRangePolicy::Reject,
+                );
+                let mut seed = 0x8ad7_415e_c62b_193fu64;
+                for _ in 0..32 {
+                    let input: [$float; 4] = std::array::from_fn(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        #[allow(clippy::cast_possible_truncation)]
+                        // Select the tested encoding width.
+                        let bits = seed as $bits;
+                        let value = <$float>::from_bits(bits);
+                        if value.is_finite() {
+                            value
+                        } else {
+                            1.0 as $float
+                        }
+                    });
+                    kernel
+                        .call(&mut [
+                            PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+                            PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                        ])
+                        .unwrap();
+                    assert_eq!(
+                        output.map(<$float>::to_bits),
+                        input.map(|value| value.to_bits() ^ $sign)
+                    );
+                }
+            }
+        }
+    };
+}
+
+neg_acceptance!(
+    checked_f32_neg_exact_bits_fault_clamp_and_retry,
+    f32,
+    u32,
+    PcuValueType::f32(),
+    0x8000_0000u32
+);
+neg_acceptance!(
+    checked_f64_neg_exact_bits_fault_clamp_and_retry,
+    f64,
+    u64,
+    PcuValueType::f64(),
+    0x8000_0000_0000_0000u64
+);

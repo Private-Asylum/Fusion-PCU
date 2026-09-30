@@ -383,6 +383,44 @@ impl CudaOwnedDispatchBackend {
         })
     }
 
+    /// Private explicitly native MSE storage ABI. Tensor policy admission happens before this
+    /// path; arbitrary unchecked scalar IR cannot use this trusted source preparation method.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_native_mse_dispatch(
+        &self,
+        count: u32,
+        stream: &crate::CudaStreamHandle,
+    ) -> Result<CudaPreparedDispatch, CudaOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(CudaOwnedDispatchError::Cuda(CudaError::DifferentRuntime));
+        }
+        let shape = fusion_pcu::PcuInvocationShape::invocations(
+            core::num::NonZeroU32::new(count)
+                .ok_or(CudaOwnedDispatchError::UnsupportedRequirements)?,
+        );
+        let requirements = crate::tensor::native_mse::requirements(count);
+        let grid_x = launch_grid(count, self.block_size)?;
+        let image = self.compile_tensor_source(&crate::tensor::native_mse::source(count))?;
+        let module = self.runtime.load_module(&image)?;
+        let function = module.function(c"fusion_kernel")?;
+        let binding_targets = requirements
+            .iter()
+            .map(|requirement| requirement.target)
+            .collect();
+        Ok(CudaPreparedDispatch {
+            runtime: self.runtime.clone(),
+            device: self.device,
+            binding_requirements: requirements,
+            shape,
+            grid_x,
+            block_size: self.block_size,
+            function,
+            stream: stream.clone(),
+            binding_targets,
+            checked_arithmetic: false,
+        })
+    }
+
     /// Validate and open one discovered device for owned asynchronous Dispatch.
     ///
     /// The code-generation target is detected from the selected device's CUDA compute capability. Library-backed tensor work can use this session without it;

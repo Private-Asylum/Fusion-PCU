@@ -18,7 +18,8 @@ use fusion_pcu::{
 };
 use std::num::NonZeroU32;
 
-fn prepare_relu(
+fn prepare_unary(
+    operation: PcuDispatchFloatUnaryOp,
     backend: &RocmOwnedDispatchBackend,
     value_type: PcuValueType,
     policy: PcuFloatUnderflowPolicy,
@@ -56,7 +57,7 @@ fn prepare_relu(
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
             value_type,
-            op: PcuDispatchFloatUnaryOp::Relu,
+            op: operation,
             underflow_policy: policy,
             range_policy,
             result: PcuDispatchValueId(2),
@@ -86,7 +87,7 @@ fn prepare_relu(
             kernel: &PcuDispatchKernelIr {
                 id: fusion_pcu::PcuKernelId(0xf17e),
                 entry: PcuDispatchEntryPoint {
-                    name: "rocm_checked_relu",
+                    name: "rocm_checked_unary",
                     logical_shape: [if grid { 1 } else { 4 }, 1, 1],
                 },
                 bindings: &bindings,
@@ -107,10 +108,10 @@ fn prepare_relu(
                 NonZeroU32::new(if grid { 1 } else { 4 }).expect("nonempty shape"),
             ),
         })
-        .expect("prepare checked ReLU")
+        .expect("prepare checked unary")
 }
 
-fn run_relu(
+fn run_unary(
     backend: &RocmOwnedDispatchBackend,
     prepared: &RocmPreparedDispatch,
     value_type: PcuValueType,
@@ -142,8 +143,8 @@ fn run_relu(
     ];
     let mut completion = prepared
         .submit_with_fault_word(&bindings, fault_word)
-        .expect("submit checked ReLU");
-    (completion.wait().expect("wait for checked ReLU"), output)
+        .expect("submit checked unary");
+    (completion.wait().expect("wait for checked unary"), output)
 }
 
 fn encode_f32(values: &[u32]) -> Vec<u8> {
@@ -154,7 +155,7 @@ fn encode_f64(values: &[u64]) -> Vec<u8> {
     values.iter().flat_map(|bits| bits.to_ne_bytes()).collect()
 }
 
-fn assert_sequential_relu_lifecycle(
+fn assert_sequential_unary_lifecycle(
     backend: &RocmOwnedDispatchBackend,
     prepared: &RocmPreparedDispatch,
     value_type: PcuValueType,
@@ -223,7 +224,7 @@ fn assert_sequential_relu_lifecycle(
     assert_eq!(actual, finite_expected);
 }
 
-#[allow(clippy::too_many_arguments)] // Keep both-width fixtures explicit at the hardware boundary.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep typed payloads, fault precedence, and retry in one hardware lifecycle.
 fn assert_relu_width(
     backend: &RocmOwnedDispatchBackend,
     value_type: PcuValueType,
@@ -238,14 +239,15 @@ fn assert_relu_width(
 ) {
     let sentinel = vec![0x5a; scalar_bytes * 4];
     let mut fault_word = backend.allocate(core::mem::size_of::<u64>()).unwrap();
-    let ordinary = prepare_relu(
+    let ordinary = prepare_unary(
+        PcuDispatchFloatUnaryOp::Relu,
         backend,
         value_type,
         PcuFloatUnderflowPolicy::IeeeAfterRounding,
         PcuRangePolicy::Reject,
         grid,
     );
-    let (outcome, output) = run_relu(
+    let (outcome, output) = run_unary(
         backend,
         &ordinary,
         value_type,
@@ -258,14 +260,15 @@ fn assert_relu_width(
     output.copy_to(&mut bytes).unwrap();
     assert_eq!(bytes, finite_expected);
 
-    let strict = prepare_relu(
+    let strict = prepare_unary(
+        PcuDispatchFloatUnaryOp::Relu,
         backend,
         value_type,
         PcuFloatUnderflowPolicy::RejectSubnormalResult,
         PcuRangePolicy::Reject,
         grid,
     );
-    let (outcome, _) = run_relu(
+    let (outcome, _) = run_unary(
         backend,
         &strict,
         value_type,
@@ -282,14 +285,15 @@ fn assert_relu_width(
         })
     );
 
-    let clamp = prepare_relu(
+    let clamp = prepare_unary(
+        PcuDispatchFloatUnaryOp::Relu,
         backend,
         value_type,
         PcuFloatUnderflowPolicy::RejectSubnormalResult,
         PcuRangePolicy::Clamp,
         grid,
     );
-    let (outcome, output) = run_relu(
+    let (outcome, output) = run_unary(
         backend,
         &clamp,
         value_type,
@@ -308,7 +312,7 @@ fn assert_relu_width(
     output.copy_to(&mut bytes).unwrap();
     assert_eq!(bytes, recovered_expected);
 
-    assert_sequential_relu_lifecycle(
+    assert_sequential_unary_lifecycle(
         backend,
         &clamp,
         value_type,
@@ -319,7 +323,7 @@ fn assert_relu_width(
     );
 
     for (bad, expected_invocation) in [(nan_input, 0), (fatal_input, 2)] {
-        let (outcome, _) = run_relu(backend, &clamp, value_type, bad, &sentinel, &mut fault_word);
+        let (outcome, _) = run_unary(backend, &clamp, value_type, bad, &sentinel, &mut fault_word);
         assert_eq!(
             outcome,
             PcuCompletionOutcome::Fault(fusion_pcu::PcuExecutionFault {
@@ -331,7 +335,7 @@ fn assert_relu_width(
     }
 
     // The rejected launch remains reusable and the fresh successful result is fully checked.
-    let (outcome, output) = run_relu(
+    let (outcome, output) = run_unary(
         backend,
         &ordinary,
         value_type,
@@ -388,5 +392,205 @@ fn checked_relu_direct_and_grid_cover_f32_f64_bits_faults_recovery_and_retry() {
             &encode_f64(&[1, 0, 0x3ff0_0000_0000_0000, 0]),
             grid,
         );
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep direct/grid fault precedence, sequential retry, and bit corpus together.
+fn assert_neg_width(backend: &RocmOwnedDispatchBackend, value_type: PcuValueType, grid: bool) {
+    let width = usize::from(value_type.scalar_type().bit_width()) / 8;
+    let sign = if width == 4 { 1u64 << 31 } else { 1u64 << 63 };
+    let normal = if width == 4 {
+        0x3f80_0000
+    } else {
+        0x3ff0_0000_0000_0000
+    };
+    let maximum = if width == 4 {
+        0x7f7f_ffff
+    } else {
+        0x7fef_ffff_ffff_ffff
+    };
+    let infinity = if width == 4 {
+        0x7f80_0000
+    } else {
+        0x7ff0_0000_0000_0000
+    };
+    let encode = |values: &[u64]| {
+        if width == 4 {
+            encode_f32(
+                &values
+                    .iter()
+                    .map(|&v| u32::try_from(v).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            encode_f64(values)
+        }
+    };
+    let finite = [0, sign, maximum, normal];
+    let subnormal = [1, sign | 1, normal, normal | sign];
+    let expected = encode(&finite.map(|bits| bits ^ sign));
+    let recovered = encode(&subnormal.map(|bits| bits ^ sign));
+    let sentinel = vec![0x5a; width * 4];
+    let mut status = backend.allocate(size_of::<u64>()).unwrap();
+    let ordinary = prepare_unary(
+        PcuDispatchFloatUnaryOp::Neg,
+        backend,
+        value_type,
+        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        PcuRangePolicy::Reject,
+        grid,
+    );
+    let reject = prepare_unary(
+        PcuDispatchFloatUnaryOp::Neg,
+        backend,
+        value_type,
+        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        PcuRangePolicy::Reject,
+        grid,
+    );
+    let clamp = prepare_unary(
+        PcuDispatchFloatUnaryOp::Neg,
+        backend,
+        value_type,
+        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        PcuRangePolicy::Clamp,
+        grid,
+    );
+    let check = |prepared: &RocmPreparedDispatch,
+                 input: &[u8],
+                 expected_outcome: PcuCompletionOutcome,
+                 status: &mut DeviceBuffer| {
+        let (outcome, output) = run_unary(backend, prepared, value_type, input, &sentinel, status);
+        assert_eq!(outcome, expected_outcome);
+        let mut bytes = vec![0; sentinel.len()];
+        output.copy_to(&mut bytes).unwrap();
+        bytes
+    };
+    assert_eq!(
+        check(
+            &ordinary,
+            &encode(&finite),
+            PcuCompletionOutcome::Succeeded,
+            &mut status
+        ),
+        expected
+    );
+    assert_eq!(
+        check(
+            &ordinary,
+            &encode(&subnormal),
+            PcuCompletionOutcome::Succeeded,
+            &mut status
+        ),
+        recovered
+    );
+    let fault = |kind, invocation_id, recovered| {
+        PcuCompletionOutcome::Fault(fusion_pcu::PcuExecutionFault {
+            kind,
+            invocation_id,
+            recovered,
+        })
+    };
+    check(
+        &reject,
+        &encode(&subnormal),
+        fault(PcuExecutionFaultKind::ArithmeticUnderflow, 0, false),
+        &mut status,
+    );
+    assert_eq!(
+        check(
+            &clamp,
+            &encode(&subnormal),
+            fault(PcuExecutionFaultKind::ArithmeticUnderflow, 0, true),
+            &mut status
+        ),
+        recovered
+    );
+    for bad in [infinity, infinity | sign, infinity | 1, infinity | sign | 1] {
+        check(
+            &ordinary,
+            &encode(&[normal, bad, infinity, 0]),
+            fault(PcuExecutionFaultKind::InvalidFloatingOperand, 1, false),
+            &mut status,
+        );
+        // A fatal lane supersedes earlier recovered underflow and keeps its own attribution.
+        check(
+            &clamp,
+            &encode(&[1, normal, bad, 0]),
+            fault(PcuExecutionFaultKind::InvalidFloatingOperand, 2, false),
+            &mut status,
+        );
+        assert_eq!(
+            check(
+                &ordinary,
+                &encode(&finite),
+                PcuCompletionOutcome::Succeeded,
+                &mut status
+            ),
+            expected
+        );
+    }
+    assert_sequential_unary_lifecycle(
+        backend,
+        &clamp,
+        value_type,
+        &encode(&finite),
+        &expected,
+        &encode(&subnormal),
+        &recovered,
+    );
+    // Encoding corpus includes lattice boundaries and deterministic finite random signs/exponents.
+    let tiny_maximum = if width == 4 {
+        0x007f_ffff
+    } else {
+        0x000f_ffff_ffff_ffff
+    };
+    let min_normal = tiny_maximum + 1;
+    let mut corpus = vec![
+        0,
+        sign,
+        1,
+        sign | 1,
+        tiny_maximum,
+        tiny_maximum | sign,
+        min_normal,
+        min_normal | sign,
+        maximum,
+        maximum | sign,
+        normal,
+        normal | sign,
+    ];
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..52 {
+        state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9).wrapping_add(1);
+        let bits = if width == 4 {
+            state & u64::from(u32::MAX)
+        } else {
+            state
+        };
+        corpus.push(bits & (maximum | sign));
+    }
+    for chunk in corpus.as_chunks::<4>().0 {
+        let wanted = encode(&chunk.iter().map(|bits| bits ^ sign).collect::<Vec<_>>());
+        assert_eq!(
+            check(
+                &ordinary,
+                &encode(chunk),
+                PcuCompletionOutcome::Succeeded,
+                &mut status
+            ),
+            wanted
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a working ROCm device"]
+fn checked_neg_direct_and_grid_cover_f32_f64_bits_faults_recovery_retry_and_corpus() {
+    let (_discovery, backend) = super::checked_integer_tests::selected_device();
+    for grid in [false, true] {
+        for value_type in [PcuValueType::f32(), PcuValueType::f64()] {
+            assert_neg_width(&backend, value_type, grid);
+        }
     }
 }

@@ -23,6 +23,40 @@ const NORMALIZED_LIMIT: u64 = 1 << (NORMALIZED_EXTENT + 1);
 const MIN_NORMAL_EXPONENT: i32 = -1022;
 const MAX_NORMAL_EXPONENT: i32 = 1023;
 
+fn neg<const CLAMP: bool>(
+    value: f64,
+    policy: PcuFloatUnderflowPolicy,
+) -> Result<f64, PcuClampedError<f64>> {
+    let bits = value.to_bits();
+    if bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000 {
+        return Err(PcuClampedError::Fatal(
+            PcuExecutionFaultKind::InvalidFloatingOperand,
+        ));
+    }
+    let result_bits = bits ^ SIGN_MASK;
+    let subnormal = result_bits & !SIGN_MASK != 0 && result_bits & 0x7ff0_0000_0000_0000 == 0;
+    let class = PcuFloatUnderflowClassification {
+        is_tiny_after_rounding: subnormal,
+        is_inexact: false,
+        result_is_subnormal: subnormal,
+    };
+    let result = f64::from_bits(result_bits);
+    if policy.rejects(class) {
+        if CLAMP {
+            Err(PcuClampedError::Range(PcuClampedFault::new(
+                PcuExecutionFaultKind::ArithmeticUnderflow,
+                result,
+            )))
+        } else {
+            Err(PcuClampedError::Fatal(
+                PcuExecutionFaultKind::ArithmeticUnderflow,
+            ))
+        }
+    } else {
+        Ok(result)
+    }
+}
+
 fn relu<const CLAMP: bool>(
     value: f64,
     policy: PcuFloatUnderflowPolicy,
@@ -396,6 +430,17 @@ fn divide<const CLAMP: bool>(
 }
 
 impl PcuCheckedFloat for f64 {
+    fn pcu_checked_neg(self) -> Result<Self, PcuExecutionFaultKind> {
+        self.pcu_checked_neg_with_policy(PcuFloatUnderflowPolicy::default())
+    }
+
+    fn pcu_checked_neg_with_policy(
+        self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuExecutionFaultKind> {
+        neg::<false>(self, policy).map_err(|fault| fault.kind())
+    }
+
     fn pcu_checked_relu(self) -> Result<Self, PcuExecutionFaultKind> {
         self.pcu_checked_relu_with_policy(PcuFloatUnderflowPolicy::default())
     }
@@ -456,6 +501,17 @@ impl PcuCheckedFloat for f64 {
 }
 
 impl PcuClampedFloat for f64 {
+    fn pcu_clamped_neg(self) -> Result<Self, PcuClampedError<Self>> {
+        self.pcu_clamped_neg_with_policy(PcuFloatUnderflowPolicy::default())
+    }
+
+    fn pcu_clamped_neg_with_policy(
+        self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuClampedError<Self>> {
+        neg::<true>(self, policy)
+    }
+
     fn pcu_clamped_relu(self) -> Result<Self, PcuClampedError<Self>> {
         self.pcu_clamped_relu_with_policy(PcuFloatUnderflowPolicy::default())
     }

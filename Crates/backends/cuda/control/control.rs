@@ -16,23 +16,13 @@ use crate::{
     CudaStreamHandle,
     CudaTimingEventHandle,
     StreamInner,
-    ffi::{
-        symbol,
-        runtime::{
+    ffi::runtime::{
             CUDA_ERROR_NOT_READY,
             CUDA_STREAM_DEFAULT,
             CUDA_STREAM_NON_BLOCKING,
             CUDA_SUCCESS,
             CudaResult,
-            DeviceGetStreamPriorityRange,
-            EventQuery,
-            StreamCreateWithPriority,
-            StreamGetFlags,
-            StreamGetPriority,
-            StreamQuery,
-            runtime_symbol,
         },
-    },
 };
 
 /// CUDA's implicit synchronization relationship with the legacy default stream.
@@ -89,7 +79,7 @@ pub enum CudaReadiness {
     Ready,
 }
 
-const fn classify_readiness(status: CudaResult) -> Option<CudaReadiness> {
+pub const fn classify_readiness(status: CudaResult) -> Option<CudaReadiness> {
     match status {
         CUDA_SUCCESS => Some(CudaReadiness::Ready),
         CUDA_ERROR_NOT_READY => Some(CudaReadiness::Pending),
@@ -109,12 +99,14 @@ impl CudaRuntime {
         options: CudaStreamOptions,
     ) -> Result<CudaStreamHandle, CudaError> {
         let mut stream = ptr::null_mut();
-        self.call(
-            "cudaStreamCreateWithPriority",
-            |f: StreamCreateWithPriority| unsafe {
-                f(&raw mut stream, options.mode.flags(), options.priority)
-            },
-        )?;
+        unsafe {
+            crate::ffi::invoke_cudaStreamCreateWithPriority(
+                self,
+                &raw mut stream,
+                options.mode.flags(),
+                options.priority,
+            )
+        }?;
         Ok(CudaStreamHandle {
             inner: Rc::new(StreamInner {
                 runtime: self.clone(),
@@ -132,34 +124,14 @@ impl CudaRuntime {
             least: 0,
             greatest: 0,
         };
-        self.call(
-            "cudaDeviceGetStreamPriorityRange",
-            |f: DeviceGetStreamPriorityRange| unsafe {
-                f(&raw mut range.least, &raw mut range.greatest)
-            },
-        )?;
+        unsafe {
+            crate::ffi::invoke_cudaDeviceGetStreamPriorityRange(
+                self,
+                &raw mut range.least,
+                &raw mut range.greatest,
+            )
+        }?;
         Ok(range)
-    }
-
-    fn query_readiness<T: Copy>(
-        &self,
-        operation: &'static str,
-        invoke: impl FnOnce(T) -> CudaResult,
-    ) -> Result<CudaReadiness, CudaError> {
-        self.cuda_set_device(self.0.ordinal)?;
-        let bytes = runtime_symbol(operation).ok_or_else(|| CudaError::MissingSymbol {
-            symbol: operation,
-            detail: "readiness symbol is not declared in the CUDA runtime ABI table".into(),
-        })?;
-        // SAFETY: each private caller supplies the declared ABI type and retains this runtime.
-        let function = unsafe { symbol::<T>(&self.0.library, bytes) }.map_err(|error| {
-            CudaError::MissingSymbol {
-                symbol: operation,
-                detail: error.to_string(),
-            }
-        })?;
-        let status = invoke(*function);
-        classify_readiness(status).ok_or_else(|| self.error(operation, status))
     }
 }
 
@@ -171,13 +143,11 @@ impl CudaStreamHandle {
     pub fn options(&self) -> Result<CudaStreamOptions, CudaError> {
         let runtime = &self.inner.runtime;
         let mut flags = 0;
-        runtime.call("cudaStreamGetFlags", |f: StreamGetFlags| unsafe {
-            f(self.inner.raw, &raw mut flags)
-        })?;
+        unsafe { crate::ffi::invoke_cudaStreamGetFlags(runtime, self.inner.raw, &raw mut flags) }?;
         let mut priority = 0;
-        runtime.call("cudaStreamGetPriority", |f: StreamGetPriority| unsafe {
-            f(self.inner.raw, &raw mut priority)
-        })?;
+        unsafe {
+            crate::ffi::invoke_cudaStreamGetPriority(runtime, self.inner.raw, &raw mut priority)
+        }?;
         Ok(CudaStreamOptions {
             mode: CudaStreamMode::from_flags(flags)?,
             priority,
@@ -190,11 +160,7 @@ impl CudaStreamHandle {
     /// # Errors
     /// Returns a missing query symbol or CUDA error other than ordinary not-ready status.
     pub fn query(&self) -> Result<CudaReadiness, CudaError> {
-        self.inner
-            .runtime
-            .query_readiness("cudaStreamQuery", |f: StreamQuery| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_cudaStreamQuery(&self.inner.runtime, self.inner.raw) }
     }
 }
 
@@ -205,11 +171,7 @@ impl CudaEventHandle {
     /// # Errors
     /// Returns a missing query symbol or CUDA error other than ordinary not-ready status.
     pub fn query(&self) -> Result<CudaReadiness, CudaError> {
-        self.inner
-            .runtime
-            .query_readiness("cudaEventQuery", |f: EventQuery| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_cudaEventQuery(&self.inner.runtime, self.inner.raw) }
     }
 }
 
@@ -220,11 +182,7 @@ impl CudaTimingEventHandle {
     /// # Errors
     /// Returns a missing query symbol or CUDA error other than ordinary not-ready status.
     pub fn query(&self) -> Result<CudaReadiness, CudaError> {
-        self.inner
-            .runtime
-            .query_readiness("cudaEventQuery", |f: EventQuery| unsafe {
-                f(self.inner.raw)
-            })
+        unsafe { crate::ffi::invoke_cudaEventQuery(&self.inner.runtime, self.inner.raw) }
     }
 }
 

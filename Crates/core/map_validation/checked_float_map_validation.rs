@@ -148,7 +148,7 @@ pub fn validate_checked_float_map_kernel(
                 }
                 | PcuDispatchDataOp::CheckedFloatUnary {
                     value_type: actual,
-                    op: PcuDispatchFloatUnaryOp::Relu,
+                    op: PcuDispatchFloatUnaryOp::Relu | PcuDispatchFloatUnaryOp::Neg,
                     ..
                 },
             ) => {
