@@ -1,6 +1,5 @@
 //! Owned, shaped device-resident tensor storage.
 
-use alloc::vec::Vec;
 use core::fmt;
 
 #[rustfmt::skip]
@@ -8,6 +7,7 @@ use crate::{
     PcuBindingRef,
     PcuDeviceArgument,
     PcuDeviceBuffer,
+    PcuOwnedShape,
     PcuScalar,
 };
 
@@ -39,7 +39,7 @@ impl core::error::Error for PcuDeviceTensorError {}
 /// The shape uses row-major dense semantics, matching the tensor dialect. The buffer is moved
 /// into this value and is not cloneable, so ownership transfer does not create an implicit alias.
 pub struct PcuDeviceTensor<T: PcuScalar, R> {
-    shape: Vec<usize>,
+    shape: PcuOwnedShape,
     buffer: PcuDeviceBuffer<T, R>,
 }
 
@@ -51,11 +51,12 @@ impl<T: PcuScalar, R> PcuDeviceTensor<T, R> {
     /// Returns [`PcuDeviceTensorError::ShapeOverflow`] for an overflowing dimension product or
     /// [`PcuDeviceTensorError::ElementCountMismatch`] when the buffer length differs.
     pub fn new(
-        shape: impl Into<Vec<usize>>,
+        shape: impl Into<PcuOwnedShape>,
         buffer: PcuDeviceBuffer<T, R>,
     ) -> Result<Self, PcuDeviceTensorError> {
         let shape = shape.into();
         let expected = shape
+            .as_slice()
             .iter()
             .try_fold(1_usize, |count, &dimension| count.checked_mul(dimension));
         let expected = expected.ok_or(PcuDeviceTensorError::ShapeOverflow)?;
@@ -71,7 +72,7 @@ impl<T: PcuScalar, R> PcuDeviceTensor<T, R> {
     /// Dense row-major dimensions for this tensor.
     #[must_use]
     pub fn shape(&self) -> &[usize] {
-        &self.shape
+        self.shape.as_slice()
     }
 
     /// Typed device buffer backing this tensor.
@@ -111,6 +112,16 @@ impl<T: PcuScalar, R> PcuDeviceTensor<T, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn device_tensor_checks_dense_shape_against_logical_buffer_length() {
@@ -147,5 +158,48 @@ mod tests {
             PcuDeviceTensor::new([usize::MAX, 2], buffer),
             Err(PcuDeviceTensorError::ShapeOverflow)
         ));
+    }
+
+    #[test]
+    fn device_tensor_accepts_borrowed_inline_and_spilled_shapes() {
+        let scalar = PcuDeviceTensor::<u8, [u8; 1]>::new(
+            PcuOwnedShape::from_slice(&[]),
+            PcuDeviceBuffer::new([0], 1),
+        )
+        .expect("rank-zero scalar has one element");
+        assert_eq!(scalar.shape(), &[]);
+
+        let small_dimensions = [2, 3];
+        let small = PcuDeviceTensor::<u8, [u8; 6]>::new(
+            PcuOwnedShape::from_slice(&small_dimensions),
+            PcuDeviceBuffer::new([0; 6], 6),
+        )
+        .expect("borrowed low-rank shape");
+        assert_eq!(small.shape(), &[2, 3]);
+
+        let large_dimensions = [1, 1, 1, 1, 6];
+        let large = PcuDeviceTensor::<u8, [u8; 6]>::new(
+            PcuOwnedShape::from_slice(&large_dimensions),
+            PcuDeviceBuffer::new([0; 6], 6),
+        )
+        .expect("borrowed high-rank shape");
+        assert_eq!(large.shape(), &large_dimensions);
+
+        let empty = PcuDeviceTensor::<u8, [u8; 0]>::new([2, 0, 3], PcuDeviceBuffer::new([], 0))
+            .expect("zero extent has zero elements");
+        assert_eq!(empty.shape(), &[2, 0, 3]);
+    }
+
+    #[test]
+    fn device_tensor_drops_buffer_when_shape_validation_fails() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource = DropProbe(Arc::clone(&drops));
+        let buffer = PcuDeviceBuffer::<u8, _>::new(resource, 1);
+
+        assert!(matches!(
+            PcuDeviceTensor::new([2], buffer),
+            Err(PcuDeviceTensorError::ElementCountMismatch { .. })
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

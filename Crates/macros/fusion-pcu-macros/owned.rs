@@ -48,11 +48,44 @@ pub fn declares_owned_tensor_return(output: &ReturnType) -> bool {
 }
 
 /// Expand a homogeneous scalar composition over slices, fixed arrays, or fixed matrices.
+#[cfg(test)]
 pub fn expand_owned_return(
     function: &ItemFn,
     crate_path: &Path,
 ) -> Result<proc_macro2::TokenStream, Error> {
+    expand_owned_return_with_flag(function, crate_path, None)
+}
+
+#[cfg(test)]
+pub fn expand_owned_return_with_flag(
+    function: &ItemFn,
+    crate_path: &Path,
+    underflow_flag: Option<super::PcuOwnedFlag>,
+) -> Result<proc_macro2::TokenStream, Error> {
+    expand_owned_return_with_policies(function, crate_path, underflow_flag, None)
+}
+
+pub fn expand_owned_return_with_policies(
+    function: &ItemFn,
+    crate_path: &Path,
+    underflow_flag: Option<super::PcuOwnedFlag>,
+    numerical_mode: Option<bool>,
+) -> Result<proc_macro2::TokenStream, Error> {
     let (parameters, const_params) = validate_owned_function(function)?;
+    if underflow_flag.is_some() {
+        let scalar = owned_return_scalar(&function.sig.output).expect("validated owned scalar");
+        let generic_scalar = function
+            .sig
+            .generics
+            .type_params()
+            .any(|parameter| parameter.ident == scalar);
+        if scalar != "f32" && scalar != "f64" && !generic_scalar {
+            return Err(Error::new_spanned(
+                &function.sig.output,
+                "float underflow flags require an f32/f64 owned tensor helper; generic scalar helpers are checked at capture time",
+            ));
+        }
+    }
     let input_idents = parameters
         .iter()
         .map(|parameter| parameter.ident.clone())
@@ -124,6 +157,8 @@ pub fn expand_owned_return(
         source_ident: &source_ident,
         entry_capture_ident: &entry_capture_ident,
         program: &parsed,
+        underflow_flag,
+        numerical_mode,
     };
     Ok(emit_owned_items(&emission))
 }
@@ -139,6 +174,8 @@ struct OwnedEmission<'a> {
     source_ident: &'a syn::Ident,
     entry_capture_ident: &'a syn::Ident,
     program: &'a CapturedProgram,
+    underflow_flag: Option<super::PcuOwnedFlag>,
+    numerical_mode: Option<bool>,
 }
 
 // This builds one wrapper and its matching cold companion from the same names and signatures;
@@ -156,6 +193,8 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
         source_ident,
         entry_capture_ident,
         program: parsed,
+        underflow_flag,
+        numerical_mode,
     } = emission;
     let input_count = parameters.len();
     // Signature validation guarantees the concrete scalar and matching input profile.
@@ -410,6 +449,44 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
     });
     let capture_body = &parsed.statements;
     let output_tokens = &parsed.output;
+    let float_policy_scalar_check = if underflow_flag.is_some() {
+        let parameter = parameters.first().expect("owned helper has an input");
+        let value = &parameter.ident;
+        let value = match parameter.mode {
+            SourceMode::ConsumedResident => quote! { #value.borrowed_graph_value() },
+            SourceMode::Borrowed | SourceMode::BorrowedResident => quote! { #value },
+        };
+        quote! { #capture_ident.require_float_underflow_policy(#value)?; }
+    } else {
+        quote! {}
+    };
+    let numerical_policy = match numerical_mode {
+        Some(true) => {
+            quote! { ::core::option::Option::Some(#companion_crate_path::PcuNumericalMode::Strict) }
+        }
+        Some(false) => {
+            quote! { ::core::option::Option::Some(#companion_crate_path::PcuNumericalMode::Boundary) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    let float_policy = match underflow_flag {
+        Some(super::PcuOwnedFlag::IeeeUnderflow) => quote! {
+            ::core::option::Option::Some(
+                #companion_crate_path::PcuFloatUnderflowPolicy::IeeeAfterRounding
+            )
+        },
+        Some(super::PcuOwnedFlag::AllowGradualUnderflow) => quote! {
+            ::core::option::Option::Some(
+                #companion_crate_path::PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            )
+        },
+        Some(super::PcuOwnedFlag::RejectSubnormalResult) => quote! {
+            ::core::option::Option::Some(
+                #companion_crate_path::PcuFloatUnderflowPolicy::RejectSubnormalResult
+            )
+        },
+        None => quote! { ::core::option::Option::None },
+    };
     quote! {
         #(#wrapper_attrs)*
         // The wrapper must inspect every source argument to preserve its metadata, including
@@ -454,16 +531,24 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
                 #capture_ident: &mut #companion_crate_path::global::PcuTensorGraphCapture,
                 #(#capture_parameters),*
             ) -> ::core::result::Result<#input_type, #companion_crate_path::PcuExecutionError> #where_clause {
-                #capture_ident.enter(::core::any::TypeId::of::<#capture_marker_type>())?;
-                let __pcu_capture_result = (|| -> ::core::result::Result<
-                    #input_type,
-                    #companion_crate_path::PcuExecutionError,
-                > {
-                    #(#input_shape_checks)*
-                    #(#capture_body)*
-                    ::core::result::Result::Ok(#output_tokens)
-                })();
-                #capture_ident.leave();
+                let __pcu_capture_result = #capture_ident.with_marker(
+                    ::core::any::TypeId::of::<#capture_marker_type>(),
+                    |#capture_ident| #capture_ident.with_numerical_mode(
+                        #numerical_policy,
+                        |#capture_ident| #capture_ident.with_float_underflow_policy(
+                        #float_policy,
+                        |#capture_ident| (|| -> ::core::result::Result<
+                            #input_type,
+                            #companion_crate_path::PcuExecutionError,
+                        > {
+                            #float_policy_scalar_check
+                            #(#input_shape_checks)*
+                            #(#capture_body)*
+                            ::core::result::Result::Ok(#output_tokens)
+                        })(),
+                        ),
+                    ),
+                )?;
                 __pcu_capture_result
             }
         }
@@ -842,6 +927,7 @@ enum Operation {
     Add,
     Sub,
     Mul,
+    Div,
     Matmul,
     Helper(Path),
 }
@@ -1217,6 +1303,7 @@ impl LoweringState<'_> {
             syn::BinOp::Add(_) => Operation::Add,
             syn::BinOp::Sub(_) => Operation::Sub,
             syn::BinOp::Mul(_) => Operation::Mul,
+            syn::BinOp::Div(_) => Operation::Div,
             _ => return Err(composition_body_error(binary)),
         };
         let lhs = self.lower(&binary.left, depth + 1)?;
@@ -1253,7 +1340,11 @@ impl LoweringState<'_> {
         )?;
         let expected = match &operation {
             Operation::Identity | Operation::Relu => Some(1),
-            Operation::Add | Operation::Sub | Operation::Mul | Operation::Matmul => Some(2),
+            Operation::Add
+            | Operation::Sub
+            | Operation::Mul
+            | Operation::Div
+            | Operation::Matmul => Some(2),
             Operation::Helper(_) => None,
         };
         if expected.is_some_and(|expected| call.args.len() != expected)
@@ -1283,6 +1374,7 @@ impl LoweringState<'_> {
             Operation::Add => quote! { #capture.add(#(#values),*)? },
             Operation::Sub => quote! { #capture.sub(#(#values),*)? },
             Operation::Mul => quote! { #capture.mul(#(#values),*)? },
+            Operation::Div => quote! { #capture.div(#(#values),*)? },
             Operation::Matmul => quote! { #capture.matmul(#(#values),*)? },
             Operation::Helper(path) => quote! { #path(#capture, #(#values),*)? },
         };
@@ -1324,6 +1416,7 @@ fn operation_for_path(
             "add" => Ok(Operation::Add),
             "sub" => Ok(Operation::Sub),
             "mul" => Ok(Operation::Mul),
+            "div" => Ok(Operation::Div),
             "matmul" => Ok(Operation::Matmul),
             _ => Err(composition_body_error(span)),
         };
@@ -1579,6 +1672,93 @@ mod tests {
         expand_owned_return(source, &syn::parse_quote!(::pcu_alias))
             .expect("owned tensor composition should expand")
             .to_string()
+    }
+
+    #[test]
+    fn owned_capture_scopes_use_explicit_or_global_base_policy() {
+        let source: ItemFn = syn::parse_quote! {
+            fn project(left: &[f32], right: &[f32])
+                -> Result<PcuTensor<f32>, PcuExecutionError>
+            {
+                Ok(pcu::add(left, right)?)
+            }
+        };
+        let defaulted =
+            expand_owned_return_with_flag(&source, &syn::parse_quote!(::pcu_alias), None)
+                .expect("unannotated owned helpers expand")
+                .to_string();
+        assert!(defaulted.contains("with_float_underflow_policy"));
+        assert!(defaulted.contains("Option :: None"));
+
+        for (flag, expected) in [
+            (
+                super::super::PcuOwnedFlag::IeeeUnderflow,
+                "PcuFloatUnderflowPolicy :: IeeeAfterRounding",
+            ),
+            (
+                super::super::PcuOwnedFlag::AllowGradualUnderflow,
+                "PcuFloatUnderflowPolicy :: AllowGradualUnderflow",
+            ),
+            (
+                super::super::PcuOwnedFlag::RejectSubnormalResult,
+                "PcuFloatUnderflowPolicy :: RejectSubnormalResult",
+            ),
+        ] {
+            let generated =
+                expand_owned_return_with_flag(&source, &syn::parse_quote!(::pcu_alias), Some(flag))
+                    .expect("annotated owned helpers expand")
+                    .to_string();
+            assert!(generated.contains("with_float_underflow_policy"));
+            assert!(generated.contains(expected), "{generated}");
+        }
+
+        let generic: ItemFn = syn::parse_quote! {
+            fn project<T: PcuScalar>(left: &[T], right: &[T])
+                -> Result<PcuTensor<T>, PcuExecutionError>
+            {
+                Ok(pcu::add(left, right)?)
+            }
+        };
+        let generated = expand_owned_return_with_flag(
+            &generic,
+            &syn::parse_quote!(::pcu_alias),
+            Some(super::super::PcuOwnedFlag::AllowGradualUnderflow),
+        )
+        .expect("generic policy helpers defer scalar validation to capture")
+        .to_string();
+        assert!(generated.contains("require_float_underflow_policy"));
+
+        let f64_function: ItemFn = syn::parse_quote! {
+            fn project(left: &[f64], right: &[f64])
+                -> Result<PcuTensor<f64>, PcuExecutionError>
+            {
+                Ok(pcu::add(left, right)?)
+            }
+        };
+        for (flag, expected) in [
+            (
+                super::super::PcuOwnedFlag::IeeeUnderflow,
+                "IeeeAfterRounding",
+            ),
+            (
+                super::super::PcuOwnedFlag::AllowGradualUnderflow,
+                "AllowGradualUnderflow",
+            ),
+            (
+                super::super::PcuOwnedFlag::RejectSubnormalResult,
+                "RejectSubnormalResult",
+            ),
+        ] {
+            let generated = expand_owned_return_with_flag(
+                &f64_function,
+                &syn::parse_quote!(::pcu_alias),
+                Some(flag),
+            )
+            .expect("f64 policy helpers are accepted")
+            .to_string();
+            assert!(generated.contains("require_float_underflow_policy"));
+            assert!(generated.contains(expected), "{generated}");
+        }
     }
 
     #[test]
@@ -2085,8 +2265,8 @@ mod tests {
         assert!(expanded.contains("outer :: __pcu_capture"));
         assert!(expanded.contains("inner :: __pcu_capture"));
         assert!(expanded.contains("math :: finish :: __pcu_capture"));
-        assert!(expanded.contains("__pcu_capture . enter"));
-        assert!(expanded.contains("__pcu_capture . leave"));
+        assert!(expanded.contains("__pcu_capture . with_marker"));
+        assert!(expanded.contains("with_float_underflow_policy"));
         assert!(!expanded.contains("call_owned_tensor_program"));
     }
 
@@ -2236,21 +2416,25 @@ mod tests {
                 let sum = lhs + rhs;
                 let difference = pcu::sub(lhs, rhs)?;
                 let product = difference * rhs;
-                Ok(pcu::mul(sum, product)?)
+                let quotient = sum / product;
+                Ok(pcu::div(lhs, rhs)?)
             }
         };
         let expanded = expand(&source);
         assert!(expanded.contains("__pcu_capture . add (lhs , rhs)"));
         assert!(expanded.contains("__pcu_capture . sub (lhs , rhs)"));
-        assert_eq!(expanded.matches("__pcu_capture . mul").count(), 2);
+        assert!(expanded.contains("__pcu_capture . mul"));
+        assert_eq!(expanded.matches("__pcu_capture . div").count(), 2);
+        assert!(expanded.contains("__pcu_capture . div (lhs , rhs)"));
 
-        let unsupported: ItemFn = syn::parse_quote! {
+        let wrong_builtin_arity: ItemFn = syn::parse_quote! {
             fn arithmetic(lhs: &[f32], rhs: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {
-                let invalid = lhs / rhs;
-                Ok(invalid)
+                Ok(pcu::div(lhs)?)
             }
         };
-        assert!(expand_owned_return(&unsupported, &syn::parse_quote!(::pcu_alias)).is_err());
+        assert!(
+            expand_owned_return(&wrong_builtin_arity, &syn::parse_quote!(::pcu_alias)).is_err()
+        );
     }
 
     #[test]

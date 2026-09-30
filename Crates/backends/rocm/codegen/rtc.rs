@@ -5,14 +5,12 @@ use std::{
     ffi::{
         CStr,
         CString,
-        c_char,
-        c_int,
     },
     fmt,
     ptr,
 };
 
-use libloading::Library;
+use crate::ffi::{Library, load_uncached_library};
 
 #[rustfmt::skip]
 use crate::{
@@ -20,23 +18,19 @@ use crate::{
     HipRuntime,
 };
 
-type Program = *mut std::ffi::c_void;
-type ResultCode = c_int;
-type CreateProgram = unsafe extern "C" fn(
-    *mut Program,
-    *const c_char,
-    *const c_char,
-    c_int,
-    *const *const c_char,
-    *const *const c_char,
-) -> ResultCode;
-type DestroyProgram = unsafe extern "C" fn(*mut Program) -> ResultCode;
-type CompileProgram = unsafe extern "C" fn(Program, c_int, *const *const c_char) -> ResultCode;
-type GetProgramLogSize = unsafe extern "C" fn(Program, *mut usize) -> ResultCode;
-type GetProgramLog = unsafe extern "C" fn(Program, *mut c_char) -> ResultCode;
-type GetCodeSize = unsafe extern "C" fn(Program, *mut usize) -> ResultCode;
-type GetCode = unsafe extern "C" fn(Program, *mut c_char) -> ResultCode;
-type GetErrorString = unsafe extern "C" fn(ResultCode) -> *const c_char;
+#[rustfmt::skip]
+use crate::ffi::hiprtc::{
+    Program,
+    ResultCode,
+    CreateProgram,
+    DestroyProgram,
+    CompileProgram,
+    GetProgramLogSize,
+    GetProgramLog,
+    GetCodeSize,
+    GetCode,
+    GetErrorString,
+};
 
 /// Failures from loading HIPRTC or compiling HIP source for the selected device.
 #[derive(Debug)]
@@ -194,7 +188,8 @@ fn load_hiprtc() -> Result<Library, HipRtcError> {
     );
     let mut details = Vec::new();
     for candidate in candidates {
-        match unsafe { Library::new(&candidate) } {
+        // SAFETY: the returned handle stays alive throughout symbol lookup and HIPRTC use.
+        match unsafe { load_uncached_library(&candidate) } {
             Ok(library) => return Ok(library),
             Err(error) => details.push(format!("{}: {error}", candidate.to_string_lossy())),
         }
@@ -223,7 +218,7 @@ pub fn hiprtc_available() -> Result<(), HipRtcError> {
 fn symbol<T: Copy>(library: &Library, name: &'static str) -> Result<T, HipRtcError> {
     let mut bytes = name.as_bytes().to_vec();
     bytes.push(0);
-    unsafe { library.get::<T>(&bytes) }
+    unsafe { crate::ffi::symbol::<T>(library, &bytes) }
         .map(|symbol| *symbol)
         .map_err(|error| HipRtcError::MissingSymbol {
             symbol: name,

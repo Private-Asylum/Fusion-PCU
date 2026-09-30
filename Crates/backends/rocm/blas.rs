@@ -11,7 +11,6 @@ use std::{
     },
     ffi::{
         c_int,
-        c_void,
         OsString,
     },
     fmt,
@@ -22,7 +21,7 @@ use std::{
     time::Instant,
 };
 
-use libloading::Library;
+use crate::ffi::{Library, load_uncached_library};
 
 #[rustfmt::skip]
 use super::{
@@ -33,64 +32,26 @@ use super::{
     HipStreamHandle,
 };
 
-type RocblasStatus = c_int;
-type RocblasHandle = *mut c_void;
-type CreateHandle = unsafe extern "C" fn(*mut RocblasHandle) -> RocblasStatus;
-type DestroyHandle = unsafe extern "C" fn(RocblasHandle) -> RocblasStatus;
-type Sgemm = unsafe extern "C" fn(
+#[rustfmt::skip]
+use crate::ffi::rocblas::{
     RocblasHandle,
-    c_int,
-    c_int,
-    c_int,
-    c_int,
-    c_int,
-    *const f32,
-    *const f32,
-    c_int,
-    *const f32,
-    c_int,
-    *const f32,
-    *mut f32,
-    c_int,
-) -> RocblasStatus;
-type Dgemm = unsafe extern "C" fn(
-    RocblasHandle,
-    c_int,
-    c_int,
-    c_int,
-    c_int,
-    c_int,
-    *const f64,
-    *const f64,
-    c_int,
-    *const f64,
-    c_int,
-    *const f64,
-    *mut f64,
-    c_int,
-) -> RocblasStatus;
-type Sdot = unsafe extern "C" fn(
-    RocblasHandle,
-    c_int,
-    *const f32,
-    c_int,
-    *const f32,
-    c_int,
-    *mut f32,
-) -> RocblasStatus;
-type Sasum =
-    unsafe extern "C" fn(RocblasHandle, c_int, *const f32, c_int, *mut f32) -> RocblasStatus;
-type Sscal =
-    unsafe extern "C" fn(RocblasHandle, c_int, *const f32, *mut f32, c_int) -> RocblasStatus;
-type GetPointerMode = unsafe extern "C" fn(RocblasHandle, *mut c_int) -> RocblasStatus;
-type SetPointerMode = unsafe extern "C" fn(RocblasHandle, c_int) -> RocblasStatus;
-type SetStream = unsafe extern "C" fn(RocblasHandle, *mut c_void) -> RocblasStatus;
-
-const ROCBLAS_SUCCESS: RocblasStatus = 0;
-const ROCBLAS_OPERATION_NONE: c_int = 111;
-const ROCBLAS_OPERATION_TRANSPOSE: c_int = 112;
-const ROCBLAS_POINTER_MODE_HOST: c_int = 0;
-const ROCBLAS_POINTER_MODE_DEVICE: c_int = 1;
+    NoArgStatus,
+    CreateHandle,
+    DestroyHandle,
+    Sgemm,
+    Dgemm,
+    Sdot,
+    Sasum,
+    Sscal,
+    GetPointerMode,
+    SetPointerMode,
+    SetStream,
+    ROCBLAS_SUCCESS,
+    ROCBLAS_OPERATION_NONE,
+    ROCBLAS_OPERATION_TRANSPOSE,
+    ROCBLAS_POINTER_MODE_HOST,
+    ROCBLAS_POINTER_MODE_DEVICE,
+};
 
 /// Failures returned by the rocBLAS GEMM and vector adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,7 +419,7 @@ impl Rocblas {
             .get_or_init(|| {
                 // SAFETY: Dgemm matches the installed public rocBLAS C ABI. The owning library
                 // outlives this cached function pointer and every operation that invokes it.
-                unsafe { self.owner.library.get::<Dgemm>(b"rocblas_dgemm\0") }
+                unsafe { crate::ffi::symbol::<Dgemm>(&self.owner.library, b"rocblas_dgemm\0") }
                     .map(|symbol| *symbol)
                     .map_err(|error| RocblasError::MissingSymbol {
                         symbol: "rocblas_dgemm",
@@ -527,25 +488,26 @@ impl Rocblas {
         let mut last_error = None;
         for candidate in candidates {
             // SAFETY: rocBLAS exports the documented C ABI. Arc keeps it loaded for handle life.
-            let library = match unsafe { Library::new(&candidate) } {
+            let library = match unsafe { load_uncached_library(&candidate) } {
                 Ok(library) => Arc::new(library),
                 Err(error) => {
-                    last_error = Some(error.to_string());
+                    last_error = Some(error.clone());
                     continue;
                 }
             };
             runtime.hip_set_device(runtime.0.device)?;
             let mut handle = ptr::null_mut();
             // SAFETY: symbol type matches rocblas_create_handle's C declaration.
-            let create = unsafe { library.get::<CreateHandle>(b"rocblas_create_handle\0") }
-                .map_err(|e| RocblasError::MissingSymbol {
-                    symbol: "rocblas_create_handle",
-                    detail: e.to_string(),
-                })?;
+            let create =
+                unsafe { crate::ffi::symbol::<CreateHandle>(&library, b"rocblas_create_handle\0") }
+                    .map_err(|e| RocblasError::MissingSymbol {
+                        symbol: "rocblas_create_handle",
+                        detail: e.to_string(),
+                    })?;
             // An opened handle is only useful to the tensor adapter when the required operation
             // is present. Validate the symbol during setup so assessment cannot claim Library
             // support and defer a missing-symbol failure until execution.
-            unsafe { library.get::<Sgemm>(b"rocblas_sgemm\0") }.map_err(|e| {
+            unsafe { crate::ffi::symbol::<Sgemm>(&library, b"rocblas_sgemm\0") }.map_err(|e| {
                 RocblasError::MissingSymbol {
                     symbol: "rocblas_sgemm",
                     detail: e.to_string(),
@@ -554,25 +516,37 @@ impl Rocblas {
             for (symbol, result) in [
                 (
                     "rocblas_sdot",
-                    unsafe { library.get::<Sdot>(b"rocblas_sdot\0") }.map(|_| ()),
+                    unsafe { crate::ffi::symbol::<Sdot>(&library, b"rocblas_sdot\0") }.map(|_| ()),
                 ),
                 (
                     "rocblas_sasum",
-                    unsafe { library.get::<Sasum>(b"rocblas_sasum\0") }.map(|_| ()),
+                    unsafe { crate::ffi::symbol::<Sasum>(&library, b"rocblas_sasum\0") }
+                        .map(|_| ()),
                 ),
                 (
                     "rocblas_sscal",
-                    unsafe { library.get::<Sscal>(b"rocblas_sscal\0") }.map(|_| ()),
+                    unsafe { crate::ffi::symbol::<Sscal>(&library, b"rocblas_sscal\0") }
+                        .map(|_| ()),
                 ),
                 (
                     "rocblas_get_pointer_mode",
-                    unsafe { library.get::<GetPointerMode>(b"rocblas_get_pointer_mode\0") }
-                        .map(|_| ()),
+                    unsafe {
+                        crate::ffi::symbol::<GetPointerMode>(
+                            &library,
+                            b"rocblas_get_pointer_mode\0",
+                        )
+                    }
+                    .map(|_| ()),
                 ),
                 (
                     "rocblas_set_pointer_mode",
-                    unsafe { library.get::<SetPointerMode>(b"rocblas_set_pointer_mode\0") }
-                        .map(|_| ()),
+                    unsafe {
+                        crate::ffi::symbol::<SetPointerMode>(
+                            &library,
+                            b"rocblas_set_pointer_mode\0",
+                        )
+                    }
+                    .map(|_| ()),
                 ),
             ] {
                 result.map_err(|e| RocblasError::MissingSymbol {
@@ -625,11 +599,13 @@ impl Rocblas {
             .runtime
             .hip_set_device(self.owner.runtime.0.device)?;
         // SAFETY: rocblas_set_stream has the documented C ABI in rocblas-auxiliary.h.
-        let set_stream = unsafe { self.owner.library.get::<SetStream>(b"rocblas_set_stream\0") }
-            .map_err(|error| RocblasError::MissingSymbol {
-                symbol: "rocblas_set_stream",
-                detail: error.to_string(),
-            })?;
+        let set_stream = unsafe {
+            crate::ffi::symbol::<SetStream>(&self.owner.library, b"rocblas_set_stream\0")
+        }
+        .map_err(|error| RocblasError::MissingSymbol {
+            symbol: "rocblas_set_stream",
+            detail: error.to_string(),
+        })?;
         let status = unsafe { set_stream(self.owner.handle, stream.inner.raw) };
         if status != ROCBLAS_SUCCESS {
             return Err(RocblasError::Status {
@@ -720,12 +696,10 @@ impl Rocblas {
             .hip_set_device(self.owner.runtime.0.device)?;
         // SAFETY: signature matches rocblas_sgemm; runtime, dimensions, stream, and allocations
         // have been checked before loading or invoking the C ABI.
-        let sgemm =
-            unsafe { self.owner.library.get::<Sgemm>(b"rocblas_sgemm\0") }.map_err(|error| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sgemm",
-                    detail: error.to_string(),
-                }
+        let sgemm = unsafe { crate::ffi::symbol::<Sgemm>(&self.owner.library, b"rocblas_sgemm\0") }
+            .map_err(|error| RocblasError::MissingSymbol {
+                symbol: "rocblas_sgemm",
+                detail: error.to_string(),
             })?;
 
         reserve_async_operation(&self.in_flight)?;
@@ -1081,10 +1055,10 @@ impl Rocblas {
                 ldc,
             )
         };
-        let sync = self.owner.runtime.call(
-            "hipDeviceSynchronize",
-            |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
-        );
+        let sync = self
+            .owner
+            .runtime
+            .call("hipDeviceSynchronize", |f: NoArgStatus| unsafe { f() });
         if let Err(error) = sync {
             self.owner.poisoned.set(true);
             std::mem::forget(a_lease);
@@ -1128,55 +1102,55 @@ impl Rocblas {
         timing: &mut T,
     ) -> Result<(), RocblasError> {
         let preflight_mark = timing.begin(SgemmPhase::Preflight);
-        let preflight =
-            (|| {
-                self.ensure_idle()?;
-                let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
-                let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
-                matrix_bytes("A", a_rows, a_cols, lda, a.len())?;
-                matrix_bytes("B", b_rows, b_cols, ldb, b.len())?;
-                matrix_bytes("C", m, n, ldc, c.len())?;
-                self.owner
-                    .runtime
-                    .ensure_same_runtime(&a.allocation.runtime)
-                    .map_err(|_| RocblasError::DifferentRuntime)?;
-                self.owner
-                    .runtime
-                    .ensure_same_runtime(&b.allocation.runtime)
-                    .map_err(|_| RocblasError::DifferentRuntime)?;
-                self.owner
-                    .runtime
-                    .ensure_same_runtime(&c.allocation.runtime)
-                    .map_err(|_| RocblasError::DifferentRuntime)?;
-                if Rc::ptr_eq(&a.allocation, &b.allocation)
-                    || Rc::ptr_eq(&a.allocation, &c.allocation)
-                    || Rc::ptr_eq(&b.allocation, &c.allocation)
-                {
-                    return Err(RocblasError::AliasedBuffers);
-                }
-                let a_lease = a.acquire_access().map_err(|_| RocblasError::Busy)?;
-                let b_lease = b.acquire_access().map_err(|_| RocblasError::Busy)?;
-                let c_lease = c.acquire_access().map_err(|_| RocblasError::Busy)?;
-                let (m, n, k, lda, ldb, ldc) = (
-                    c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
-                );
-                self.owner
-                    .runtime
-                    .hip_set_device(self.owner.runtime.0.device)?;
-                // SAFETY: signature follows rocblas_sgemm in rocblas.h; buffers are validated allocations
-                // from this runtime/device and the scalar pointers remain live through the call.
-                let sgemm = unsafe { self.owner.library.get::<Sgemm>(b"rocblas_sgemm\0") }
+        let preflight = (|| {
+            self.ensure_idle()?;
+            let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
+            let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+            matrix_bytes("A", a_rows, a_cols, lda, a.len())?;
+            matrix_bytes("B", b_rows, b_cols, ldb, b.len())?;
+            matrix_bytes("C", m, n, ldc, c.len())?;
+            self.owner
+                .runtime
+                .ensure_same_runtime(&a.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            self.owner
+                .runtime
+                .ensure_same_runtime(&b.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            self.owner
+                .runtime
+                .ensure_same_runtime(&c.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            if Rc::ptr_eq(&a.allocation, &b.allocation)
+                || Rc::ptr_eq(&a.allocation, &c.allocation)
+                || Rc::ptr_eq(&b.allocation, &c.allocation)
+            {
+                return Err(RocblasError::AliasedBuffers);
+            }
+            let a_lease = a.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let b_lease = b.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let c_lease = c.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let (m, n, k, lda, ldb, ldc) = (
+                c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
+            );
+            self.owner
+                .runtime
+                .hip_set_device(self.owner.runtime.0.device)?;
+            // SAFETY: signature follows rocblas_sgemm in rocblas.h; buffers are validated allocations
+            // from this runtime/device and the scalar pointers remain live through the call.
+            let sgemm =
+                unsafe { crate::ffi::symbol::<Sgemm>(&self.owner.library, b"rocblas_sgemm\0") }
                     .map_err(|e| RocblasError::MissingSymbol {
                         symbol: "rocblas_sgemm",
                         detail: e.to_string(),
                     })?;
-                Ok((a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, *sgemm))
-            })();
+            Ok((a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, *sgemm))
+        })();
         timing.finish(SgemmPhase::Preflight, preflight_mark);
         let (a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, sgemm) = preflight?;
         let call_mark = timing.begin(SgemmPhase::RocblasCall);
@@ -1211,10 +1185,10 @@ impl Rocblas {
         // synchronous and ensures all borrowed buffer owners remain valid until completion. Even a
         // rocBLAS error is followed by synchronization because the call may have partially queued.
         let sync_mark = timing.begin(SgemmPhase::DeviceSynchronize);
-        let sync = self.owner.runtime.call(
-            "hipDeviceSynchronize",
-            |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
-        );
+        let sync = self
+            .owner
+            .runtime
+            .call("hipDeviceSynchronize", |f: NoArgStatus| unsafe { f() });
         timing.finish(SgemmPhase::DeviceSynchronize, sync_mark);
         let cleanup_mark = timing.begin(SgemmPhase::Cleanup);
         if let Err(error) = sync {
@@ -1317,35 +1291,28 @@ impl Rocblas {
         // SAFETY: symbols match rocBLAS public declarations; live validated device allocations
         // remain leased until synchronization confirms completion.
         let get_mode = unsafe {
-            self.owner
-                .library
-                .get::<GetPointerMode>(b"rocblas_get_pointer_mode\0")
+            crate::ffi::symbol::<GetPointerMode>(&self.owner.library, b"rocblas_get_pointer_mode\0")
         }
         .map_err(|e| RocblasError::MissingSymbol {
             symbol: "rocblas_get_pointer_mode",
             detail: e.to_string(),
         })?;
         let set_mode = unsafe {
-            self.owner
-                .library
-                .get::<SetPointerMode>(b"rocblas_set_pointer_mode\0")
+            crate::ffi::symbol::<SetPointerMode>(&self.owner.library, b"rocblas_set_pointer_mode\0")
         }
         .map_err(|e| RocblasError::MissingSymbol {
             symbol: "rocblas_set_pointer_mode",
             detail: e.to_string(),
         })?;
-        let sdot = unsafe { self.owner.library.get::<Sdot>(b"rocblas_sdot\0") }.map_err(|e| {
-            RocblasError::MissingSymbol {
+        let sdot = unsafe { crate::ffi::symbol::<Sdot>(&self.owner.library, b"rocblas_sdot\0") }
+            .map_err(|e| RocblasError::MissingSymbol {
                 symbol: "rocblas_sdot",
                 detail: e.to_string(),
-            }
-        })?;
-        let sscal =
-            unsafe { self.owner.library.get::<Sscal>(b"rocblas_sscal\0") }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sscal",
-                    detail: e.to_string(),
-                }
+            })?;
+        let sscal = unsafe { crate::ffi::symbol::<Sscal>(&self.owner.library, b"rocblas_sscal\0") }
+            .map_err(|e| RocblasError::MissingSymbol {
+                symbol: "rocblas_sscal",
+                detail: e.to_string(),
             })?;
         let mut prior_mode = ROCBLAS_POINTER_MODE_HOST;
         let get_status = unsafe { get_mode(self.owner.handle, &raw mut prior_mode) };
@@ -1394,10 +1361,10 @@ impl Rocblas {
             ROCBLAS_SUCCESS
         };
         let restore_status = unsafe { set_mode(self.owner.handle, prior_mode) };
-        let sync = self.owner.runtime.call(
-            "hipDeviceSynchronize",
-            |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
-        );
+        let sync = self
+            .owner
+            .runtime
+            .call("hipDeviceSynchronize", |f: NoArgStatus| unsafe { f() });
         if let Err(error) = sync {
             self.owner.poisoned.set(true);
             std::mem::forget(x_lease);
@@ -1491,36 +1458,28 @@ impl Rocblas {
         // SAFETY: symbols match rocBLAS public declarations; leased allocations remain alive
         // until synchronization confirms the operation has completed.
         let get_mode = unsafe {
-            self.owner
-                .library
-                .get::<GetPointerMode>(b"rocblas_get_pointer_mode\0")
+            crate::ffi::symbol::<GetPointerMode>(&self.owner.library, b"rocblas_get_pointer_mode\0")
         }
         .map_err(|e| RocblasError::MissingSymbol {
             symbol: "rocblas_get_pointer_mode",
             detail: e.to_string(),
         })?;
         let set_mode = unsafe {
-            self.owner
-                .library
-                .get::<SetPointerMode>(b"rocblas_set_pointer_mode\0")
+            crate::ffi::symbol::<SetPointerMode>(&self.owner.library, b"rocblas_set_pointer_mode\0")
         }
         .map_err(|e| RocblasError::MissingSymbol {
             symbol: "rocblas_set_pointer_mode",
             detail: e.to_string(),
         })?;
-        let sasum =
-            unsafe { self.owner.library.get::<Sasum>(b"rocblas_sasum\0") }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sasum",
-                    detail: e.to_string(),
-                }
+        let sasum = unsafe { crate::ffi::symbol::<Sasum>(&self.owner.library, b"rocblas_sasum\0") }
+            .map_err(|e| RocblasError::MissingSymbol {
+                symbol: "rocblas_sasum",
+                detail: e.to_string(),
             })?;
-        let sscal =
-            unsafe { self.owner.library.get::<Sscal>(b"rocblas_sscal\0") }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sscal",
-                    detail: e.to_string(),
-                }
+        let sscal = unsafe { crate::ffi::symbol::<Sscal>(&self.owner.library, b"rocblas_sscal\0") }
+            .map_err(|e| RocblasError::MissingSymbol {
+                symbol: "rocblas_sscal",
+                detail: e.to_string(),
             })?;
         let mut prior_mode = ROCBLAS_POINTER_MODE_HOST;
         let get_status = unsafe { get_mode(self.owner.handle, &raw mut prior_mode) };
@@ -1565,10 +1524,10 @@ impl Rocblas {
             ROCBLAS_SUCCESS
         };
         let restore_status = unsafe { set_mode(self.owner.handle, prior_mode) };
-        let sync = self.owner.runtime.call(
-            "hipDeviceSynchronize",
-            |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
-        );
+        let sync = self
+            .owner
+            .runtime
+            .call("hipDeviceSynchronize", |f: NoArgStatus| unsafe { f() });
         if let Err(error) = sync {
             self.owner.poisoned.set(true);
             std::mem::forget(x_lease);
@@ -1610,8 +1569,7 @@ impl Drop for RocblasHandleOwner {
         }
         // SAFETY: handle came from rocblas_create_handle and library is retained until this drop.
         if let Ok(destroy) = unsafe {
-            self.library
-                .get::<DestroyHandle>(b"rocblas_destroy_handle\0")
+            crate::ffi::symbol::<DestroyHandle>(&self.library, b"rocblas_destroy_handle\0")
         } {
             let _ = unsafe { destroy(self.handle) };
         }

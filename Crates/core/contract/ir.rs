@@ -46,6 +46,7 @@ pub use crate::core::{
     PcuValueTypeCaps,
     PcuValueType,
 };
+pub use crate::scalar_float_underflow::PcuFloatUnderflowPolicy;
 #[rustfmt::skip]
 pub use crate::ir::{
     PcuCoordinateOp,
@@ -68,12 +69,16 @@ pub use crate::model::{
     PcuDispatchCoordinateOp,
     PcuDispatchDataOp,
     PcuDispatchConversion,
+    PcuDispatchCheckedFloatConversion,
     PcuDispatchFeatureCaps,
     PcuDispatchIndex,
     PcuDispatchInstructionContract,
     PcuDispatchKernelIr,
     PcuDispatchOp,
     PcuDispatchAluOp,
+    PcuDispatchIntegerBinaryOp,
+    PcuDispatchFloatBinaryOp,
+    PcuDispatchFloatUnaryOp,
     PcuDispatchControlOp,
     PcuDispatchPortOp,
     PcuDispatchRayTraceOp,

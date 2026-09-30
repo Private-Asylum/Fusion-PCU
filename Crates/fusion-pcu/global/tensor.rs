@@ -15,8 +15,12 @@ use super::{
 #[rustfmt::skip]
 use core::{
     any::TypeId,
+    cell::Cell,
     marker::PhantomData,
 };
+#[cfg(feature = "tensor")]
+use core::cell::RefCell;
+use alloc::rc::Rc;
 #[cfg(feature = "tensor")]
 #[rustfmt::skip]
 use core::sync::atomic::{
@@ -34,7 +38,7 @@ use crate::dialect::tensor::{
 use alloc::vec::Vec;
 
 #[cfg(feature = "tensor")]
-#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))]
 static NEXT_CAPTURE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Opaque value token tied to one cold source graph capture.
@@ -89,16 +93,90 @@ pub struct PcuTensorGraphCapture {
     #[cfg(feature = "tensor")]
     capture_id: usize,
     #[cfg(feature = "tensor")]
-    active_markers: Vec<TypeId>,
+    active_markers: Rc<RefCell<Vec<TypeId>>>,
+    base_float_underflow_policy: crate::PcuFloatUnderflowPolicy,
+    float_underflow_policy: Rc<Cell<crate::PcuFloatUnderflowPolicy>>,
+    numerical_mode: Rc<Cell<crate::PcuNumericalMode>>,
     marker: PhantomData<fn() -> ()>,
+}
+
+struct FloatUnderflowPolicyRestore {
+    policy: Rc<Cell<crate::PcuFloatUnderflowPolicy>>,
+    previous: crate::PcuFloatUnderflowPolicy,
+}
+
+impl Drop for FloatUnderflowPolicyRestore {
+    fn drop(&mut self) {
+        self.policy.set(self.previous);
+    }
+}
+
+struct NumericalModeRestore {
+    mode: Rc<Cell<crate::PcuNumericalMode>>,
+    previous: crate::PcuNumericalMode,
+}
+
+impl Drop for NumericalModeRestore {
+    fn drop(&mut self) {
+        self.mode.set(self.previous);
+    }
+}
+
+#[cfg(feature = "tensor")]
+struct ActiveMarkerRestore {
+    markers: Rc<RefCell<Vec<TypeId>>>,
+    previous_len: usize,
+}
+
+#[cfg(feature = "tensor")]
+impl Drop for ActiveMarkerRestore {
+    fn drop(&mut self) {
+        self.markers.borrow_mut().truncate(self.previous_len);
+    }
 }
 
 #[cfg_attr(not(feature = "tensor"), allow(clippy::missing_const_for_fn))]
 // Executable configurations mutate the graph and recursion stack; disabled stubs are constant.
 impl PcuTensorGraphCapture {
+    /// Runs a helper under its explicit mode, or inherits its caller's active mode.
+    /// Restores the previous mode on errors and unwinding panics.
+    #[doc(hidden)]
+    pub fn with_numerical_mode<R>(
+        &mut self,
+        mode: Option<crate::PcuNumericalMode>,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let mode = mode.unwrap_or_else(|| self.numerical_mode.get());
+        let restore = NumericalModeRestore {
+            mode: Rc::clone(&self.numerical_mode),
+            previous: self.numerical_mode.replace(mode),
+        };
+        let result = operation(self);
+        drop(restore);
+        result
+    }
+
+    /// Runs capture work under one function-local arithmetic policy and restores the prior
+    /// policy on every Rust exit path, including unwinding panics.
+    #[doc(hidden)]
+    pub fn with_float_underflow_policy<R>(
+        &mut self,
+        policy: Option<crate::PcuFloatUnderflowPolicy>,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let policy = policy.unwrap_or(self.base_float_underflow_policy);
+        let restore = FloatUnderflowPolicyRestore {
+            policy: Rc::clone(&self.float_underflow_policy),
+            previous: self.float_underflow_policy.replace(policy),
+        };
+        let result = operation(self);
+        drop(restore);
+        result
+    }
+
     #[cfg(feature = "tensor")]
     #[cfg(test)]
-    #[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))]
     fn new<T: PcuScalar, const N: usize>(
         shapes: [PcuSourceShape; N],
     ) -> Result<(Self, [PcuTensorGraphValue<T>; N]), PcuExecutionError> {
@@ -106,9 +184,22 @@ impl PcuTensorGraphCapture {
     }
 
     #[cfg(feature = "tensor")]
-    #[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+    #[cfg(test)]
+    #[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))]
     fn new_with_witnesses<T: PcuScalar, const N: usize>(
         shapes: [PcuTensorShapeWitness<'_>; N],
+    ) -> Result<(Self, [PcuTensorGraphValue<T>; N]), PcuExecutionError> {
+        Self::new_with_witnesses_and_policy(
+            shapes,
+            crate::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        )
+    }
+
+    #[cfg(feature = "tensor")]
+    #[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))]
+    fn new_with_witnesses_and_policy<T: PcuScalar, const N: usize>(
+        shapes: [PcuTensorShapeWitness<'_>; N],
+        base_float_underflow_policy: crate::PcuFloatUnderflowPolicy,
     ) -> Result<(Self, [PcuTensorGraphValue<T>; N]), PcuExecutionError> {
         let capture_id = NEXT_CAPTURE_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -142,7 +233,10 @@ impl PcuTensorGraphCapture {
             Self {
                 graph,
                 capture_id,
-                active_markers: Vec::new(),
+                active_markers: Rc::new(RefCell::new(Vec::new())),
+                base_float_underflow_policy,
+                float_underflow_policy: Rc::new(Cell::new(base_float_underflow_policy)),
+                numerical_mode: Rc::new(Cell::new(crate::PcuNumericalMode::Boundary)),
                 marker: PhantomData,
             },
             values,
@@ -186,13 +280,14 @@ impl PcuTensorGraphCapture {
     pub fn enter(&mut self, marker: TypeId) -> Result<(), PcuExecutionError> {
         #[cfg(feature = "tensor")]
         {
-            if self.active_markers.contains(&marker) {
+            let mut active_markers = self.active_markers.borrow_mut();
+            if active_markers.contains(&marker) {
                 return Err(PcuExecutionError::RecursiveTensorSource);
             }
-            if self.active_markers.len() >= 64 {
+            if active_markers.len() >= 64 {
                 return Err(PcuExecutionError::TensorSourceNestingLimit);
             }
-            self.active_markers.push(marker);
+            active_markers.push(marker);
             Ok(())
         }
         #[cfg(not(feature = "tensor"))]
@@ -207,7 +302,33 @@ impl PcuTensorGraphCapture {
     pub fn leave(&mut self) {
         #[cfg(feature = "tensor")]
         {
-            let _ = self.active_markers.pop();
+            let _ = self.active_markers.borrow_mut().pop();
+        }
+    }
+
+    /// Enters one generated helper scope and restores its recursion marker on every exit path.
+    #[doc(hidden)]
+    pub fn with_marker<R>(
+        &mut self,
+        marker: TypeId,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, PcuExecutionError> {
+        #[cfg(feature = "tensor")]
+        {
+            let previous_len = self.active_markers.borrow().len();
+            self.enter(marker)?;
+            let restore = ActiveMarkerRestore {
+                markers: Rc::clone(&self.active_markers),
+                previous_len,
+            };
+            let result = operation(self);
+            drop(restore);
+            Ok(result)
+        }
+        #[cfg(not(feature = "tensor"))]
+        {
+            let _ = (marker, operation);
+            Err(PcuExecutionError::TensorExecutionUnavailable)
         }
     }
 
@@ -255,6 +376,35 @@ impl PcuTensorGraphCapture {
         }
     }
 
+    /// Rejects an explicitly requested floating underflow policy for non-float captures.
+    #[doc(hidden)]
+    pub fn require_float_underflow_policy<T: PcuScalar>(
+        &self,
+        value: PcuTensorGraphValue<T>,
+    ) -> Result<(), PcuExecutionError> {
+        #[cfg(feature = "tensor")]
+        {
+            self.validate_value(value)?;
+            if !matches!(
+                T::TYPE,
+                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
+            ) {
+                return Err(super::tensor_build_error(
+                    crate::dialect::tensor::TensorError::UnsupportedScalarType {
+                        value: value.value.erase(),
+                        scalar_type: T::TYPE,
+                    },
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "tensor"))]
+        {
+            let _ = value;
+            Err(PcuExecutionError::TensorExecutionUnavailable)
+        }
+    }
+
     /// Captures one elementwise addition after validating both operands belong to this graph.
     #[doc(hidden)]
     pub fn add<T: PcuScalar>(
@@ -266,10 +416,17 @@ impl PcuTensorGraphCapture {
         {
             self.validate_value(lhs)?;
             self.validate_value(rhs)?;
-            let value = self
-                .graph
-                .add_typed(lhs.value, rhs.value)
-                .map_err(super::tensor_build_error)?;
+            let policy = self.float_underflow_policy.get();
+            let value = if matches!(
+                T::TYPE,
+                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
+            ) {
+                self.graph
+                    .add_typed_with_underflow_policy(lhs.value, rhs.value, policy)
+            } else {
+                self.graph.add_typed(lhs.value, rhs.value)
+            }
+            .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -294,10 +451,17 @@ impl PcuTensorGraphCapture {
         {
             self.validate_value(lhs)?;
             self.validate_value(rhs)?;
-            let value = self
-                .graph
-                .sub_typed(lhs.value, rhs.value)
-                .map_err(super::tensor_build_error)?;
+            let policy = self.float_underflow_policy.get();
+            let value = if matches!(
+                T::TYPE,
+                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
+            ) {
+                self.graph
+                    .sub_typed_with_underflow_policy(lhs.value, rhs.value, policy)
+            } else {
+                self.graph.sub_typed(lhs.value, rhs.value)
+            }
+            .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
                 capture_id: self.capture_id,
@@ -322,9 +486,63 @@ impl PcuTensorGraphCapture {
         {
             self.validate_value(lhs)?;
             self.validate_value(rhs)?;
+            let policy = self.float_underflow_policy.get();
+            let value = if matches!(
+                T::TYPE,
+                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
+            ) {
+                self.graph
+                    .mul_typed_with_underflow_policy(lhs.value, rhs.value, policy)
+            } else {
+                self.graph.mul_typed(lhs.value, rhs.value)
+            }
+            .map_err(super::tensor_build_error)?;
+            Ok(PcuTensorGraphValue {
+                value,
+                capture_id: self.capture_id,
+                marker: PhantomData,
+            })
+        }
+        #[cfg(not(feature = "tensor"))]
+        {
+            let _ = (lhs, rhs);
+            Err(PcuExecutionError::TensorExecutionUnavailable)
+        }
+    }
+
+    /// Captures one checked floating-point elementwise division after validating both operands.
+    ///
+    /// Integer tensor division is outside this source profile and returns a build error before
+    /// backend selection or execution. The active scoped/global underflow policy is captured in
+    /// the graph node and preserved through preparation and execution.
+    #[doc(hidden)]
+    pub fn div<T: PcuScalar>(
+        &mut self,
+        lhs: PcuTensorGraphValue<T>,
+        rhs: PcuTensorGraphValue<T>,
+    ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError> {
+        #[cfg(feature = "tensor")]
+        {
+            self.validate_value(lhs)?;
+            self.validate_value(rhs)?;
+            if !matches!(
+                T::TYPE,
+                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
+            ) {
+                return Err(super::tensor_build_error(
+                    crate::dialect::tensor::TensorError::UnsupportedScalarType {
+                        value: lhs.value.erase(),
+                        scalar_type: T::TYPE,
+                    },
+                ));
+            }
             let value = self
                 .graph
-                .mul_typed(lhs.value, rhs.value)
+                .div_typed_with_underflow_policy(
+                    lhs.value,
+                    rhs.value,
+                    self.float_underflow_policy.get(),
+                )
                 .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
@@ -353,6 +571,12 @@ impl PcuTensorGraphCapture {
             let value = self
                 .graph
                 .matmul_typed(lhs.value, rhs.value)
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_mode(value.erase(), self.numerical_mode.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_float_underflow_policy(value.erase(), self.float_underflow_policy.get())
                 .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
                 value,
@@ -447,13 +671,13 @@ impl PcuTensorGraphCapture {
     }
 
     #[cfg(feature = "tensor")]
-    #[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))]
     fn finish<T: PcuScalar>(
         self,
         value: PcuTensorGraphValue<T>,
     ) -> Result<(Graph, ValueId), PcuExecutionError> {
         self.validate_value(value)?;
-        if !self.active_markers.is_empty() {
+        if !self.active_markers.borrow().is_empty() {
             return Err(PcuExecutionError::InvalidTensorSourcePlan);
         }
         Ok((self.graph, value.value.erase()))
@@ -463,9 +687,15 @@ impl PcuTensorGraphCapture {
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct PcuTensorInput<'a, T: PcuScalar> {
-    #[cfg_attr(not(all(feature = "rocm", feature = "tensor")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
+        allow(dead_code)
+    )]
     kind: TensorInputKind<'a, T>,
-    #[cfg_attr(not(all(feature = "rocm", feature = "tensor")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
+        allow(dead_code)
+    )]
     shape: PcuTensorShapeWitness<'a>,
 }
 
@@ -483,7 +713,10 @@ enum PcuTensorShapeWitness<'a> {
     #[cfg_attr(not(feature = "tensor"), allow(dead_code))]
     Static(PcuSourceShape),
     // The provider-off source adapter keeps the same descriptor type but cannot construct it.
-    #[cfg_attr(not(all(feature = "rocm", feature = "tensor")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
+        allow(dead_code)
+    )]
     #[cfg_attr(not(feature = "tensor"), allow(dead_code))]
     Dynamic(&'a [usize]),
 }
@@ -492,7 +725,10 @@ enum PcuTensorShapeWitness<'a> {
 #[doc(hidden)]
 pub struct DynamicResidentShape;
 
-#[cfg_attr(not(all(feature = "rocm", feature = "tensor")), allow(dead_code))]
+#[cfg_attr(
+    not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
+    allow(dead_code)
+)]
 #[derive(Clone, Copy)]
 enum TensorInputKind<'a, T: PcuScalar> {
     Host(&'a [T]),
@@ -506,14 +742,14 @@ impl<'a, T: PcuScalar> PcuTensorInput<'a, T> {
             shape: PcuTensorShapeWitness::Static(shape),
         }
     }
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     const fn resident(owner: &'a PcuTensor<T>, shape: PcuSourceShape) -> Self {
         Self {
             kind: TensorInputKind::Resident(owner),
             shape: PcuTensorShapeWitness::Static(shape),
         }
     }
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     fn resident_dynamic(owner: &'a PcuTensor<T>) -> Self {
         Self {
             kind: TensorInputKind::Resident(owner),
@@ -638,52 +874,52 @@ impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatri
     }
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> sealed::TensorSource<T, SliceShape> for PcuTensor<T> {}
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> PcuTensorSource<T, SliceShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
-        let length = self.device_tensor().buffer().len();
+        let length = self.device_tensor().len();
         let shape = PcuSourceShape::Slice { length };
         Ok(PcuTensorInput::resident(self, shape))
     }
 }
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar> sealed::TensorSource<T, SliceShape> for PcuTensor<T> {}
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar> PcuTensorSource<T, SliceShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Err(PcuArgumentError::ProviderUnavailable)
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const N: usize> sealed::TensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {}
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const N: usize> PcuTensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         let shape = PcuSourceShape::FixedArray { length: N };
         Ok(PcuTensorInput::resident(self, shape))
     }
 }
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar, const N: usize> sealed::TensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {}
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar, const N: usize> PcuTensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Err(PcuArgumentError::ProviderUnavailable)
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const R: usize, const C: usize> sealed::TensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
 }
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar, const R: usize, const C: usize> sealed::TensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
 }
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -692,23 +928,23 @@ impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatri
     }
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> sealed::TensorSource<T, DynamicResidentShape> for PcuTensor<T> {}
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> PcuTensorSource<T, DynamicResidentShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Ok(PcuTensorInput::resident_dynamic(self))
     }
 }
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar> sealed::TensorSource<T, DynamicResidentShape> for PcuTensor<T> {}
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(any(feature = "rocm", feature = "cuda")))]
 impl<T: PcuScalar> PcuTensorSource<T, DynamicResidentShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Err(PcuArgumentError::ProviderUnavailable)
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -732,17 +968,20 @@ impl<T: PcuScalar> core::fmt::Debug for PcuTensor<T> {
 }
 
 // Provider-disabled builds retain the same instance API, although no owner can be minted.
-#[cfg_attr(not(feature = "rocm"), allow(clippy::unused_self))]
+#[cfg_attr(
+    not(any(feature = "rocm", feature = "cuda")),
+    allow(clippy::unused_self)
+)]
 impl<T: PcuScalar> PcuTensor<T> {
     /// Dense logical dimensions; no device transfer occurs.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Provider configurations borrow dynamic shape metadata.
     pub fn shape(&self) -> &[usize] {
-        #[cfg(feature = "rocm")]
+        #[cfg(any(feature = "rocm", feature = "cuda"))]
         {
             self.device_tensor().shape()
         }
-        #[cfg(not(feature = "rocm"))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
         {
             &[]
         } // No safe constructor exists when no execution provider is compiled.
@@ -752,11 +991,11 @@ impl<T: PcuScalar> PcuTensor<T> {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Provider metadata comes through its typed storage view.
     pub fn len(&self) -> usize {
-        #[cfg(feature = "rocm")]
+        #[cfg(any(feature = "rocm", feature = "cuda"))]
         {
-            self.device_tensor().buffer().len()
+            self.device_tensor().len()
         }
-        #[cfg(not(feature = "rocm"))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
         {
             0
         } // The disabled-provider owner is not constructible by consumers.
@@ -777,16 +1016,12 @@ impl<T: PcuScalar> PcuTensor<T> {
     /// or backend transfer failure. No implicit CPU computation or backend migration occurs.
     #[allow(clippy::missing_const_for_fn)] // Executable configurations perform validated device IO.
     pub fn read_into(&self, destination: &mut [T]) -> Result<(), PcuExecutionError> {
-        #[cfg(feature = "rocm")]
+        #[cfg(any(feature = "rocm", feature = "cuda"))]
         {
             self.validate_initialized().map_err(super::argument_error)?;
-            let pool = crate::PcuMemoryResource::pool(self.device_tensor().buffer().resource());
-            self.session()
-                .backend()
-                .download_buffer(pool, self.device_tensor().buffer(), destination)
-                .map_err(PcuExecutionError::DeviceExecution)
+            self.session().download(self.device_tensor(), destination)
         }
-        #[cfg(not(feature = "rocm"))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
         {
             let _ = destination;
             Err(PcuExecutionError::NoBackendEnabled)
@@ -801,7 +1036,7 @@ impl<T: PcuScalar> PcuTensor<T> {
 #[doc(hidden)]
 #[allow(clippy::needless_pass_by_value)] // Generated calls transfer the validated source carrier into execution.
 #[cfg_attr(
-    not(all(feature = "rocm", feature = "tensor")),
+    not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
     allow(clippy::missing_const_for_fn)
 )] // Enabled providers execute runtime work through the same API.
 pub fn call_owned_tensor_capture<T: PcuScalar, const N: usize, F>(
@@ -817,11 +1052,11 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
-    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call(site, specialization, &inputs, build)
     }
-    #[cfg(not(all(feature = "rocm", feature = "tensor")))]
+    #[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
     {
         let _ = (site, specialization, inputs, build);
         Err(PcuExecutionError::TensorExecutionUnavailable)
@@ -841,7 +1076,7 @@ where
 #[doc(hidden)]
 #[allow(clippy::needless_pass_by_value)] // The generated signature deliberately consumes the owner.
 #[cfg_attr(
-    not(all(feature = "rocm", feature = "tensor")),
+    not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
     allow(clippy::missing_const_for_fn)
 )] // Executable configurations validate and execute through the retained provider.
 pub fn call_consumed_tensor_capture<T: PcuScalar, F>(
@@ -857,11 +1092,11 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
-    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_consumed(site, specialization, input, build)
     }
-    #[cfg(not(all(feature = "rocm", feature = "tensor")))]
+    #[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
     {
         let _ = (site, specialization, input, build);
         Err(PcuExecutionError::TensorExecutionUnavailable)
@@ -880,7 +1115,7 @@ where
 #[doc(hidden)]
 #[allow(clippy::needless_pass_by_value)] // Generated calls transfer the validated source carrier into execution.
 #[cfg_attr(
-    not(all(feature = "rocm", feature = "tensor")),
+    not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
     allow(clippy::missing_const_for_fn)
 )] // Enabled providers execute runtime work through the same API.
 pub fn call_consumed_pair_tensor_capture<T: PcuScalar, F>(
@@ -898,11 +1133,11 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
-    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_consumed_pair(site, specialization, donor, other, donor_index, build)
     }
-    #[cfg(not(all(feature = "rocm", feature = "tensor")))]
+    #[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
     {
         let _ = (site, specialization, donor, other, donor_index, build);
         Err(PcuExecutionError::TensorExecutionUnavailable)
@@ -921,7 +1156,7 @@ where
 #[doc(hidden)]
 #[allow(clippy::needless_pass_by_value)] // Generated calls transfer the validated owner array.
 #[cfg_attr(
-    not(all(feature = "rocm", feature = "tensor")),
+    not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
     allow(clippy::missing_const_for_fn)
 )] // Enabled providers execute runtime work through the same API.
 pub fn call_consumed_owners_tensor_capture<T: PcuScalar, const N: usize, F>(
@@ -937,11 +1172,11 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
-    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_consumed_owners::<T, N, F>(site, specialization, inputs, build)
     }
-    #[cfg(not(all(feature = "rocm", feature = "tensor")))]
+    #[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
     {
         let _ = (site, specialization, inputs, build);
         Err(PcuExecutionError::TensorExecutionUnavailable)
@@ -952,7 +1187,7 @@ where
 #[doc(hidden)]
 #[allow(clippy::needless_pass_by_value)] // The carrier array owns consumed arguments.
 #[cfg_attr(
-    not(all(feature = "rocm", feature = "tensor")),
+    not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
     allow(clippy::missing_const_for_fn)
 )] // Enabled providers execute runtime work through the same API.
 pub fn call_mixed_consumed_tensor_capture<T: PcuScalar, const N: usize, F>(
@@ -968,18 +1203,18 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
-    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_mixed_consumed::<T, N, F>(site, specialization, inputs, build)
     }
-    #[cfg(not(all(feature = "rocm", feature = "tensor")))]
+    #[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
     {
         let _ = (site, specialization, inputs, build);
         Err(PcuExecutionError::TensorExecutionUnavailable)
     }
 }
 
-#[cfg(all(feature = "rocm", feature = "tensor"))]
+#[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
 mod execution {
     #[rustfmt::skip]
     use super::{
@@ -1002,8 +1237,6 @@ mod execution {
         PcuHostArgument,
         PcuBindingRef,
         PcuMemoryPoolId,
-        PcuMemoryProvider,
-        PcuOwnedDispatchBackend,
     };
     #[rustfmt::skip]
     use crate::dialect::tensor::{
@@ -1013,11 +1246,11 @@ mod execution {
         ValueId,
     };
     #[rustfmt::skip]
-    use fusion_pcu_rocm::{
-        RocmMemoryProvider,
-        RocmMemoryResource,
-        RocmOwnedPreparedTensorGraph,
-        RocmTensorAssessor,
+    use crate::global::resident::{
+        Memory,
+        Resource,
+        Prepared,
+        Assessor,
     };
     #[rustfmt::skip]
     use std::{
@@ -1026,7 +1259,7 @@ mod execution {
         sync::Arc,
         sync::atomic::Ordering,
     };
-    use crate::global::session::RocmSession;
+    use crate::global::resident::Session;
 
     fn tensor_element_count(shape: PcuSourceShape) -> Result<usize, PcuExecutionError> {
         match shape {
@@ -1102,13 +1335,13 @@ mod execution {
         scalar_type: crate::core::PcuScalarType,
         shape_keys: Vec<InputShapeKey>,
         resident_affinity: bool,
-        session: Rc<RocmSession>,
-        prepared: RocmOwnedPreparedTensorGraph,
+        session: Rc<Session>,
+        prepared: Prepared,
         input_ids: Vec<ValueId>,
         input_indices: Vec<usize>,
         pool: PcuMemoryPoolId,
-        memory: RocmMemoryProvider,
-        host_inputs: Vec<Option<RocmMemoryResource>>,
+        memory: Memory,
+        host_inputs: Vec<Option<Resource>>,
     }
     struct BuiltProgram {
         program: Arc<crate::dialect::tensor::TensorOwnedSelectedProgram>,
@@ -1126,7 +1359,7 @@ mod execution {
     }
 
     fn synchronize_generation() -> Result<u64, PcuExecutionError> {
-        let generation = crate::global::hosted::current_generation();
+        let generation = crate::global::policy::generation();
         LAST_GENERATION
             .try_with(|last| {
                 if last.get() != generation {
@@ -1137,7 +1370,7 @@ mod execution {
                                 .map_err(|_| PcuExecutionError::ReentrantCall)?;
                             state.entries.clear();
                             state.generation = generation;
-                            Ok(())
+                            Ok::<(), PcuExecutionError>(())
                         })
                         .map_err(|_| PcuExecutionError::ThreadUnavailable)??;
                     last.set(generation);
@@ -1162,6 +1395,8 @@ mod execution {
 
     fn build_program<T: PcuScalar, const N: usize, F>(
         shapes: [PcuTensorShapeWitness<'_>; N],
+        base_float_underflow_policy: crate::PcuFloatUnderflowPolicy,
+        numerical_mode: crate::PcuNumericalMode,
         build: F,
     ) -> Result<BuiltProgram, PcuExecutionError>
     where
@@ -1171,8 +1406,11 @@ mod execution {
             ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
             + 'static,
     {
-        let (mut capture, input_values) =
-            PcuTensorGraphCapture::new_with_witnesses::<T, N>(shapes)?;
+        let (mut capture, input_values) = PcuTensorGraphCapture::new_with_witnesses_and_policy::<
+            T,
+            N,
+        >(shapes, base_float_underflow_policy)?;
+        capture.numerical_mode.set(numerical_mode);
         let captured_input_ids = input_values.map(|value| value.value.erase());
         let output_value = build(&mut capture, input_values)?;
         let (graph, output_id) = capture.finish(output_value)?;
@@ -1209,23 +1447,22 @@ mod execution {
     }
 
     fn prepare_entry<T: PcuScalar, const N: usize>(
-        affinity: Option<&Rc<RocmSession>>,
+        snapshot: crate::global::policy::PolicySnapshot,
+        affinity: Option<&Rc<Session>>,
         specialization: TypeId,
         factory: TypeId,
         shapes: [PcuTensorShapeWitness<'_>; N],
         built: BuiltProgram,
     ) -> Result<(Entry, u64, usize), PcuExecutionError> {
         let (session, prepared, generation, capacity) =
-            crate::global::hosted::prepare_tensor(affinity, |session| {
+            crate::global::resident::prepare_tensor(snapshot, affinity, |session| {
                 let prepared = session
-                    .tensor_assessor()
-                    .map_err(PcuExecutionError::TensorInitialization)?
-                    .prepare_shared_owned_program(Arc::clone(&built.program))
-                    .map_err(PcuExecutionError::TensorExecution)?;
+                    .tensor_assessor()?
+                    .prepare_shared_owned_program(Arc::clone(&built.program))?;
                 Ok(prepared)
             })?;
-        let pool = PcuMemoryPoolId(session.backend().device_identity().device_id());
-        let memory = session.backend().memory_provider(pool);
+        let pool = PcuMemoryPoolId(session.device_id());
+        let memory = session.memory_provider(pool);
         let entry = Entry {
             specialization,
             factory,
@@ -1261,12 +1498,8 @@ mod execution {
                 return Err(PcuExecutionError::Memory(error));
             }
         } else {
-            let buffer = entry
-                .session
-                .backend()
-                .upload_buffer(entry.pool, values)
-                .map_err(PcuExecutionError::DeviceExecution)?;
-            entry.host_inputs[index] = Some(buffer.into_resource());
+            let buffer = entry.session.upload_resource(entry.pool, values)?;
+            entry.host_inputs[index] = Some(buffer);
         }
         Ok(())
     }
@@ -1316,7 +1549,7 @@ mod execution {
     fn preflight_selected_inputs<'a, T: PcuScalar, const N: usize>(
         inputs: &'a [PcuTensorInput<'_, T>; N],
         selected_indices: &[usize],
-    ) -> Result<Option<&'a Rc<RocmSession>>, PcuExecutionError> {
+    ) -> Result<Option<&'a Rc<Session>>, PcuExecutionError> {
         let mut affinity = None;
         for &index in selected_indices {
             let input = inputs
@@ -1339,8 +1572,6 @@ mod execution {
                 }
                 owner
                     .device_tensor()
-                    .buffer()
-                    .resource()
                     .validate_access_available()
                     .map_err(|_| {
                         PcuExecutionError::Argument(PcuArgumentError::ResidentCompletionUncertain)
@@ -1363,11 +1594,8 @@ mod execution {
                 stage_host_input(entry, index, values)?;
             }
         }
-        let assessor = entry
-            .session
-            .tensor_assessor()
-            .map_err(PcuExecutionError::TensorInitialization)?;
-        let mut sources: [Option<fusion_pcu_rocm::RocmTensorInputRef<'_>>; N] =
+        let assessor = entry.session.tensor_assessor()?;
+        let mut sources: [Option<crate::global::resident::InputRef<'_>>; N] =
             core::array::from_fn(|_| None);
         for selected_index in 0..entry.input_indices.len() {
             let index = entry.input_indices[selected_index];
@@ -1384,8 +1612,7 @@ mod execution {
                 TensorInputKind::Resident(owner) => {
                     assessor.borrow_device_input_ref(owner.device_tensor(), entry.pool)
                 }
-            }
-            .map_err(PcuExecutionError::TensorExecution)?;
+            }?;
             sources[index] = Some(source);
         }
         let first_index = *entry
@@ -1409,20 +1636,12 @@ mod execution {
                     .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?,
             );
         }
-        let outputs = assessor
-            .execute_owned_program_outputs_from_inputs(
-                &entry.prepared,
-                &bindings[..entry.input_ids.len()],
-                entry.pool,
-                &mut entry.memory,
-            )
-            .map_err(PcuExecutionError::TensorExecution)?;
-        let mut outputs = outputs.into_iter();
-        let (_, tensor) = outputs
-            .next()
-            .ok_or(PcuExecutionError::PreparationDidNotProduceKernel)?;
-        let extra_output = outputs.next();
-        debug_assert!(extra_output.is_none(), "source capture has one output");
+        let tensor = assessor.execute_owned_program_output_from_inputs(
+            &entry.prepared,
+            &bindings[..entry.input_ids.len()],
+            entry.pool,
+            &mut entry.memory,
+        )?;
         Ok(PcuTensor::from_successful_output(
             tensor,
             Rc::clone(&entry.session),
@@ -1501,18 +1720,13 @@ mod execution {
                     PcuArgumentError::SessionMismatch,
                 ));
             }
-            let assessor = entry
-                .session
-                .tensor_assessor()
-                .map_err(PcuExecutionError::TensorInitialization)?;
-            let output = assessor
-                .execute_owned_program_consuming_input(
-                    &entry.prepared,
-                    tensor,
-                    entry.pool,
-                    &mut entry.memory,
-                )
-                .map_err(PcuExecutionError::TensorExecution)?;
+            let assessor = entry.session.tensor_assessor()?;
+            let output = assessor.execute_owned_program_consuming_input(
+                &entry.prepared,
+                tensor,
+                entry.pool,
+                &mut entry.memory,
+            )?;
             Ok(PcuTensor::from_successful_output(output, retained_session))
         })
     }
@@ -1561,10 +1775,7 @@ mod execution {
                     PcuArgumentError::SessionMismatch,
                 ));
             }
-            let assessor = entry
-                .session
-                .tensor_assessor()
-                .map_err(PcuExecutionError::TensorInitialization)?;
+            let assessor = entry.session.tensor_assessor()?;
             let output = if let Some(other_value) = selected.other_value {
                 let other_index = 1 - donor_index;
                 let other_ref = match &other.kind {
@@ -1579,8 +1790,7 @@ mod execution {
                     TensorInputKind::Resident(owner) => {
                         assessor.borrow_device_input_ref(owner.device_tensor(), entry.pool)
                     }
-                }
-                .map_err(PcuExecutionError::TensorExecution)?;
+                }?;
                 assessor.execute_owned_program_consuming_binary_input(
                     &entry.prepared,
                     selected.donor_value,
@@ -1596,8 +1806,7 @@ mod execution {
                     entry.pool,
                     &mut entry.memory,
                 )
-            }
-            .map_err(PcuExecutionError::TensorExecution)?;
+            }?;
             Ok(PcuTensor::from_successful_output(output, retained_session))
         })
     }
@@ -1644,9 +1853,7 @@ mod execution {
                 host_inputs,
                 ..
             } = entry;
-            let assessor = session
-                .tensor_assessor()
-                .map_err(PcuExecutionError::TensorInitialization)?;
+            let assessor = session.tensor_assessor()?;
             let context = SelectedOwnerExecution {
                 session,
                 prepared,
@@ -1705,9 +1912,7 @@ mod execution {
                 host_inputs,
                 ..
             } = entry;
-            let assessor = session
-                .tensor_assessor()
-                .map_err(PcuExecutionError::TensorInitialization)?;
+            let assessor = session.tensor_assessor()?;
             let context = SelectedOwnerExecution {
                 session,
                 prepared,
@@ -1765,12 +1970,12 @@ mod execution {
     }
 
     struct SelectedOwnerExecution<'a> {
-        session: &'a Rc<RocmSession>,
-        prepared: &'a RocmOwnedPreparedTensorGraph,
+        session: &'a Rc<Session>,
+        prepared: &'a Prepared,
         pool: PcuMemoryPoolId,
-        memory: &'a mut RocmMemoryProvider,
+        memory: &'a mut Memory,
         shape_keys: &'a [InputShapeKey],
-        host_inputs: &'a [Option<RocmMemoryResource>],
+        host_inputs: &'a [Option<Resource>],
     }
 
     fn resolve_consumed_owners<T: PcuScalar, const N: usize, F>(
@@ -1939,7 +2144,7 @@ mod execution {
     }
 
     fn execute_single_selected_owner<T: PcuScalar>(
-        assessor: &RocmTensorAssessor<'_>,
+        assessor: &Assessor<'_>,
         context: SelectedOwnerExecution<'_>,
         owner_inputs: [Option<PcuTensor<T>>; 2],
     ) -> Result<PcuTensor<T>, PcuExecutionError> {
@@ -1962,14 +2167,13 @@ mod execution {
                 PcuArgumentError::SessionMismatch,
             ));
         }
-        let output = assessor
-            .execute_owned_program_consuming_input(prepared, tensor, pool, memory)
-            .map_err(PcuExecutionError::TensorExecution)?;
+        let output =
+            assessor.execute_owned_program_consuming_input(prepared, tensor, pool, memory)?;
         Ok(PcuTensor::from_successful_output(output, retained_session))
     }
 
     fn execute_both_selected_owners<T: PcuScalar>(
-        assessor: &RocmTensorAssessor<'_>,
+        assessor: &Assessor<'_>,
         context: SelectedOwnerExecution<'_>,
         owner_inputs: [Option<PcuTensor<T>>; 2],
         selected: ConsumedOwnersSelection,
@@ -2005,15 +2209,18 @@ mod execution {
                 tensor1,
             ),
         ];
-        let output = assessor
-            .execute_owned_program_consuming_binary_pair(prepared, ordered_inputs, pool, memory)
-            .map_err(PcuExecutionError::TensorExecution)?;
+        let output = assessor.execute_owned_program_consuming_binary_pair(
+            prepared,
+            ordered_inputs,
+            pool,
+            memory,
+        )?;
         drop(other_session);
         Ok(PcuTensor::from_successful_output(output, retained_session))
     }
 
     fn execute_owner_with_borrowed_peer<T: PcuScalar>(
-        assessor: &RocmTensorAssessor<'_>,
+        assessor: &Assessor<'_>,
         context: SelectedOwnerExecution<'_>,
         owners: [Option<PcuTensor<T>>; 2],
         borrowed: [Option<PcuTensorInput<'_, T>>; 2],
@@ -2072,18 +2279,15 @@ mod execution {
             TensorInputKind::Resident(owner) => {
                 assessor.borrow_device_input_ref(owner.device_tensor(), pool)
             }
-        }
-        .map_err(PcuExecutionError::TensorExecution)?;
-        let output = assessor
-            .execute_owned_program_consuming_binary_input(
-                prepared,
-                donor_value,
-                tensor,
-                &[(peer_value, &peer_ref)],
-                pool,
-                memory,
-            )
-            .map_err(PcuExecutionError::TensorExecution)?;
+        }?;
+        let output = assessor.execute_owned_program_consuming_binary_input(
+            prepared,
+            donor_value,
+            tensor,
+            &[(peer_value, &peer_ref)],
+            pool,
+            memory,
+        )?;
         Ok(PcuTensor::from_successful_output(output, retained_session))
     }
 
@@ -2237,10 +2441,25 @@ mod execution {
             }
         }
 
-        let selected_program = build_program::<T, N, F>(shapes, build)?;
+        let snapshot = crate::global::policy::snapshot()?;
+        if snapshot.policy.range_policy == crate::PcuRangePolicy::Clamp {
+            return Err(PcuExecutionError::UnsupportedRangePolicy);
+        }
+        let selected_program = build_program::<T, N, F>(
+            shapes,
+            snapshot.policy.float_underflow,
+            snapshot.policy.numerical_mode,
+            build,
+        )?;
         let affinity = preflight_selected_inputs(inputs, &selected_program.input_indices)?;
-        let (entry, prepared_generation, capacity) =
-            prepare_entry::<T, N>(affinity, specialization, factory, shapes, selected_program)?;
+        let (entry, prepared_generation, capacity) = prepare_entry::<T, N>(
+            snapshot,
+            affinity,
+            specialization,
+            factory,
+            shapes,
+            selected_program,
+        )?;
         if prepared_generation != generation {
             state.entries.clear();
             state.generation = prepared_generation;
@@ -2293,7 +2512,7 @@ mod execution {
             })
             .unwrap();
 
-            let expected = crate::global::hosted::current_generation();
+            let expected = crate::global::policy::generation();
             super::LAST_GENERATION.with(|last| last.set(expected.wrapping_sub(1)));
             super::synchronize_generation().unwrap();
 
@@ -2308,6 +2527,8 @@ mod execution {
 
 #[cfg(all(test, feature = "tensor"))]
 mod capture_tests {
+    extern crate std;
+
     #[rustfmt::skip]
     use super::{
         PcuExecutionError,
@@ -2316,6 +2537,216 @@ mod capture_tests {
         PcuTensorGraphOwner,
     };
     use core::any::TypeId;
+    use crate::PcuFloatUnderflowPolicy;
+
+    #[crate::pcu(crate_path = crate)]
+    fn inherited_matmul(
+        lhs: &[[f32; 1]; 1],
+        rhs: &[[f32; 1]; 1],
+    ) -> Result<crate::PcuTensor<f32>, PcuExecutionError> {
+        Ok(pcu::matmul(lhs, rhs)?)
+    }
+
+    #[crate::pcu(crate_path = crate, flag(non_strict))]
+    fn boundary_matmul(
+        lhs: &[[f32; 1]; 1],
+        rhs: &[[f32; 1]; 1],
+    ) -> Result<crate::PcuTensor<f32>, PcuExecutionError> {
+        Ok(pcu::matmul(lhs, rhs)?)
+    }
+
+    #[crate::pcu(crate_path = crate, flag(strict))]
+    fn strict_helper_call(
+        lhs: &[[f32; 1]; 1],
+        rhs: &[[f32; 1]; 1],
+    ) -> Result<crate::PcuTensor<f32>, PcuExecutionError> {
+        inherited_matmul(lhs, rhs)
+    }
+
+    #[test]
+    fn generated_helpers_capture_inherited_and_explicit_numerical_modes() {
+        use crate::PcuNumericalMode;
+        let (mut capture, values) = PcuTensorGraphCapture::new::<f32, 2>([
+            PcuSourceShape::FixedMatrix {
+                rows: 1,
+                columns: 1,
+            },
+            PcuSourceShape::FixedMatrix {
+                rows: 1,
+                columns: 1,
+            },
+        ])
+        .unwrap();
+        let result = strict_helper_call::__pcu_capture_entry(&mut capture, values).unwrap();
+        assert_eq!(
+            capture
+                .graph
+                .node(result.value.erase())
+                .unwrap()
+                .numerical_mode,
+            Some(PcuNumericalMode::Strict)
+        );
+        assert_eq!(capture.numerical_mode.get(), PcuNumericalMode::Boundary);
+        capture.with_numerical_mode(Some(PcuNumericalMode::Strict), |capture| {
+            let result = boundary_matmul::__pcu_capture_entry(capture, values).unwrap();
+            assert_eq!(
+                capture
+                    .graph
+                    .node(result.value.erase())
+                    .unwrap()
+                    .numerical_mode,
+                Some(PcuNumericalMode::Boundary)
+            );
+            assert_eq!(capture.numerical_mode.get(), PcuNumericalMode::Strict);
+        });
+    }
+
+    #[test]
+    fn numerical_scope_inherits_overrides_and_restores_on_panic() {
+        use crate::PcuNumericalMode;
+        let (mut capture, values) = PcuTensorGraphCapture::new::<f32, 2>([
+            PcuSourceShape::FixedMatrix {
+                rows: 1,
+                columns: 1,
+            },
+            PcuSourceShape::FixedMatrix {
+                rows: 1,
+                columns: 1,
+            },
+        ])
+        .unwrap();
+        assert_eq!(capture.numerical_mode.get(), PcuNumericalMode::Boundary);
+        capture.with_numerical_mode(Some(PcuNumericalMode::Strict), |capture| {
+            capture.with_numerical_mode(None, |capture| {
+                let result = capture.matmul(values[0], values[1]).unwrap();
+                let node = capture.graph.node(result.value.erase()).unwrap();
+                assert_eq!(node.numerical_mode, Some(PcuNumericalMode::Strict));
+                assert_eq!(
+                    node.float_underflow_policy,
+                    Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+                );
+            });
+            let error: Result<(), ()> =
+                capture.with_numerical_mode(Some(PcuNumericalMode::Boundary), |capture| {
+                    assert_eq!(capture.numerical_mode.get(), PcuNumericalMode::Boundary);
+                    Err(())
+                });
+            assert!(error.is_err());
+            assert_eq!(capture.numerical_mode.get(), PcuNumericalMode::Strict);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture.with_numerical_mode(Some(PcuNumericalMode::Boundary), |_| panic!("scope"));
+            }));
+            assert!(panic.is_err());
+            assert_eq!(capture.numerical_mode.get(), PcuNumericalMode::Strict);
+        });
+        assert_eq!(capture.numerical_mode.get(), PcuNumericalMode::Boundary);
+    }
+
+    #[test]
+    fn policy_scope_restores_on_nested_result_error_and_panic() {
+        let (mut capture, _) = PcuTensorGraphCapture::new::<f32, 0>([]).unwrap();
+        assert_eq!(
+            capture.float_underflow_policy.get(),
+            PcuFloatUnderflowPolicy::IeeeAfterRounding
+        );
+
+        capture.with_float_underflow_policy(
+            Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow),
+            |capture| {
+                assert_eq!(
+                    capture.float_underflow_policy.get(),
+                    PcuFloatUnderflowPolicy::AllowGradualUnderflow
+                );
+                capture.with_float_underflow_policy(None, |capture| {
+                    assert_eq!(
+                        capture.float_underflow_policy.get(),
+                        PcuFloatUnderflowPolicy::IeeeAfterRounding
+                    );
+                });
+                assert_eq!(
+                    capture.float_underflow_policy.get(),
+                    PcuFloatUnderflowPolicy::AllowGradualUnderflow
+                );
+                let failed: Result<(), &'static str> = capture.with_float_underflow_policy(
+                    Some(PcuFloatUnderflowPolicy::RejectSubnormalResult),
+                    |_| Err("capture failed"),
+                );
+                assert_eq!(failed, Err("capture failed"));
+                assert_eq!(
+                    capture.float_underflow_policy.get(),
+                    PcuFloatUnderflowPolicy::AllowGradualUnderflow
+                );
+            },
+        );
+        assert_eq!(
+            capture.float_underflow_policy.get(),
+            PcuFloatUnderflowPolicy::IeeeAfterRounding
+        );
+        let marker = TypeId::of::<u64>();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = capture.with_marker(marker, |_| panic!("exercise marker unwind restoration"));
+        }));
+        assert!(panic.is_err());
+        assert!(capture.active_markers.borrow().is_empty());
+        capture.with_marker(marker, |_| ()).unwrap();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture.with_float_underflow_policy(
+                Some(PcuFloatUnderflowPolicy::RejectSubnormalResult),
+                |_| panic!("exercise policy unwind restoration"),
+            );
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            capture.float_underflow_policy.get(),
+            PcuFloatUnderflowPolicy::IeeeAfterRounding
+        );
+    }
+
+    #[test]
+    fn nested_unannotated_scope_uses_capture_base_and_records_policy_per_node() {
+        let shape = PcuSourceShape::Slice { length: 2 };
+        let (mut capture, [lhs, rhs]) =
+            PcuTensorGraphCapture::new_with_witnesses_and_policy::<f32, 2>(
+                [
+                    super::PcuTensorShapeWitness::Static(shape),
+                    super::PcuTensorShapeWitness::Static(shape),
+                ],
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+            )
+            .unwrap();
+        let (strict, inherited, strict_after_nested) = capture
+            .with_float_underflow_policy(
+                Some(PcuFloatUnderflowPolicy::RejectSubnormalResult),
+                |capture| {
+                    let strict = capture.add(lhs, rhs)?;
+                    let inherited = capture
+                        .with_float_underflow_policy(None, |capture| capture.add(lhs, rhs))?;
+                    let strict_after_nested = capture.add(inherited, rhs)?;
+                    Ok::<_, PcuExecutionError>((strict, inherited, strict_after_nested))
+                },
+            )
+            .unwrap();
+        let (graph, output) = capture.finish(strict_after_nested).unwrap();
+        assert_eq!(
+            graph
+                .node(strict.value.erase())
+                .unwrap()
+                .float_underflow_policy,
+            Some(PcuFloatUnderflowPolicy::RejectSubnormalResult)
+        );
+        assert_eq!(
+            graph
+                .node(inherited.value.erase())
+                .unwrap()
+                .float_underflow_policy,
+            Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow)
+        );
+        assert_eq!(
+            graph.node(output).unwrap().float_underflow_policy,
+            Some(PcuFloatUnderflowPolicy::RejectSubnormalResult)
+        );
+    }
 
     #[test]
     fn graph_owner_borrow_and_consume_preserve_capture_provenance() {
@@ -2343,10 +2774,21 @@ mod capture_tests {
     }
 
     #[test]
-    fn one_capture_can_register_independent_f32_and_f64_inputs() {
+    fn one_capture_can_register_independent_float_inputs_and_policy_for_f64() {
         let slice = PcuSourceShape::Slice { length: 2 };
         let (mut capture, [f32_input]) = PcuTensorGraphCapture::new::<f32, 1>([slice]).unwrap();
         let f64_input = capture.input::<f64>(slice).unwrap();
+        capture.require_float_underflow_policy(f64_input).unwrap();
+        let f64_rhs = capture.input::<f64>(slice).unwrap();
+        let f64_sum = capture.add(f64_input, f64_rhs).unwrap();
+        assert_eq!(
+            capture
+                .graph
+                .node(f64_sum.value.erase())
+                .unwrap()
+                .float_underflow_policy,
+            Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+        );
         let f64_output = capture.relu(f64_input).unwrap();
         capture.require_shape(f64_output, slice).unwrap();
 
@@ -2363,6 +2805,18 @@ mod capture_tests {
             graph.node(output).unwrap().scalar_type,
             crate::core::PcuScalarType::F64
         );
+
+        let (integer_capture, [integer_input]) =
+            PcuTensorGraphCapture::new::<i32, 1>([slice]).unwrap();
+        assert!(matches!(
+            integer_capture.require_float_underflow_policy(integer_input),
+            Err(PcuExecutionError::TensorBuild(
+                crate::dialect::tensor::TensorError::UnsupportedScalarType {
+                    scalar_type: crate::PcuScalarType::I32,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -2391,12 +2845,12 @@ mod capture_tests {
         capture.leave();
         capture.enter(marker).unwrap();
         capture.leave();
-        capture.active_markers.resize(64, marker);
+        capture.active_markers.borrow_mut().resize(64, marker);
         assert!(matches!(
             capture.enter(TypeId::of::<u16>()),
             Err(PcuExecutionError::TensorSourceNestingLimit)
         ));
-        capture.active_markers.clear();
+        capture.active_markers.borrow_mut().clear();
         capture.finish(value).unwrap();
     }
 
@@ -2498,7 +2952,7 @@ mod capture_tests {
     }
 }
 
-#[cfg(all(feature = "rocm", feature = "tensor"))]
+#[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
 pub(super) fn clear_cache() -> Result<(), PcuExecutionError> {
     execution::clear_cache()
 }

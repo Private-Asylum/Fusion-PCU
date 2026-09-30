@@ -21,14 +21,17 @@ default = []
 insights = ["fusion-pcu-core/insights"]
 std = ["fusion-pcu-core/std"]
 hosted = ["std"]
-tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor"]
+tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor", "fusion-pcu-cuda?/tensor"]
 vm-reference = ["fusion-pcu-core/vm-reference"]
 rocm = ["std", "dep:fusion-pcu-rocm"]
+cuda = ["std", "dep:fusion-pcu-cuda"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
 fusion-pcu-macros.workspace = true
 fusion-pcu-rocm = { workspace = true, optional = true }
+fusion-pcu-cuda = { workspace = true, optional = true }
+smallvec.workspace = true
 
 [lints]
 workspace = true

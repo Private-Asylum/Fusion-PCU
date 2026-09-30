@@ -70,6 +70,12 @@ fn run() -> Result<(), String> {
                     device.location,
                     caps.support.caps.bits()
                 );
+                // Optional cold native facts inform consumer scoring. They do not advertise
+                // executable operations or open a device session, stream, or allocation.
+                match registry.device_facts(device.reference) {
+                    Ok(facts) => println!("      hardware facts: {facts:?}"),
+                    Err(error) => println!("      hardware facts unavailable: {}", report(error)),
+                }
             }
         }
     }

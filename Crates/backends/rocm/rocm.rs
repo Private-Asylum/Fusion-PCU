@@ -25,7 +25,6 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::fs;
 
-use libloading::Library;
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryPoolId,
@@ -35,14 +34,18 @@ use fusion_pcu::{
 
 mod blas;
 mod codegen;
+#[path = "device_facts/device_facts.rs"]
+mod device_facts;
 mod device_kernel;
 mod discovery;
 mod dispatch;
 mod error;
+#[path = "ffi/ffi.rs"]
+mod ffi;
+use ffi::Library;
 mod host_kernel;
 mod memory;
 mod owned_dispatch;
-mod runtime;
 #[cfg(feature = "tensor")]
 mod tensor;
 
@@ -103,6 +106,7 @@ pub use owned_dispatch::{
     RocmOwnedExecutionOperation,
     RocmOwnedExecutionTwoSlot,
     RocmPreparedDispatch,
+    RocmSequentialCheckedDispatch,
     RocmTwoSlotExecutionStep,
 };
 #[rustfmt::skip]
@@ -113,6 +117,7 @@ pub use codegen::rtc::{
 #[cfg(feature = "tensor")]
 #[rustfmt::skip]
 pub use tensor::{
+    lower_strict_matmul_to_hip_source,
     RocmAdmittedTensorFeedbackResources,
     RocmPreparedTensorGraph,
     RocmTensorExecution,
@@ -142,59 +147,47 @@ pub use tensor::{
     RocmTensorOperationInsight,
 };
 
-type HipResult = c_int;
-type HipDevice = c_int;
-type HipStream = *mut c_void;
-type HipEvent = *mut c_void;
-
-const HIP_SUCCESS: HipResult = 0;
-const HIP_EVENT_DEFAULT: c_int = 0;
-const HIP_EVENT_DISABLE_TIMING: c_int = 2;
-const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
-const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
-const HIP_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
-
-type GetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipResult;
-type GetDevice = unsafe extern "C" fn(*mut HipDevice, c_int) -> HipResult;
-type SetDevice = unsafe extern "C" fn(HipDevice) -> HipResult;
-type GetDeviceName = unsafe extern "C" fn(*mut c_char, c_int, HipDevice) -> HipResult;
-type GetDevicePciBusId = unsafe extern "C" fn(*mut c_char, c_int, c_int) -> HipResult;
-type DeviceTotalMem = unsafe extern "C" fn(*mut usize, HipDevice) -> HipResult;
-type MemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> HipResult;
-type GetErrorString = unsafe extern "C" fn(HipResult) -> *const c_char;
-type Malloc = unsafe extern "C" fn(*mut *mut c_void, usize) -> HipResult;
-type Free = unsafe extern "C" fn(*mut c_void) -> HipResult;
-type Memcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipResult;
-type MemcpyAsync =
-    unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, HipStream) -> HipResult;
-type StreamCreate = unsafe extern "C" fn(*mut HipStream) -> HipResult;
-type StreamDestroy = unsafe extern "C" fn(HipStream) -> HipResult;
-type StreamSynchronize = unsafe extern "C" fn(HipStream) -> HipResult;
-type StreamWaitEvent = unsafe extern "C" fn(HipStream, HipEvent, u32) -> HipResult;
-type EventCreate = unsafe extern "C" fn(*mut HipEvent, c_int) -> HipResult;
-type EventDestroy = unsafe extern "C" fn(HipEvent) -> HipResult;
-type EventRecord = unsafe extern "C" fn(HipEvent, HipStream) -> HipResult;
-type EventSynchronize = unsafe extern "C" fn(HipEvent) -> HipResult;
-type EventElapsedTime = unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> HipResult;
-type ModuleHandle = *mut c_void;
-type KernelHandle = *mut c_void;
-type ModuleLoadData = unsafe extern "C" fn(*mut ModuleHandle, *const c_void) -> HipResult;
-type ModuleGetFunction =
-    unsafe extern "C" fn(*mut KernelHandle, ModuleHandle, *const c_char) -> HipResult;
-type ModuleUnload = unsafe extern "C" fn(ModuleHandle) -> HipResult;
-type ModuleLaunchKernel = unsafe extern "C" fn(
-    KernelHandle,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
+#[rustfmt::skip]
+use ffi::hip::{
+    HipResult,
+    HipDevice,
     HipStream,
-    *mut *mut c_void,
-    *mut *mut c_void,
-) -> HipResult;
+    HipEvent,
+    HipNoArgStatus,
+    HIP_SUCCESS,
+    HIP_EVENT_DEFAULT,
+    HIP_EVENT_DISABLE_TIMING,
+    HIP_MEMCPY_HOST_TO_DEVICE,
+    HIP_MEMCPY_DEVICE_TO_HOST,
+    HIP_MEMCPY_DEVICE_TO_DEVICE,
+    GetDeviceCount,
+    GetDevice,
+    SetDevice,
+    GetDeviceName,
+    GetDevicePciBusId,
+    DeviceTotalMem,
+    MemGetInfo,
+    GetErrorString,
+    Malloc,
+    Free,
+    Memcpy,
+    MemcpyAsync,
+    StreamCreate,
+    StreamDestroy,
+    StreamSynchronize,
+    StreamWaitEvent,
+    EventCreate,
+    EventDestroy,
+    EventRecord,
+    EventSynchronize,
+    EventElapsedTime,
+    ModuleHandle,
+    KernelHandle,
+    ModuleLoadData,
+    ModuleGetFunction,
+    ModuleUnload,
+    ModuleLaunchKernel,
+};
 
 /// Dynamically loaded HIP runtime and the selected device.
 #[derive(Clone)]
@@ -228,15 +221,16 @@ impl HipRuntime {
         let mut last_error = None;
         for candidate in candidates {
             let path = candidate.to_string_lossy().into_owned();
-            let library = match runtime::load_library(&candidate) {
+            let library = match ffi::load_library(&candidate) {
                 Ok(library) => library,
                 Err(error) => {
                     last_error = Some(error);
                     continue;
                 }
             };
-            let get_count = unsafe { library.get::<GetDeviceCount>(b"hipGetDeviceCount\0") }
-                .map_err(|error| HipError::MissingSymbol {
+            let get_count =
+                unsafe { crate::ffi::symbol::<GetDeviceCount>(&library, b"hipGetDeviceCount\0") }
+                    .map_err(|error| HipError::MissingSymbol {
                     symbol: "hipGetDeviceCount",
                     detail: error.to_string(),
                 })?;
@@ -268,33 +262,35 @@ impl HipRuntime {
         );
         let mut last_error = None;
         for candidate in candidates {
-            let library = match runtime::load_library(&candidate) {
+            let library = match ffi::load_library(&candidate) {
                 Ok(library) => library,
                 Err(error) => {
                     last_error = Some(error);
                     continue;
                 }
             };
-            let get_count = unsafe { library.get::<GetDeviceCount>(b"hipGetDeviceCount\0") }
-                .map_err(|error| HipError::MissingSymbol {
+            let get_count =
+                unsafe { crate::ffi::symbol::<GetDeviceCount>(&library, b"hipGetDeviceCount\0") }
+                    .map_err(|error| HipError::MissingSymbol {
                     symbol: "hipGetDeviceCount",
                     detail: error.to_string(),
                 })?;
             let get_device =
-                unsafe { library.get::<GetDevice>(b"hipDeviceGet\0") }.map_err(|error| {
-                    HipError::MissingSymbol {
+                unsafe { crate::ffi::symbol::<GetDevice>(&library, b"hipDeviceGet\0") }.map_err(
+                    |error| HipError::MissingSymbol {
                         symbol: "hipDeviceGet",
                         detail: error.to_string(),
-                    }
-                })?;
-            let get_name = unsafe { library.get::<GetDeviceName>(b"hipDeviceGetName\0") }.map_err(
-                |error| HipError::MissingSymbol {
-                    symbol: "hipDeviceGetName",
-                    detail: error.to_string(),
-                },
-            )?;
-            let total_mem = unsafe { library.get::<DeviceTotalMem>(b"hipDeviceTotalMem\0") }
-                .map_err(|error| HipError::MissingSymbol {
+                    },
+                )?;
+            let get_name =
+                unsafe { crate::ffi::symbol::<GetDeviceName>(&library, b"hipDeviceGetName\0") }
+                    .map_err(|error| HipError::MissingSymbol {
+                        symbol: "hipDeviceGetName",
+                        detail: error.to_string(),
+                    })?;
+            let total_mem =
+                unsafe { crate::ffi::symbol::<DeviceTotalMem>(&library, b"hipDeviceTotalMem\0") }
+                    .map_err(|error| HipError::MissingSymbol {
                     symbol: "hipDeviceTotalMem",
                     detail: error.to_string(),
                 })?;
@@ -351,7 +347,7 @@ impl HipRuntime {
         );
         let mut last_error = None;
         for candidate in candidates {
-            let library = match runtime::load_library(&candidate) {
+            let library = match ffi::load_library(&candidate) {
                 Ok(library) => library,
                 Err(error) => {
                     last_error = Some(error);
@@ -360,8 +356,9 @@ impl HipRuntime {
             };
             // Query availability before selecting a device. hipSetDevice(0) can fail when no GPU
             // is visible, hiding the useful zero-device result.
-            let get_count = unsafe { library.get::<GetDeviceCount>(b"hipGetDeviceCount\0") }
-                .map_err(|error| HipError::MissingSymbol {
+            let get_count =
+                unsafe { crate::ffi::symbol::<GetDeviceCount>(&library, b"hipGetDeviceCount\0") }
+                    .map_err(|error| HipError::MissingSymbol {
                     symbol: "hipGetDeviceCount",
                     detail: error.to_string(),
                 })?;
@@ -641,12 +638,11 @@ impl HipRuntime {
             // HIP's current device is thread-local, so select this runtime's device before each
             // operation. This keeps cloned handles valid when used from another host thread.
             let setter =
-                unsafe { self.0.library.get::<SetDevice>(b"hipSetDevice\0") }.map_err(|error| {
-                    HipError::MissingSymbol {
+                unsafe { crate::ffi::symbol::<SetDevice>(&self.0.library, b"hipSetDevice\0") }
+                    .map_err(|error| HipError::MissingSymbol {
                         symbol: "hipSetDevice",
                         detail: error.to_string(),
-                    }
-                })?;
+                    })?;
             let status = unsafe { setter(self.0.device) };
             if status != HIP_SUCCESS {
                 return Err(self.error("hipSetDevice", status));
@@ -666,12 +662,13 @@ impl HipRuntime {
             &overflow_symbol
         };
         // SAFETY: `symbol` is loaded from the retained HIP runtime and `T` matches the named C ABI.
-        let function = unsafe { self.0.library.get::<T>(symbol_bytes) }.map_err(|error| {
-            HipError::MissingSymbol {
-                symbol,
-                detail: error.to_string(),
-            }
-        })?;
+        let function =
+            unsafe { ffi::symbol::<T>(&self.0.library, symbol_bytes) }.map_err(|error| {
+                HipError::MissingSymbol {
+                    symbol,
+                    detail: error.to_string(),
+                }
+            })?;
         let status = invoke(*function);
         if status == HIP_SUCCESS {
             Ok(())
@@ -682,11 +679,13 @@ impl HipRuntime {
 
     fn error(&self, operation: &'static str, code: HipResult) -> HipError {
         // Error-string lookup is optional; preserve numeric status even if the symbol is absent.
-        let detail = unsafe { self.0.library.get::<GetErrorString>(b"hipGetErrorString\0") }
-            .ok()
-            .map(|f| unsafe { f(code) })
-            .filter(|p| !p.is_null())
-            .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
+        let detail = unsafe {
+            crate::ffi::symbol::<GetErrorString>(&self.0.library, b"hipGetErrorString\0")
+        }
+        .ok()
+        .map(|f| unsafe { f(code) })
+        .filter(|p| !p.is_null())
+        .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
         HipError::Runtime {
             operation,
             code,
@@ -724,7 +723,9 @@ pub struct HipDeviceInfo {
 /// Query PCI location through HIP's standalone C API, which avoids `hipDeviceProp_t` ABI layout.
 /// Older runtimes may not export this symbol; discovery remains useful without the location.
 fn query_pci_bus_id(library: &Library, ordinal: c_int) -> Option<String> {
-    let function = unsafe { library.get::<GetDevicePciBusId>(b"hipDeviceGetPCIBusId\0") }.ok()?;
+    let function =
+        unsafe { crate::ffi::symbol::<GetDevicePciBusId>(library, b"hipDeviceGetPCIBusId\0") }
+            .ok()?;
     let mut buffer = [0_i8; 64];
     let capacity = c_int::try_from(buffer.len()).expect("fixed PCI bus buffer fits c_int");
     let status = unsafe { function(buffer.as_mut_ptr(), capacity, ordinal) };
@@ -812,7 +813,7 @@ fn bounded_device_name(buffer: &[c_char]) -> String {
 }
 
 fn raw_hip_error(library: &Library, operation: &'static str, code: HipResult) -> HipError {
-    let detail = unsafe { library.get::<GetErrorString>(b"hipGetErrorString\0") }
+    let detail = unsafe { crate::ffi::symbol::<GetErrorString>(library, b"hipGetErrorString\0") }
         .ok()
         .map(|function| unsafe { function(code) })
         .filter(|pointer| !pointer.is_null())
@@ -1367,10 +1368,7 @@ impl DeviceAccessLease {
                 if self
                     .allocation
                     .runtime
-                    .call(
-                        "hipDeviceSynchronize",
-                        |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
-                    )
+                    .call("hipDeviceSynchronize", |f: HipNoArgStatus| unsafe { f() })
                     .is_err()
                 {
                     std::mem::forget(self);
@@ -1391,10 +1389,7 @@ impl DeviceAccessLease {
                 if self
                     .allocation
                     .runtime
-                    .call(
-                        "hipDeviceSynchronize",
-                        |f: unsafe extern "C" fn() -> c_int| unsafe { f() },
-                    )
+                    .call("hipDeviceSynchronize", |f: HipNoArgStatus| unsafe { f() })
                     .is_err()
                 {
                     std::mem::forget(self);

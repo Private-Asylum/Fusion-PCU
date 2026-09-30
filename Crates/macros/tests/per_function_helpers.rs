@@ -1,10 +1,11 @@
-use fusion_pcu_cpu::{PcuF32Reference, PcuF64Reference};
+use fusion_pcu_cpu::{PcuF32Reference, PcuF32ReferenceError, PcuF64Reference, PcuF64ReferenceError};
 use fusion_pcu_macros::pcu;
 #[rustfmt::skip]
 use pcu_alias::{
     PcuBindingRef,
     PcuHostScalarBinding,
     PcuHostScalarSlice,
+    PcuHostDispatchError,
     PcuInvocationParameters,
     PcuInvocationShape,
     PcuSynchronousHostDispatchBackend,
@@ -152,10 +153,16 @@ fn matrix_f64_helper(input: &[[f64; 2]; 2], factor: &f64, seed: &f64, output: &m
 }
 
 #[test]
-fn per_function_helpers_compose_through_rust_resolved_companions() {
+fn per_function_helpers_emit_checked_ir_and_cpu_reference_rejects_before_writes() {
     let descriptors = map_bindings();
     let builder = map_ir(&descriptors).expect("per-function helper lowers");
     let kernel = builder.ir();
+    pcu_alias::validate_checked_float_map_kernel(
+        &kernel,
+        pcu_alias::PcuValueType::f32(),
+        pcu_alias::PcuValueTypeCaps::FLOAT32,
+    )
+    .expect("nested helper arithmetic is flattened to checked f32 IR");
     let submission = pcu_alias::PcuDispatchSubmission {
         kernel: &kernel,
         shape: PcuInvocationShape::invocations(NonZeroU32::new(4).expect("nonzero")),
@@ -172,12 +179,16 @@ fn per_function_helpers_compose_through_rust_resolved_companions() {
             slice: PcuHostScalarSlice::ReadWrite(&mut output),
         },
     ];
-    PcuF32Reference
-        .run_host(submission, &mut bindings, PcuInvocationParameters::empty())
-        .expect("CPU reference executes lowered companion IR");
-    assert_eq!(
-        output.map(f32::to_bits),
-        [3.0_f32, 5.0, 7.0, 9.0].map(f32::to_bits)
+    assert!(matches!(
+        PcuF32Reference.run_host(submission, &mut bindings, PcuInvocationParameters::empty()),
+        Err(PcuHostDispatchError::Backend(
+            PcuF32ReferenceError::UnsupportedInstruction(_)
+        ))
+    ));
+    assert!(
+        output
+            .iter()
+            .all(|value| value.to_bits() == 0.0_f32.to_bits())
     );
 }
 
@@ -186,13 +197,19 @@ fn per_function_helpers_lower_into_owned_grid_stride_body() {
     let descriptors = map_grid_stride_bindings();
     let builder = map_grid_stride_ir::<4>(&descriptors).expect("helper grid-stride lowers");
     builder.with_ir(|ir| {
+        pcu_alias::validate_checked_float_map_kernel(
+            ir,
+            pcu_alias::PcuValueType::f32(),
+            pcu_alias::PcuValueTypeCaps::FLOAT32,
+        )
+        .expect("grid-stride helper body is checked-float IR");
         assert!(ir.ops.iter().any(|operation| matches!(
             operation,
             pcu_alias::PcuDispatchOp::GridStrideLoop { body, .. }
                 if body.iter().any(|nested| matches!(
                     nested,
-                    pcu_alias::PcuDispatchOp::Data(pcu_alias::PcuDispatchDataOp::Alu {
-                        op: pcu_alias::PcuDispatchAluOp::Mul,
+                    pcu_alias::PcuDispatchOp::Data(pcu_alias::PcuDispatchDataOp::CheckedFloatBinary {
+                        op: pcu_alias::PcuDispatchFloatBinaryOp::Mul,
                         ..
                     })
                 ))
@@ -207,13 +224,19 @@ fn recursive_companions_fail_at_the_bounded_depth() {
 }
 
 #[test]
-fn readonly_scalar_references_broadcast_element_zero_for_f32_and_f64() {
+fn readonly_scalar_references_lower_but_cpu_oracles_reject_checked_ops() {
     let f32_input = [1.0_f32, 2.0, 3.0, 4.0];
     let factor = 2.5_f32;
     let mut f32_output = [0.0_f32; 4];
     let f32_descriptors = map_with_scalar_bindings();
     let f32_builder = map_with_scalar_ir(&f32_descriptors).expect("f32 scalar lowers");
     let f32_ir = f32_builder.ir();
+    pcu_alias::validate_checked_float_map_kernel(
+        &f32_ir,
+        pcu_alias::PcuValueType::f32(),
+        pcu_alias::PcuValueTypeCaps::FLOAT32,
+    )
+    .expect("scalar helper arithmetic remains checked f32 IR");
     let f32_submission = pcu_alias::PcuDispatchSubmission {
         kernel: &f32_ir,
         shape: PcuInvocationShape::invocations(NonZeroU32::new(4).expect("nonzero")),
@@ -232,16 +255,20 @@ fn readonly_scalar_references_broadcast_element_zero_for_f32_and_f64() {
             slice: PcuHostScalarSlice::ReadWrite(&mut f32_output),
         },
     ];
-    PcuF32Reference
-        .run_host(
+    assert!(matches!(
+        PcuF32Reference.run_host(
             f32_submission,
             &mut f32_bindings,
             PcuInvocationParameters::empty(),
-        )
-        .expect("f32 scalar executes");
-    assert_eq!(
-        f32_output.map(f32::to_bits),
-        [2.5_f32, 5.0, 7.5, 10.0].map(f32::to_bits)
+        ),
+        Err(PcuHostDispatchError::Backend(
+            PcuF32ReferenceError::UnsupportedInstruction(_)
+        ))
+    ));
+    assert!(
+        f32_output
+            .iter()
+            .all(|value| value.to_bits() == 0.0_f32.to_bits())
     );
 
     let f64_input = [1.0_f64, 2.0, 3.0, 4.0];
@@ -250,6 +277,12 @@ fn readonly_scalar_references_broadcast_element_zero_for_f32_and_f64() {
     let f64_descriptors = map_f64_with_seed_bindings();
     let f64_builder = map_f64_with_seed_ir(&f64_descriptors).expect("f64 scalar lowers");
     let f64_ir = f64_builder.ir();
+    pcu_alias::validate_checked_float_map_kernel(
+        &f64_ir,
+        pcu_alias::PcuValueType::f64(),
+        pcu_alias::PcuValueTypeCaps::FLOAT64,
+    )
+    .expect("f64 arithmetic is structurally checked");
     let f64_submission = pcu_alias::PcuDispatchSubmission {
         kernel: &f64_ir,
         shape: PcuInvocationShape::invocations(NonZeroU32::new(4).expect("nonzero")),
@@ -268,22 +301,26 @@ fn readonly_scalar_references_broadcast_element_zero_for_f32_and_f64() {
             slice: PcuHostScalarSlice::ReadWrite(&mut f64_output),
         },
     ];
-    PcuF64Reference
-        .run_host(
+    assert!(matches!(
+        PcuF64Reference.run_host(
             f64_submission,
             &mut f64_bindings,
             PcuInvocationParameters::empty(),
-        )
-        .expect("f64 scalar executes");
-    assert_eq!(
-        f64_output.map(f64::to_bits),
-        [1.25_f64, 2.25, 3.25, 4.25].map(f64::to_bits)
+        ),
+        Err(PcuHostDispatchError::Backend(
+            PcuF64ReferenceError::InvalidKernel
+        ))
+    ));
+    assert!(
+        f64_output
+            .iter()
+            .all(|value| value.to_bits() == 0.0_f64.to_bits())
     );
 }
 
 #[test]
 #[allow(clippy::suboptimal_flops)] // The lowered IR preserves separate multiply/add rounding.
-fn f64_helpers_compose_through_qualified_paths_and_import_aliases() {
+fn f64_helper_paths_emit_checked_ir_and_cpu_oracle_rejects_before_writes() {
     let input = [1.0e40_f64, 2.0e40, 3.0e40, 4.0e40];
     let factor = 1.5_f64;
     let seed = 0.125_f64;
@@ -291,6 +328,18 @@ fn f64_helpers_compose_through_qualified_paths_and_import_aliases() {
     let descriptors = map_f64_helper_bindings();
     let builder = map_f64_helper_ir(&descriptors).expect("f64 helper lowers");
     let ir = builder.ir();
+    pcu_alias::validate_checked_float_map_kernel(
+        &ir,
+        pcu_alias::PcuValueType::f64(),
+        pcu_alias::PcuValueTypeCaps::FLOAT64,
+    )
+    .expect("qualified helper arithmetic is structurally checked");
+    pcu_alias::validate_checked_float_map_kernel(
+        &ir,
+        pcu_alias::PcuValueType::f64(),
+        pcu_alias::PcuValueTypeCaps::FLOAT64,
+    )
+    .expect("qualified helper arithmetic is flattened to checked f64 IR");
     let submission = pcu_alias::PcuDispatchSubmission {
         kernel: &ir,
         shape: PcuInvocationShape::invocations(NonZeroU32::new(4).expect("nonzero")),
@@ -313,12 +362,16 @@ fn f64_helpers_compose_through_qualified_paths_and_import_aliases() {
             slice: PcuHostScalarSlice::ReadWrite(&mut output),
         },
     ];
-    PcuF64Reference
-        .run_host(submission, &mut bindings, PcuInvocationParameters::empty())
-        .expect("f64 companion IR executes");
-    assert_eq!(
-        output.map(f64::to_bits),
-        input.map(|value| (value * factor + seed).to_bits())
+    assert!(matches!(
+        PcuF64Reference.run_host(submission, &mut bindings, PcuInvocationParameters::empty()),
+        Err(PcuHostDispatchError::Backend(
+            PcuF64ReferenceError::InvalidKernel
+        ))
+    ));
+    assert!(
+        output
+            .iter()
+            .all(|value| value.to_bits() == 0.0_f64.to_bits())
     );
 }
 
@@ -329,9 +382,9 @@ fn f64_helper_argument_lowering_accepts_canonical_rank_two_loads() {
     builder.with_ir(|ir| {
         assert!(ir.ops.iter().any(|operation| matches!(
             operation,
-            pcu_alias::PcuDispatchOp::Data(pcu_alias::PcuDispatchDataOp::Alu {
+            pcu_alias::PcuDispatchOp::Data(pcu_alias::PcuDispatchDataOp::CheckedFloatBinary {
                 value_type,
-                op: pcu_alias::PcuDispatchAluOp::Mul,
+                op: pcu_alias::PcuDispatchFloatBinaryOp::Mul,
                 ..
             }) if *value_type == pcu_alias::PcuValueType::f64()
         )));

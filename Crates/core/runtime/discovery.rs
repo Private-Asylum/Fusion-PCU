@@ -5,6 +5,7 @@
 
 #[rustfmt::skip]
 use crate::{
+    PcuDeviceFacts,
     PcuExecutorDescriptor,
     PcuSupport,
 };
@@ -243,7 +244,11 @@ pub trait PcuRuntimeDiscovery {
         target: PcuObjectRef,
     ) -> Result<PcuCapabilitySnapshot, Self::Error>;
 
-    /// Queries device-specific capabilities and limits.
+    /// Queries device-specific executable capabilities and limits.
+    ///
+    /// Implementations must validate provider, generation, device kind, and identifier against
+    /// current discovery state before returning a snapshot. The default `device_facts` query
+    /// relies on this validation when reporting unknown physical facts.
     ///
     /// # Errors
     ///
@@ -252,6 +257,21 @@ pub trait PcuRuntimeDiscovery {
         &self,
         device: PcuObjectRef,
     ) -> Result<PcuCapabilitySnapshot, Self::Error>;
+
+    /// Queries optional cold physical-device facts without activating the device.
+    ///
+    /// Implementations must validate provider, generation, kind, and identifier before querying.
+    /// The default delegates validation to `device_capabilities` and reports every fact unknown.
+    /// Providers overriding this method must not create contexts, sessions, streams, or buffers.
+    /// Returned native limits do not establish executable support or kernel admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider-specific discovery error for an invalid reference or failed query.
+    fn device_facts(&self, device: PcuObjectRef) -> Result<PcuDeviceFacts, Self::Error> {
+        self.device_capabilities(device)?;
+        Ok(PcuDeviceFacts::default())
+    }
 
     /// Copies executor descriptors into caller storage and returns the required total count.
     ///
@@ -421,7 +441,17 @@ mod tests {
                 support: PcuSupport::unsupported(),
             })
         }
-        fn device_capabilities(&self, _: PcuObjectRef) -> Result<PcuCapabilitySnapshot, PcuError> {
+        fn device_capabilities(
+            &self,
+            device: PcuObjectRef,
+        ) -> Result<PcuCapabilitySnapshot, PcuError> {
+            if device.provider != PcuProviderId(3)
+                || device.generation != 7
+                || device.kind != PcuObjectKind::Device
+                || device.id != 2
+            {
+                return Err(PcuError::invalid());
+            }
             self.target_capabilities(PcuObjectRef {
                 provider: PcuProviderId(3),
                 generation: 7,
@@ -435,6 +465,37 @@ mod tests {
             _: &mut [PcuExecutorDescriptor],
         ) -> Result<usize, PcuError> {
             Ok(0)
+        }
+    }
+
+    #[test]
+    fn default_facts_validate_references_before_returning_unknown() {
+        let device = PcuObjectRef {
+            provider: PcuProviderId(3),
+            generation: 7,
+            kind: PcuObjectKind::Device,
+            id: 2,
+        };
+        assert_eq!(
+            Mock.device_facts(device).unwrap(),
+            PcuDeviceFacts::default()
+        );
+        for invalid in [
+            PcuObjectRef {
+                provider: PcuProviderId(4),
+                ..device
+            },
+            PcuObjectRef {
+                generation: 6,
+                ..device
+            },
+            PcuObjectRef {
+                kind: PcuObjectKind::Context,
+                ..device
+            },
+            PcuObjectRef { id: 3, ..device },
+        ] {
+            assert!(Mock.device_facts(invalid).is_err());
         }
     }
 

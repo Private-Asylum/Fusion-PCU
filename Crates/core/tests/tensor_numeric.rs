@@ -4,7 +4,7 @@
 use fusion_pcu_core::{
     PcuBf16Bits,
     PcuF16Bits,
-    core::PcuScalarType,
+    core::{PcuExecutionFaultKind, PcuScalarType},
     dialect::tensor::{
         Graph,
         Tensor,
@@ -161,6 +161,47 @@ fn independent_f32_and_f64_graph_branches_evaluate_without_coercion() {
             .unwrap()
             .data(),
         &[2.5, -9.0]
+    );
+}
+
+#[test]
+fn tensor_relu_uses_checked_finite_selection_and_reports_nonfinite_faults() {
+    let mut graph = Graph::default();
+    let input = graph.input_typed::<f32>([4]).unwrap();
+    let output = graph.relu_typed(input).unwrap();
+    let execution = graph
+        .evaluate(&[(
+            input.erase(),
+            TensorValue::from(
+                Tensor::new(
+                    [4],
+                    vec![f32::from_bits(1), -0.0, f32::from_bits(0x8000_0001), 2.0],
+                )
+                .unwrap(),
+            ),
+        )])
+        .unwrap();
+    let values = execution.value_typed::<f32>(output.erase()).unwrap();
+    assert_eq!(values.data()[0].to_bits(), 1);
+    assert_eq!(values.data()[1].to_bits(), 0);
+    assert_eq!(values.data()[2].to_bits(), 0);
+    assert_eq!(values.data()[3].to_bits(), 2.0_f32.to_bits());
+
+    let mut graph = Graph::default();
+    let input = graph.input_typed::<f32>([1]).unwrap();
+    let output = graph.relu_typed(input).unwrap();
+    assert_eq!(
+        graph
+            .evaluate(&[(
+                input.erase(),
+                TensorValue::from(Tensor::new([1], vec![f32::NAN]).unwrap()),
+            )])
+            .unwrap_err(),
+        TensorError::ArithmeticFault {
+            value: output.erase(),
+            element_index: 0,
+            kind: PcuExecutionFaultKind::InvalidFloatingOperand,
+        }
     );
 }
 

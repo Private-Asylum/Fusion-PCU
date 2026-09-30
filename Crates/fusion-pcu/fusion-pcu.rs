@@ -12,6 +12,8 @@ pub use fusion_pcu_macros::*;
 
 #[cfg(feature = "rocm")]
 pub use fusion_pcu_rocm as rocm;
+#[cfg(feature = "cuda")]
+pub use fusion_pcu_cuda as cuda;
 
 // `global` is supplied by the facade's provider-selection layer.
 pub mod global;

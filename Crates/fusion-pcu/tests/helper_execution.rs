@@ -31,7 +31,12 @@ fn aliased_helper_ir_is_admitted_by_the_double_precision_profile() {
     let builder = transform_ir::<4>(&bindings).expect("lower helper kernel");
     let kernel = builder.ir();
     assert!(
-        fusion_pcu::validate_f64_map_kernel(&kernel).is_ok(),
+        fusion_pcu::validate_checked_float_map_kernel(
+            &kernel,
+            fusion_pcu::PcuValueType::f64(),
+            fusion_pcu::PcuValueTypeCaps::FLOAT64
+        )
+        .is_ok(),
         "f64 helper IR fails its scalar profile: {kernel:?}"
     );
 }

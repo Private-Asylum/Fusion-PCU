@@ -171,6 +171,7 @@ fn run_checked_u8_div_rem(
         let rhs = read(input_b).ok_or(PcuU8MapReferenceError::MissingBinding(input_b))?;
         if rhs == 0 {
             return Err(PcuU8MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));
@@ -330,6 +331,7 @@ fn run_checked_u16_div_rem(
         let rhs = read(input_b).ok_or(PcuU16MapReferenceError::MissingBinding(input_b))?;
         if rhs == 0 {
             return Err(PcuU16MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));
@@ -489,6 +491,7 @@ fn run_checked_u32_div_rem(
         let rhs = read(input_b).ok_or(PcuU32MapReferenceError::MissingBinding(input_b))?;
         if rhs == 0 {
             return Err(PcuU32MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));
@@ -650,6 +653,7 @@ fn run_checked_u64_div_rem(
             .ok_or(PcuU64MapReferenceError::MissingBinding(input_b))?;
         if rhs == 0 {
             return Err(PcuU64MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));
@@ -934,6 +938,7 @@ fn run_checked_i32_div_rem(
         };
         if let Some(kind) = kind {
             return Err(PcuI32MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));
@@ -1005,6 +1010,7 @@ fn run_checked_i64_div_rem(
         };
         if let Some(kind) = kind {
             return Err(PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));
@@ -1182,6 +1188,7 @@ fn run_checked_i8_div_rem(
         };
         if let Some(kind) = kind {
             return Err(PcuI8MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));
@@ -1358,6 +1365,7 @@ fn run_checked_i16_div_rem(
         };
         if let Some(kind) = kind {
             return Err(PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind,
                 invocation_id: u64::try_from(logical).unwrap_or(u64::MAX),
             }));

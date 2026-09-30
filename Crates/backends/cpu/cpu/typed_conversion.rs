@@ -53,6 +53,7 @@ pub enum PcuCpuTypedSlice<'a> {
     ReadWriteU64(&'a mut [u64]),
     ReadF32(&'a [f32]),
     ReadWriteF32(&'a mut [f32]),
+    ReadF64(&'a [f64]),
     ReadWriteF64(&'a mut [f64]),
     ReadF16Bits(&'a [PcuF16Bits]),
     ReadWriteF16Bits(&'a mut [PcuF16Bits]),
@@ -72,7 +73,7 @@ impl PcuCpuTypedSlice<'_> {
             Self::ReadI64(_) | Self::ReadWriteI64(_) => PcuValueType::Scalar(PcuScalarType::I64),
             Self::ReadU64(_) | Self::ReadWriteU64(_) => PcuValueType::Scalar(PcuScalarType::U64),
             Self::ReadF32(_) | Self::ReadWriteF32(_) => PcuValueType::Scalar(PcuScalarType::F32),
-            Self::ReadWriteF64(_) => PcuValueType::Scalar(PcuScalarType::F64),
+            Self::ReadF64(_) | Self::ReadWriteF64(_) => PcuValueType::Scalar(PcuScalarType::F64),
             Self::ReadF16Bits(_) | Self::ReadWriteF16Bits(_) => {
                 PcuValueType::Scalar(PcuScalarType::F16)
             }
@@ -102,6 +103,7 @@ impl PcuCpuTypedSlice<'_> {
             Self::ReadWriteU64(slice) => slice.len(),
             Self::ReadF32(slice) => slice.len(),
             Self::ReadWriteF32(slice) => slice.len(),
+            Self::ReadF64(slice) => slice.len(),
             Self::ReadWriteF64(slice) => slice.len(),
             Self::ReadF16Bits(slice) => slice.len(),
             Self::ReadWriteF16Bits(slice) => slice.len(),
@@ -200,7 +202,8 @@ impl PcuTypedConversionReference {
 }
 
 #[derive(Clone, Copy)]
-enum Value {
+#[allow(clippy::redundant_pub_crate)] // Shared only with the sibling checked CPU executor.
+pub(super) enum Value {
     I8(i8),
     U8(u8),
     I16(i16),
@@ -306,7 +309,8 @@ fn validate_profile_ops(
     Ok(())
 }
 
-fn validate_bindings(
+#[allow(clippy::redundant_pub_crate)] // Shared only with the sibling checked CPU executor.
+pub(super) fn validate_bindings(
     submission: PcuDispatchSubmission<'_>,
     bindings: &[PcuCpuTypedBinding<'_>],
     _grid: bool,
@@ -451,7 +455,8 @@ fn execute_invocation(
     Ok(())
 }
 
-const fn load_slice_value(slice: &PcuCpuTypedSlice<'_>, element: usize) -> Value {
+#[allow(clippy::redundant_pub_crate)] // Shared only with the sibling checked CPU executor.
+pub(super) const fn load_slice_value(slice: &PcuCpuTypedSlice<'_>, element: usize) -> Value {
     match slice {
         PcuCpuTypedSlice::ReadI8(slice) => Value::I8(slice[element]),
         PcuCpuTypedSlice::ReadU8(slice) => Value::U8(slice[element]),
@@ -471,6 +476,7 @@ const fn load_slice_value(slice: &PcuCpuTypedSlice<'_>, element: usize) -> Value
         PcuCpuTypedSlice::ReadWriteU64(slice) => Value::U64(slice[element]),
         PcuCpuTypedSlice::ReadF32(slice) => Value::F32(slice[element]),
         PcuCpuTypedSlice::ReadWriteF32(slice) => Value::F32(slice[element]),
+        PcuCpuTypedSlice::ReadF64(slice) => Value::F64(slice[element]),
         PcuCpuTypedSlice::ReadWriteF64(slice) => Value::F64(slice[element]),
         PcuCpuTypedSlice::ReadF16Bits(slice) => Value::F16Bits(slice[element]),
         PcuCpuTypedSlice::ReadWriteF16Bits(slice) => Value::F16Bits(slice[element]),
@@ -509,7 +515,8 @@ fn convert_value(
     }
 }
 
-const fn store_slice_value(
+#[allow(clippy::redundant_pub_crate)] // Shared only with the sibling checked CPU executor.
+pub(super) const fn store_slice_value(
     slice: &mut PcuCpuTypedSlice<'_>,
     index: usize,
     value: Value,

@@ -58,6 +58,11 @@ path = "benches/typed_kernel.rs"
 harness = false
 
 [[bench]]
+name = "checked_float_convert"
+path = "benches/checked_float_convert.rs"
+harness = false
+
+[[bench]]
 name = "tensor"
 path = "benches/tensor.rs"
 harness = false
@@ -229,6 +234,7 @@ harness = false
 
 [features]
 default = []
+allocation-census = []
 insights = ["fusion-pcu/insights", "fusion-pcu-rocm/insights"]
 
 [dependencies]
@@ -295,6 +301,11 @@ path = "benches/owned_relu.rs"
 harness = false
 
 [[bench]]
+name = "checked_relu"
+path = "benches/checked_relu.rs"
+harness = false
+
+[[bench]]
 name = "owned_identity_transfer"
 path = "benches/owned_identity_transfer.rs"
 harness = false
@@ -307,4 +318,28 @@ harness = false
 [[bench]]
 name = "owned_selected_owners"
 path = "benches/owned_selected_owners.rs"
+harness = false
+
+[[bench]]
+name = "owned_checked_integer"
+path = "benches/owned_checked_integer.rs"
+harness = false
+
+[[bench]]
+name = "owned_checked_float"
+path = "benches/owned_checked_float.rs"
+harness = false
+
+[[bench]]
+name = "owned_checked_float_div"
+harness = false
+
+[[bench]]
+name = "clamped_float"
+path = "benches/clamped_float.rs"
+harness = false
+
+[[bench]]
+name = "strict_matmul"
+path = "benches/strict_matmul/strict_matmul.rs"
 harness = false

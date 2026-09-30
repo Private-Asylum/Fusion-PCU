@@ -1,0 +1,5 @@
+error: conflicting `pcu` numerical mode flags
+ --> tests/ui/numerical_mode_conflict.rs:3:43
+  |
+3 | #[pcu(invocations = 1, flag(strict), flag(non_strict))]
+  |                                           ^^^^^^^^^^

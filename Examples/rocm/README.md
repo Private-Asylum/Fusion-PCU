@@ -87,12 +87,12 @@ kernel extent remains intact, and short buffers return an error.
 
 The `typed_kernel` Criterion target has distinct host-slice and resident-device groups. The host
 group compares prepared PCU, direct PCU, and native HIP calls including matched input upload,
-launch, wait, and result download at 65 and 1,048,576 elements. This complete-writer kernel does
+fault reset, launch, wait, terminal fault-status readback, and result download at 65 and 1,048,576 elements. Native HIP compiles the same checked multiply/add kernel as PCU; both fault on invalid operands, overflow and policy-rejected underflow. This complete-writer kernel does
 not read old output contents, so neither route uploads them. Other kernels still receive current
 mutable input contents whenever required, and untouched host tails remain intact. Preparation and native
 compilation are reported separately. Each measured job uses a new input and checks the full result
 against a CPU oracle. The resident group keeps typed device buffers across invocations to measure
-reusable device-side calls without introducing a host-transfer flag. Additional alternating pairs
+reusable device-side calls without introducing a host-transfer flag. Resident timing includes checked launch, wait and fault handling; input refresh and payload download/oracle stay outside the timer on both routes. Additional alternating pairs
 check order effects separately from Criterion intervals, and a warm Rust heap census reports
 allocations without claiming to count driver/device allocations. Run it with
 `cargo bench -p fusion-pcu-example-rocm --bench typed_kernel` on a ROCm host. The ignored
@@ -393,3 +393,36 @@ topology. When that target or `hipcc` is unavailable, PCU Dispatch uses HIPRTC's
 compilation if the runtime compiler is present; rocBLAS tensor work does not require either
 source compiler. Set `HIPCC` if the compiler is not on `PATH`. The execution binaries return exit
 code 1 on compile or runtime failure.
+
+### Strict MatMul benchmark
+
+`cargo +stable bench -p fusion-pcu-example-rocm --bench strict_matmul` runs executed
+`#[pcu(flag(strict))]` source against an explicit prepared graph and a native launch of the
+same public generated ordered checker. F32/F64 profiles are 4×2×4, 32×32×32 and 64×256×64.
+The selected provider and device ordinal 0 are explicit, with block size 256 on every route.
+Run only after the lab GPU ownership gate and backend hardware conformance tests pass.
+The benchmark also checks utilization before setup and each profile.
+
+Every strict route uses increasing K, separate destination-precision multiply/add checks,
+fresh output, fresh private fault status, terminal completion/status and timed output release.
+Full-host timing includes input upload and completed readback; resident timing alternates two
+preloaded input banks and excludes readback. Explicit graph and native inputs reuse allocated
+storage. The source route owns its ordinary staging/cache behavior. These compare complete API
+boundaries and do not isolate scheduler cost. All output bits are checked outside the summed
+elapsed time. Thirty-six resident interleaved triples repeat all six strict route orders equally;
+printed ratios are medians of paired ratios, with no confidence interval.
+
+Boundary mode is asserted Unsupported, without treating rejection latency as compute throughput.
+Vendor BLAS is a separate unchecked, different-semantics throughput control with a preallocated
+output. Its timing does not establish checked numerical equivalence. Nominal dyadic inputs permit
+bitwise comparison without granting the vendor route a fault contract.
+
+Untimed F32/F64 preflights compare source, explicit graph and native checks against the core
+checked reference for intermediate/final underflow, multiply/add overflow, later cancellation,
+exact subnormal and zero controls, gradual/reject-subnormal policies, no-FMA rounding and invalid
+operands. A successful retry follows every case through the same prepared graph/native status.
+No failed output is read. `--features allocation-census` selects a separate resident Rust allocation
+census run and skips Criterion timings; device and driver internal allocations are excluded.
+
+The existing ROCm `owned_matmul` benchmark still needs an explicit numerical-contract migration;
+its widened/FMA tolerance oracle and vendor BLAS route cannot serve as a strict comparison.

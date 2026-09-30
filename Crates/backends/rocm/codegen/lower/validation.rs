@@ -6,12 +6,13 @@ use super::{
     PcuBindingRef,
     PcuBindingStorageClass,
     PcuBindingType,
-    PcuDispatchAluOp,
     PcuDispatchControlOp,
     PcuDispatchDataOp,
     PcuDispatchFeatureCaps,
+    PcuDispatchFloatUnaryOp,
     PcuDispatchIndex,
     PcuDispatchKernelIr,
+    PcuDispatchIntegerBinaryOp,
     PcuDispatchOp,
     PcuDispatchValueId,
     PcuF32MapValidationError,
@@ -20,6 +21,8 @@ use super::{
     PcuValueTypeCaps,
     RocmLowerError,
     validate_f32_map_kernel,
+    validate_checked_float_map_kernel,
+    validate_checked_float_conversion_map_kernel,
     validate_f64_map_kernel,
     validate_i16_map_kernel,
     validate_i16_checked_div_rem_kernel,
@@ -38,6 +41,7 @@ use super::{
     validate_u64_identity_kernel,
     validate_u64_map_kernel,
     validate_u8_checked_div_rem_kernel,
+    validate_integer_checked_binary_kernel,
     validate_u8_map_kernel,
 };
 
@@ -51,6 +55,62 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
     }
     if !kernel.ports.is_empty() || !kernel.parameters.is_empty() {
         return Err(RocmLowerError::UnsupportedKernelInterface);
+    }
+    if contains_raw_value_alu(kernel.ops) {
+        let op = kernel
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                PcuDispatchOp::Data(PcuDispatchDataOp::Alu { op, .. }) => Some(*op),
+                PcuDispatchOp::GridStrideLoop { body, .. } => {
+                    body.iter().find_map(|body_op| match body_op {
+                        PcuDispatchOp::Data(PcuDispatchDataOp::Alu { op, .. }) => Some(*op),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("raw ALU presence was checked");
+        return Err(RocmLowerError::UnsupportedAlu(op));
+    }
+    if has_checked_float_conversion(kernel) {
+        return validate_checked_float_conversion_map_kernel(
+            kernel,
+            PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::FLOAT64,
+        )
+        .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
+    }
+    if let Some(value_type) = checked_float_binary_profile(kernel) {
+        let scalar_caps = if value_type == PcuValueType::f32() {
+            PcuValueTypeCaps::FLOAT32
+        } else if value_type == PcuValueType::f64() {
+            PcuValueTypeCaps::FLOAT64
+        } else {
+            return Err(RocmLowerError::UnsupportedKernelInterface);
+        };
+        return validate_checked_float_map_kernel(kernel, value_type, scalar_caps)
+            .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
+    }
+    if let Some(value_type) = checked_float_unary_profile(kernel) {
+        let scalar_caps = if value_type == PcuValueType::f32() {
+            PcuValueTypeCaps::FLOAT32
+        } else if value_type == PcuValueType::f64() {
+            PcuValueTypeCaps::FLOAT64
+        } else {
+            return Err(RocmLowerError::UnsupportedKernelInterface);
+        };
+        return validate_checked_float_map_kernel(kernel, value_type, scalar_caps)
+            .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
+    }
+    if let Some((value_type, op)) = checked_integer_binary_profile(kernel) {
+        let scalar = value_type.scalar_type();
+        return validate_integer_checked_binary_kernel(
+            kernel,
+            value_type,
+            op,
+            PcuValueTypeCaps::for_scalar(scalar),
+        )
+        .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
     if let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
         kernel.bindings.first().map(|binding| binding.binding_type)
@@ -264,26 +324,8 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
                 }
                 define(&mut definitions, result)?;
             }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                result,
-                op,
-                lhs,
-                rhs,
-                ..
-            }) => {
-                if !matches!(
-                    op,
-                    PcuDispatchAluOp::Add
-                        | PcuDispatchAluOp::Sub
-                        | PcuDispatchAluOp::Mul
-                        | PcuDispatchAluOp::Div
-                        | PcuDispatchAluOp::Max
-                ) {
-                    return Err(RocmLowerError::UnsupportedAlu(op));
-                }
-                require_defined(&definitions, lhs)?;
-                require_defined(&definitions, rhs)?;
-                define(&mut definitions, result)?;
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu { op, .. }) => {
+                return Err(RocmLowerError::UnsupportedAlu(op));
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
                 binding,
@@ -334,7 +376,89 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
     }
 }
 
-pub(super) fn kernel_uses_checked_div_rem(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+fn contains_raw_value_alu(ops: &[PcuDispatchOp<'_>]) -> bool {
+    ops.iter().any(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::Alu { .. }) => true,
+        PcuDispatchOp::GridStrideLoop { body, .. } => contains_raw_value_alu(body),
+        _ => false,
+    })
+}
+
+pub(super) fn kernel_uses_checked_fault(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    kernel.ops.iter().any(|op| match op {
+        PcuDispatchOp::Data(
+            PcuDispatchDataOp::CheckedDivRem { .. }
+            | PcuDispatchDataOp::CheckedIntegerBinary { .. }
+            | PcuDispatchDataOp::CheckedFloatBinary { .. }
+            | PcuDispatchDataOp::CheckedFloatUnary { .. }
+            | PcuDispatchDataOp::CheckedFloatConvert { .. },
+        ) => true,
+        PcuDispatchOp::GridStrideLoop { body, .. } => body.iter().any(|body_op| {
+            matches!(
+                body_op,
+                PcuDispatchOp::Data(
+                    PcuDispatchDataOp::CheckedDivRem { .. }
+                        | PcuDispatchDataOp::CheckedIntegerBinary { .. }
+                        | PcuDispatchDataOp::CheckedFloatBinary { .. }
+                        | PcuDispatchDataOp::CheckedFloatUnary { .. }
+                        | PcuDispatchDataOp::CheckedFloatConvert { .. }
+                )
+            )
+        }),
+        _ => false,
+    })
+}
+
+fn has_checked_float_conversion(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    fn contains(ops: &[PcuDispatchOp<'_>]) -> bool {
+        ops.iter().any(|op| match op {
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert { .. }) => true,
+            PcuDispatchOp::GridStrideLoop { body, .. } => contains(body),
+            _ => false,
+        })
+    }
+    contains(kernel.ops)
+}
+
+fn checked_float_binary_profile(kernel: &PcuDispatchKernelIr<'_>) -> Option<PcuValueType> {
+    kernel.ops.iter().find_map(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary { value_type, .. }) => {
+            Some(*value_type)
+        }
+        PcuDispatchOp::GridStrideLoop { body, .. } => {
+            body.iter().find_map(|body_op| match body_op {
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+                    value_type, ..
+                }) => Some(*value_type),
+                _ => None,
+            })
+        }
+        _ => None,
+    })
+}
+
+fn checked_float_unary_profile(kernel: &PcuDispatchKernelIr<'_>) -> Option<PcuValueType> {
+    kernel.ops.iter().find_map(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
+            value_type,
+            op: PcuDispatchFloatUnaryOp::Relu,
+            ..
+        }) => Some(*value_type),
+        PcuDispatchOp::GridStrideLoop { body, .. } => {
+            body.iter().find_map(|body_op| match body_op {
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
+                    value_type,
+                    op: PcuDispatchFloatUnaryOp::Relu,
+                    ..
+                }) => Some(*value_type),
+                _ => None,
+            })
+        }
+        _ => None,
+    })
+}
+
+fn kernel_uses_checked_div_rem(kernel: &PcuDispatchKernelIr<'_>) -> bool {
     kernel.ops.iter().any(|op| match op {
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. }) => true,
         PcuDispatchOp::GridStrideLoop { body, .. } => body.iter().any(|body_op| {
@@ -344,6 +468,27 @@ pub(super) fn kernel_uses_checked_div_rem(kernel: &PcuDispatchKernelIr<'_>) -> b
             )
         }),
         _ => false,
+    })
+}
+
+fn checked_integer_binary_profile(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Option<(PcuValueType, PcuDispatchIntegerBinaryOp)> {
+    kernel.ops.iter().find_map(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary { value_type, op, .. }) => {
+            Some((*value_type, *op))
+        }
+        PcuDispatchOp::GridStrideLoop { body, .. } => {
+            body.iter().find_map(|body_op| match body_op {
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+                    value_type,
+                    op,
+                    ..
+                }) => Some((*value_type, *op)),
+                _ => None,
+            })
+        }
+        _ => None,
     })
 }
 
@@ -378,32 +523,8 @@ fn validate_grid_stride_body(
                 }
                 define(&mut definitions, result)?;
             }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                result,
-                op,
-                lhs,
-                rhs,
-                value_type,
-            }) => {
-                if value_type != PcuValueType::f32() {
-                    return Err(RocmLowerError::UnsupportedOperation {
-                        index,
-                        support: op.support_flag(),
-                    });
-                }
-                if !matches!(
-                    op,
-                    PcuDispatchAluOp::Add
-                        | PcuDispatchAluOp::Sub
-                        | PcuDispatchAluOp::Mul
-                        | PcuDispatchAluOp::Div
-                        | PcuDispatchAluOp::Max
-                ) {
-                    return Err(RocmLowerError::UnsupportedAlu(op));
-                }
-                require_defined(&definitions, lhs)?;
-                require_defined(&definitions, rhs)?;
-                define(&mut definitions, result)?;
+            PcuDispatchOp::Data(PcuDispatchDataOp::Alu { op, .. }) => {
+                return Err(RocmLowerError::UnsupportedAlu(op));
             }
             _ => {
                 return Err(RocmLowerError::UnsupportedOperation {

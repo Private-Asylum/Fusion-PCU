@@ -12,43 +12,80 @@ use std::{
 
 const INLINE_ARGUMENTS: usize = 8;
 const FAULT_WORD_SENTINEL: u64 = u64::MAX;
+const RECOVERED_FAULT_BIT: u64 = 1 << 63;
 
 const fn validate_batch_fault_semantics(
-    checked_division: bool,
+    checked_arithmetic: bool,
 ) -> Result<(), RocmOwnedDispatchError> {
-    if checked_division {
-        // Checked DivRem publishes a terminal fault only after its completion token is waited.
+    if checked_arithmetic {
+        // Checked arithmetic publishes a terminal fault only after its completion token is waited.
         // A batch can enqueue dependent work before that observation, so accepting the launch
-        // would let consumers read undefined quotient/remainder values.
-        return Err(RocmOwnedDispatchError::CheckedDivisionBatchUnsupported);
+        // would let consumers read invalid arithmetic results.
+        return Err(RocmOwnedDispatchError::CheckedArithmeticBatchUnsupported);
     }
     Ok(())
 }
 
-fn kernel_uses_checked_div_rem(kernel: &PcuDispatchKernelIr<'_>) -> bool {
-    ops_use_checked_div_rem(kernel.ops)
+fn kernel_uses_checked_arithmetic(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    ops_use_checked_arithmetic(kernel.ops)
 }
 
-fn ops_use_checked_div_rem(ops: &[PcuDispatchOp<'_>]) -> bool {
+fn validate_dispatch_requirements(
+    kernel: &PcuDispatchKernelIr<'_>,
+    support: &PcuSupport,
+) -> Result<(), RocmOwnedDispatchError> {
+    if support.supports_kernel_direct(fusion_pcu::PcuKernel::Dispatch(*kernel)) {
+        Ok(())
+    } else {
+        Err(RocmOwnedDispatchError::UnsupportedRequirements)
+    }
+}
+
+fn ops_use_checked_arithmetic(ops: &[PcuDispatchOp<'_>]) -> bool {
     ops.iter().any(|op| match op {
-        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. }) => true,
-        PcuDispatchOp::GridStrideLoop { body, .. } => ops_use_checked_div_rem(body),
+        PcuDispatchOp::Data(
+            PcuDispatchDataOp::CheckedDivRem { .. }
+            | PcuDispatchDataOp::CheckedIntegerBinary { .. }
+            | PcuDispatchDataOp::CheckedFloatBinary { .. }
+            | PcuDispatchDataOp::CheckedFloatUnary { .. }
+            | PcuDispatchDataOp::CheckedFloatConvert { .. },
+        ) => true,
+        PcuDispatchOp::GridStrideLoop { body, .. } => ops_use_checked_arithmetic(body),
         _ => false,
     })
 }
 
+// ROCm lowering bounds direct invocation shapes and grid-stride extents to u32, leaving
+// three tag bits for the logical index. Recovered range faults set the high bit; fatal
+// faults leave it clear, so `atomicMin` always gives fatal faults priority. Within either
+// class, the smallest logical index wins, and clamp-mode code records only the first
+// recoverable range fault per invocation.
 const fn decode_fault_word(word: u64) -> Result<Option<PcuExecutionFault>, HipError> {
     if word == FAULT_WORD_SENTINEL {
         return Ok(None);
     }
-    let kind = match word & 0b11 {
+    let recovered = word & RECOVERED_FAULT_BIT != 0;
+    let payload = word & !RECOVERED_FAULT_BIT;
+    let kind = match payload & 0b111 {
         1 => PcuExecutionFaultKind::DivideByZero,
         2 => PcuExecutionFaultKind::SignedDivisionOverflow,
+        3 => PcuExecutionFaultKind::ArithmeticOverflow,
+        4 => PcuExecutionFaultKind::ArithmeticUnderflow,
+        5 => PcuExecutionFaultKind::InvalidFloatingOperand,
         _ => return Err(HipError::InvalidExecutionFaultWord(word)),
     };
+    if recovered
+        && !matches!(
+            kind,
+            PcuExecutionFaultKind::ArithmeticOverflow | PcuExecutionFaultKind::ArithmeticUnderflow
+        )
+    {
+        return Err(HipError::InvalidExecutionFaultWord(word));
+    }
     Ok(Some(PcuExecutionFault {
         kind,
-        invocation_id: word >> 2,
+        invocation_id: payload >> 3,
+        recovered,
     }))
 }
 
@@ -142,10 +179,12 @@ pub enum RocmOwnedDispatchError {
     MemoryAccessMismatch(PcuBindingRef),
     GeometryOverflow,
     Binding(PcuOwnedDispatchBindingError),
-    CheckedDivisionBatchUnsupported,
-    CheckedDivisionBatchClosed,
-    CheckedDivisionRequired,
+    UnsupportedRequirements,
+    CheckedArithmeticBatchUnsupported,
+    CheckedArithmeticBatchClosed,
+    CheckedArithmeticRequired,
     CheckedBatchUnavailable,
+    CheckedSequentialDispatchPoisoned,
     CheckedBatchFaultWordUnavailable,
     CheckedFaultWordSize {
         actual: usize,
@@ -193,17 +232,23 @@ impl fmt::Display for RocmOwnedDispatchError {
             ),
             Self::GeometryOverflow => f.write_str("HIP launch geometry overflow"),
             Self::Binding(error) => write!(f, "invalid owned PCU binding: {error:?}"),
-            Self::CheckedDivisionBatchUnsupported => f.write_str(
-                "checked integer division cannot be submitted through the ordered HIP batch path",
+            Self::UnsupportedRequirements => f.write_str(
+                "ROCm does not advertise the scalar types, instructions, ALU operations, or features required by this dispatch kernel",
             ),
-            Self::CheckedDivisionBatchClosed => f.write_str(
+            Self::CheckedArithmeticBatchUnsupported => f.write_str(
+                "checked arithmetic cannot be submitted through the ordered HIP batch path",
+            ),
+            Self::CheckedArithmeticBatchClosed => f.write_str(
                 "the checked ROCm batch has already submitted its final checked dispatch",
             ),
-            Self::CheckedDivisionRequired => f.write_str(
-                "a checked ROCm batch must end with a checked integer division dispatch",
-            ),
+            Self::CheckedArithmeticRequired => {
+                f.write_str("a checked ROCm batch must end with a checked arithmetic dispatch")
+            }
             Self::CheckedBatchUnavailable => {
                 f.write_str("the checked ROCm batch no longer has an open HIP batch")
+            }
+            Self::CheckedSequentialDispatchPoisoned => {
+                f.write_str("the checked ROCm sequential dispatch has uncertain in-flight work")
             }
             Self::CheckedBatchFaultWordUnavailable => {
                 f.write_str("the checked ROCm completion has no retained fault word")
@@ -455,13 +500,59 @@ impl RocmOwnedDispatchBackend {
         self.prepare_dispatch_ir_with_stream_preference(kernel, shape, stream.clone(), true)
     }
 
+    /// Prepares only the private, validated ordered `MatMul` factory's buffer/fault ABI.
+    /// Arbitrary consumer source cannot enter the safe owned-submission path here.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_strict_matmul_on_stream(
+        &self,
+        spec: crate::tensor::strict_matmul::StrictMatMulSpec,
+        stream: &crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
+        }
+        let compiler = self
+            .compiler
+            .ok_or(RocmOwnedDispatchError::CompilerUnavailable)?;
+        let source = spec.source();
+        let image = match crate::compile_hip_source_for_device(&self.runtime, &source) {
+            Ok(image) => image,
+            Err(_) if compiler == crate::discovery::DispatchCompiler::Hipcc => {
+                self.compile_tensor_source(&source)?
+            }
+            Err(error) => return Err(RocmOwnedDispatchError::HipRtc(error)),
+        };
+        let module = self.runtime.load_module(&image)?;
+        let function = module.function(c"fusion_kernel")?;
+        let binding_requirements = spec.requirements().to_vec();
+        let binding_targets = binding_requirements
+            .iter()
+            .map(|requirement| requirement.target)
+            .collect();
+        let shape = spec.shape();
+        let grid_x = launch_grid(shape.invocation_count().get(), self.block_size)?;
+        Ok(RocmPreparedDispatch {
+            runtime: self.runtime.clone(),
+            device: self.device,
+            binding_requirements,
+            shape,
+            grid_x,
+            block_size: self.block_size,
+            function,
+            stream: stream.clone(),
+            binding_targets,
+            checked_arithmetic: true,
+        })
+    }
+
     fn prepare_dispatch_ir(
         &self,
         kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
         shape: fusion_pcu::PcuInvocationShape,
     ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        let validated = self.validate_dispatch_ir(kernel, shape)?;
         let stream = self.runtime.create_stream()?;
-        self.prepare_dispatch_ir_with_stream(kernel, shape, stream)
+        self.prepare_dispatch_ir_after_validation(kernel, shape, stream, false, validated)
     }
 
     fn prepare_dispatch_ir_with_stream(
@@ -480,8 +571,16 @@ impl RocmOwnedDispatchBackend {
         stream: crate::HipStreamHandle,
         prefer_hiprtc: bool,
     ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        let validated = self.validate_dispatch_ir(kernel, shape)?;
+        self.prepare_dispatch_ir_after_validation(kernel, shape, stream, prefer_hiprtc, validated)
+    }
+
+    fn validate_dispatch_ir(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
+        shape: fusion_pcu::PcuInvocationShape,
+    ) -> Result<ValidatedDispatch, RocmOwnedDispatchError> {
         let source = lower_dispatch_to_hip_source(&kernel)?;
-        let checked_division = kernel_uses_checked_div_rem(&kernel);
         let logical_invocations = shape.invocation_count().get();
         if kernel.entry.logical_shape != [logical_invocations, 1, 1] {
             return Err(RocmOwnedDispatchError::Lower(
@@ -489,6 +588,27 @@ impl RocmOwnedDispatchBackend {
             ));
         }
         let grid_x = launch_grid(logical_invocations, self.block_size)?;
+        validate_dispatch_requirements(&kernel, &owned_dispatch_support())?;
+        Ok(ValidatedDispatch {
+            source,
+            grid_x,
+            checked_arithmetic: kernel_uses_checked_arithmetic(&kernel),
+        })
+    }
+
+    fn prepare_dispatch_ir_after_validation(
+        &self,
+        kernel: fusion_pcu::PcuDispatchKernelIr<'_>,
+        shape: fusion_pcu::PcuInvocationShape,
+        stream: crate::HipStreamHandle,
+        prefer_hiprtc: bool,
+        validated: ValidatedDispatch,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        let ValidatedDispatch {
+            source,
+            grid_x,
+            checked_arithmetic,
+        } = validated;
         let compiler = self
             .compiler
             .ok_or(RocmOwnedDispatchError::CompilerUnavailable)?;
@@ -555,9 +675,15 @@ impl RocmOwnedDispatchBackend {
             function,
             stream,
             binding_targets,
-            checked_division,
+            checked_arithmetic,
         })
     }
+}
+
+struct ValidatedDispatch {
+    source: String,
+    grid_x: u32,
+    checked_arithmetic: bool,
 }
 
 /// Reusable compiled `ROCm` executable for one PCU Dispatch descriptor.
@@ -575,12 +701,12 @@ pub struct RocmPreparedDispatch {
     function: crate::HipKernel,
     stream: crate::HipStreamHandle,
     binding_targets: Vec<PcuBindingRef>,
-    checked_division: bool,
+    checked_arithmetic: bool,
 }
 
 impl RocmPreparedDispatch {
     pub(crate) const fn requires_checked_fault_word(&self) -> bool {
-        self.checked_division
+        self.checked_arithmetic
     }
 
     /// Clone the stream captured by this executable for preparing related ordered work.
@@ -610,6 +736,36 @@ impl RocmPreparedDispatch {
         RocmCheckedDispatchBatch::new(&self.stream)
     }
 
+    /// Allocate reusable status storage for checked submissions that are waited in sequence.
+    ///
+    /// This opt-in path requires sequential use. Its returned owner permits one in-flight
+    /// submission, and `submit_and_wait` holds an exclusive borrow until HIP completion and status
+    /// readback finish. Public [`Self::submit`] keeps independent status storage per call and
+    /// supports overlapping submissions. After a terminal success, this owner's observed sentinel
+    /// is reused without another host-to-device reset. Faults and known prelaunch rejections
+    /// require a reset before the next attempt. An uncertain HIP failure poisons the owner because
+    /// the status word may still be in use by the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RocmOwnedDispatchError::CheckedArithmeticRequired`] for an unchecked executable,
+    /// or a HIP allocation/initialization error.
+    pub fn sequential_checked(
+        &self,
+    ) -> Result<RocmSequentialCheckedDispatch<'_>, RocmOwnedDispatchError> {
+        if !self.checked_arithmetic {
+            return Err(RocmOwnedDispatchError::CheckedArithmeticRequired);
+        }
+        let mut fault_word = self.runtime.allocate(core::mem::size_of::<u64>())?;
+        fault_word.copy_from(&FAULT_WORD_SENTINEL.to_le_bytes())?;
+        Ok(RocmSequentialCheckedDispatch {
+            dispatch: self,
+            fault_word,
+            state: FaultWordState::Sentinel,
+            poisoned: false,
+        })
+    }
+
     /// Submit this executable with a fresh set of owned bindings.
     ///
     /// Binding metadata, allocation size, and captured runtime/device identity are checked on
@@ -626,14 +782,15 @@ impl RocmPreparedDispatch {
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
         self.validate_bindings(bindings)?;
-        let fault_word = if self.checked_division {
+        let fault_word = if self.checked_arithmetic {
             Some(self.runtime.allocate(core::mem::size_of::<u64>())?)
         } else {
             None
         };
-        self.submit_validated(bindings, fault_word)
+        self.submit_validated(bindings, fault_word, self.checked_arithmetic)
     }
 
+    #[cfg(test)] // GPU conformance tests reuse explicit status storage with reset-always semantics.
     /// Submits a checked kernel with caller-owned status storage.
     ///
     /// This crate-private path is for synchronous typed wrappers that wait for each completion
@@ -648,8 +805,23 @@ impl RocmPreparedDispatch {
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
         fault_word: &mut DeviceBuffer,
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
-        if !self.checked_division {
-            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+        self.submit_with_fault_word_state(bindings, fault_word, true)
+    }
+
+    /// Submit with caller-proven sentinel state for synchronous prepared wrappers.
+    ///
+    /// `reset_fault_word` may be false only after the prior launch reached terminal success and
+    /// its status readback observed `FAULT_WORD_SENTINEL`. The ordinary submit method always
+    /// resets caller-provided storage.
+    #[allow(clippy::needless_pass_by_ref_mut)] // Typed wrappers hold exclusive status ownership and wait before reuse.
+    pub(crate) fn submit_with_fault_word_state(
+        &self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+        fault_word: &mut DeviceBuffer,
+        reset_fault_word: bool,
+    ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
+        if !self.checked_arithmetic {
+            return Err(RocmOwnedDispatchError::CheckedArithmeticRequired);
         }
         self.validate_bindings(bindings)?;
         if fault_word.len() != core::mem::size_of::<u64>() {
@@ -660,7 +832,7 @@ impl RocmPreparedDispatch {
         self.runtime
             .ensure_same_runtime(&fault_word.allocation.runtime)
             .map_err(|_| HipError::DifferentRuntime)?;
-        self.submit_validated(bindings, Some(fault_word.clone()))
+        self.submit_validated(bindings, Some(fault_word.clone()), reset_fault_word)
     }
 
     fn validate_bindings(
@@ -689,11 +861,12 @@ impl RocmPreparedDispatch {
         &self,
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
         mut fault_word: Option<DeviceBuffer>,
+        reset_fault_word: bool,
     ) -> Result<RocmOwnedCompletion, RocmOwnedDispatchError> {
         // Kernel arguments are borrowed only during `launch`; HIP copies their pointer values
         // into owned aligned storage before returning. Keep common small interfaces on the stack
         // without constraining larger kernels to an arbitrary binding-count limit.
-        if self.checked_division {
+        if self.checked_arithmetic && reset_fault_word {
             let buffer = fault_word
                 .as_mut()
                 .ok_or(RocmOwnedDispatchError::CheckedBatchFaultWordUnavailable)?;
@@ -755,7 +928,7 @@ impl RocmPreparedDispatch {
     /// This path avoids creating a per-launch HIP event. The batch must use the stream captured
     /// by this prepared dispatch and must be finished after the final queued operation. Checked
     /// `DivRem` is rejected because its fault word is observed only after completion; subsequent
-    /// queued work could otherwise consume undefined quotient/remainder values before the fault
+    /// queued work could otherwise consume invalid arithmetic results before the fault
     /// becomes visible. If this method returns a HIP launch error, the batch is poisoned and must
     /// be dropped; its drop path synchronizes the stream or quarantines its retained resources.
     ///
@@ -767,7 +940,7 @@ impl RocmPreparedDispatch {
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
         batch: &mut HipCompletionBatch,
     ) -> Result<(), RocmOwnedDispatchError> {
-        validate_batch_fault_semantics(self.checked_division)?;
+        validate_batch_fault_semantics(self.checked_arithmetic)?;
         validate_owned_binding_requirements(&self.binding_requirements, self.device, bindings)
             .map_err(RocmOwnedDispatchError::Binding)?;
         for binding in bindings {
@@ -827,8 +1000,8 @@ impl RocmPreparedDispatch {
         batch: &mut HipCompletionBatch,
         fault_word: &DeviceBuffer,
     ) -> Result<(), RocmOwnedDispatchError> {
-        if !self.checked_division {
-            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+        if !self.checked_arithmetic {
+            return Err(RocmOwnedDispatchError::CheckedArithmeticRequired);
         }
         validate_owned_binding_requirements(&self.binding_requirements, self.device, bindings)
             .map_err(RocmOwnedDispatchError::Binding)?;
@@ -890,6 +1063,70 @@ impl RocmPreparedDispatch {
     }
 }
 
+/// Checked prepared dispatch with owned status storage for strictly sequential use.
+///
+/// This wrapper is deliberately synchronous. Its mutable borrow prevents safe Rust callers from
+/// starting another launch with this status word before the previous completion is terminal.
+pub struct RocmSequentialCheckedDispatch<'a> {
+    dispatch: &'a RocmPreparedDispatch,
+    fault_word: DeviceBuffer,
+    state: FaultWordState,
+    poisoned: bool,
+}
+
+impl RocmSequentialCheckedDispatch<'_> {
+    /// Submit a checked dispatch and wait for its terminal status before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, HIP launch/wait/readback, or invalid checked-status errors. Uncertain
+    /// launch/wait/readback errors poison this owner; a terminal arithmetic fault is returned as
+    /// `Ok(PcuCompletionOutcome::Fault(_))` so callers may recover and submit again.
+    pub fn submit_and_wait(
+        &mut self,
+        bindings: &[PcuOwnedBinding<DeviceBuffer>],
+    ) -> Result<PcuCompletionOutcome, RocmOwnedDispatchError> {
+        if self.poisoned {
+            return Err(RocmOwnedDispatchError::CheckedSequentialDispatchPoisoned);
+        }
+        let reset = self.state.begin_submission();
+        let submission =
+            self.dispatch
+                .submit_with_fault_word_state(bindings, &mut self.fault_word, reset);
+        let mut completion = match submission {
+            Ok(completion) => completion,
+            Err(error) => {
+                if is_certain_checked_prelaunch_error(&error) {
+                    self.state = FaultWordState::NeedsReset;
+                } else {
+                    self.poisoned = true;
+                }
+                return Err(error);
+            }
+        };
+        let outcome = match PcuOwnedCompletion::wait(&mut completion) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(RocmOwnedDispatchError::Hip(error));
+            }
+        };
+        self.state = FaultWordState::after_terminal(outcome);
+        Ok(outcome)
+    }
+}
+
+const fn is_certain_checked_prelaunch_error(error: &RocmOwnedDispatchError) -> bool {
+    matches!(
+        error,
+        RocmOwnedDispatchError::Binding(_)
+            | RocmOwnedDispatchError::BufferSizeMismatch { .. }
+            | RocmOwnedDispatchError::DifferentRuntime(_)
+            | RocmOwnedDispatchError::MemoryAccessMismatch(_)
+            | RocmOwnedDispatchError::CheckedFaultWordSize { .. }
+    )
+}
+
 /// Ordered `ROCm` batch that may end in one checked `DivRem` dispatch.
 ///
 /// Unchecked dispatches may be appended before the checked dispatch. Once the checked dispatch
@@ -927,7 +1164,7 @@ impl RocmCheckedDispatchBatch {
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<(), RocmOwnedDispatchError> {
         if self.checked_attempted {
-            return Err(RocmOwnedDispatchError::CheckedDivisionBatchClosed);
+            return Err(RocmOwnedDispatchError::CheckedArithmeticBatchClosed);
         }
         let batch = self
             .batch
@@ -954,10 +1191,10 @@ impl RocmCheckedDispatchBatch {
         bindings: &[PcuOwnedBinding<DeviceBuffer>],
     ) -> Result<(), RocmOwnedDispatchError> {
         if self.checked_attempted {
-            return Err(RocmOwnedDispatchError::CheckedDivisionBatchClosed);
+            return Err(RocmOwnedDispatchError::CheckedArithmeticBatchClosed);
         }
-        if !dispatch.checked_division {
-            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+        if !dispatch.checked_arithmetic {
+            return Err(RocmOwnedDispatchError::CheckedArithmeticRequired);
         }
         let mut fault_word = dispatch.runtime.allocate(core::mem::size_of::<u64>())?;
         fault_word.copy_from(&FAULT_WORD_SENTINEL.to_le_bytes())?;
@@ -988,7 +1225,7 @@ impl RocmCheckedDispatchBatch {
     /// record the final completion event.
     pub fn finish(mut self) -> Result<RocmCheckedBatchCompletion, RocmOwnedDispatchError> {
         if !self.checked_submitted {
-            return Err(RocmOwnedDispatchError::CheckedDivisionRequired);
+            return Err(RocmOwnedDispatchError::CheckedArithmeticRequired);
         }
         let batch = self
             .batch
@@ -1302,13 +1539,11 @@ const fn owned_dispatch_support() -> PcuSupport {
     dispatch.instructions = PcuFeatureSupport::new(
         PcuDispatchOpCaps::VALUE_CONSTANT
             .union(PcuDispatchOpCaps::VALUE_CAST)
-            .union(PcuDispatchOpCaps::ALU_ADD)
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL)
-            .union(PcuDispatchOpCaps::ALU_DIV)
-            .union(PcuDispatchOpCaps::ALU_MIN)
-            .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
             .union(PcuDispatchOpCaps::CONTROL_LOOP)
             .union(PcuDispatchOpCaps::BINDING_LOAD)
@@ -1323,7 +1558,7 @@ const fn owned_dispatch_support() -> PcuSupport {
             .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
             .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
             .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
             .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
@@ -1332,7 +1567,8 @@ const fn owned_dispatch_support() -> PcuSupport {
     );
     dispatch.features = PcuFeatureSupport::new(
         PcuDispatchFeatureCaps::MUTABLE_RESOURCES
-            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES),
+            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES)
+            .union(PcuDispatchFeatureCaps::RANGE_CLAMP),
         PcuDispatchFeatureCaps::empty(),
     );
     support.dispatch_support = dispatch;
@@ -1341,13 +1577,11 @@ const fn owned_dispatch_support() -> PcuSupport {
 
 const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_CONSTANT
     .union(PcuDispatchOpCaps::VALUE_CAST)
-    .union(PcuDispatchOpCaps::ALU_ADD)
-    .union(PcuDispatchOpCaps::ALU_SUB)
-    .union(PcuDispatchOpCaps::ALU_MUL)
-    .union(PcuDispatchOpCaps::ALU_DIV)
-    .union(PcuDispatchOpCaps::ALU_MIN)
-    .union(PcuDispatchOpCaps::ALU_MAX)
     .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+    .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+    .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+    .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
     .union(PcuDispatchOpCaps::CONTROL_RETURN)
     .union(PcuDispatchOpCaps::CONTROL_LOOP)
     .union(PcuDispatchOpCaps::BINDING_LOAD)
@@ -1355,54 +1589,67 @@ const OWNED_DISPATCH_INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::VALUE_
     .union(PcuDispatchOpCaps::BINDING_STORE);
 
 const fn f32_alu_caps() -> PcuDispatchOpCaps {
-    PcuDispatchOpCaps::ALU_ADD
-        .union(PcuDispatchOpCaps::ALU_SUB)
-        .union(PcuDispatchOpCaps::ALU_MUL)
-        .union(PcuDispatchOpCaps::ALU_DIV)
-        .union(PcuDispatchOpCaps::ALU_MAX)
+    PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
 }
 
 const fn f64_alu_caps() -> PcuDispatchOpCaps {
-    PcuDispatchOpCaps::ALU_ADD
-        .union(PcuDispatchOpCaps::ALU_SUB)
-        .union(PcuDispatchOpCaps::ALU_MUL)
-        .union(PcuDispatchOpCaps::ALU_DIV)
-        .union(PcuDispatchOpCaps::ALU_MIN)
-        .union(PcuDispatchOpCaps::ALU_MAX)
+    PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
 }
 
 const fn int_alu_caps() -> PcuDispatchOpCaps {
-    PcuDispatchOpCaps::ALU_ADD
-        .union(PcuDispatchOpCaps::ALU_SUB)
-        .union(PcuDispatchOpCaps::ALU_MUL)
+    PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+}
+
+const fn checked_u8_alu_caps() -> PcuDispatchOpCaps {
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const fn checked_u32_alu_caps() -> PcuDispatchOpCaps {
-    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const fn checked_u16_alu_caps() -> PcuDispatchOpCaps {
-    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const fn checked_u64_alu_caps() -> PcuDispatchOpCaps {
-    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const fn checked_i32_alu_caps() -> PcuDispatchOpCaps {
-    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const fn checked_i16_alu_caps() -> PcuDispatchOpCaps {
-    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const fn checked_i8_alu_caps() -> PcuDispatchOpCaps {
-    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const fn checked_i64_alu_caps() -> PcuDispatchOpCaps {
-    int_alu_caps().union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    int_alu_caps()
+        .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
 }
 
 const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
@@ -1434,13 +1681,14 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
             .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
             .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U8, int_alu_caps())
+            .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
             .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
             .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
             .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
             .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
         dispatch_features: PcuDispatchFeatureCaps::MUTABLE_RESOURCES
-            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES),
+            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES)
+            .union(PcuDispatchFeatureCaps::RANGE_CLAMP),
         stream_instructions: fusion_pcu::PcuStreamCapabilities::empty(),
         command_instructions: fusion_pcu::PcuCommandOpCaps::empty(),
         transaction_features: fusion_pcu::PcuTransactionFeatureCaps::empty(),
@@ -1454,7 +1702,8 @@ mod tests {
     use super::{
         decode_fault_word,
         validate_batch_fault_semantics,
-        ops_use_checked_div_rem,
+        validate_dispatch_requirements,
+        ops_use_checked_arithmetic,
         FAULT_WORD_SENTINEL,
         RocmOwnedDispatchError,
         RocmCheckedBatchCompletion,
@@ -1464,6 +1713,7 @@ mod tests {
         find_binding,
         memory_access_supports_binding,
         launch_grid,
+        RECOVERED_FAULT_BIT,
     };
     #[rustfmt::skip]
     use fusion_pcu::{
@@ -1498,6 +1748,54 @@ mod tests {
     struct Noop;
 
     #[test]
+    fn owned_dispatch_rejects_legacy_raw_value_alu_capabilities() {
+        let raw = PcuDispatchOpCaps::ALU_ADD
+            .union(PcuDispatchOpCaps::ALU_SUB)
+            .union(PcuDispatchOpCaps::ALU_MUL)
+            .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MIN)
+            .union(PcuDispatchOpCaps::ALU_MAX);
+        let support = owned_dispatch_support();
+        assert_eq!(
+            support.dispatch_support.instructions.direct.bits() & raw.bits(),
+            0
+        );
+        assert_eq!(OWNED_DISPATCH_INSTRUCTIONS.bits() & raw.bits(), 0);
+        for scalar in [
+            fusion_pcu::PcuScalarType::F32,
+            fusion_pcu::PcuScalarType::F64,
+            fusion_pcu::PcuScalarType::I8,
+            fusion_pcu::PcuScalarType::U8,
+            fusion_pcu::PcuScalarType::I16,
+            fusion_pcu::PcuScalarType::U16,
+            fusion_pcu::PcuScalarType::I32,
+            fusion_pcu::PcuScalarType::U32,
+            fusion_pcu::PcuScalarType::I64,
+            fusion_pcu::PcuScalarType::U64,
+        ] {
+            assert_eq!(
+                support
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar)
+                    .bits()
+                    & raw.bits(),
+                0
+            );
+            assert_eq!(
+                OWNED_EXECUTORS[0]
+                    .support
+                    .dispatch_scalar_alu
+                    .for_scalar(scalar)
+                    .bits()
+                    & raw.bits(),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn checked_batch_completion_implements_common_owned_completion_contract() {
         fn state<C: PcuOwnedCompletion>(completion: &C) -> PcuCompletionState {
             completion
@@ -1512,17 +1810,18 @@ mod tests {
             terminal: Some(PcuCompletionOutcome::Fault(PcuExecutionFault {
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: 7,
+                recovered: false,
             })),
         };
         assert_eq!(state(&completion), PcuCompletionState::Failed);
     }
 
     #[test]
-    fn ordered_batch_acceptance_preserves_checked_division_fault_boundary() {
+    fn ordered_batch_acceptance_preserves_checked_arithmetic_fault_boundary() {
         assert!(validate_batch_fault_semantics(false).is_ok());
         assert!(matches!(
             validate_batch_fault_semantics(true),
-            Err(RocmOwnedDispatchError::CheckedDivisionBatchUnsupported)
+            Err(RocmOwnedDispatchError::CheckedArithmeticBatchUnsupported)
         ));
 
         let result = PcuExecutionResourceUse {
@@ -1557,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_division_scan_finds_nested_region_operations() {
+    fn checked_arithmetic_scan_finds_nested_region_operations() {
         let checked = PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
             value_type: PcuValueType::Scalar(fusion_pcu::PcuScalarType::I32),
             flags: PcuIntegerDivFlags::CHECKED,
@@ -1571,27 +1870,100 @@ mod tests {
             extent: 4,
             body: &inner,
         }];
-        assert!(ops_use_checked_div_rem(&outer));
+        assert!(ops_use_checked_arithmetic(&outer));
+        let checked_cast = PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+            conversion: fusion_pcu::PcuDispatchCheckedFloatConversion::F64ToF32,
+            underflow_policy: fusion_pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: fusion_pcu::PcuRangePolicy::Reject,
+            result: PcuDispatchValueId(4),
+            value: PcuDispatchValueId(3),
+        });
+        let cast_body = [checked_cast];
+        let cast_loop = [PcuDispatchOp::GridStrideLoop {
+            extent: 4,
+            body: &cast_body,
+        }];
+        assert!(ops_use_checked_arithmetic(&cast_loop));
+
+        let checked_relu = PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
+            value_type: PcuValueType::f32(),
+            op: fusion_pcu::PcuDispatchFloatUnaryOp::Relu,
+            underflow_policy: fusion_pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: fusion_pcu::PcuRangePolicy::Reject,
+            result: PcuDispatchValueId(5),
+            value: PcuDispatchValueId(4),
+        });
+        assert!(ops_use_checked_arithmetic(&[checked_relu]));
+        assert!(validate_batch_fault_semantics(true).is_err());
     }
 
     #[test]
-    fn checked_division_fault_word_decodes_sentinel_and_logical_invocation() {
+    fn checked_arithmetic_fault_word_decodes_sentinel_and_logical_invocation() {
         assert_eq!(decode_fault_word(FAULT_WORD_SENTINEL), Ok(None));
         assert_eq!(
-            decode_fault_word((37_u64 << 2) | 1),
+            decode_fault_word((37_u64 << 3) | 1),
             Ok(Some(PcuExecutionFault {
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: 37,
+                recovered: false,
             }))
         );
         assert_eq!(
-            decode_fault_word((37_u64 << 2) | 2),
+            decode_fault_word((37_u64 << 3) | 2),
             Ok(Some(PcuExecutionFault {
                 kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                 invocation_id: 37,
+                recovered: false,
             }))
         );
-        assert!(decode_fault_word((37_u64 << 2) | 3).is_err());
+        for (tag, kind) in [
+            (3, PcuExecutionFaultKind::ArithmeticOverflow),
+            (4, PcuExecutionFaultKind::ArithmeticUnderflow),
+            (5, PcuExecutionFaultKind::InvalidFloatingOperand),
+        ] {
+            assert_eq!(
+                decode_fault_word((u64::from(u32::MAX) << 3) | tag),
+                Ok(Some(PcuExecutionFault {
+                    kind,
+                    invocation_id: u64::from(u32::MAX),
+                    recovered: false,
+                }))
+            );
+        }
+        for tag in [0, 6, 7] {
+            assert!(decode_fault_word((37_u64 << 3) | tag).is_err());
+        }
+    }
+
+    #[test]
+    fn range_fault_words_decode_recovery_and_fatal_faults_sort_first() {
+        for (tag, kind) in [
+            (3, PcuExecutionFaultKind::ArithmeticOverflow),
+            (4, PcuExecutionFaultKind::ArithmeticUnderflow),
+        ] {
+            assert_eq!(
+                decode_fault_word(RECOVERED_FAULT_BIT | (19_u64 << 3) | tag),
+                Ok(Some(PcuExecutionFault {
+                    kind,
+                    invocation_id: 19,
+                    recovered: true,
+                }))
+            );
+        }
+        assert!(decode_fault_word(RECOVERED_FAULT_BIT | (2_u64 << 3) | 1).is_err());
+        assert!(decode_fault_word(RECOVERED_FAULT_BIT | (2_u64 << 3) | 5).is_err());
+
+        let lowest_recovered = RECOVERED_FAULT_BIT | 3;
+        let highest_fatal = (u64::from(u32::MAX) << 3) | 5;
+        assert!(highest_fatal < lowest_recovered);
+        assert_eq!(
+            decode_fault_word(core::cmp::min(lowest_recovered, highest_fatal)),
+            Ok(Some(PcuExecutionFault {
+                kind: PcuExecutionFaultKind::InvalidFloatingOperand,
+                invocation_id: u64::from(u32::MAX),
+                recovered: false,
+            }))
+        );
     }
 
     #[test]
@@ -1652,163 +2024,363 @@ mod tests {
     }
 
     #[test]
-    fn owned_dispatch_advertises_f64_type_with_its_alu_operations() {
-        let required = fusion_pcu::PcuValueTypeCaps::FLOAT64
-            .union(fusion_pcu::PcuValueTypeCaps::SCALAR_VALUES);
-        assert!(
-            owned_dispatch_support()
-                .value_type_support
-                .direct
-                .contains(required)
-        );
-        assert!(OWNED_EXECUTORS[0].support.value_types.contains(required));
+    fn owned_dispatch_advertises_checked_float_binary_for_f32_and_f64() {
+        let checked = PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY;
+        let checked_unary = PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY;
+        for scalar_type in [
+            fusion_pcu::PcuScalarType::F32,
+            fusion_pcu::PcuScalarType::F64,
+        ] {
+            assert!(
+                owned_dispatch_support()
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar_type)
+                    .contains(checked)
+            );
+            assert!(
+                OWNED_EXECUTORS[0]
+                    .support
+                    .dispatch_scalar_alu
+                    .for_scalar(scalar_type)
+                    .contains(checked)
+            );
+            assert!(
+                owned_dispatch_support()
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar_type)
+                    .contains(checked_unary)
+            );
+            assert!(
+                OWNED_EXECUTORS[0]
+                    .support
+                    .dispatch_scalar_alu
+                    .for_scalar(scalar_type)
+                    .contains(checked_unary)
+            );
+            assert_eq!(
+                owned_dispatch_support()
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar_type)
+                    .bits()
+                    & (PcuDispatchOpCaps::ALU_ADD
+                        .union(PcuDispatchOpCaps::ALU_SUB)
+                        .union(PcuDispatchOpCaps::ALU_MUL)
+                        .union(PcuDispatchOpCaps::ALU_DIV)
+                        .union(PcuDispatchOpCaps::ALU_MIN)
+                        .union(PcuDispatchOpCaps::ALU_MAX))
+                    .bits(),
+                0
+            );
+        }
+        assert!(OWNED_DISPATCH_INSTRUCTIONS.contains(checked));
+        assert!(OWNED_DISPATCH_INSTRUCTIONS.contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT));
         assert!(
             owned_dispatch_support()
                 .dispatch_support
-                .scalar_alu
+                .instructions
                 .direct
-                .for_scalar(fusion_pcu::PcuScalarType::F64)
-                .contains(PcuDispatchOpCaps::ALU_ADD)
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
         );
     }
 
+    fn checked_conversion_kernel_is_supported(
+        conversion: fusion_pcu::PcuDispatchCheckedFloatConversion,
+        grid: bool,
+        support: &fusion_pcu::PcuSupport,
+    ) -> Result<(), RocmOwnedDispatchError> {
+        #[rustfmt::skip]
+        use fusion_pcu::{
+            PcuBinding,
+            PcuBindingStorageClass,
+            PcuDispatchControlOp,
+            PcuDispatchEntryPoint,
+            PcuDispatchFeatureCaps,
+            PcuDispatchIndex,
+            PcuDispatchKernelIr,
+        };
+
+        let bindings = [
+            PcuBinding::value(
+                Some("input"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                conversion.source_type(),
+            ),
+            PcuBinding::value(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                conversion.target_type(),
+            ),
+        ];
+        let index = if grid {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+                conversion,
+                underflow_policy: fusion_pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                range_policy: fusion_pcu::PcuRangePolicy::Reject,
+                result: PcuDispatchValueId(2),
+                value: PcuDispatchValueId(1),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 1),
+                index,
+                value: PcuDispatchValueId(2),
+            }),
+        ];
+        let direct_ops = [
+            body[0],
+            body[1],
+            body[2],
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let grid_ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 8,
+                body: &body,
+            },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let kernel = PcuDispatchKernelIr {
+            id: fusion_pcu::PcuKernelId(0xfeed),
+            entry: PcuDispatchEntryPoint {
+                name: "checked_float_conversion_caps",
+                logical_shape: [8, 1, 1],
+            },
+            bindings: &bindings,
+            ports: &[],
+            parameters: &[],
+            ops: if grid { &grid_ops } else { &direct_ops },
+            type_caps: fusion_pcu::PcuValueTypeCaps::FLOAT32
+                | fusion_pcu::PcuValueTypeCaps::FLOAT64,
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        validate_dispatch_requirements(&kernel, support)
+    }
+
+    fn checked_float_binary_kernel_is_supported(
+        value_type: fusion_pcu::PcuValueType,
+        op: fusion_pcu::PcuDispatchFloatBinaryOp,
+        grid: bool,
+        support: &fusion_pcu::PcuSupport,
+    ) -> bool {
+        #[rustfmt::skip]
+        use fusion_pcu::{
+            PcuBinding,
+            PcuBindingStorageClass,
+            PcuDispatchControlOp,
+            PcuDispatchEntryPoint,
+            PcuDispatchFeatureCaps,
+            PcuDispatchIndex,
+            PcuDispatchKernelIr,
+            PcuFloatUnderflowPolicy,
+            PcuKernel,
+        };
+
+        let bindings = [0, 1].map(|slot| {
+            PcuBinding::value(
+                Some(if slot == 0 { "lhs" } else { "rhs" }),
+                0,
+                slot,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+                value_type,
+            )
+        });
+        let bindings = [
+            bindings[0],
+            bindings[1],
+            PcuBinding::value(
+                Some("output"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+                value_type,
+            ),
+        ];
+        let index = if grid {
+            PcuDispatchIndex::GridStrideId
+        } else {
+            PcuDispatchIndex::InvocationId
+        };
+        let body = [
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(1),
+                binding: PcuBindingRef::new(0, 0),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                result: PcuDispatchValueId(2),
+                binding: PcuBindingRef::new(0, 1),
+                index,
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+                value_type,
+                op,
+                underflow_policy: PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                range_policy: fusion_pcu::PcuRangePolicy::Reject,
+                result: PcuDispatchValueId(3),
+                lhs: PcuDispatchValueId(1),
+                rhs: PcuDispatchValueId(2),
+            }),
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index,
+                value: PcuDispatchValueId(3),
+            }),
+        ];
+        let direct_ops = [
+            body[0],
+            body[1],
+            body[2],
+            body[3],
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let grid_ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 8,
+                body: &body,
+            },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
+        let kernel = PcuDispatchKernelIr {
+            id: fusion_pcu::PcuKernelId(0xbeef),
+            entry: PcuDispatchEntryPoint {
+                name: "checked_float_binary_caps",
+                logical_shape: [8, 1, 1],
+            },
+            bindings: &bindings,
+            ports: &[],
+            parameters: &[],
+            ops: if grid { &grid_ops } else { &direct_ops },
+            type_caps: if value_type == fusion_pcu::PcuValueType::f32() {
+                fusion_pcu::PcuValueTypeCaps::FLOAT32
+            } else {
+                fusion_pcu::PcuValueTypeCaps::FLOAT64
+            },
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        support.supports_kernel_direct(PcuKernel::Dispatch(kernel))
+    }
+
     #[test]
-    fn owned_dispatch_advertises_lowered_f32_max() {
+    fn checked_float_conversion_caps_admit_both_widths_and_require_both_width_caps() {
+        #[rustfmt::skip]
+        use fusion_pcu::{
+            PcuDispatchCheckedFloatConversion as Conversion,
+            PcuScalarType,
+        };
+
         let support = owned_dispatch_support();
-        assert!(
-            support
-                .dispatch_support
-                .scalar_alu
-                .direct
-                .for_scalar(fusion_pcu::PcuScalarType::F32)
-                .contains(PcuDispatchOpCaps::ALU_MAX)
-        );
-        assert!(
-            support
-                .dispatch_support
-                .instructions
-                .direct
-                .contains(PcuDispatchOpCaps::ALU_MAX)
-        );
-        assert!(
-            OWNED_EXECUTORS[0]
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::F32)
-                .contains(PcuDispatchOpCaps::ALU_MAX)
-        );
-        assert!(
-            OWNED_EXECUTORS[0]
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::F64)
-                .contains(PcuDispatchOpCaps::ALU_MAX)
-        );
-        assert!(
-            OWNED_EXECUTORS[0]
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::F64)
-                .contains(PcuDispatchOpCaps::ALU_MIN)
-        );
-        assert!(
-            OWNED_EXECUTORS[0]
-                .support
-                .dispatch_instructions
-                .contains(PcuDispatchOpCaps::ALU_MIN)
-        );
+        for conversion in [Conversion::F32ToF64, Conversion::F64ToF32] {
+            for grid in [false, true] {
+                assert!(checked_conversion_kernel_is_supported(conversion, grid, &support).is_ok());
+            }
+        }
+
+        // Keep every pre-existing F32/F64 ALU claim while removing only the conversion claim.
+        let f32_without_conversion = PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+            .union(PcuDispatchOpCaps::ALU_ADD)
+            .union(PcuDispatchOpCaps::ALU_SUB)
+            .union(PcuDispatchOpCaps::ALU_MUL)
+            .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MAX);
+        let f64_without_conversion = PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+            .union(PcuDispatchOpCaps::ALU_ADD)
+            .union(PcuDispatchOpCaps::ALU_SUB)
+            .union(PcuDispatchOpCaps::ALU_MUL)
+            .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MIN)
+            .union(PcuDispatchOpCaps::ALU_MAX);
+        for (missing_width, without_conversion) in [
+            (PcuScalarType::F32, f32_without_conversion),
+            (PcuScalarType::F64, f64_without_conversion),
+        ] {
+            let mut incomplete = support;
+            let complete = incomplete.dispatch_support.scalar_alu.direct;
+            incomplete.dispatch_support.scalar_alu.direct =
+                fusion_pcu::PcuDispatchScalarAluSupport::empty()
+                    .with(
+                        PcuScalarType::F32,
+                        if missing_width == PcuScalarType::F32 {
+                            without_conversion
+                        } else {
+                            complete.for_scalar(PcuScalarType::F32)
+                        },
+                    )
+                    .with(
+                        PcuScalarType::F64,
+                        if missing_width == PcuScalarType::F64 {
+                            without_conversion
+                        } else {
+                            complete.for_scalar(PcuScalarType::F64)
+                        },
+                    );
+            for conversion in [Conversion::F32ToF64, Conversion::F64ToF32] {
+                for grid in [false, true] {
+                    assert!(matches!(
+                        checked_conversion_kernel_is_supported(conversion, grid, &incomplete),
+                        Err(RocmOwnedDispatchError::UnsupportedRequirements)
+                    ));
+                }
+            }
+        }
+
+        let mut missing_instruction = support;
+        missing_instruction.dispatch_support.instructions.direct = PcuDispatchOpCaps::BINDING_LOAD
+            .union(PcuDispatchOpCaps::BINDING_STORE)
+            .union(PcuDispatchOpCaps::CONTROL_RETURN);
+        let mut missing_feature = support;
+        missing_feature.dispatch_support.features.direct =
+            fusion_pcu::PcuDispatchFeatureCaps::READ_ONLY_RESOURCES;
+        for conversion in [Conversion::F32ToF64, Conversion::F64ToF32] {
+            for grid in [false, true] {
+                assert!(matches!(
+                    checked_conversion_kernel_is_supported(conversion, grid, &missing_instruction),
+                    Err(RocmOwnedDispatchError::UnsupportedRequirements)
+                ));
+                assert!(matches!(
+                    checked_conversion_kernel_is_supported(conversion, grid, &missing_feature),
+                    Err(RocmOwnedDispatchError::UnsupportedRequirements)
+                ));
+            }
+        }
     }
 
     #[test]
-    #[allow(clippy::cognitive_complexity)]
-    fn owned_dispatch_advertises_only_supported_u32_alu_operations() {
-        let supported = PcuDispatchOpCaps::ALU_ADD
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL);
-        let support = owned_dispatch_support()
-            .dispatch_support
-            .scalar_alu
-            .direct
-            .for_scalar(fusion_pcu::PcuScalarType::U32);
-        assert!(support.contains(supported));
-        assert!(!support.contains(PcuDispatchOpCaps::ALU_DIV));
-        assert!(support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
-        assert!(
-            owned_dispatch_support()
-                .dispatch_support
-                .instructions
-                .direct
-                .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
-        );
-        assert!(OWNED_DISPATCH_INSTRUCTIONS.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
-        assert!(
-            OWNED_EXECUTORS[0]
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::U32)
-                .contains(supported)
-        );
-        assert!(
-            OWNED_EXECUTORS[0]
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::U32)
-                .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
-        );
-        assert!(
-            !OWNED_EXECUTORS[0]
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::U32)
-                .contains(PcuDispatchOpCaps::ALU_DIV)
-        );
-        let u64_support = OWNED_EXECUTORS[0]
-            .support
-            .dispatch_scalar_alu
-            .for_scalar(fusion_pcu::PcuScalarType::U64);
-        assert!(u64_support.contains(supported));
-        assert!(u64_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
-        assert!(!u64_support.contains(PcuDispatchOpCaps::ALU_DIV));
-        let u16_support = OWNED_EXECUTORS[0]
-            .support
-            .dispatch_scalar_alu
-            .for_scalar(fusion_pcu::PcuScalarType::U16);
-        assert!(u16_support.contains(supported));
-        assert!(u16_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
-        assert!(!u16_support.contains(PcuDispatchOpCaps::ALU_DIV));
-        let u8_support = OWNED_EXECUTORS[0]
-            .support
-            .dispatch_scalar_alu
-            .for_scalar(fusion_pcu::PcuScalarType::U8);
-        assert!(u8_support.contains(supported));
-        assert!(!u8_support.contains(PcuDispatchOpCaps::ALU_DIV));
-        let i16_support = OWNED_EXECUTORS[0]
-            .support
-            .dispatch_scalar_alu
-            .for_scalar(fusion_pcu::PcuScalarType::I16);
-        assert!(i16_support.contains(supported));
-        assert!(i16_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
-        assert!(!i16_support.contains(PcuDispatchOpCaps::ALU_DIV));
-        let i8_support = OWNED_EXECUTORS[0]
-            .support
-            .dispatch_scalar_alu
-            .for_scalar(fusion_pcu::PcuScalarType::I8);
-        assert!(i8_support.contains(supported));
-        assert!(!i8_support.contains(PcuDispatchOpCaps::ALU_DIV));
-        let i32_support = OWNED_EXECUTORS[0]
-            .support
-            .dispatch_scalar_alu
-            .for_scalar(fusion_pcu::PcuScalarType::I32);
-        assert!(i32_support.contains(supported));
-        assert!(i32_support.contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM));
-        assert!(!i32_support.contains(PcuDispatchOpCaps::ALU_DIV));
-        assert!(
-            OWNED_EXECUTORS[0]
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::I64)
-                .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
-        );
+    fn owned_admission_preserves_checked_float_binary_profiles() {
+        use fusion_pcu::model::PcuDispatchFloatBinaryOp as Binary;
+
+        let support = owned_dispatch_support();
+        for value_type in [PcuValueType::f32(), PcuValueType::f64()] {
+            for op in [Binary::Add, Binary::Sub, Binary::Mul, Binary::Div] {
+                for grid in [false, true] {
+                    assert!(checked_float_binary_kernel_is_supported(
+                        value_type, op, grid, &support
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1880,3 +2452,20 @@ pub use execution::{
     RocmOwnedExecutionTwoSlot,
     RocmTwoSlotExecutionStep,
 };
+
+#[cfg(test)]
+#[path = "owned_dispatch/checked_integer_tests.rs"]
+mod checked_integer_tests;
+
+#[cfg(test)]
+#[path = "owned_dispatch/checked_float_tests.rs"]
+mod checked_float_tests;
+
+#[cfg(test)]
+#[path = "owned_dispatch/checked_unary_tests.rs"]
+mod checked_unary_tests;
+
+mod fault_word;
+#[allow(clippy::redundant_pub_crate)]
+// Keep the state machine internal even if this module is exposed later.
+pub(crate) use fault_word::FaultWordState;

@@ -40,13 +40,34 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
     let context_ident = fresh_ident("__pcu_context");
     let bindings_ident = fresh_ident("__pcu_bindings");
     let builder_ident = fresh_ident("__pcu_builder");
+    let policy_ident = format_ident!("__pcu_float_underflow_policy");
+    let range_policy_ident = format_ident!("__pcu_float_range_policy");
     let generic_args = input.generic_arguments;
     let bindings_call = &input.bindings_call;
-    let ir_ident = format_ident!("{}_ir", ident);
-    let builder_call = if generic_args.is_empty() {
-        quote! { #ir_ident(&#bindings_ident) }
+    let policy_builder_ident = &input.policy_builder_ident;
+    let policy_builder_call = if generic_args.is_empty() {
+        quote! { #policy_builder_ident(&#bindings_ident, #policy_ident, #range_policy_ident) }
     } else {
-        quote! { #ir_ident::<#(#generic_args),*>(&#bindings_ident) }
+        quote! { #policy_builder_ident::<#(#generic_args),*>(&#bindings_ident, #policy_ident, #range_policy_ident) }
+    };
+    let underflow_policy = input.explicit_policy.as_ref().map_or_else(
+        || quote! { #context_ident.float_underflow_policy() },
+        |policy| quote! { #policy },
+    );
+    let range_policy = input.explicit_range_policy.as_ref().map_or_else(
+        || quote! { #context_ident.range_policy() },
+        |policy| quote! { #policy },
+    );
+    let range_profile_guard = if input.supports_float_range {
+        quote! {}
+    } else {
+        quote! {
+            if #context_ident.range_policy() == #pcu::PcuRangePolicy::Clamp {
+                return ::core::result::Result::Err(
+                    #pcu::global::PcuExecutionError::UnsupportedRangePolicy
+                );
+            }
+        }
     };
     let marker = fresh_ident("__PcuSpecialization");
     let marker_type = if generic_args.is_empty() {
@@ -114,8 +135,11 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
                 ::core::any::TypeId::of::<#marker_type>(),
                 #args_ident,
                 |#context_ident| {
+                    #range_profile_guard
                     let #bindings_ident = #bindings_call;
-                    let #builder_ident = #builder_call.map_err(#pcu::global::build_error)?;
+                    let #policy_ident = #underflow_policy;
+                    let #range_policy_ident = #range_policy;
+                    let #builder_ident = #policy_builder_call.map_err(#pcu::global::build_error)?;
                     #builder_ident.with_ir(|ir| #context_ident.prepare(ir))
                 },
             )

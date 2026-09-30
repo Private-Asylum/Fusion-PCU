@@ -479,8 +479,10 @@ name = "fusion-pcu"
 version = "0.0.3"
 dependencies = [
  "fusion-pcu-core",
+ "fusion-pcu-cuda",
  "fusion-pcu-macros",
  "fusion-pcu-rocm",
+ "smallvec",
 ]
 
 [[package]]
@@ -498,7 +500,10 @@ dependencies = [
 name = "fusion-pcu-cuda"
 version = "0.0.3"
 dependencies = [
+ "criterion",
  "fusion-pcu-core",
+ "libloading",
+ "smallvec",
 ]
 
 [[package]]
@@ -506,6 +511,15 @@ name = "fusion-pcu-dx12"
 version = "0.0.3"
 dependencies = [
  "fusion-pcu-core",
+]
+
+[[package]]
+name = "fusion-pcu-example-cuda"
+version = "0.0.3"
+dependencies = [
+ "criterion",
+ "fusion-pcu",
+ "fusion-pcu-cuda",
 ]
 
 [[package]]

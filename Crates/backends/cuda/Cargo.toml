@@ -1,6 +1,6 @@
 [package]
 name = "fusion-pcu-cuda"
-description = "CUDA backend scaffold for Fusion PCU"
+description = "CUDA compute backend for Fusion PCU on NVIDIA GPUs"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -18,9 +18,24 @@ path = "cuda.rs"
 
 [features]
 default = []
+insights = ["fusion-pcu-core/insights"]
+tensor = ["fusion-pcu-core/tensor"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
+libloading.workspace = true
+smallvec.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "checked_dispatch"
+harness = false
+
+[[bench]]
+name = "pinned_transfer"
+harness = false

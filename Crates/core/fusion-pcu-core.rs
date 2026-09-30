@@ -27,20 +27,30 @@ mod insight_macros;
 pub use dialect::builder as dialect_builder;
 pub mod dispatch;
 pub mod function;
+#[path = "hardware/hardware.rs"]
+pub mod hardware;
 #[cfg(feature = "insights")]
 pub mod insights;
 pub mod ir;
 pub mod map_validation;
 #[path = "model/model.rs"]
 pub mod model;
+#[path = "numerical/numerical.rs"]
+pub mod numerical;
 pub mod resource;
 pub mod runtime;
 pub mod scalar;
+pub mod scalar_checked;
+pub mod scalar_checked_conversion;
+pub mod scalar_checked_float;
+pub mod scalar_clamped;
+pub mod scalar_float_underflow;
 pub mod scalar_widen;
 pub mod scalar_wrapping;
 pub mod validation;
 
 pub use contract::*;
+pub use hardware::*;
 #[rustfmt::skip]
 pub use runtime::{
     activation,
@@ -55,6 +65,8 @@ pub use runtime::assessment::*;
 pub use runtime::discovery::*;
 #[cfg(feature = "alloc")]
 pub use runtime::device_tensor::*;
+#[cfg(feature = "alloc")]
+pub use runtime::owned_shape::*;
 pub use runtime::device_kernel::*;
 pub use runtime::execution::*;
 pub use runtime::host_kernel::*;
@@ -72,9 +84,15 @@ pub use builder::*;
 pub use dispatch::*;
 pub use function::*;
 pub use map_validation::*;
+pub use numerical::*;
 pub use dialect::*;
 pub use memory::*;
 pub use owned::*;
 pub use scalar::*;
+pub use scalar_checked::*;
+pub use scalar_clamped::*;
+pub use scalar_checked_float::*;
+pub use scalar_checked_conversion::*;
+pub use scalar_float_underflow::*;
 pub use scalar_widen::*;
 pub use scalar_wrapping::*;

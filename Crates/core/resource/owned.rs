@@ -1483,6 +1483,7 @@ mod tests {
         let fault = crate::PcuExecutionFault {
             kind: crate::PcuExecutionFaultKind::DivideByZero,
             invocation_id: 17,
+            recovered: false,
         };
         let mut faulted = PcuOwnedSubmission::new(
             QueueFixtureCompletion {
@@ -1523,6 +1524,7 @@ mod tests {
         let fault = crate::PcuExecutionFault {
             kind: crate::PcuExecutionFaultKind::SignedDivisionOverflow,
             invocation_id: 29,
+            recovered: false,
         };
         let mut queued = PcuOwnedSubmission::new(
             QueueFixtureCompletion {

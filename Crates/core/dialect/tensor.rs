@@ -2,13 +2,15 @@
 //!
 //! Tensor semantics remain isolated from generic coprocessor contracts. This module uses
 //! `core` and `alloc`, never `std`. Graph inputs, constants, and uniforms retain scalar identity
-//! in one erased graph; [`TensorValueId`] provides checked typed handles, with no implicit type
-//! promotion. Dense host storage round-trips each [`TensorValue`] scalar variant, but that fact
+//! in one erased graph; [`TensorValueId`](crate::dialect::tensor::TensorValueId) provides checked typed handles, with no implicit type
+//! promotion. Dense host storage round-trips each [`TensorValue`](crate::dialect::tensor::TensorValue) scalar variant, but that fact
 //! does not claim that every executor implements its type or arithmetic. The reference evaluator
-//! transports typed leaf values and implements forward f32/f64 elementwise arithmetic, `ReLU`,
-//! and matrix multiplication. Mean-squared error, SGD, and reverse-mode differentiation remain
-//! f32-only. Integer elementwise operations can be described in a graph but are not executed by
-//! the current reference evaluator; packed and opaque half-bit arithmetic has no assigned
+//! transports typed leaf values and implements checked integer and f32/f64 elementwise arithmetic, `ReLU`,
+//! and strict ordered matrix multiplication. The legacy boundary-mode reference compounds
+//! retain raw arithmetic; they are not evidence of checked conformance. Use
+//! [`Graph::evaluate_checked`] or [`TensorCheckedReferenceAssessor`] for checked admission.
+//! Mean-squared error, SGD, and reverse-mode differentiation remain
+//! f32-only. Packed and opaque half-bit arithmetic has no assigned
 //! semantics. Broadcasting, batching, convolution, views, optimizers, and serialization remain
 //! outside this dialect.
 
@@ -21,6 +23,9 @@ use alloc::{
 #[rustfmt::skip]
 use crate::{
     PcuScalar,
+    PcuExecutionFaultKind,
+    PcuFloatUnderflowPolicy,
+    PcuNumericalMode,
     core::PcuScalarType,
 };
 use core::fmt;
@@ -206,6 +211,27 @@ impl<T: PcuScalar> Tensor<T> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TensorError {
+    /// Checked integer arithmetic failed at the first affected tensor element.
+    ArithmeticFault {
+        value: ValueId,
+        element_index: usize,
+        kind: PcuExecutionFaultKind,
+    },
+    /// A strict compound operation failed before publishing its output.
+    CompoundArithmeticFault {
+        value: ValueId,
+        /// Row-major output cell index.
+        element_index: usize,
+        /// Increasing reduction index of the first failing operation.
+        reduction_index: usize,
+        step: TensorArithmeticStep,
+        kind: PcuExecutionFaultKind,
+    },
+    /// The reference route has not implemented this compound numerical contract.
+    UnsupportedNumericalMode {
+        value: ValueId,
+        mode: PcuNumericalMode,
+    },
     ShapeOverflow,
     InvalidStorageAlignment {
         value: ValueId,
@@ -336,6 +362,10 @@ pub enum OpDescriptor<'a> {
         left: ValueId,
         right: ValueId,
     },
+    Div {
+        left: ValueId,
+        right: ValueId,
+    },
     SgdUpdate {
         weights: ValueId,
         gradient: ValueId,
@@ -360,6 +390,13 @@ pub enum OpDescriptor<'a> {
     },
 }
 
+/// Constituent arithmetic boundary inside an ordered compound operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TensorArithmeticStep {
+    Multiply,
+    Add,
+}
+
 /// Read-only metadata for one graph value, yielded in stable append order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeDescriptor<'a> {
@@ -367,6 +404,10 @@ pub struct NodeDescriptor<'a> {
     pub op: OpDescriptor<'a>,
     pub shape: &'a [usize],
     pub scalar_type: PcuScalarType,
+    /// Exception detection granularity for compound nodes; absent for scalar operations.
+    pub numerical_mode: Option<PcuNumericalMode>,
+    /// Independent checked-float underflow policy for binary and compound nodes.
+    pub float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
 }
 
 /// Execution route selected by an explicit tensor operation assessor.
@@ -466,17 +507,45 @@ pub unsafe trait TensorSynchronousF32MatMulBackend: TensorOperationAssessor {
 
 /// Explicit assessor for this crate's deterministic host reference evaluator.
 ///
+/// Boundary-mode compounds retain historical raw arithmetic in this legacy route. Support
+/// here describes reference executability, not checked numerical conformance. For a checked
+/// reference execution use [`Graph::evaluate_checked`].
+///
 /// Applications must select this route deliberately; assessing another backend never causes an
 /// automatic retry through the reference evaluator. Its temporary workspace is not yet bounded.
 pub struct TensorReferenceAssessor;
 
 impl TensorOperationAssessor for TensorReferenceAssessor {
     fn assess_node(&self, _graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+        if node.numerical_mode == Some(PcuNumericalMode::Strict)
+            && !matches!(node.op, OpDescriptor::MatMul { .. })
+        {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::Operation,
+            };
+        }
         let leaf = matches!(
             node.op,
             OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
         );
-        if leaf || matches!(node.scalar_type, PcuScalarType::F32 | PcuScalarType::F64) {
+        let integer_binary = matches!(
+            node.op,
+            OpDescriptor::Add { .. } | OpDescriptor::Sub { .. } | OpDescriptor::Mul { .. }
+        ) && matches!(
+            node.scalar_type,
+            PcuScalarType::U8
+                | PcuScalarType::U16
+                | PcuScalarType::U32
+                | PcuScalarType::U64
+                | PcuScalarType::I8
+                | PcuScalarType::I16
+                | PcuScalarType::I32
+                | PcuScalarType::I64
+        );
+        if leaf
+            || integer_binary
+            || matches!(node.scalar_type, PcuScalarType::F32 | PcuScalarType::F64)
+        {
             TensorOperationSupport::Supported {
                 route: TensorExecutionRoute::Reference,
                 workspace_bytes: None,
@@ -485,6 +554,27 @@ impl TensorOperationAssessor for TensorReferenceAssessor {
             TensorOperationSupport::Unsupported {
                 reason: TensorUnsupportedReason::ElementType,
             }
+        }
+    }
+}
+
+/// Assessor admitting only implemented checked host-reference numerical contracts.
+///
+/// Unlike the legacy reference assessor, this rejects raw boundary compounds. Selection of
+/// this assessor never triggers implicit fallback from another backend.
+pub struct TensorCheckedReferenceAssessor;
+
+impl TensorOperationAssessor for TensorCheckedReferenceAssessor {
+    fn assess_node(&self, graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+        let unsupported_compound = node.numerical_mode.is_some_and(|mode| {
+            mode != PcuNumericalMode::Strict || !matches!(node.op, OpDescriptor::MatMul { .. })
+        });
+        if unsupported_compound || matches!(node.op, OpDescriptor::ReluBackward { .. }) {
+            TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::Operation,
+            }
+        } else {
+            TensorReferenceAssessor.assess_node(graph, node)
         }
     }
 }
@@ -1935,6 +2025,7 @@ fn for_each_descriptor_operand(op: OpDescriptor<'_>, mut visit: impl FnMut(Value
         OpDescriptor::Add { left, right }
         | OpDescriptor::Sub { left, right }
         | OpDescriptor::Mul { left, right }
+        | OpDescriptor::Div { left, right }
         | OpDescriptor::MatMul { left, right, .. } => {
             visit(left);
             visit(right);
@@ -1979,6 +2070,9 @@ fn identify_pointwise_groups(
             continue;
         }
         let add = nodes[add_index];
+        if !supports_unchecked_fusion(add) {
+            continue;
+        }
         let OpDescriptor::Add { left, right } = add.op else {
             continue;
         };
@@ -2094,7 +2188,9 @@ fn identify_bounded_mul_groups(
 ) -> Vec<TensorBoundedMulFusionGroup> {
     nodes
         .iter()
-        .filter(|node| matches!(node.op, OpDescriptor::Mul { .. }))
+        .filter(|node| {
+            supports_unchecked_fusion(**node) && matches!(node.op, OpDescriptor::Mul { .. })
+        })
         .filter(|terminal| {
             output_values.contains(&terminal.value)
                 || nodes.iter().any(|consumer| {
@@ -2151,6 +2247,7 @@ fn collect_bounded_mul(
     };
     let node = nodes[index];
     if node.shape != shape
+        || !supports_unchecked_fusion(node)
         || (require_single_use && use_counts[index] != 1)
         || !matches!(node.op, OpDescriptor::Mul { .. })
     {
@@ -2316,6 +2413,7 @@ fn identify_bounded_pointwise_relu_group(
         .filter(|index| *index != usize::MAX)?;
     let root = nodes[root_index];
     if !matches!(root.op, OpDescriptor::Add { .. } | OpDescriptor::Sub { .. })
+        || !supports_unchecked_fusion(root)
         || use_counts[root_index] != 1
     {
         return None;
@@ -2402,6 +2500,9 @@ fn identify_bounded_pointwise_identity_group(
     index_by_value: &[usize],
     use_counts: &[usize],
 ) -> Option<TensorBoundedPointwiseFusionGroup> {
+    if !supports_unchecked_fusion(*terminal) {
+        return None;
+    }
     let mut included = Vec::new();
     if !collect_bounded_arithmetic(
         terminal.value,
@@ -2505,6 +2606,7 @@ fn collect_bounded_arithmetic(
     };
     let node = nodes[index];
     if node.shape != shape
+        || !supports_unchecked_fusion(node)
         || (require_single_use && use_counts[index] != 1)
         || !matches!(node.op, OpDescriptor::Add { .. } | OpDescriptor::Sub { .. })
     {
@@ -2753,6 +2855,7 @@ enum Op {
     Add(ValueId, ValueId),
     Sub(ValueId, ValueId),
     Mul(ValueId, ValueId),
+    Div(ValueId, ValueId),
     SgdUpdate(ValueId, ValueId, f32),
     MatMul(ValueId, ValueId, bool, bool),
     Relu(ValueId),
@@ -2793,6 +2896,7 @@ enum BinaryOp {
     Add,
     Sub,
     Mul,
+    Div,
 }
 
 fn operands(op: &Op) -> impl Iterator<Item = ValueId> + '_ {
@@ -2800,6 +2904,7 @@ fn operands(op: &Op) -> impl Iterator<Item = ValueId> + '_ {
         Op::Add(a, b)
         | Op::Sub(a, b)
         | Op::Mul(a, b)
+        | Op::Div(a, b)
         | Op::SgdUpdate(a, b, _)
         | Op::MeanSquaredError(a, b)
         | Op::MatMul(a, b, _, _) => (Some(*a), Some(*b)),
@@ -2810,11 +2915,37 @@ fn operands(op: &Op) -> impl Iterator<Item = ValueId> + '_ {
     first.into_iter().chain(second)
 }
 
+const fn checked_binary(
+    op: &Op,
+    scalar_type: PcuScalarType,
+    float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
+) -> bool {
+    matches!(op, Op::Add(..) | Op::Sub(..) | Op::Mul(..) | Op::Div(..))
+        && match scalar_type {
+            PcuScalarType::U8
+            | PcuScalarType::U16
+            | PcuScalarType::U32
+            | PcuScalarType::U64
+            | PcuScalarType::I8
+            | PcuScalarType::I16
+            | PcuScalarType::I32
+            | PcuScalarType::I64 => true,
+            PcuScalarType::F32 | PcuScalarType::F64 => float_underflow_policy.is_some(),
+            _ => false,
+        }
+}
+
+const fn supports_unchecked_fusion(node: NodeDescriptor<'_>) -> bool {
+    matches!(node.scalar_type, PcuScalarType::F64) && node.float_underflow_policy.is_none()
+}
+
 #[derive(Clone, Debug)]
 struct Node {
     op: Op,
     shape: Vec<usize>,
     scalar_type: PcuScalarType,
+    float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
+    numerical_mode: Option<PcuNumericalMode>,
 }
 
 /// An immutable-in-practice, append-only graph builder. Value identifiers are graph-local.
@@ -2822,6 +2953,7 @@ struct Node {
 pub struct Graph {
     id: u64,
     nodes: Vec<Node>,
+    numerical_mode: PcuNumericalMode,
 }
 
 impl Default for Graph {
@@ -2829,11 +2961,62 @@ impl Default for Graph {
         Self {
             id: next_graph_id(),
             nodes: Vec::new(),
+            numerical_mode: PcuNumericalMode::default(),
         }
     }
 }
 
 impl Graph {
+    /// Sets the mode captured by subsequently appended compound operations.
+    pub const fn set_numerical_mode(&mut self, mode: PcuNumericalMode) {
+        self.numerical_mode = mode;
+    }
+
+    /// Default mode for subsequently appended compound operations.
+    #[must_use]
+    pub const fn numerical_mode(&self) -> PcuNumericalMode {
+        self.numerical_mode
+    }
+
+    /// Sets a compound node's exception detection mode without changing its underflow policy.
+    ///
+    /// # Errors
+    /// Returns `UnknownValue` for invalid IDs or `UnsupportedNumericalMode` for scalar nodes.
+    pub fn set_value_numerical_mode(
+        &mut self,
+        value: ValueId,
+        mode: PcuNumericalMode,
+    ) -> Result<(), TensorError> {
+        self.node(value)?;
+        let node = &mut self.nodes[value.index];
+        if node.numerical_mode.is_none() {
+            return Err(TensorError::UnsupportedNumericalMode { value, mode });
+        }
+        node.numerical_mode = Some(mode);
+        Ok(())
+    }
+
+    /// Sets the independent underflow policy for a checked floating arithmetic node.
+    ///
+    /// # Errors
+    /// Returns `UnknownValue` for invalid IDs or `UnsupportedScalarType` for other nodes.
+    pub fn set_value_float_underflow_policy(
+        &mut self,
+        value: ValueId,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<(), TensorError> {
+        self.node(value)?;
+        let node = &mut self.nodes[value.index];
+        if node.float_underflow_policy.is_none() {
+            return Err(TensorError::UnsupportedScalarType {
+                value,
+                scalar_type: node.scalar_type,
+            });
+        }
+        node.float_underflow_policy = Some(policy);
+        Ok(())
+    }
+
     /// Builds a stable topological CPU reference plan with checked liveness facts.
     ///
     /// # Panics
@@ -2870,7 +3053,9 @@ impl Graph {
     /// Builds a backend-neutral plan for the dependency closure of the requested outputs.
     ///
     /// Node order is stable append order, output order matches the request, and requested outputs
-    /// remain live through the end of the plan. Unrelated graph nodes are omitted.
+    /// remain live through the end of the plan. Checked integer arithmetic and checked F32/F64
+    /// Add/Sub/Mul/Div nodes are retained as fault effects with their dependencies, even when
+    /// they do not contribute to a requested output. Other unrelated graph nodes are omitted.
     ///
     /// # Errors
     ///
@@ -2906,6 +3091,20 @@ impl Graph {
                 }
                 selected[at] = true;
                 stack.extend(operands(&self.nodes[at].op).map(|operand| operand.index));
+            }
+        }
+        for (index, node) in self.nodes.iter().enumerate() {
+            if checked_binary(&node.op, node.scalar_type, node.float_underflow_policy)
+                || node.numerical_mode.is_some()
+            {
+                let mut stack = vec![index];
+                while let Some(at) = stack.pop() {
+                    if selected[at] {
+                        continue;
+                    }
+                    selected[at] = true;
+                    stack.extend(operands(&self.nodes[at].op).map(|operand| operand.index));
+                }
             }
         }
         let node_order: Vec<_> = selected
@@ -3181,6 +3380,10 @@ impl Graph {
                 left: *left,
                 right: *right,
             },
+            Op::Div(left, right) => OpDescriptor::Div {
+                left: *left,
+                right: *right,
+            },
             Op::SgdUpdate(weights, gradient, learning_rate) => OpDescriptor::SgdUpdate {
                 weights: *weights,
                 gradient: *gradient,
@@ -3207,6 +3410,8 @@ impl Graph {
             op,
             shape: &node.shape,
             scalar_type: node.scalar_type,
+            float_underflow_policy: node.float_underflow_policy,
+            numerical_mode: node.numerical_mode,
         }
     }
 
@@ -3215,10 +3420,22 @@ impl Graph {
             graph_id: self.id,
             index: self.nodes.len(),
         };
+        let numerical_mode = matches!(
+            op,
+            Op::MatMul(..) | Op::MeanSquaredError(..) | Op::SgdUpdate(..)
+        )
+        .then_some(self.numerical_mode);
+        let float_underflow_policy =
+            (matches!(scalar_type, PcuScalarType::F32 | PcuScalarType::F64)
+                && (matches!(op, Op::Add(..) | Op::Sub(..) | Op::Mul(..) | Op::Div(..))
+                    || numerical_mode.is_some()))
+            .then(PcuFloatUnderflowPolicy::default);
         self.nodes.push(Node {
             op,
             shape,
             scalar_type,
+            float_underflow_policy,
+            numerical_mode,
         });
         id
     }
@@ -3295,6 +3512,22 @@ impl Graph {
         self.add(a.value, b.value).map(TensorValueId::new)
     }
 
+    /// Adds same-type checked elementwise arithmetic using an explicit F32/F64 underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity, shape/type, or non-float policy errors from
+    /// [`Self::add_with_underflow_policy`].
+    pub fn add_typed_with_underflow_policy<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.add_with_underflow_policy(a.value, b.value, policy)
+            .map(TensorValueId::new)
+    }
+
     /// Adds a same-type typed elementwise difference.
     ///
     /// # Errors
@@ -3308,6 +3541,22 @@ impl Graph {
         self.sub(a.value, b.value).map(TensorValueId::new)
     }
 
+    /// Subtracts with an explicit checked floating-point underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity, shape/type, or non-float policy errors from
+    /// [`Self::sub_with_underflow_policy`].
+    pub fn sub_typed_with_underflow_policy<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.sub_with_underflow_policy(a.value, b.value, policy)
+            .map(TensorValueId::new)
+    }
+
     /// Adds a same-type typed elementwise product.
     ///
     /// # Errors
@@ -3319,6 +3568,50 @@ impl Graph {
         b: TensorValueId<T>,
     ) -> Result<TensorValueId<T>, TensorError> {
         self.mul(a.value, b.value).map(TensorValueId::new)
+    }
+
+    /// Multiplies with an explicit checked floating-point underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity, shape/type, or non-float policy errors from
+    /// [`Self::mul_with_underflow_policy`].
+    pub fn mul_typed_with_underflow_policy<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.mul_with_underflow_policy(a.value, b.value, policy)
+            .map(TensorValueId::new)
+    }
+
+    /// Divides same-type F32/F64 tensors elementwise using the default checked-float policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity, shape, type, or unsupported-scalar errors.
+    pub fn div_typed<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.div(a.value, b.value).map(TensorValueId::new)
+    }
+
+    /// Divides same-type F32/F64 tensors with an explicit checked-float underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns graph identity, shape, type, or unsupported-scalar errors.
+    pub fn div_typed_with_underflow_policy<T: PcuScalar>(
+        &mut self,
+        a: TensorValueId<T>,
+        b: TensorValueId<T>,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<TensorValueId<T>, TensorError> {
+        self.div_with_underflow_policy(a.value, b.value, policy)
+            .map(TensorValueId::new)
     }
 
     /// Adds a typed `ReLU` operation.
@@ -3420,6 +3713,21 @@ impl Graph {
         self.same_shape_binary(a, b, BinaryOp::Add)
     }
 
+    /// Adds F32/F64 tensors using an explicit checked floating-point underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownValue`, `ShapeMismatch`, `ScalarTypeMismatch`, or
+    /// `UnsupportedScalarType` if the operands are not F32/F64.
+    pub fn add_with_underflow_policy(
+        &mut self,
+        a: ValueId,
+        b: ValueId,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<ValueId, TensorError> {
+        self.same_shape_binary_with_policy(a, b, BinaryOp::Add, Some(policy))
+    }
+
     /// Subtracts two values with identical shapes, without broadcasting.
     ///
     /// # Errors
@@ -3429,6 +3737,21 @@ impl Graph {
         self.same_shape_binary(a, b, BinaryOp::Sub)
     }
 
+    /// Subtracts F32/F64 tensors using an explicit checked floating-point underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownValue`, `ShapeMismatch`, `ScalarTypeMismatch`, or
+    /// `UnsupportedScalarType` if the operands are not F32/F64.
+    pub fn sub_with_underflow_policy(
+        &mut self,
+        a: ValueId,
+        b: ValueId,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<ValueId, TensorError> {
+        self.same_shape_binary_with_policy(a, b, BinaryOp::Sub, Some(policy))
+    }
+
     /// Multiplies two values elementwise with identical shapes, without broadcasting.
     ///
     /// # Errors
@@ -3436,6 +3759,44 @@ impl Graph {
     /// Returns the same graph identity, shape, and scalar-semantics errors as [`Self::add`].
     pub fn mul(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
         self.same_shape_binary(a, b, BinaryOp::Mul)
+    }
+
+    /// Multiplies F32/F64 tensors using an explicit checked floating-point underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownValue`, `ShapeMismatch`, `ScalarTypeMismatch`, or
+    /// `UnsupportedScalarType` if the operands are not F32/F64.
+    pub fn mul_with_underflow_policy(
+        &mut self,
+        a: ValueId,
+        b: ValueId,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<ValueId, TensorError> {
+        self.same_shape_binary_with_policy(a, b, BinaryOp::Mul, Some(policy))
+    }
+
+    /// Divides F32/F64 tensors elementwise using checked rounding and the default underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns shape/type errors, or `UnsupportedScalarType` unless both operands are F32/F64.
+    pub fn div(&mut self, a: ValueId, b: ValueId) -> Result<ValueId, TensorError> {
+        self.same_shape_binary(a, b, BinaryOp::Div)
+    }
+
+    /// Divides F32/F64 tensors with an explicit checked floating-point underflow policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns shape/type errors, or `UnsupportedScalarType` unless both operands are F32/F64.
+    pub fn div_with_underflow_policy(
+        &mut self,
+        a: ValueId,
+        b: ValueId,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<ValueId, TensorError> {
+        self.same_shape_binary_with_policy(a, b, BinaryOp::Div, Some(policy))
     }
 
     /// Adds an elementwise SGD update, `weights - learning_rate * gradient`.
@@ -3487,6 +3848,16 @@ impl Graph {
         b: ValueId,
         operation: BinaryOp,
     ) -> Result<ValueId, TensorError> {
+        self.same_shape_binary_with_policy(a, b, operation, None)
+    }
+
+    fn same_shape_binary_with_policy(
+        &mut self,
+        a: ValueId,
+        b: ValueId,
+        operation: BinaryOp,
+        explicit_policy: Option<PcuFloatUnderflowPolicy>,
+    ) -> Result<ValueId, TensorError> {
         let sa = self.shape(a)?.to_vec();
         let sb = self.shape(b)?.to_vec();
         if sa != sb {
@@ -3505,12 +3876,36 @@ impl Graph {
             });
         }
         self.require_elementwise_numeric(a)?;
+        let is_float_binary = matches!(left_type, PcuScalarType::F32 | PcuScalarType::F64)
+            && matches!(
+                operation,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+            );
+        if matches!(operation, BinaryOp::Div) && !is_float_binary {
+            return Err(TensorError::UnsupportedScalarType {
+                value: a,
+                scalar_type: left_type,
+            });
+        }
+        if explicit_policy.is_some() && !is_float_binary {
+            return Err(TensorError::UnsupportedScalarType {
+                value: a,
+                scalar_type: left_type,
+            });
+        }
         let op = match operation {
             BinaryOp::Add => Op::Add(a, b),
             BinaryOp::Sub => Op::Sub(a, b),
             BinaryOp::Mul => Op::Mul(a, b),
+            BinaryOp::Div => Op::Div(a, b),
         };
-        Ok(self.push(op, self.nodes[a.index].shape.clone(), left_type))
+        let result = self.push(op, self.nodes[a.index].shape.clone(), left_type);
+        self.nodes[result.index].float_underflow_policy = if is_float_binary {
+            Some(explicit_policy.unwrap_or_default())
+        } else {
+            None
+        };
+        Ok(result)
     }
 
     fn require_f32(&self, value: ValueId) -> Result<(), TensorError> {
@@ -3736,6 +4131,12 @@ impl Graph {
                     index,
                 }));
             }
+            if matches!(op, Op::Div(..)) {
+                return Err(TensorError::UnsupportedGradient(ValueId {
+                    graph_id: self.id,
+                    index,
+                }));
+            }
             pending.extend(operands(op).map(|id| id.index));
         }
         let mut gradients = vec![None; original_len];
@@ -3758,6 +4159,7 @@ impl Graph {
                     left: *left,
                     right: *right,
                 },
+                Op::Div(..) => unreachable!("division was rejected during gradient preflight"),
                 Op::SgdUpdate(weights, gradient, learning_rate) => OpDescriptor::SgdUpdate {
                     weights: *weights,
                     gradient: *gradient,
@@ -3811,14 +4213,59 @@ impl Graph {
             .ok_or(TensorError::UnknownValue(id))
     }
 
+    /// Executes only reference operations with implemented checked numerical contracts.
+    ///
+    /// Strict F32/F64 `MatMul` checks separate multiply/add steps in increasing reduction order.
+    /// Boundary compounds and other raw reference operations have no checked certificate.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedNumericalMode` for unsupported compound contracts, or the ordinary
+    /// input validation and checked arithmetic errors from [`Self::evaluate`].
+    pub fn evaluate_checked(
+        &self,
+        inputs: &[(ValueId, TensorValue)],
+    ) -> Result<Execution, TensorError> {
+        for node in self.nodes() {
+            if let Some(mode) = node.numerical_mode {
+                if mode != PcuNumericalMode::Strict
+                    || !matches!(node.op, OpDescriptor::MatMul { .. })
+                {
+                    return Err(TensorError::UnsupportedNumericalMode {
+                        value: node.value,
+                        mode,
+                    });
+                }
+            } else if matches!(node.op, OpDescriptor::ReluBackward { .. }) {
+                return Err(TensorError::UnsupportedNumericalMode {
+                    value: node.value,
+                    mode: PcuNumericalMode::Boundary,
+                });
+            }
+        }
+        self.evaluate(inputs)
+    }
+
     /// Evaluates the graph using the supplied input tensors.
     ///
     /// # Errors
     ///
     /// Returns an error for missing, duplicate, extra, wrongly typed/shaped inputs, or an
     /// unsupported arithmetic operation in the graph.
+    ///
+    /// Boundary compounds use historical raw arithmetic and are not certified checked.
+    /// Use [`Self::evaluate_checked`] when a checked reference contract is required.
     #[allow(clippy::too_many_lines)] // Keeps reference operation dispatch and validation together.
     pub fn evaluate(&self, inputs: &[(ValueId, TensorValue)]) -> Result<Execution, TensorError> {
+        for node in self.nodes() {
+            if node.numerical_mode == Some(PcuNumericalMode::Strict)
+                && !matches!(node.op, OpDescriptor::MatMul { .. })
+            {
+                return Err(TensorError::UnsupportedNumericalMode {
+                    value: node.value,
+                    mode: PcuNumericalMode::Strict,
+                });
+            }
+        }
         let mut supplied: Vec<Option<&TensorValue>> = vec![None; self.nodes.len()];
         for (id, tensor) in inputs {
             let node = self
@@ -3859,15 +4306,34 @@ impl Graph {
                 }
                 Op::Constant(tensor) => tensor.clone(),
                 Op::Uniform(scalar) => scalar.splat(node.shape.clone())?,
-                Op::Add(a, b) => {
-                    binary_value(&values[a.index], &values[b.index], id, BinaryOp::Add)?
-                }
-                Op::Sub(a, b) => {
-                    binary_value(&values[a.index], &values[b.index], id, BinaryOp::Sub)?
-                }
-                Op::Mul(a, b) => {
-                    binary_value(&values[a.index], &values[b.index], id, BinaryOp::Mul)?
-                }
+                Op::Add(a, b) => binary_value(
+                    &values[a.index],
+                    &values[b.index],
+                    id,
+                    BinaryOp::Add,
+                    node.float_underflow_policy,
+                )?,
+                Op::Sub(a, b) => binary_value(
+                    &values[a.index],
+                    &values[b.index],
+                    id,
+                    BinaryOp::Sub,
+                    node.float_underflow_policy,
+                )?,
+                Op::Mul(a, b) => binary_value(
+                    &values[a.index],
+                    &values[b.index],
+                    id,
+                    BinaryOp::Mul,
+                    node.float_underflow_policy,
+                )?,
+                Op::Div(a, b) => binary_value(
+                    &values[a.index],
+                    &values[b.index],
+                    id,
+                    BinaryOp::Div,
+                    node.float_underflow_policy,
+                )?,
                 Op::SgdUpdate(weights, gradient, learning_rate) => {
                     let left = as_f32_value(&values[weights.index], id)?;
                     let right = as_f32_value(&values[gradient.index], id)?;
@@ -3881,6 +4347,8 @@ impl Graph {
                     *transpose_left,
                     *transpose_right,
                     id,
+                    node.numerical_mode.unwrap_or_default(),
+                    node.float_underflow_policy.unwrap_or_default(),
                 )?,
                 Op::Relu(input) => relu_value(&values[input.index], id)?,
                 Op::ReluBackward(input, upstream) => {
@@ -3925,6 +4393,9 @@ fn append_node_gradients(
             let right_gradient = graph.mul(gradient, left)?;
             accumulate_gradient(graph, gradients, left, left_gradient)?;
             accumulate_gradient(graph, gradients, right, right_gradient)?;
+        }
+        OpDescriptor::Div { .. } => {
+            unreachable!("division is rejected by the gradient preflight")
         }
         OpDescriptor::SgdUpdate {
             weights,
@@ -4130,6 +4601,12 @@ impl Execution {
                         elementwise_mul_gradients(left, right, &grad)?;
                     accumulate(&mut grads, a, left_gradient);
                     accumulate(&mut grads, b, right_gradient);
+                }
+                Op::Div(..) => {
+                    return Err(TensorError::UnsupportedGradient(ValueId {
+                        graph_id: graph.id,
+                        index: i,
+                    }));
                 }
                 Op::SgdUpdate(weights, update_gradient, learning_rate) => {
                     let input_gradient = grad.clone();

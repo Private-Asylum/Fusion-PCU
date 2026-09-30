@@ -112,7 +112,7 @@ impl RocmOwnedExecutionOperation<'_> {
     }
 
     const fn checked(&self) -> bool {
-        matches!(self, Self::Dispatch { prepared, .. } if prepared.checked_division)
+        matches!(self, Self::Dispatch { prepared, .. } if prepared.checked_arithmetic)
     }
 
     fn can_submit_into_event_chain(&self, predecessor: &ExecutionCompletion) -> bool {
@@ -1921,6 +1921,7 @@ mod tests {
         let fault = PcuCompletionOutcome::Fault(PcuExecutionFault {
             kind: PcuExecutionFaultKind::DivideByZero,
             invocation_id: 9,
+            recovered: false,
         });
         assert!(matches!(
             wait_and_finish(&mut tracker, 0, || Ok::<_, ()>(fault)),

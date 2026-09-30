@@ -33,7 +33,7 @@ pub enum PcuTypedDispatchValidationError {
 /// Type-check scalar value flow for direct instructions and one bounded grid-stride region.
 ///
 /// The accepted subset is `BindingLoad`, scalar `Alu`, `CheckedDivRem`, the explicitly defined
-/// integer widening and f32/half conversions, `BindingStore` and `Return`. Values are SSA scoped
+/// integer widening and f32/half conversions, checked F64-to-F32 conversion, `BindingStore` and `Return`. Values are SSA scoped
 /// to their region. The verifier deliberately rejects vector/matrix values and unlisted casts.
 ///
 /// # Errors
@@ -65,85 +65,13 @@ fn validate_region(
     let mut types: [Option<PcuValueType>; VALUE_LIMIT] = [None; VALUE_LIMIT];
     for (position, op) in ops.iter().copied().enumerate() {
         match op {
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result,
-                binding,
-                index,
-            }) => {
-                if !in_grid && matches!(index, PcuDispatchIndex::GridStrideId) {
-                    return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
-                        position,
-                    ));
-                }
-                let binding = kernel
-                    .bindings
-                    .iter()
-                    .find(|item| item.reference() == binding)
-                    .ok_or(PcuTypedDispatchValidationError::MissingBinding(binding))?;
-                let PcuBindingType::Value(value_type) = binding.binding_type else {
-                    return Err(PcuTypedDispatchValidationError::NonValueBinding(
-                        binding.reference(),
-                    ));
-                };
-                if !matches!(value_type, PcuValueType::Scalar(_)) {
-                    return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
-                        position,
-                    ));
-                }
-                define(&mut types, result, value_type)?;
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { .. }) => {
+                validate_load(kernel, &mut types, op, position, in_grid)?;
             }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
-                define(&mut types, result, value.value_type())?;
+            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { .. }) => {
+                validate_store(kernel, &types, op)?;
             }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Convert {
-                result,
-                value,
-                conversion,
-            }) => {
-                let source = require(&types, value)?;
-                check_type(conversion.source_type(), source)?;
-                define(&mut types, result, conversion.target_type())?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type,
-                result,
-                lhs,
-                rhs,
-                ..
-            }) => {
-                if !matches!(value_type, PcuValueType::Scalar(_)) {
-                    return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
-                        position,
-                    ));
-                }
-                check_type(value_type, require(&types, lhs)?)?;
-                check_type(value_type, require(&types, rhs)?)?;
-                define(&mut types, result, value_type)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
-                value_type,
-                quotient,
-                remainder,
-                lhs,
-                rhs,
-                ..
-            }) => {
-                check_type(value_type, require(&types, lhs)?)?;
-                check_type(value_type, require(&types, rhs)?)?;
-                define(&mut types, quotient, value_type)?;
-                define(&mut types, remainder, value_type)?;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { binding, value, .. }) => {
-                let target = kernel
-                    .bindings
-                    .iter()
-                    .find(|item| item.reference() == binding)
-                    .ok_or(PcuTypedDispatchValidationError::MissingBinding(binding))?;
-                let PcuBindingType::Value(expected) = target.binding_type else {
-                    return Err(PcuTypedDispatchValidationError::NonValueBinding(binding));
-                };
-                check_type(expected, require(&types, value)?)?;
-            }
+            PcuDispatchOp::Data(data) => validate_computation(&mut types, data, position)?,
             PcuDispatchOp::Control(PcuDispatchControlOp::Return) if !in_grid => {}
             _ => {
                 return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
@@ -153,6 +81,198 @@ fn validate_region(
         }
     }
     Ok(())
+}
+
+fn validate_load(
+    kernel: &PcuDispatchKernelIr<'_>,
+    types: &mut [Option<PcuValueType>; VALUE_LIMIT],
+    op: PcuDispatchOp<'_>,
+    position: usize,
+    in_grid: bool,
+) -> Result<(), PcuTypedDispatchValidationError> {
+    let PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+        result,
+        binding,
+        index,
+    }) = op
+    else {
+        return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+            position,
+        ));
+    };
+    if !in_grid && matches!(index, PcuDispatchIndex::GridStrideId) {
+        return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+            position,
+        ));
+    }
+    let binding = kernel
+        .bindings
+        .iter()
+        .find(|item| item.reference() == binding)
+        .ok_or(PcuTypedDispatchValidationError::MissingBinding(binding))?;
+    let PcuBindingType::Value(value_type) = binding.binding_type else {
+        return Err(PcuTypedDispatchValidationError::NonValueBinding(
+            binding.reference(),
+        ));
+    };
+    if !matches!(value_type, PcuValueType::Scalar(_)) {
+        return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+            position,
+        ));
+    }
+    define(types, result, value_type)
+}
+
+fn validate_store(
+    kernel: &PcuDispatchKernelIr<'_>,
+    types: &[Option<PcuValueType>; VALUE_LIMIT],
+    op: PcuDispatchOp<'_>,
+) -> Result<(), PcuTypedDispatchValidationError> {
+    let PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { binding, value, .. }) = op else {
+        unreachable!();
+    };
+    let target = kernel
+        .bindings
+        .iter()
+        .find(|item| item.reference() == binding)
+        .ok_or(PcuTypedDispatchValidationError::MissingBinding(binding))?;
+    let PcuBindingType::Value(expected) = target.binding_type else {
+        return Err(PcuTypedDispatchValidationError::NonValueBinding(binding));
+    };
+    check_type(expected, require(types, value)?)
+}
+
+fn validate_computation(
+    types: &mut [Option<PcuValueType>; VALUE_LIMIT],
+    data: PcuDispatchDataOp,
+    position: usize,
+) -> Result<(), PcuTypedDispatchValidationError> {
+    match data {
+        PcuDispatchDataOp::Constant { result, value } => define(types, result, value.value_type()),
+        PcuDispatchDataOp::Convert {
+            result,
+            value,
+            conversion,
+        } => {
+            check_type(conversion.source_type(), require(types, value)?)?;
+            define(types, result, conversion.target_type())
+        }
+        PcuDispatchDataOp::CheckedFloatConvert {
+            conversion,
+            result,
+            value,
+            ..
+        } => {
+            check_type(conversion.source_type(), require(types, value)?)?;
+            define(types, result, conversion.target_type())
+        }
+        PcuDispatchDataOp::Alu {
+            value_type,
+            result,
+            lhs,
+            rhs,
+            ..
+        } => {
+            if !matches!(value_type, PcuValueType::Scalar(_)) {
+                return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+                    position,
+                ));
+            }
+            check_type(value_type, require(types, lhs)?)?;
+            check_type(value_type, require(types, rhs)?)?;
+            define(types, result, value_type)
+        }
+        PcuDispatchDataOp::CheckedDivRem {
+            value_type,
+            quotient,
+            remainder,
+            lhs,
+            rhs,
+            ..
+        } => {
+            check_type(value_type, require(types, lhs)?)?;
+            check_type(value_type, require(types, rhs)?)?;
+            define(types, quotient, value_type)?;
+            define(types, remainder, value_type)
+        }
+        PcuDispatchDataOp::CheckedIntegerBinary {
+            value_type,
+            result,
+            lhs,
+            rhs,
+            ..
+        } => {
+            if !is_supported_checked_integer(value_type) {
+                return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+                    position,
+                ));
+            }
+            check_type(value_type, require(types, lhs)?)?;
+            check_type(value_type, require(types, rhs)?)?;
+            define(types, result, value_type)
+        }
+        PcuDispatchDataOp::CheckedFloatBinary {
+            value_type,
+            result,
+            lhs,
+            rhs,
+            ..
+        } => {
+            if !is_supported_checked_float(value_type) {
+                return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+                    position,
+                ));
+            }
+            check_type(value_type, require(types, lhs)?)?;
+            check_type(value_type, require(types, rhs)?)?;
+            define(types, result, value_type)
+        }
+        PcuDispatchDataOp::CheckedFloatUnary {
+            value_type,
+            result,
+            value,
+            ..
+        } => {
+            if !is_supported_checked_float(value_type) {
+                return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+                    position,
+                ));
+            }
+            check_type(value_type, require(types, value)?)?;
+            define(types, result, value_type)
+        }
+        _ => Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+            position,
+        )),
+    }
+}
+
+const fn is_supported_checked_float(value_type: PcuValueType) -> bool {
+    matches!(
+        value_type,
+        PcuValueType::Scalar(
+            crate::PcuScalarType::F16
+                | crate::PcuScalarType::BF16
+                | crate::PcuScalarType::F32
+                | crate::PcuScalarType::F64
+        )
+    )
+}
+
+const fn is_supported_checked_integer(value_type: PcuValueType) -> bool {
+    matches!(
+        value_type,
+        PcuValueType::Scalar(
+            crate::PcuScalarType::I8
+                | crate::PcuScalarType::U8
+                | crate::PcuScalarType::I16
+                | crate::PcuScalarType::U16
+                | crate::PcuScalarType::I32
+                | crate::PcuScalarType::U32
+                | crate::PcuScalarType::I64
+                | crate::PcuScalarType::U64
+        )
+    )
 }
 
 fn slot(value: PcuDispatchValueId) -> Result<usize, PcuTypedDispatchValidationError> {
@@ -209,6 +329,7 @@ mod tests {
         PcuBindingRef,
         PcuBindingStorageClass,
         PcuDispatchConversion,
+        PcuDispatchCheckedFloatConversion,
         PcuDispatchDataOp as Data,
         PcuDispatchEntryPoint,
         PcuDispatchFeatureCaps,
@@ -435,6 +556,222 @@ mod tests {
         assert_eq!(
             validate_typed_dispatch_value_flow(&kernel(&[], &ops)),
             Err(Error::ValueOutOfRange(Id(256)))
+        );
+    }
+
+    #[test]
+    fn checked_integer_binary_requires_exact_integer_types_and_valid_ssa() {
+        let bindings = [
+            binding(0, crate::PcuScalarType::I32, PcuBindingAccess::ReadOnly),
+            binding(1, crate::PcuScalarType::I32, PcuBindingAccess::ReadOnly),
+            binding(2, crate::PcuScalarType::I32, PcuBindingAccess::WriteOnly),
+        ];
+        let load_a = Op::Data(Data::BindingLoad {
+            result: Id(1),
+            binding: PcuBindingRef::new(0, 0),
+            index: PcuDispatchIndex::InvocationId,
+        });
+        let load_b = Op::Data(Data::BindingLoad {
+            result: Id(2),
+            binding: PcuBindingRef::new(0, 1),
+            index: PcuDispatchIndex::InvocationId,
+        });
+        let checked = Op::Data(Data::CheckedIntegerBinary {
+            value_type: PcuValueType::i32(),
+            op: crate::model::PcuDispatchIntegerBinaryOp::Add,
+            result: Id(3),
+            lhs: Id(1),
+            rhs: Id(2),
+        });
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &[load_a, load_b, checked])),
+            Ok(())
+        );
+
+        let bad_type = Op::Data(Data::CheckedIntegerBinary {
+            value_type: PcuValueType::f32(),
+            op: crate::model::PcuDispatchIntegerBinaryOp::Mul,
+            result: Id(3),
+            lhs: Id(1),
+            rhs: Id(2),
+        });
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &[load_a, load_b, bad_type])),
+            Err(Error::UnsupportedOperation(2))
+        );
+        let duplicate = Op::Data(Data::CheckedIntegerBinary {
+            value_type: PcuValueType::i32(),
+            op: crate::model::PcuDispatchIntegerBinaryOp::Sub,
+            result: Id(1),
+            lhs: Id(1),
+            rhs: Id(2),
+        });
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &[load_a, load_b, duplicate])),
+            Err(Error::DuplicateValue(Id(1)))
+        );
+        let undefined = Op::Data(Data::CheckedIntegerBinary {
+            value_type: PcuValueType::i32(),
+            op: crate::model::PcuDispatchIntegerBinaryOp::Sub,
+            result: Id(3),
+            lhs: Id(99),
+            rhs: Id(2),
+        });
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &[load_a, load_b, undefined])),
+            Err(Error::UndefinedValue(Id(99)))
+        );
+    }
+
+    #[test]
+    fn checked_float_binary_ssa_preserves_homogeneous_f64_type() {
+        let bindings = [
+            binding(0, crate::PcuScalarType::F64, PcuBindingAccess::ReadOnly),
+            binding(1, crate::PcuScalarType::F64, PcuBindingAccess::ReadOnly),
+            binding(2, crate::PcuScalarType::F64, PcuBindingAccess::WriteOnly),
+        ];
+        let ops = [
+            Op::Data(Data::BindingLoad {
+                result: Id(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            Op::Data(Data::BindingLoad {
+                result: Id(2),
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            Op::Data(Data::CheckedFloatBinary {
+                value_type: PcuValueType::f64(),
+                op: crate::PcuDispatchFloatBinaryOp::Mul,
+                underflow_policy: crate::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                range_policy: crate::PcuRangePolicy::Reject,
+                result: Id(3),
+                lhs: Id(1),
+                rhs: Id(2),
+            }),
+            Op::Data(Data::BindingStore {
+                binding: PcuBindingRef::new(0, 2),
+                index: PcuDispatchIndex::InvocationId,
+                value: Id(3),
+            }),
+        ];
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &ops)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn checked_f64_to_f32_conversion_checks_input_output_types_and_ssa() {
+        let bindings = [
+            binding(0, crate::PcuScalarType::F64, PcuBindingAccess::ReadOnly),
+            binding(1, crate::PcuScalarType::F32, PcuBindingAccess::WriteOnly),
+        ];
+        let load = Op::Data(Data::BindingLoad {
+            result: Id(1),
+            binding: PcuBindingRef::new(0, 0),
+            index: PcuDispatchIndex::InvocationId,
+        });
+        let convert = Op::Data(Data::CheckedFloatConvert {
+            conversion: PcuDispatchCheckedFloatConversion::F64ToF32,
+            underflow_policy: crate::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: crate::PcuRangePolicy::Reject,
+            result: Id(2),
+            value: Id(1),
+        });
+        let store = Op::Data(Data::BindingStore {
+            binding: PcuBindingRef::new(0, 1),
+            index: PcuDispatchIndex::InvocationId,
+            value: Id(2),
+        });
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &[load, convert, store])),
+            Ok(())
+        );
+
+        let missing = Op::Data(Data::CheckedFloatConvert {
+            conversion: PcuDispatchCheckedFloatConversion::F64ToF32,
+            underflow_policy: crate::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: crate::PcuRangePolicy::Reject,
+            result: Id(2),
+            value: Id(99),
+        });
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&[], &[missing])),
+            Err(Error::UndefinedValue(Id(99)))
+        );
+
+        let wrong_input = [
+            Op::Data(Data::BindingLoad {
+                result: Id(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            convert,
+        ];
+        let wrong_bindings = [binding(
+            0,
+            crate::PcuScalarType::F32,
+            PcuBindingAccess::ReadOnly,
+        )];
+        assert!(matches!(
+            validate_typed_dispatch_value_flow(&kernel(&wrong_bindings, &wrong_input)),
+            Err(Error::TypeMismatch { .. })
+        ));
+
+        let wrong_output = [
+            binding(0, crate::PcuScalarType::F64, PcuBindingAccess::ReadOnly),
+            binding(1, crate::PcuScalarType::F64, PcuBindingAccess::WriteOnly),
+        ];
+        assert!(matches!(
+            validate_typed_dispatch_value_flow(&kernel(&wrong_output, &[load, convert, store])),
+            Err(Error::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn checked_f32_to_f64_widening_checks_mixed_width_ssa() {
+        let bindings = [
+            binding(0, crate::PcuScalarType::F32, PcuBindingAccess::ReadOnly),
+            binding(1, crate::PcuScalarType::F64, PcuBindingAccess::WriteOnly),
+        ];
+        let ops = [
+            Op::Data(Data::BindingLoad {
+                result: Id(1),
+                binding: PcuBindingRef::new(0, 0),
+                index: PcuDispatchIndex::InvocationId,
+            }),
+            Op::Data(Data::CheckedFloatConvert {
+                conversion: PcuDispatchCheckedFloatConversion::F32ToF64,
+                underflow_policy: crate::PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                range_policy: crate::PcuRangePolicy::Reject,
+                result: Id(2),
+                value: Id(1),
+            }),
+            Op::Data(Data::BindingStore {
+                binding: PcuBindingRef::new(0, 1),
+                index: PcuDispatchIndex::InvocationId,
+                value: Id(2),
+            }),
+        ];
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &ops)),
+            Ok(())
+        );
+        let bad = [
+            ops[0],
+            Op::Data(Data::CheckedFloatConvert {
+                conversion: PcuDispatchCheckedFloatConversion::F32ToF64,
+                underflow_policy: crate::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                range_policy: crate::PcuRangePolicy::Reject,
+                result: Id(2),
+                value: Id(99),
+            }),
+        ];
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &bad)),
+            Err(Error::UndefinedValue(Id(99)))
         );
     }
 }

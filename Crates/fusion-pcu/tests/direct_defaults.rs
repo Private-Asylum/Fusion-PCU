@@ -1,5 +1,5 @@
 //! Direct syntax remains available without any runtime provider or implicit CPU fallback.
-#![cfg(not(feature = "rocm"))]
+#![cfg(not(any(feature = "rocm", feature = "cuda")))]
 
 #[rustfmt::skip]
 use fusion_pcu::{

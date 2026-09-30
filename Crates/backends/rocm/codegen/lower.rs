@@ -49,7 +49,18 @@ use fusion_pcu::{
     validate_u8_map_kernel,
     validate_u64_identity_kernel,
     validate_u64_map_kernel,
+    validate_integer_checked_binary_kernel,
+    validate_checked_float_map_kernel,
+    validate_checked_float_conversion_map_kernel,
 };
+use fusion_pcu::model::{PcuDispatchFloatUnaryOp, PcuDispatchIntegerBinaryOp};
+
+/// Emits the existing checked arithmetic implementation for a validated tensor profile.
+#[cfg(feature = "tensor")]
+#[allow(clippy::redundant_pub_crate)] // Remains internal even if parent module visibility changes.
+pub(crate) fn emit_compound_float_helpers(source: &mut String, scalar_type: PcuScalarType) {
+    checked_float::emit_compound_helpers(source, scalar_type);
+}
 
 /// Structured reason why a dispatch kernel is outside the HIP source-lowering subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +175,7 @@ impl HipScalarKind {
                     fusion_pcu::PcuScalarType::BF16 => Self::Bf16Bits,
                     fusion_pcu::PcuScalarType::U8 => Self::U8,
                     fusion_pcu::PcuScalarType::I8 => {
-                        if kernel_uses_checked_div_rem(kernel) {
+                        if kernel_uses_checked_fault(kernel) {
                             Self::I8
                         } else {
                             Self::U8
@@ -172,7 +183,7 @@ impl HipScalarKind {
                     }
                     fusion_pcu::PcuScalarType::U16 => Self::U16,
                     fusion_pcu::PcuScalarType::I16 => {
-                        if kernel_uses_checked_div_rem(kernel) {
+                        if kernel_uses_checked_fault(kernel) {
                             Self::I16
                         } else {
                             Self::U16
@@ -180,7 +191,7 @@ impl HipScalarKind {
                     }
                     fusion_pcu::PcuScalarType::U64 => Self::U64,
                     fusion_pcu::PcuScalarType::I64 => {
-                        if kernel_uses_checked_div_rem(kernel) {
+                        if kernel_uses_checked_fault(kernel) {
                             Self::I64
                         } else {
                             Self::U64
@@ -236,6 +247,31 @@ impl HipScalarKind {
     }
 }
 
+const fn scalar_kind_for_binding_type(
+    binding_type: PcuBindingType,
+    fallback: HipScalarKind,
+) -> HipScalarKind {
+    match binding_type {
+        PcuBindingType::Value(PcuValueType::Scalar(PcuScalarType::F32)) => HipScalarKind::F32,
+        PcuBindingType::Value(PcuValueType::Scalar(PcuScalarType::F64)) => HipScalarKind::F64,
+        _ => fallback,
+    }
+}
+
+fn scalar_kind_for_binding(
+    kernel: &PcuDispatchKernelIr<'_>,
+    binding: PcuBindingRef,
+    fallback: HipScalarKind,
+) -> HipScalarKind {
+    kernel
+        .bindings
+        .iter()
+        .find(|candidate| candidate.reference() == binding)
+        .map_or(fallback, |candidate| {
+            scalar_kind_for_binding_type(candidate.binding_type, fallback)
+        })
+}
+
 /// Lower an eligible PCU dispatch kernel to a HIP C++ kernel source string.
 ///
 /// The generated kernel is named `fusion_kernel`. Its launch geometry is expected to cover the
@@ -278,7 +314,12 @@ fn lower_dispatch_to_hip_source_with_preamble(
         return lower_mixed_widening_to_hip(kernel, include_runtime_header, profile);
     }
     let scalar_kind = HipScalarKind::for_kernel(kernel);
-    let checked_division = kernel_uses_checked_div_rem(kernel);
+    let checked_fault = kernel_uses_checked_fault(kernel);
+    let has_grid_stride = kernel
+        .ops
+        .iter()
+        .any(|op| matches!(op, PcuDispatchOp::GridStrideLoop { .. }));
+    let needs_range_fault_marker = ops_use_range_clamp(kernel.ops);
 
     let mut source = if include_runtime_header {
         String::from("#include <hip/hip_runtime.h>\n\n")
@@ -288,6 +329,9 @@ fn lower_dispatch_to_hip_source_with_preamble(
     // Ordinary IR arithmetic preserves each operation's rounding boundary.
     // Explicit fused operations remain explicit intrinsics.
     source.push_str("#pragma clang fp contract(off)\n");
+    if checked_float::uses_checked_float(kernel) {
+        checked_float::emit_helpers(&mut source, kernel);
+    }
     source.push_str("extern \"C\" __global__ void fusion_kernel(");
     for (index, binding) in kernel.bindings.iter().enumerate() {
         if index != 0 {
@@ -302,7 +346,8 @@ fn lower_dispatch_to_hip_source_with_preamble(
             )
         });
         let is_const = !used_for_store && binding.access == PcuBindingAccess::ReadOnly;
-        let qualifier = scalar_kind.pointer_type(is_const);
+        let binding_kind = scalar_kind_for_binding_type(binding.binding_type, scalar_kind);
+        let qualifier = binding_kind.pointer_type(is_const);
         write!(
             &mut source,
             "{qualifier} binding_{}_{}",
@@ -310,7 +355,7 @@ fn lower_dispatch_to_hip_source_with_preamble(
         )
         .map_err(|_| RocmLowerError::FormattingFailure)?;
     }
-    if checked_division {
+    if checked_fault {
         if !source.ends_with('(') {
             source.push_str(", ");
         }
@@ -322,6 +367,9 @@ fn lower_dispatch_to_hip_source_with_preamble(
         kernel.entry.logical_shape[0]
     )
     .map_err(|_| RocmLowerError::FormattingFailure)?;
+    if needs_range_fault_marker && !has_grid_stride {
+        source.push_str("    bool fusion_range_fault_recorded = false;\n");
+    }
 
     for op in kernel.ops.iter().copied() {
         match op {
@@ -332,7 +380,7 @@ fn lower_dispatch_to_hip_source_with_preamble(
             }) => writeln!(
                 &mut source,
                 "    {} v{} = binding_{}_{}[fusion_gid];",
-                scalar_kind.cpp_type(),
+                scalar_kind_for_binding(kernel, binding, scalar_kind).cpp_type(),
                 result.0,
                 binding.set,
                 binding.binding
@@ -345,7 +393,7 @@ fn lower_dispatch_to_hip_source_with_preamble(
             }) => writeln!(
                 &mut source,
                 "    {} v{} = binding_{}_{}[0];",
-                scalar_kind.cpp_type(),
+                scalar_kind_for_binding(kernel, binding, scalar_kind).cpp_type(),
                 result.0,
                 binding.set,
                 binding.binding
@@ -432,6 +480,77 @@ fn lower_dispatch_to_hip_source_with_preamble(
                     }
                 }
             }
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+                value_type: PcuValueType::Scalar(scalar),
+                op,
+                result,
+                lhs,
+                rhs,
+            }) => emit_checked_integer_binary(
+                &mut source,
+                "    ",
+                "fusion_gid",
+                scalar,
+                op,
+                result,
+                lhs,
+                rhs,
+            )?,
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+                value_type,
+                op,
+                underflow_policy,
+                range_policy,
+                result,
+                lhs,
+                rhs,
+                ..
+            }) => checked_float::emit_checked_float_binary(
+                &mut source,
+                "    ",
+                "fusion_gid",
+                op,
+                underflow_policy,
+                range_policy,
+                value_type,
+                result,
+                lhs,
+                rhs,
+            )?,
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
+                value_type,
+                op,
+                underflow_policy,
+                range_policy,
+                result,
+                value,
+            }) => checked_float::emit_checked_float_unary(
+                &mut source,
+                "    ",
+                "fusion_gid",
+                op,
+                underflow_policy,
+                range_policy,
+                value_type,
+                result,
+                value,
+            )?,
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+                conversion,
+                underflow_policy,
+                range_policy,
+                result,
+                value,
+            }) => checked_float::emit_checked_float_convert(
+                &mut source,
+                "    ",
+                "fusion_gid",
+                conversion,
+                underflow_policy,
+                range_policy,
+                result,
+                value,
+            )?,
             PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
                 value_type: PcuValueType::Scalar(fusion_pcu::PcuScalarType::U8),
                 flags,
@@ -630,13 +749,17 @@ fn lower_dispatch_to_hip_source_with_preamble(
                     "    for ({index_type} fusion_idx = fusion_gid; fusion_idx < {extent}{suffix}; fusion_idx += {stride}{suffix}) {{"
                 )
                 .map_err(|_| RocmLowerError::FormattingFailure)?;
+                if ops_use_range_clamp(body) {
+                    source.push_str("        bool fusion_range_fault_recorded = false;\n");
+                }
                 for body_op in body.iter().copied() {
                     emit_hip_data_op(
                         &mut source,
                         body_op,
                         "fusion_idx",
                         scalar_kind,
-                        checked_division,
+                        kernel,
+                        checked_fault,
                     )?;
                 }
                 source.push_str("    }\n");
@@ -646,6 +769,18 @@ fn lower_dispatch_to_hip_source_with_preamble(
     }
     source.push_str("}\n");
     Ok(source)
+}
+
+fn ops_use_range_clamp(ops: &[PcuDispatchOp<'_>]) -> bool {
+    ops.iter().any(|op| match op {
+        PcuDispatchOp::Data(
+            PcuDispatchDataOp::CheckedFloatBinary { range_policy, .. }
+            | PcuDispatchDataOp::CheckedFloatUnary { range_policy, .. }
+            | PcuDispatchDataOp::CheckedFloatConvert { range_policy, .. },
+        ) => *range_policy == fusion_pcu::PcuRangePolicy::Clamp,
+        PcuDispatchOp::GridStrideLoop { body, .. } => ops_use_range_clamp(body),
+        _ => false,
+    })
 }
 
 fn is_exact_f32_f64_profile(kernel: &PcuDispatchKernelIr<'_>) -> bool {
@@ -1309,7 +1444,8 @@ fn emit_hip_data_op(
     op: PcuDispatchOp<'_>,
     index_name: &str,
     scalar_kind: HipScalarKind,
-    checked_division: bool,
+    kernel: &PcuDispatchKernelIr<'_>,
+    checked_fault: bool,
 ) -> Result<(), RocmLowerError> {
     match op {
         PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
@@ -1319,7 +1455,7 @@ fn emit_hip_data_op(
         }) => writeln!(
             source,
             "        {} v{} = binding_{}_{}[{index_name}];",
-            scalar_kind.cpp_type(),
+            scalar_kind_for_binding(kernel, binding, scalar_kind).cpp_type(),
             result.0,
             binding.set,
             binding.binding
@@ -1332,7 +1468,7 @@ fn emit_hip_data_op(
         }) => writeln!(
             source,
             "        {} v{} = binding_{}_{}[0];",
-            scalar_kind.cpp_type(),
+            scalar_kind_for_binding(kernel, binding, scalar_kind).cpp_type(),
             result.0,
             binding.set,
             binding.binding
@@ -1400,7 +1536,7 @@ fn emit_hip_data_op(
                     PcuDispatchAluOp::Sub => "-",
                     PcuDispatchAluOp::Mul => "*",
                     PcuDispatchAluOp::Div => "/",
-                    _ => unreachable!("validated ALU op"),
+                    _ => return Err(RocmLowerError::UnsupportedAlu(op)),
                 };
                 if scalar_kind == HipScalarKind::U8 {
                     writeln!(
@@ -1429,6 +1565,90 @@ fn emit_hip_data_op(
                 }
             }
         }
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            value_type: PcuValueType::Scalar(scalar),
+            op,
+            result,
+            lhs,
+            rhs,
+        }) => {
+            if !checked_fault {
+                return Err(RocmLowerError::UnsupportedKernelInterface);
+            }
+            emit_checked_integer_binary(
+                source, "        ", index_name, scalar, op, result, lhs, rhs,
+            )
+        }
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+            value_type,
+            op,
+            underflow_policy,
+            range_policy,
+            result,
+            lhs,
+            rhs,
+            ..
+        }) => {
+            if !checked_fault {
+                return Err(RocmLowerError::UnsupportedKernelInterface);
+            }
+            checked_float::emit_checked_float_binary(
+                source,
+                "        ",
+                index_name,
+                op,
+                underflow_policy,
+                range_policy,
+                value_type,
+                result,
+                lhs,
+                rhs,
+            )
+        }
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
+            op,
+            underflow_policy,
+            range_policy,
+            value_type,
+            result,
+            value,
+        }) => {
+            if !checked_fault {
+                return Err(RocmLowerError::UnsupportedKernelInterface);
+            }
+            checked_float::emit_checked_float_unary(
+                source,
+                "        ",
+                index_name,
+                op,
+                underflow_policy,
+                range_policy,
+                value_type,
+                result,
+                value,
+            )
+        }
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+            conversion,
+            underflow_policy,
+            range_policy,
+            result,
+            value,
+        }) => {
+            if !checked_fault {
+                return Err(RocmLowerError::UnsupportedKernelInterface);
+            }
+            checked_float::emit_checked_float_convert(
+                source,
+                "        ",
+                index_name,
+                conversion,
+                underflow_policy,
+                range_policy,
+                result,
+                value,
+            )
+        }
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
             value_type: PcuValueType::Scalar(fusion_pcu::PcuScalarType::U8),
             flags,
@@ -1437,7 +1657,7 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_u8_checked_div_rem(
@@ -1452,7 +1672,7 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_i8_checked_div_rem(
@@ -1467,7 +1687,7 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_u32_checked_div_rem(
@@ -1482,7 +1702,7 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_u16_checked_div_rem(
@@ -1497,7 +1717,7 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_u64_checked_div_rem(
@@ -1512,7 +1732,7 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_i16_checked_div_rem(
@@ -1527,7 +1747,7 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_i32_checked_div_rem(
@@ -1542,14 +1762,14 @@ fn emit_hip_data_op(
             lhs,
             rhs,
         }) => {
-            if !checked_division || flags.bits() != 0 {
+            if !checked_fault || flags.bits() != 0 {
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_i64_checked_div_rem(
                 source, "        ", index_name, quotient, remainder, lhs, rhs,
             )
         }
-        _ => unreachable!("validated grid-stride body operation"),
+        _ => Err(RocmLowerError::UnsupportedKernelInterface),
     }
 }
 
@@ -1564,7 +1784,7 @@ fn emit_u8_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}unsigned char v{} = 0u; unsigned char v{} = 0u;\n{indent}if (v{} == 0u) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else {{ v{} = static_cast<unsigned char>(static_cast<unsigned int>(v{}) / static_cast<unsigned int>(v{})); v{} = static_cast<unsigned char>(static_cast<unsigned int>(v{}) % static_cast<unsigned int>(v{})); }}",
+        "{indent}unsigned char v{} = 0u; unsigned char v{} = 0u;\n{indent}if (v{} == 0u) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else {{ v{} = static_cast<unsigned char>(static_cast<unsigned int>(v{}) / static_cast<unsigned int>(v{})); v{} = static_cast<unsigned char>(static_cast<unsigned int>(v{}) % static_cast<unsigned int>(v{})); }}",
         quotient.0, remainder.0, rhs.0, quotient.0, lhs.0, rhs.0, remainder.0, lhs.0, rhs.0
     )
     .map_err(|_| RocmLowerError::FormattingFailure)
@@ -1581,7 +1801,7 @@ fn emit_i8_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}signed char v{} = 0; signed char v{} = v{};\n{indent}if (v{} == 0) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else if (v{} == (-127 - 1) && v{} == -1) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 2ull); }} else {{ v{} = static_cast<signed char>(static_cast<int>(v{}) / static_cast<int>(v{})); v{} = static_cast<signed char>(static_cast<int>(v{}) % static_cast<int>(v{})); }}",
+        "{indent}signed char v{} = 0; signed char v{} = v{};\n{indent}if (v{} == 0) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else if (v{} == (-127 - 1) && v{} == -1) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 2ull); }} else {{ v{} = static_cast<signed char>(static_cast<int>(v{}) / static_cast<int>(v{})); v{} = static_cast<signed char>(static_cast<int>(v{}) % static_cast<int>(v{})); }}",
         quotient.0, remainder.0, lhs.0, rhs.0, lhs.0, rhs.0,
         quotient.0, lhs.0, rhs.0, remainder.0, lhs.0, rhs.0
     )
@@ -1599,7 +1819,7 @@ fn emit_u16_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}unsigned short v{} = 0u; unsigned short v{} = 0u;\n{indent}if (v{} == 0u) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else {{ v{} = static_cast<unsigned short>(static_cast<unsigned int>(v{}) / static_cast<unsigned int>(v{})); v{} = static_cast<unsigned short>(static_cast<unsigned int>(v{}) % static_cast<unsigned int>(v{})); }}",
+        "{indent}unsigned short v{} = 0u; unsigned short v{} = 0u;\n{indent}if (v{} == 0u) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else {{ v{} = static_cast<unsigned short>(static_cast<unsigned int>(v{}) / static_cast<unsigned int>(v{})); v{} = static_cast<unsigned short>(static_cast<unsigned int>(v{}) % static_cast<unsigned int>(v{})); }}",
         quotient.0, remainder.0, rhs.0, quotient.0, lhs.0, rhs.0, remainder.0, lhs.0, rhs.0
     )
     .map_err(|_| RocmLowerError::FormattingFailure)
@@ -1616,7 +1836,7 @@ fn emit_u32_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}unsigned int v{} = 0u; unsigned int v{} = 0u;\n{indent}if (v{} == 0u) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
+        "{indent}unsigned int v{} = 0u; unsigned int v{} = 0u;\n{indent}if (v{} == 0u) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
         quotient.0,
         remainder.0,
         rhs.0,
@@ -1641,7 +1861,7 @@ fn emit_u64_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}unsigned long long v{} = 0ull; unsigned long long v{} = 0ull;\n{indent}if (v{} == 0ull) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
+        "{indent}unsigned long long v{} = 0ull; unsigned long long v{} = 0ull;\n{indent}if (v{} == 0ull) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
         quotient.0, remainder.0, rhs.0, quotient.0, lhs.0, rhs.0, remainder.0, lhs.0, rhs.0
     )
     .map_err(|_| RocmLowerError::FormattingFailure)
@@ -1658,7 +1878,7 @@ fn emit_i16_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}short v{} = 0; short v{} = v{};\n{indent}if (v{} == 0) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else if (v{} == (-32767 - 1) && v{} == -1) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 2ull); }} else {{ v{} = static_cast<short>(static_cast<int>(v{}) / static_cast<int>(v{})); v{} = static_cast<short>(static_cast<int>(v{}) % static_cast<int>(v{})); }}",
+        "{indent}short v{} = 0; short v{} = v{};\n{indent}if (v{} == 0) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else if (v{} == (-32767 - 1) && v{} == -1) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 2ull); }} else {{ v{} = static_cast<short>(static_cast<int>(v{}) / static_cast<int>(v{})); v{} = static_cast<short>(static_cast<int>(v{}) % static_cast<int>(v{})); }}",
         quotient.0, remainder.0, lhs.0, rhs.0, lhs.0, rhs.0,
         quotient.0, lhs.0, rhs.0, remainder.0, lhs.0, rhs.0
     )
@@ -1676,7 +1896,7 @@ fn emit_i32_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}int v{} = 0; int v{} = v{};\n{indent}if (v{} == 0) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else if (v{} == (-2147483647 - 1) && v{} == -1) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 2ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
+        "{indent}int v{} = 0; int v{} = v{};\n{indent}if (v{} == 0) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else if (v{} == (-2147483647 - 1) && v{} == -1) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 2ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
         quotient.0, remainder.0, lhs.0, rhs.0, lhs.0, rhs.0,
         quotient.0, lhs.0, rhs.0, remainder.0, lhs.0, rhs.0
     )
@@ -1694,17 +1914,21 @@ fn emit_i64_checked_div_rem(
 ) -> Result<(), RocmLowerError> {
     writeln!(
         source,
-        "{indent}long long v{} = 0ll; long long v{} = v{};\n{indent}if (v{} == 0ll) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 1ull); }} else if (v{} == (-9223372036854775807ll - 1ll) && v{} == -1ll) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 2u) | 2ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
+        "{indent}long long v{} = 0ll; long long v{} = v{};\n{indent}if (v{} == 0ll) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 1ull); }} else if (v{} == (-9223372036854775807ll - 1ll) && v{} == -1ll) {{ atomicMin(fusion_fault_word, (static_cast<unsigned long long>({logical_index}) << 3u) | 2ull); }} else {{ v{} = v{} / v{}; v{} = v{} % v{}; }}",
         quotient.0, remainder.0, lhs.0, rhs.0, lhs.0, rhs.0,
         quotient.0, lhs.0, rhs.0, remainder.0, lhs.0, rhs.0
     )
     .map_err(|_| RocmLowerError::FormattingFailure)
 }
 
+mod checked_float;
+mod checked_integer;
 mod validation;
 #[rustfmt::skip]
+use checked_integer::emit_checked_integer_binary;
+#[rustfmt::skip]
 use validation::{
-    kernel_uses_checked_div_rem,
+    kernel_uses_checked_fault,
     validate_kernel,
 };
 
@@ -2226,713 +2450,6 @@ mod tests {
     }
 
     #[test]
-    fn lowers_f64_add_map_with_double_hip_operations() {
-        let bindings = [
-            PcuBinding::value(
-                Some("a"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::f64(),
-            ),
-            PcuBinding::value(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::f64(),
-            ),
-            PcuBinding::value(
-                Some("out"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                PcuValueType::f64(),
-            ),
-        ];
-        let ops = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::f64(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(3),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let source = lower_dispatch_to_hip_rtc_source(&kernel(&ops, &bindings)).unwrap();
-        assert!(source.contains("const double* binding_0_0"));
-        assert!(source.contains("double* binding_0_2"));
-        assert!(source.contains("double v1 = binding_0_0[fusion_gid];"));
-        assert!(source.contains("double v3 = v1 + v2;"));
-
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::f64(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(3),
-            }),
-        ];
-        let loop_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 256,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
-        assert!(loop_source.contains("double v1 = binding_0_0[fusion_idx];"));
-        assert!(loop_source.contains("double v3 = v1 * v2;"));
-    }
-
-    #[test]
-    fn lowers_f64_relu_and_add_relu_with_double_maximum() {
-        let bindings = [
-            PcuBinding::value(
-                Some("left"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::f64(),
-            ),
-            PcuBinding::value(
-                Some("right"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::f64(),
-            ),
-            PcuBinding::value(
-                Some("output"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                PcuValueType::f64(),
-            ),
-        ];
-        let ops = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::f64(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
-                result: PcuDispatchValueId(4),
-                value: PcuParameterValue::F64(0.0_f64.to_bits()),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::f64(),
-                result: PcuDispatchValueId(5),
-                op: PcuDispatchAluOp::Max,
-                lhs: PcuDispatchValueId(3),
-                rhs: PcuDispatchValueId(4),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(5),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let source = lower_dispatch_to_hip_rtc_source(&kernel(&ops, &bindings)).unwrap();
-        assert!(source.contains("double v3 = v1 + v2;"));
-        assert!(source.contains("double v4 = __builtin_bit_cast(double, 0x0000000000000000ull);"));
-        assert!(source.contains("double v5 = fmax(v3, v4);"));
-        assert!(!source.contains("fmaxf"));
-
-        let minimum_ops = [
-            ops[0],
-            ops[1],
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::f64(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Min,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(3),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let minimum_source =
-            lower_dispatch_to_hip_rtc_source(&kernel(&minimum_ops, &bindings)).unwrap();
-        assert!(minimum_source.contains("double v3 = fmin(v1, v2);"));
-        assert!(!minimum_source.contains("fminf"));
-    }
-
-    #[test]
-    fn lowers_u64_add_map_with_native_hip_u64_operations() {
-        let bindings = [
-            PcuBinding::value(
-                Some("a"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::u64(),
-            ),
-            PcuBinding::value(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::u64(),
-            ),
-            PcuBinding::value(
-                Some("out"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                PcuValueType::u64(),
-            ),
-        ];
-        let ops = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::u64(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(3),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let source = lower_dispatch_to_hip_rtc_source(&kernel(&ops, &bindings)).unwrap();
-        assert!(source.contains("const unsigned long long* binding_0_0"));
-        assert!(source.contains("unsigned long long* binding_0_2"));
-        assert!(source.contains("unsigned long long v1 = binding_0_0[fusion_gid];"));
-        assert!(source.contains("unsigned long long v3 = v1 + v2;"));
-
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::u64(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(3),
-            }),
-        ];
-        let loop_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 256,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
-        assert!(loop_source.contains("unsigned long long v1 = binding_0_0[fusion_idx];"));
-        assert!(loop_source.contains("unsigned long long v3 = v1 * v2;"));
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)] // Keep direct and loop u32 lowering coverage together.
-    fn lowers_u32_wrapping_map_with_unsigned_alu_in_direct_and_loop_kernels() {
-        let bindings = [
-            PcuBinding::value(
-                Some("a"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::u32(),
-            ),
-            PcuBinding::value(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::u32(),
-            ),
-            PcuBinding::value(
-                Some("out"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                PcuValueType::u32(),
-            ),
-        ];
-        let direct = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::u32(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::u32(),
-                result: PcuDispatchValueId(4),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(3),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(4),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let source = lower_dispatch_to_hip_rtc_source(&kernel(&direct, &bindings)).unwrap();
-        assert!(source.contains("unsigned int v3 = v1 + v2;"));
-        assert!(source.contains("unsigned int v4 = v3 * v2;"));
-
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::u32(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(3),
-            }),
-        ];
-        let loop_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 256,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
-        assert!(loop_source.contains("unsigned int v3 = v1 * v2;"));
-
-        let division = [
-            direct[0],
-            direct[1],
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::u32(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Div,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            direct[3],
-            direct[4],
-        ];
-        assert!(lower_dispatch_to_hip_rtc_source(&kernel(&division, &bindings)).is_err());
-    }
-
-    #[test]
-    fn lowers_u16_maps_with_explicit_modulo_results_direct_and_grid_stride() {
-        let u16_type = PcuValueType::Scalar(fusion_pcu::PcuScalarType::U16);
-        let bindings = [
-            PcuBinding::value(
-                Some("a"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                u16_type,
-            ),
-            PcuBinding::value(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                u16_type,
-            ),
-            PcuBinding::value(
-                Some("out"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                u16_type,
-            ),
-        ];
-        let direct = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: u16_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(3),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let direct_source = lower_dispatch_to_hip_rtc_source(&kernel(&direct, &bindings)).unwrap();
-        assert!(direct_source.contains("const unsigned short* binding_0_0"));
-        assert!(direct_source.contains("unsigned short* binding_0_2"));
-        assert!(direct_source.contains("unsigned short v1 = binding_0_0[fusion_gid];"));
-        assert!(direct_source.contains("unsigned short v3 = static_cast<unsigned short>((static_cast<unsigned int>(v1) + static_cast<unsigned int>(v2)) & 0xffffu);"));
-
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: u16_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Sub,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: u16_type,
-                result: PcuDispatchValueId(4),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(3),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(4),
-            }),
-        ];
-        let loop_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 256,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
-        assert!(loop_source.contains("unsigned short v3 = static_cast<unsigned short>((static_cast<unsigned int>(v1) - static_cast<unsigned int>(v2)) & 0xffffu);"));
-        assert!(loop_source.contains("unsigned short v4 = static_cast<unsigned short>((static_cast<unsigned int>(v3) * static_cast<unsigned int>(v2)) & 0xffffu);"));
-    }
-
-    #[test]
-    fn lowers_u8_maps_with_explicit_modulo_results_direct_and_grid_stride() {
-        let u8_type = PcuValueType::Scalar(fusion_pcu::PcuScalarType::U8);
-        let bindings = [
-            PcuBinding::value(
-                Some("a"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                u8_type,
-            ),
-            PcuBinding::value(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                u8_type,
-            ),
-            PcuBinding::value(
-                Some("out"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                u8_type,
-            ),
-        ];
-        let direct = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: u8_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(3),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let direct_source = lower_dispatch_to_hip_rtc_source(&kernel(&direct, &bindings)).unwrap();
-        assert!(direct_source.contains("const unsigned char* binding_0_0"));
-        assert!(direct_source.contains("unsigned char* binding_0_2"));
-        assert!(direct_source.contains("unsigned char v1 = binding_0_0[fusion_gid];"));
-        assert!(direct_source.contains("unsigned char v3 = static_cast<unsigned char>((static_cast<unsigned int>(v1) + static_cast<unsigned int>(v2)) & 0xffu);"));
-
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: u8_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Sub,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: u8_type,
-                result: PcuDispatchValueId(4),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(3),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(4),
-            }),
-        ];
-        let loop_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 256,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
-        assert!(loop_source.contains("unsigned char v3 = static_cast<unsigned char>((static_cast<unsigned int>(v1) - static_cast<unsigned int>(v2)) & 0xffu);"));
-        assert!(loop_source.contains("unsigned char v4 = static_cast<unsigned char>((static_cast<unsigned int>(v3) * static_cast<unsigned int>(v2)) & 0xffu);"));
-    }
-
-    #[test]
-    fn lowers_i16_maps_as_unsigned_bits_with_explicit_modulo_results() {
-        let i16_type = PcuValueType::Scalar(fusion_pcu::PcuScalarType::I16);
-        let bindings = [
-            PcuBinding::value(
-                Some("a"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                i16_type,
-            ),
-            PcuBinding::value(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                i16_type,
-            ),
-            PcuBinding::value(
-                Some("out"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                i16_type,
-            ),
-        ];
-        let direct = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: i16_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(3),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let direct_source = lower_dispatch_to_hip_rtc_source(&kernel(&direct, &bindings)).unwrap();
-        assert!(direct_source.contains("const unsigned short* binding_0_0"));
-        assert!(direct_source.contains("unsigned short* binding_0_2"));
-        assert!(direct_source.contains("unsigned short v1 = binding_0_0[fusion_gid];"));
-        assert!(direct_source.contains("unsigned short v3 = static_cast<unsigned short>((static_cast<unsigned int>(v1) + static_cast<unsigned int>(v2)) & 0xffffu);"));
-
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: i16_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Sub,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: i16_type,
-                result: PcuDispatchValueId(4),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(3),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(4),
-            }),
-        ];
-        let loop_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 256,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
-        assert!(loop_source.contains("unsigned short v3 = static_cast<unsigned short>((static_cast<unsigned int>(v1) - static_cast<unsigned int>(v2)) & 0xffffu);"));
-        assert!(loop_source.contains("unsigned short v4 = static_cast<unsigned short>((static_cast<unsigned int>(v3) * static_cast<unsigned int>(v2)) & 0xffffu);"));
-    }
-
-    #[test]
     fn lowers_checked_i8_div_rem_with_signed_loads_and_overflow_guard() {
         let value_type = PcuValueType::Scalar(fusion_pcu::PcuScalarType::I8);
         let bindings = [
@@ -3080,7 +2597,7 @@ mod tests {
         let source = lower_dispatch_to_hip_source(&kernel(&direct, &bindings)).unwrap();
         assert!(source.contains("const short* binding_0_0, const short* binding_0_1, short* binding_0_2, short* binding_0_3"));
         assert!(source.contains("short v1 = binding_0_0[fusion_gid];"));
-        assert!(source.contains("if (v2 == 0) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 2u) | 1ull); }"));
+        assert!(source.contains("if (v2 == 0) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 3u) | 1ull); }"));
         assert!(source.contains("v1 == (-32767 - 1) && v2 == -1"));
         assert!(source.contains("static_cast<int>(v1) / static_cast<int>(v2)"));
         assert!(
@@ -3119,174 +2636,9 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let source = lower_dispatch_to_hip_source(&kernel(&grid, &bindings)).unwrap();
-        assert!(source.contains("static_cast<unsigned long long>(fusion_idx) << 2u) | 1ull"));
-        assert!(source.contains("static_cast<unsigned long long>(fusion_idx) << 2u) | 2ull"));
-        assert!(!source.contains("static_cast<unsigned long long>(fusion_gid) << 2u"));
-    }
-
-    #[test]
-    fn lowers_i8_maps_as_unsigned_bits_with_explicit_modulo_results() {
-        let i8_type = PcuValueType::Scalar(fusion_pcu::PcuScalarType::I8);
-        let bindings = [
-            PcuBinding::value(
-                Some("a"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                i8_type,
-            ),
-            PcuBinding::value(
-                Some("b"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                i8_type,
-            ),
-            PcuBinding::value(
-                Some("out"),
-                0,
-                2,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                i8_type,
-            ),
-        ];
-        let direct = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: i8_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(3),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let direct_source = lower_dispatch_to_hip_rtc_source(&kernel(&direct, &bindings)).unwrap();
-        assert!(direct_source.contains("const unsigned char* binding_0_0"));
-        assert!(direct_source.contains("unsigned char* binding_0_2"));
-        assert!(direct_source.contains("unsigned char v1 = binding_0_0[fusion_gid];"));
-        assert!(direct_source.contains("unsigned char v3 = static_cast<unsigned char>((static_cast<unsigned int>(v1) + static_cast<unsigned int>(v2)) & 0xffu);"));
-
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(2),
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: i8_type,
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Sub,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: i8_type,
-                result: PcuDispatchValueId(4),
-                op: PcuDispatchAluOp::Mul,
-                lhs: PcuDispatchValueId(3),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 2),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(4),
-            }),
-        ];
-        let loop_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 256,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let loop_source = lower_dispatch_to_hip_rtc_source(&kernel(&loop_ops, &bindings)).unwrap();
-        assert!(loop_source.contains("unsigned char v3 = static_cast<unsigned char>((static_cast<unsigned int>(v1) - static_cast<unsigned int>(v2)) & 0xffu);"));
-        assert!(loop_source.contains("unsigned char v4 = static_cast<unsigned char>((static_cast<unsigned int>(v3) * static_cast<unsigned int>(v2)) & 0xffu);"));
-    }
-
-    #[test]
-    fn lowers_f32_load_alu_store_kernel() {
-        let bindings = [
-            PcuBinding::value(
-                Some("input"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::f32(),
-            ),
-            PcuBinding::value(
-                Some("output"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                PcuValueType::f32(),
-            ),
-        ];
-        let ops = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(4),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::InvocationId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
-                result: PcuDispatchValueId(7),
-                value: PcuParameterValue::F32(1.0_f32.to_bits()),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: fusion_pcu::PcuValueType::f32(),
-                result: PcuDispatchValueId(9),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(4),
-                rhs: PcuDispatchValueId(7),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::InvocationId,
-                value: PcuDispatchValueId(9),
-            }),
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-
-        let source = lower_dispatch_to_hip_source(&kernel(&ops, &bindings)).unwrap();
-        let rtc_source = lower_dispatch_to_hip_rtc_source(&kernel(&ops, &bindings)).unwrap();
-        assert_eq!(
-            source.strip_prefix("#include <hip/hip_runtime.h>\n\n"),
-            Some(rtc_source.as_str())
-        );
-        assert!(source.contains("const float* binding_0_0"));
-        assert!(source.contains("float* binding_0_1"));
-        assert!(source.contains("float v7 = __builtin_bit_cast(float, 0x3f800000u);"));
-        assert!(source.contains("float v9 = v4 + v7;"));
-        assert!(source.contains("binding_0_1[fusion_gid] = v9;"));
-        if std::env::var_os("FUSION_ROCM_COMPILE_TEST").is_some() {
-            let image = crate::compile_hip_source(&source, "gfx1030").unwrap();
-            assert!(!image.is_empty());
-        }
+        assert!(source.contains("static_cast<unsigned long long>(fusion_idx) << 3u) | 1ull"));
+        assert!(source.contains("static_cast<unsigned long long>(fusion_idx) << 3u) | 2ull"));
+        assert!(!source.contains("static_cast<unsigned long long>(fusion_gid) << 3u"));
     }
 
     #[test]
@@ -3331,98 +2683,6 @@ mod tests {
             let image = crate::compile_hip_source(&source, "gfx1030").expect("HIP compile");
             assert!(!image.is_empty());
         }
-    }
-
-    #[test]
-    fn lowers_grid_stride_map_to_real_hip_loop() {
-        let bindings = [
-            PcuBinding::value(
-                Some("input"),
-                0,
-                0,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::f32(),
-            ),
-            PcuBinding::value(
-                Some("output"),
-                0,
-                1,
-                PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                PcuValueType::f32(),
-            ),
-        ];
-        let body = [
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
-                result: PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: PcuDispatchIndex::GridStrideId,
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
-                result: PcuDispatchValueId(2),
-                value: PcuParameterValue::F32(1.0_f32.to_bits()),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
-                value_type: fusion_pcu::PcuValueType::f32(),
-                result: PcuDispatchValueId(3),
-                op: PcuDispatchAluOp::Add,
-                lhs: PcuDispatchValueId(1),
-                rhs: PcuDispatchValueId(2),
-            }),
-            PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 1),
-                index: PcuDispatchIndex::GridStrideId,
-                value: PcuDispatchValueId(3),
-            }),
-        ];
-        let ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 2048,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let mut loop_kernel = kernel(&ops, &bindings);
-        loop_kernel.entry.logical_shape = [250, 1, 1];
-
-        let source = lower_dispatch_to_hip_source(&loop_kernel).expect("grid-stride lower");
-        assert!(source.contains("fusion_gid >= 250u"));
-        assert!(source.contains(
-            "for (unsigned int fusion_idx = fusion_gid; fusion_idx < 2048u; fusion_idx += 250u)"
-        ));
-        assert!(source.contains("binding_0_0[fusion_idx]"));
-        assert!(source.contains("binding_0_1[fusion_idx] = v3;"));
-
-        // Binding types do not authorize contradictory ALU metadata.
-        let mut wrong_width_body = body;
-        if let PcuDispatchOp::Data(PcuDispatchDataOp::Alu { value_type, .. }) =
-            &mut wrong_width_body[2]
-        {
-            *value_type = PcuValueType::f64();
-        }
-        let wrong_width_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: 2048,
-                body: &wrong_width_body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        let wrong_width_kernel = kernel(&wrong_width_ops, &bindings);
-        assert!(lower_dispatch_to_hip_source(&wrong_width_kernel).is_err());
-
-        let mut near_limit_kernel = loop_kernel;
-        let near_limit_ops = [
-            PcuDispatchOp::GridStrideLoop {
-                extent: u32::MAX - 100,
-                body: &body,
-            },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ];
-        near_limit_kernel.ops = &near_limit_ops;
-        let near_limit_source =
-            lower_dispatch_to_hip_source(&near_limit_kernel).expect("near-limit grid-stride lower");
-        assert!(near_limit_source.contains("for (unsigned long long fusion_idx = fusion_gid; fusion_idx < 4294967195ull; fusion_idx += 250ull)"));
     }
 
     #[test]
@@ -3564,17 +2824,53 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_min_with_structured_error() {
-        let ops = [PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+    fn rejects_legacy_raw_value_alu_for_float_and_integer_types() {
+        for value_type in [
+            fusion_pcu::PcuValueType::f32(),
+            fusion_pcu::PcuValueType::f64(),
+            fusion_pcu::PcuValueType::u8(),
+            fusion_pcu::PcuValueType::i16(),
+            fusion_pcu::PcuValueType::u32(),
+            fusion_pcu::PcuValueType::i64(),
+        ] {
+            for op in [
+                PcuDispatchAluOp::Add,
+                PcuDispatchAluOp::Sub,
+                PcuDispatchAluOp::Mul,
+                PcuDispatchAluOp::Div,
+                PcuDispatchAluOp::Min,
+                PcuDispatchAluOp::Max,
+            ] {
+                let body = [PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+                    value_type,
+                    result: PcuDispatchValueId(3),
+                    op,
+                    lhs: PcuDispatchValueId(1),
+                    rhs: PcuDispatchValueId(2),
+                })];
+                assert_eq!(
+                    lower_dispatch_to_hip_source(&kernel(&body, &[])),
+                    Err(RocmLowerError::UnsupportedAlu(op))
+                );
+            }
+        }
+        let nested_alu = [PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
             value_type: fusion_pcu::PcuValueType::f32(),
             result: PcuDispatchValueId(3),
-            op: PcuDispatchAluOp::Min,
+            op: PcuDispatchAluOp::Add,
             lhs: PcuDispatchValueId(1),
             rhs: PcuDispatchValueId(2),
         })];
+        let loop_ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 8,
+                body: &nested_alu,
+            },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ];
         assert_eq!(
-            lower_dispatch_to_hip_source(&kernel(&ops, &[])),
-            Err(RocmLowerError::UnsupportedAlu(PcuDispatchAluOp::Min))
+            lower_dispatch_to_hip_source(&kernel(&loop_ops, &[])),
+            Err(RocmLowerError::UnsupportedAlu(PcuDispatchAluOp::Add))
         );
     }
 
@@ -3648,7 +2944,7 @@ mod tests {
         ];
         let direct_source = lower_dispatch_to_hip_source(&kernel(&direct, &bindings)).unwrap();
         assert!(direct_source.contains("unsigned long long* fusion_fault_word"));
-        assert!(direct_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 2u) | 1ull)"));
+        assert!(direct_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 3u) | 1ull)"));
         assert!(direct_source.contains("if (v2 == 0u)"));
         assert!(direct_source.contains("v3 = v1 / v2; v4 = v1 % v2;"));
 
@@ -3683,8 +2979,8 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let grid_source = lower_dispatch_to_hip_source(&kernel(&grid_ops, &bindings)).unwrap();
-        assert!(grid_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_idx) << 2u) | 1ull)"));
-        assert!(!grid_source.contains("static_cast<unsigned long long>(fusion_gid) << 2u"));
+        assert!(grid_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_idx) << 3u) | 1ull)"));
+        assert!(!grid_source.contains("static_cast<unsigned long long>(fusion_gid) << 3u"));
     }
 
     #[test]
@@ -3767,7 +3063,7 @@ mod tests {
         let direct = lower_dispatch_to_hip_source(&kernel(&direct_ops, &bindings)).unwrap();
         assert!(direct.contains("unsigned long long* fusion_fault_word"));
         assert!(direct.contains("unsigned char v3 = 0u; unsigned char v4 = 0u;"));
-        assert!(direct.contains("if (v2 == 0u) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 2u) | 1ull); }"));
+        assert!(direct.contains("if (v2 == 0u) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 3u) | 1ull); }"));
         assert!(direct.contains("static_cast<unsigned int>(v1) / static_cast<unsigned int>(v2)"));
 
         let loop_body = make_ops(PcuDispatchIndex::GridStrideId);
@@ -3779,7 +3075,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let grid = lower_dispatch_to_hip_source(&kernel(&grid_ops, &bindings)).unwrap();
-        assert!(grid.contains("static_cast<unsigned long long>(fusion_idx) << 2u"));
+        assert!(grid.contains("static_cast<unsigned long long>(fusion_idx) << 3u"));
         assert!(grid.contains("if (v2 == 0u)"));
     }
 
@@ -3861,7 +3157,7 @@ mod tests {
         let direct_source = lower_dispatch_to_hip_source(&kernel(&direct_ops, &bindings)).unwrap();
         assert!(direct_source.contains("unsigned short"));
         assert!(direct_source.contains("unsigned short v3 = 0u; unsigned short v4 = 0u;"));
-        assert!(direct_source.contains("if (v2 == 0u) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 2u) | 1ull); }"));
+        assert!(direct_source.contains("if (v2 == 0u) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 3u) | 1ull); }"));
         assert!(
             direct_source.contains("static_cast<unsigned int>(v1) / static_cast<unsigned int>(v2)")
         );
@@ -3901,7 +3197,7 @@ mod tests {
         ];
         let grid_source = lower_dispatch_to_hip_source(&kernel(&grid_ops, &bindings)).unwrap();
         assert!(grid_source.contains("unsigned short"));
-        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 2u"));
+        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 3u"));
         assert!(
             grid_source.contains("static_cast<unsigned int>(v1) / static_cast<unsigned int>(v2)")
         );
@@ -3982,7 +3278,7 @@ mod tests {
         );
         assert!(direct_source.contains("if (v2 == 0ull)"));
         assert!(direct_source.contains("v3 = v1 / v2; v4 = v1 % v2;"));
-        assert!(direct_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 2u) | 1ull)"));
+        assert!(direct_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 3u) | 1ull)"));
 
         let body = [
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
@@ -4015,8 +3311,8 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let grid_source = lower_dispatch_to_hip_source(&kernel(&grid_ops, &bindings)).unwrap();
-        assert!(grid_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_idx) << 2u) | 1ull)"));
-        assert!(!grid_source.contains("static_cast<unsigned long long>(fusion_gid) << 2u"));
+        assert!(grid_source.contains("atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_idx) << 3u) | 1ull)"));
+        assert!(!grid_source.contains("static_cast<unsigned long long>(fusion_gid) << 3u"));
     }
 
     #[test]
@@ -4093,10 +3389,10 @@ mod tests {
         ));
         assert!(direct_source.contains("int v1 = binding_0_0[fusion_gid];"));
         assert!(direct_source.contains("int v2 = binding_0_1[fusion_gid];"));
-        assert!(direct_source.contains("if (v2 == 0) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 2u) | 1ull); }"));
+        assert!(direct_source.contains("if (v2 == 0) { atomicMin(fusion_fault_word, (static_cast<unsigned long long>(fusion_gid) << 3u) | 1ull); }"));
         assert!(direct_source.contains("v1 == (-2147483647 - 1) && v2 == -1"));
         assert!(
-            direct_source.contains("static_cast<unsigned long long>(fusion_gid) << 2u) | 2ull")
+            direct_source.contains("static_cast<unsigned long long>(fusion_gid) << 3u) | 2ull")
         );
         assert!(direct_source.contains("v3 = v1 / v2; v4 = v1 % v2;"));
         assert!(
@@ -4137,9 +3433,9 @@ mod tests {
         let grid_source = lower_dispatch_to_hip_source(&kernel(&grid_ops, &bindings)).unwrap();
         assert!(grid_source.contains("int v1 = binding_0_0[fusion_idx];"));
         assert!(grid_source.contains("int v2 = binding_0_1[fusion_idx];"));
-        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 2u) | 1ull"));
-        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 2u) | 2ull"));
-        assert!(!grid_source.contains("static_cast<unsigned long long>(fusion_gid) << 2u"));
+        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 3u) | 1ull"));
+        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 3u) | 2ull"));
+        assert!(!grid_source.contains("static_cast<unsigned long long>(fusion_gid) << 3u"));
     }
 
     #[test]
@@ -4255,8 +3551,8 @@ mod tests {
         let grid_source = lower_dispatch_to_hip_source(&kernel(&grid, &bindings)).unwrap();
         assert!(grid_source.contains("long long v1 = binding_0_0[fusion_idx];"));
         assert!(grid_source.contains("long long v2 = binding_0_1[fusion_idx];"));
-        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 2u) | 1ull"));
-        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 2u) | 2ull"));
+        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 3u) | 1ull"));
+        assert!(grid_source.contains("static_cast<unsigned long long>(fusion_idx) << 3u) | 2ull"));
     }
 
     #[test]

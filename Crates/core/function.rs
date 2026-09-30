@@ -109,6 +109,7 @@ pub enum PcuFunctionInlineError {
 /// # Errors
 /// Returns an error for a mismatched signature/body, malformed SSA values, insufficient
 /// caller-provided storage, unsupported body instructions, or id exhaustion.
+#[allow(clippy::too_many_lines)] // Keeps bounded SSA remapping and validation in one auditable pass.
 pub fn inline_pcu_dispatch_function(
     functions: &[PcuFunctionSignature<'_>],
     body: &PcuDispatchFunctionBody<'_>,
@@ -204,6 +205,29 @@ pub fn inline_pcu_dispatch_function(
                     rhs,
                 }
             }
+            PcuDispatchDataOp::CheckedFloatUnary {
+                value_type,
+                op,
+                underflow_policy,
+                range_policy,
+                result: local_result,
+                value,
+            } => {
+                if type_map.get(value.0 as usize).copied().flatten() != Some(value_type) {
+                    return Err(PcuFunctionInlineError::TypeMismatch(value));
+                }
+                let value = remap_inline_value(value, value_map)?;
+                let result = define_inline_value(local_result, &mut next, value_map)?;
+                type_map[local_result.0 as usize] = Some(value_type);
+                PcuDispatchDataOp::CheckedFloatUnary {
+                    value_type,
+                    op,
+                    underflow_policy,
+                    range_policy,
+                    result,
+                    value,
+                }
+            }
             _ => return Err(PcuFunctionInlineError::UnsupportedOperation),
         };
         output[index] = remapped;
@@ -234,9 +258,9 @@ fn max_body_local_id(body: &PcuDispatchFunctionBody<'_>) -> usize {
 
 const fn dispatch_result_id(operation: &PcuDispatchDataOp) -> Option<PcuDispatchValueId> {
     match operation {
-        PcuDispatchDataOp::Constant { result, .. } | PcuDispatchDataOp::Alu { result, .. } => {
-            Some(*result)
-        }
+        PcuDispatchDataOp::Constant { result, .. }
+        | PcuDispatchDataOp::Alu { result, .. }
+        | PcuDispatchDataOp::CheckedFloatUnary { result, .. } => Some(*result),
         _ => None,
     }
 }

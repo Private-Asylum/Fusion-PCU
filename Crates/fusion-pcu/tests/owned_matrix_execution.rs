@@ -6,6 +6,7 @@ use fusion_pcu::pcu;
 use fusion_pcu::{
     global,
     PcuArgumentError,
+    PcuCheckedFloat,
     PcuExecutionError,
     PcuSourceShape,
     PcuTensor,
@@ -25,7 +26,7 @@ fn copy_vector(input: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {
     Ok(pcu::identity(input)?)
 }
 
-#[pcu]
+#[pcu(flag(strict))]
 fn gemm<const M: usize, const K: usize, const N: usize>(
     lhs: &[[f32; K]; M],
     rhs: &[[f32; N]; K],
@@ -62,7 +63,8 @@ fn assert_gemm<const M: usize, const K: usize, const N: usize>(
         let mut expected = [0.0_f32; N];
         for (lhs_value, rhs_row) in lhs_row.iter().zip(rhs) {
             for (total, rhs_value) in expected.iter_mut().zip(rhs_row) {
-                *total = lhs_value.mul_add(*rhs_value, *total);
+                let product = lhs_value.pcu_checked_mul(*rhs_value).unwrap();
+                *total = total.pcu_checked_add(product).unwrap();
             }
         }
         let actual_row = &actual[row * N..(row + 1) * N];
@@ -100,7 +102,7 @@ fn helper_shape_contracts_fail_before_backend_discovery() {
 }
 
 #[test]
-#[ignore = "requires a working ROCm device with rocBLAS"]
+#[ignore = "requires a working ROCm device and HIPRTC"]
 fn matrix_shapes_survive_host_resident_and_mixed_capture() {
     let _guard = POLICY_TEST_LOCK.lock().unwrap();
     global::use_defaults().unwrap();

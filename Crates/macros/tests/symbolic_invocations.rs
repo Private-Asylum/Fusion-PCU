@@ -319,29 +319,31 @@ fn const_generic_invocations_specialize_to_the_declared_shape() {
     let grid_stride_bindings = grid_stride_map_bindings();
     let grid_stride = grid_stride_map::<16>(&grid_stride_bindings)
         .expect("equal extent and logical count reduce to one indexed map");
-    assert_eq!(grid_stride.ir().entry.logical_shape, [16, 1, 1]);
-    assert!(grid_stride.ir().ops.iter().any(|op| matches!(
-        op,
-        PcuDispatchOp::GridStrideLoop { extent: 16, body }
-            if body.iter().any(|body_op| matches!(
-                body_op,
-                PcuDispatchOp::Data(pcu_alias::PcuDispatchDataOp::BindingStore {
-                    index: pcu_alias::PcuDispatchIndex::GridStrideId,
-                    ..
-                })
-            ))
-    )));
+    grid_stride.with_ir(|ir| {
+        assert_eq!(ir.entry.logical_shape, [16, 1, 1]);
+        assert!(ir.ops.iter().any(|op| matches!(
+            op,
+            PcuDispatchOp::GridStrideLoop { extent: 16, body }
+                if body.iter().any(|body_op| matches!(
+                    body_op,
+                    PcuDispatchOp::Data(pcu_alias::PcuDispatchDataOp::BindingStore {
+                        index: pcu_alias::PcuDispatchIndex::GridStrideId,
+                        ..
+                    })
+                ))
+        )));
+    });
 
     let tiled = tiled_grid_stride_map::<16>(&grid_stride_bindings)
         .expect("a four-lane launch covers the sixteen-element extent");
-    assert_eq!(tiled.ir().entry.logical_shape, [4, 1, 1]);
-    assert!(
-        tiled
-            .ir()
-            .ops
-            .iter()
-            .any(|op| matches!(op, PcuDispatchOp::GridStrideLoop { extent: 16, .. }))
-    );
+    tiled.with_ir(|ir| {
+        assert_eq!(ir.entry.logical_shape, [4, 1, 1]);
+        assert!(
+            ir.ops
+                .iter()
+                .any(|op| matches!(op, PcuDispatchOp::GridStrideLoop { extent: 16, .. }))
+        );
+    });
 }
 
 #[test]
@@ -354,23 +356,34 @@ fn equal_extent_grid_stride_covers_each_logical_lane_once_and_excludes_padding()
 }
 
 #[test]
-fn specialized_ir_is_admitted_by_both_current_compute_lowerers() {
+fn checked_float_specialization_lowers_to_hip_and_reports_deferred_spirv_support() {
     let bindings = matrix_map_bindings();
     let builder = matrix_map::<32, 64>(&bindings).expect("macro builds specialized IR");
     let kernel = builder.ir();
+    pcu_alias::validate_checked_float_map_kernel(
+        &kernel,
+        PcuValueType::f32(),
+        pcu_alias::PcuValueTypeCaps::FLOAT32,
+    )
+    .expect("specialized kernel satisfies checked-float map structure");
 
     let hip = fusion_pcu_rocm::lower_dispatch_to_hip_source(&kernel)
         .expect("HIP lowerer admits the specialized kernel");
     assert!(hip.contains("fusion_gid >= 2048u"));
+    assert!(hip.contains("fusion_checked_f32_binary"));
 
     let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<2048>::new();
-    fusion_pcu_spirv::lower_dispatch_to_spirv(
-        &kernel,
-        fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
-        &mut spirv,
-    )
-    .expect("SPIR-V lowerer admits the specialized kernel");
-    assert!(!spirv.is_empty());
+    assert_eq!(
+        fusion_pcu_spirv::lower_dispatch_to_spirv(
+            &kernel,
+            fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
+            &mut spirv,
+        ),
+        Err(fusion_pcu_spirv::PcuSpirvError::UnsupportedInstruction(
+            pcu_alias::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY,
+        )),
+        "SPIR-V explicitly reports that checked float lowering is not implemented"
+    );
 }
 
 struct SynchronousProbe;
@@ -453,7 +466,7 @@ fn scoped_host_bindings_enforce_reference_permissions_and_extent() {
 }
 
 #[test]
-fn cpu_reference_executes_macro_ir_and_preflights_unsupported_work() {
+fn checked_float_ir_is_admitted_but_cpu_reference_rejects_before_writes() {
     let descriptors = matrix_map_bindings();
     let builder = matrix_map::<2, 3>(&descriptors).expect("valid map");
     let kernel = builder.ir();
@@ -473,12 +486,22 @@ fn cpu_reference_executes_macro_ir_and_preflights_unsupported_work() {
             slice: PcuHostScalarSlice::ReadWrite(&mut output),
         },
     ];
-    PcuF32Reference
-        .run_host(submission, &mut bindings, PcuInvocationParameters::empty())
-        .expect("reference executes the same IR as the GPU lowerers");
-    assert_eq!(
-        output.map(f32::to_bits),
-        [2.0_f32, 4.0, 6.0, 8.0, 10.0, 12.0].map(f32::to_bits)
+    pcu_alias::validate_checked_float_map_kernel(
+        &kernel,
+        PcuValueType::f32(),
+        pcu_alias::PcuValueTypeCaps::FLOAT32,
+    )
+    .expect("macro emitted structurally valid checked-float IR");
+    assert!(matches!(
+        PcuF32Reference.run_host(submission, &mut bindings, PcuInvocationParameters::empty()),
+        Err(PcuHostDispatchError::Backend(
+            PcuF32ReferenceError::UnsupportedInstruction(_)
+        ))
+    ));
+    assert!(
+        output
+            .iter()
+            .all(|value| value.to_bits() == 0.0_f32.to_bits())
     );
 
     let invalid_ops = [PcuDispatchOp::Arithmetic(PcuDispatchAluOp::Min)];
@@ -543,46 +566,47 @@ fn cpu_reference_executes_macro_ir_and_preflights_unsupported_work() {
 }
 
 #[test]
-fn cpu_reference_executes_grid_stride_iterations_beyond_the_launch_count() {
+fn cpu_reference_rejects_checked_grid_stride_before_writes() {
     let descriptors = tiled_grid_stride_map_bindings();
     let builder = tiled_grid_stride_map::<16>(&descriptors).expect("valid tiled map");
-    let kernel = builder.ir();
-    let submission = PcuDispatchSubmission {
-        kernel: &kernel,
-        shape: PcuInvocationShape::invocations(core::num::NonZeroU32::new(4).expect("nonzero")),
-    };
-    let input = [
-        1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
-    ];
-    let mut output = [0.0; 16];
-    let mut bindings = [
-        PcuHostScalarBinding {
-            target: PcuBindingRef::new(0, 0),
-            slice: PcuHostScalarSlice::Read(&input),
-        },
-        PcuHostScalarBinding {
-            target: PcuBindingRef::new(0, 1),
-            slice: PcuHostScalarSlice::ReadWrite(&mut output),
-        },
-    ];
-    PcuF32Reference
-        .run_host(submission, &mut bindings, PcuInvocationParameters::empty())
-        .expect("CPU reference repeats each lane by the launch stride");
-    assert_eq!(
-        output.map(f32::to_bits),
-        [
-            2.0_f32, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0,
-            30.0, 32.0,
-        ]
-        .map(f32::to_bits)
-    );
+    builder.with_ir(|kernel| {
+        let submission = PcuDispatchSubmission {
+            kernel,
+            shape: PcuInvocationShape::invocations(core::num::NonZeroU32::new(4).expect("nonzero")),
+        };
+        let input = [
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ];
+        let mut output = [0.0; 16];
+        let mut bindings = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&input),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::ReadWrite(&mut output),
+            },
+        ];
+        assert!(matches!(
+            PcuF32Reference.run_host(submission, &mut bindings, PcuInvocationParameters::empty()),
+            Err(PcuHostDispatchError::Backend(
+                PcuF32ReferenceError::UnsupportedInstruction(_)
+            ))
+        ));
+        assert!(
+            output
+                .iter()
+                .all(|value| value.to_bits() == 0.0_f32.to_bits())
+        );
+    });
 }
 
 #[test]
-fn bounded_grid_stride_vectors_execute_and_lower_consistently() {
-    // These finite, exact multiply-by-two values exercise coverage only; they do not claim
-    // cross-backend parity for exceptional or rounding-sensitive f32 values.
-    // The final case also keeps storage beyond the semantic extent as a padded-lane sentinel.
+fn checked_grid_stride_vectors_lower_and_deferred_backends_reject_before_writes() {
+    // These finite values exercise structural checked-float lowering and deferred-backend
+    // rejection. The final case also keeps padded storage as a no-write sentinel.
     let cases = [(4_u32, 16_u32), (8_u32, 8_u32), (8_u32, 5_u32)];
     for (width, extent) in cases {
         let descriptors = if width == 4 {
@@ -597,65 +621,71 @@ fn bounded_grid_stride_vectors_execute_and_lower_consistently() {
         } else {
             padded_grid_stride_map::<5>(&descriptors).expect("padded-lane IR builds")
         };
-        let kernel = builder.ir();
-        assert_eq!(kernel.entry.logical_shape, [width, 1, 1]);
-        assert_eq!(
-            kernel.minimum_binding_elements(width),
-            extent,
-            "semantic extent differs from launch width in the test vector"
-        );
-        pcu_alias::validate_f32_map_kernel(&kernel).expect("shared validator admits the vector");
-        let hip = fusion_pcu_rocm::lower_dispatch_to_hip_source(&kernel)
-            .expect("HIP structural lowering accepts the vector");
-        assert!(hip.contains(&format!("fusion_idx < {extent}u")));
-        let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<4096>::new();
-        fusion_pcu_spirv::lower_dispatch_to_spirv(
-            &kernel,
-            fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
-            &mut spirv,
-        )
-        .expect("SPIR-V structural lowering accepts the vector");
-        assert!(!spirv.is_empty());
+        builder.with_ir(|kernel| {
+            assert_eq!(kernel.entry.logical_shape, [width, 1, 1]);
+            assert_eq!(
+                kernel.minimum_binding_elements(width),
+                extent,
+                "semantic extent differs from launch width in the test vector"
+            );
+            pcu_alias::validate_checked_float_map_kernel(
+                kernel,
+                PcuValueType::f32(),
+                pcu_alias::PcuValueTypeCaps::FLOAT32,
+            )
+            .expect("checked-float validator admits the vector");
+            let hip = fusion_pcu_rocm::lower_dispatch_to_hip_source(kernel)
+                .expect("HIP structural lowering accepts the vector");
+            assert!(hip.contains(&format!("fusion_idx < {extent}u")));
+            let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<4096>::new();
+            assert_eq!(
+                fusion_pcu_spirv::lower_dispatch_to_spirv(
+                    kernel,
+                    fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
+                    &mut spirv,
+                ),
+                Err(fusion_pcu_spirv::PcuSpirvError::UnsupportedInstruction(
+                    pcu_alias::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY,
+                ))
+            );
 
-        let input = [
-            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-            16.0,
-        ];
-        let mut output = [f32::NAN; 16];
-        let mut bindings = [
-            PcuHostScalarBinding {
-                target: PcuBindingRef::new(0, 0),
-                slice: PcuHostScalarSlice::Read(&input),
-            },
-            PcuHostScalarBinding {
-                target: PcuBindingRef::new(0, 1),
-                slice: PcuHostScalarSlice::ReadWrite(&mut output),
-            },
-        ];
-        let submission = PcuDispatchSubmission {
-            kernel: &kernel,
-            shape: PcuInvocationShape::invocations(
-                core::num::NonZeroU32::new(width).expect("nonzero vector width"),
-            ),
-        };
-        PcuF32Reference
-            .run_host(submission, &mut bindings, PcuInvocationParameters::empty())
-            .expect("CPU oracle executes every logical element");
-        assert_eq!(
-            output[..extent as usize]
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            input[..extent as usize]
-                .iter()
-                .map(|value| (value * 2.0).to_bits())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            output[extent as usize..]
-                .iter()
-                .all(|value| value.to_bits() == f32::NAN.to_bits())
-        );
+            let input = [
+                1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
+                15.0, 16.0,
+            ];
+            let mut output = [f32::NAN; 16];
+            let mut bindings = [
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 0),
+                    slice: PcuHostScalarSlice::Read(&input),
+                },
+                PcuHostScalarBinding {
+                    target: PcuBindingRef::new(0, 1),
+                    slice: PcuHostScalarSlice::ReadWrite(&mut output),
+                },
+            ];
+            let submission = PcuDispatchSubmission {
+                kernel,
+                shape: PcuInvocationShape::invocations(
+                    core::num::NonZeroU32::new(width).expect("nonzero vector width"),
+                ),
+            };
+            assert!(matches!(
+                PcuF32Reference.run_host(
+                    submission,
+                    &mut bindings,
+                    PcuInvocationParameters::empty()
+                ),
+                Err(PcuHostDispatchError::Backend(
+                    PcuF32ReferenceError::UnsupportedInstruction(_)
+                ))
+            ));
+            assert!(
+                output
+                    .iter()
+                    .all(|value| value.to_bits() == f32::NAN.to_bits())
+            );
+        });
     }
 }
 
@@ -664,74 +694,91 @@ fn grid_stride_extent_near_u32_limit_is_checked_without_host_allocation() {
     let descriptors = wide_grid_stride_map_bindings();
     let builder = wide_grid_stride_map::<{ u32::MAX as usize }>(&descriptors)
         .expect("maximum u32 extent is representable by the IR");
-    let kernel = builder.ir();
-    assert_eq!(kernel.minimum_binding_elements(250), u32::MAX);
-    pcu_alias::validate_f32_map_kernel(&kernel).expect("maximum extent passes structural checks");
-    let hip = fusion_pcu_rocm::lower_dispatch_to_hip_source(&kernel)
-        .expect("HIP uses a wide loop index for the maximum extent");
-    assert!(hip.contains("fusion_idx < 4294967295ull"));
-    assert!(hip.contains("fusion_idx += 250ull"));
-    let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<4096>::new();
-    fusion_pcu_spirv::lower_dispatch_to_spirv(
-        &kernel,
-        fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
-        &mut spirv,
-    )
-    .expect("SPIR-V lowers the maximum extent structurally");
-    assert!(!spirv.is_empty());
+    builder.with_ir(|kernel| {
+        assert_eq!(kernel.minimum_binding_elements(250), u32::MAX);
+        pcu_alias::validate_checked_float_map_kernel(
+            kernel,
+            PcuValueType::f32(),
+            pcu_alias::PcuValueTypeCaps::FLOAT32,
+        )
+        .expect("maximum extent passes checked-float structural checks");
+        let hip = fusion_pcu_rocm::lower_dispatch_to_hip_source(kernel)
+            .expect("HIP uses a wide loop index for the maximum extent");
+        assert!(hip.contains("fusion_idx < 4294967295ull"));
+        assert!(hip.contains("fusion_idx += 250ull"));
+        let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<4096>::new();
+        assert_eq!(
+            fusion_pcu_spirv::lower_dispatch_to_spirv(
+                kernel,
+                fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
+                &mut spirv,
+            ),
+            Err(fusion_pcu_spirv::PcuSpirvError::UnsupportedInstruction(
+                pcu_alias::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY,
+            ))
+        );
+    });
 }
 
 #[test]
 fn malformed_grid_stride_ir_is_rejected_before_execution_or_lowering() {
     let descriptors = tiled_grid_stride_map_bindings();
     let builder = tiled_grid_stride_map::<16>(&descriptors).expect("valid grid-stride map");
-    let kernel = builder.ir();
-    let invalid_ops = [
-        PcuDispatchOp::GridStrideLoop {
-            extent: 0,
-            body: match kernel.ops[0] {
-                PcuDispatchOp::GridStrideLoop { body, .. } => body,
-                _ => unreachable!("macro emitted a grid-stride loop"),
+    builder.with_ir(|kernel| {
+        let invalid_ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 0,
+                body: match kernel.ops[0] {
+                    PcuDispatchOp::GridStrideLoop { body, .. } => body,
+                    _ => unreachable!("macro emitted a grid-stride loop"),
+                },
             },
-        },
-        PcuDispatchOp::Control(pcu_alias::PcuDispatchControlOp::Return),
-    ];
-    let invalid_kernel = pcu_alias::PcuDispatchKernelIr {
-        ops: &invalid_ops,
-        ..kernel
-    };
-    assert!(pcu_alias::validate_f32_map_kernel(&invalid_kernel).is_err());
-    assert!(fusion_pcu_rocm::lower_dispatch_to_hip_source(&invalid_kernel).is_err());
-    let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<128>::new();
-    assert!(
-        fusion_pcu_spirv::lower_dispatch_to_spirv(
-            &invalid_kernel,
-            fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
-            &mut spirv,
-        )
-        .is_err()
-    );
-    let mut output = [7.0_f32; 16];
-    let mut bindings = [
-        PcuHostScalarBinding {
-            target: PcuBindingRef::new(0, 0),
-            slice: PcuHostScalarSlice::Read(&[1.0_f32; 16]),
-        },
-        PcuHostScalarBinding {
-            target: PcuBindingRef::new(0, 1),
-            slice: PcuHostScalarSlice::ReadWrite(&mut output),
-        },
-    ];
-    let submission = PcuDispatchSubmission {
-        kernel: &invalid_kernel,
-        shape: PcuInvocationShape::invocations(
-            core::num::NonZeroU32::new(4).expect("nonzero width"),
-        ),
-    };
-    assert!(
-        PcuF32Reference
-            .run_host(submission, &mut bindings, PcuInvocationParameters::empty())
+            PcuDispatchOp::Control(pcu_alias::PcuDispatchControlOp::Return),
+        ];
+        let invalid_kernel = pcu_alias::PcuDispatchKernelIr {
+            ops: &invalid_ops,
+            ..*kernel
+        };
+        assert!(
+            pcu_alias::validate_checked_float_map_kernel(
+                &invalid_kernel,
+                PcuValueType::f32(),
+                pcu_alias::PcuValueTypeCaps::FLOAT32,
+            )
             .is_err()
-    );
-    assert_eq!(output.map(f32::to_bits), [7.0_f32; 16].map(f32::to_bits));
+        );
+        assert!(fusion_pcu_rocm::lower_dispatch_to_hip_source(&invalid_kernel).is_err());
+        let mut spirv = fusion_pcu_spirv::PcuSpirvFixedSink::<128>::new();
+        assert!(
+            fusion_pcu_spirv::lower_dispatch_to_spirv(
+                &invalid_kernel,
+                fusion_pcu_spirv::PcuSpirvLoweringOptions::minimal_shader(),
+                &mut spirv,
+            )
+            .is_err()
+        );
+        let mut output = [7.0_f32; 16];
+        let mut bindings = [
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 0),
+                slice: PcuHostScalarSlice::Read(&[1.0_f32; 16]),
+            },
+            PcuHostScalarBinding {
+                target: PcuBindingRef::new(0, 1),
+                slice: PcuHostScalarSlice::ReadWrite(&mut output),
+            },
+        ];
+        let submission = PcuDispatchSubmission {
+            kernel: &invalid_kernel,
+            shape: PcuInvocationShape::invocations(
+                core::num::NonZeroU32::new(4).expect("nonzero width"),
+            ),
+        };
+        assert!(
+            PcuF32Reference
+                .run_host(submission, &mut bindings, PcuInvocationParameters::empty())
+                .is_err()
+        );
+        assert_eq!(output.map(f32::to_bits), [7.0_f32; 16].map(f32::to_bits));
+    });
 }

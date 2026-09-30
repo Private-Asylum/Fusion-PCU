@@ -30,6 +30,9 @@ pub enum IntegerMapValidationError {
     MissingReturn,
 }
 
+mod checked_binary;
+pub use checked_binary::validate_integer_checked_binary_kernel;
+
 /// Shared structural admission for checked exact-width quotient/remainder maps.
 #[allow(clippy::too_many_lines)]
 pub fn validate_integer_checked_div_rem_kernel(

@@ -55,28 +55,100 @@ struct PcuDispatchArgs {
     kernel_id: u32,
     invocations: Expr,
     crate_path: Path,
+    underflow_flag: Option<PcuOwnedFlag>,
+    clamp_range: bool,
+    numerical_mode: Option<bool>,
 }
 
 struct PcuScalarHelperArgs {
     crate_path: Path,
+    underflow_flag: Option<PcuOwnedFlag>,
+    clamp_range: bool,
+    numerical_mode: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PcuOwnedFlag {
+    IeeeUnderflow,
+    AllowGradualUnderflow,
+    RejectSubnormalResult,
 }
 
 impl Parse for PcuScalarHelperArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self, Error> {
         let mut crate_path = None;
+        let mut underflow_flag = None;
+        let mut clamp_range = false;
+        let mut numerical_mode = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
-            let _: Token![=] = input.parse()?;
-            if key != "crate_path" {
-                return Err(Error::new(
-                    key.span(),
-                    "scalar `#[pcu]` helpers only accept `crate_path = <path>`",
-                ));
+            if key == "flag" {
+                let content;
+                syn::parenthesized!(content in input);
+                let flag: Ident = content.parse()?;
+                if !content.is_empty() {
+                    return Err(content.error("a `pcu` float flag takes exactly one name"));
+                }
+                let parsed = match flag.to_string().as_str() {
+                    "strict" | "non_strict" => {
+                        let strict = flag == "strict";
+                        if let Some(previous) = numerical_mode {
+                            return Err(Error::new(
+                                flag.span(),
+                                if previous == strict {
+                                    "duplicate `pcu` numerical mode flag"
+                                } else {
+                                    "conflicting `pcu` numerical mode flags"
+                                },
+                            ));
+                        }
+                        numerical_mode = Some(strict);
+                        if input.is_empty() {
+                            break;
+                        }
+                        let _: Token![,] = input.parse()?;
+                        continue;
+                    }
+                    "clamp_range" => {
+                        if clamp_range {
+                            return Err(Error::new(flag.span(), "duplicate `pcu` clamp flag"));
+                        }
+                        clamp_range = true;
+                        if input.is_empty() {
+                            break;
+                        }
+                        let _: Token![,] = input.parse()?;
+                        continue;
+                    }
+                    "ieee_underflow" => PcuOwnedFlag::IeeeUnderflow,
+                    "allow_gradual_underflow" => PcuOwnedFlag::AllowGradualUnderflow,
+                    "reject_subnormal_result" => PcuOwnedFlag::RejectSubnormalResult,
+                    _ => return Err(Error::new(flag.span(), "unknown `pcu` float flag")),
+                };
+                if let Some(previous) = underflow_flag {
+                    return Err(Error::new(
+                        flag.span(),
+                        if previous == parsed {
+                            "duplicate `pcu` float flag"
+                        } else {
+                            "conflicting `pcu` float flags; choose one underflow policy"
+                        },
+                    ));
+                }
+                underflow_flag = Some(parsed);
+            } else {
+                let _: Token![=] = input.parse()?;
+                if key != "crate_path" {
+                    return Err(Error::new(
+                        key.span(),
+                        "`#[pcu]` helpers accept `crate_path = <path>` and one `flag(...)`",
+                    ));
+                }
+                if crate_path.is_some() {
+                    return Err(Error::new(key.span(), "duplicate `crate_path` argument"));
+                }
+                crate_path = Some(input.parse()?);
             }
-            if crate_path.is_some() {
-                return Err(Error::new(key.span(), "duplicate `crate_path` argument"));
-            }
-            crate_path = Some(input.parse()?);
             if input.is_empty() {
                 break;
             }
@@ -84,18 +156,86 @@ impl Parse for PcuScalarHelperArgs {
         }
         Ok(Self {
             crate_path: crate_path.unwrap_or_else(|| syn::parse_quote!(::fusion_pcu)),
+            underflow_flag,
+            clamp_range,
+            numerical_mode,
         })
     }
 }
 
+// Argument parsing keeps independent numerical, range, and underflow diagnostics together.
 impl Parse for PcuDispatchArgs {
+    #[allow(clippy::too_many_lines)]
     fn parse(input: ParseStream<'_>) -> Result<Self, Error> {
         let mut kernel_id = None;
         let mut invocations = None;
         let mut crate_path = None;
+        let mut underflow_flag = None;
+        let mut clamp_range = false;
+        let mut numerical_mode = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
+            if key == "flag" {
+                let content;
+                syn::parenthesized!(content in input);
+                let flag: Ident = content.parse()?;
+                if !content.is_empty() {
+                    return Err(content.error("a `pcu` float flag takes exactly one name"));
+                }
+                let parsed = match flag.to_string().as_str() {
+                    "strict" | "non_strict" => {
+                        let strict = flag == "strict";
+                        if let Some(previous) = numerical_mode {
+                            return Err(Error::new(
+                                flag.span(),
+                                if previous == strict {
+                                    "duplicate `pcu` numerical mode flag"
+                                } else {
+                                    "conflicting `pcu` numerical mode flags"
+                                },
+                            ));
+                        }
+                        numerical_mode = Some(strict);
+                        if input.is_empty() {
+                            break;
+                        }
+                        let _: Token![,] = input.parse()?;
+                        continue;
+                    }
+                    "clamp_range" => {
+                        if clamp_range {
+                            return Err(Error::new(flag.span(), "duplicate `pcu` clamp flag"));
+                        }
+                        clamp_range = true;
+                        if input.is_empty() {
+                            break;
+                        }
+                        let _: Token![,] = input.parse()?;
+                        continue;
+                    }
+                    "ieee_underflow" => PcuOwnedFlag::IeeeUnderflow,
+                    "allow_gradual_underflow" => PcuOwnedFlag::AllowGradualUnderflow,
+                    "reject_subnormal_result" => PcuOwnedFlag::RejectSubnormalResult,
+                    _ => return Err(Error::new(flag.span(), "unknown `pcu` float flag")),
+                };
+                if let Some(previous) = underflow_flag {
+                    return Err(Error::new(
+                        flag.span(),
+                        if previous == parsed {
+                            "duplicate `pcu` float flag"
+                        } else {
+                            "conflicting `pcu` float flags; choose one underflow policy"
+                        },
+                    ));
+                }
+                underflow_flag = Some(parsed);
+                if input.is_empty() {
+                    break;
+                }
+                let _: Token![,] = input.parse()?;
+                continue;
+            }
             if key == "invocations" && input.peek(Token![:]) {
                 let _: Token![:] = input.parse()?;
             } else {
@@ -146,6 +286,9 @@ impl Parse for PcuDispatchArgs {
             kernel_id: kernel_id.unwrap_or(1),
             invocations,
             crate_path: crate_path.unwrap_or_else(|| syn::parse_quote!(::fusion_pcu)),
+            underflow_flag,
+            clamp_range,
+            numerical_mode,
         })
     }
 }
@@ -215,8 +358,16 @@ struct PcuHelper {
     body: Expr,
 }
 
-fn scalar_kind(ty: &Type) -> Option<ScalarKind> {
+fn transparent_type(ty: &Type) -> &Type {
     match ty {
+        Type::Group(group) => transparent_type(&group.elem),
+        Type::Paren(paren) => transparent_type(&paren.elem),
+        _ => ty,
+    }
+}
+
+fn scalar_kind(ty: &Type) -> Option<ScalarKind> {
+    match transparent_type(ty) {
         Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32") => {
             Some(ScalarKind::F32)
         }
@@ -277,13 +428,60 @@ impl<'a> RuntimeExprEmitter<'a> {
     #[allow(clippy::too_many_lines)]
     fn emit_expr(&mut self, expr: &Expr) -> Result<(TokenStream2, ScalarKind), Error> {
         match expr {
+            Expr::Cast(cast) => {
+                let target_kind = match transparent_type(&cast.ty) {
+                    Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32") => {
+                        ScalarKind::F32
+                    }
+                    Type::Path(path) if path.qself.is_none() && path.path.is_ident("f64") => {
+                        ScalarKind::F64
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            cast.ty.span(),
+                            "PCU checked casts support only explicit `f64 as f32` and `f32 as f64` conversions",
+                        ));
+                    }
+                };
+                if target_kind == ScalarKind::F64 && !self.has_f32_source_evidence(&cast.expr) {
+                    return Err(Error::new(
+                        cast.expr.span(),
+                        "PCU checked cast to f64 requires an explicitly typed f32 source; unsuffixed float literals default to f64",
+                    ));
+                }
+                let (source_kind, conversion_method) = match target_kind {
+                    ScalarKind::F32 => (ScalarKind::F64, quote! { checked_f64_to_f32_value }),
+                    ScalarKind::F64 => (ScalarKind::F32, quote! { checked_f32_to_f64_value }),
+                    _ => unreachable!("cast target kinds are concrete floats"),
+                };
+                // Infer an unsuffixed literal from the explicit conversion direction, then
+                // restore the enclosing result kind before returning from this cast node.
+                let enclosing_scalar = self.expected_scalar;
+                self.expected_scalar = source_kind;
+                let source_result = self.emit_expr(&cast.expr);
+                self.expected_scalar = enclosing_scalar;
+                let (source, actual_source_kind) = source_result?;
+                if actual_source_kind != source_kind {
+                    let expectation = match target_kind {
+                        ScalarKind::F32 => "PCU checked cast to f32 requires a concrete f64 source",
+                        ScalarKind::F64 => "PCU checked cast to f64 requires a concrete f32 source",
+                        _ => unreachable!("cast target kinds are concrete floats"),
+                    };
+                    return Err(Error::new(cast.expr.span(), expectation));
+                }
+                let result = self.fresh_local();
+                self.statements.push(quote! {
+                    let #result = __pcu_context.#conversion_method(#source)?;
+                });
+                Ok((quote! { #result }, target_kind))
+            }
             Expr::Binary(binary) => {
                 let (lhs, lhs_type) = self.emit_expr(&binary.left)?;
                 let (rhs, rhs_type) = self.emit_expr(&binary.right)?;
                 if lhs_type != rhs_type || !matches!(lhs_type, ScalarKind::F32 | ScalarKind::F64) {
                     return Err(Error::new(
                         binary.span(),
-                        "PCU helper arithmetic requires matching f32 or f64 operands",
+                        "PCU floating arithmetic requires matching f32 or f64 operands",
                     ));
                 }
                 let op = match &binary.op {
@@ -301,7 +499,7 @@ impl<'a> RuntimeExprEmitter<'a> {
                 let result = self.fresh_local();
                 let pcu = self.crate_path;
                 self.statements.push(quote! {
-                    let #result = __pcu_context.alu_value(#pcu::PcuDispatchAluOp::#op, #lhs, #rhs)?;
+                    let #result = __pcu_context.checked_binary_value(#pcu::PcuDispatchFloatBinaryOp::#op, #lhs, #rhs)?;
                 });
                 Ok((quote! { #result }, lhs_type))
             }
@@ -499,6 +697,53 @@ impl<'a> RuntimeExprEmitter<'a> {
                 unsupported_expression_span(expr),
                 "unsupported PCU expression; supported subset is binding[index], f32/f64 literals, parentheses, arithmetic, and #[pcu] scalar helper calls",
             )),
+        }
+    }
+
+    fn has_f32_source_evidence(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Lit(literal) => matches!(
+                &literal.lit,
+                Lit::Float(float) if float.suffix() == "f32"
+            ),
+            Expr::Paren(paren) => self.has_f32_source_evidence(&paren.expr),
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+                self.has_f32_source_evidence(&unary.expr)
+            }
+            Expr::Binary(binary) => {
+                self.has_f32_source_evidence(&binary.left)
+                    || self.has_f32_source_evidence(&binary.right)
+            }
+            Expr::Cast(cast) => matches!(
+                transparent_type(&cast.ty),
+                Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32")
+            ),
+            Expr::Index(index) => {
+                let base = shape::matrix_base(index).unwrap_or(&index.expr);
+                expr_ident(base)
+                    .and_then(|ident| self.bindings.iter().find(|binding| binding.ident == *ident))
+                    .is_some_and(|binding| binding.scalar == ScalarKind::F32)
+            }
+            Expr::Path(path) if path.qself.is_none() && path.path.segments.len() == 1 => {
+                let ident = &path.path.segments[0].ident;
+                self.values
+                    .iter()
+                    .rev()
+                    .find(|(name, _, _)| name == ident)
+                    .is_some_and(|(_, _, kind)| *kind == ScalarKind::F32)
+                    || self
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.ident == *ident)
+                        .is_some_and(|binding| {
+                            binding.scalar_reference && binding.scalar == ScalarKind::F32
+                        })
+            }
+            Expr::Call(call) => call
+                .args
+                .iter()
+                .any(|argument| self.has_f32_source_evidence(argument)),
+            _ => false,
         }
     }
 
@@ -894,15 +1139,48 @@ pub fn pcu_dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Kernel bodies are limited to the documented bounded indexed or canonical grid-stride maps and
 /// supported scalar profiles. Helper bodies support homogeneous f32 or f64 arithmetic expressions.
+/// `flag(strict)` requests checked internal compound operations; `flag(non_strict)` explicitly
+/// selects boundary handling. Unannotated owned helpers inherit the caller's active mode, with
+/// the global numerical mode providing the outer default. Scalar helper and invocation operators
+/// are already checked in either mode. Raw `_ir` and `_prepare` builders use their documented
+/// fixed defaults and do not consult the process policy.
+/// Invocation kernels may select one underflow policy with `flag(ieee_underflow)`,
+/// `flag(allow_gradual_underflow)`, or `flag(reject_subnormal_result)`. The selected policy
+/// applies to every checked floating operation in that compiled kernel, including nested scalar
+/// helper expansions. Concrete F32/F64 invocation kernels may independently select
+/// `flag(clamp_range)` to report and recover from finite range faults; it can be combined with an
+/// underflow flag. Scalar helper declarations and owned tensor compositions do not accept this
+/// invocation-only range flag.
 #[proc_macro_attribute]
 pub fn pcu(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(helper_args) = syn::parse::<PcuScalarHelperArgs>(attr.clone()) {
         let function = parse_macro_input!(item as ItemFn);
         if owned::declares_owned_tensor_return(&function.sig.output) {
-            return match owned::expand_owned_return(&function, &helper_args.crate_path) {
+            if helper_args.clamp_range {
+                return Error::new_spanned(
+                    &function.sig,
+                    "`flag(clamp_range)` is not supported on owned tensor composition helpers yet",
+                )
+                .into_compile_error()
+                .into();
+            }
+            return match owned::expand_owned_return_with_policies(
+                &function,
+                &helper_args.crate_path,
+                helper_args.underflow_flag,
+                helper_args.numerical_mode,
+            ) {
                 Ok(tokens) => tokens.into(),
                 Err(error) => error.into_compile_error().into(),
             };
+        }
+        if helper_args.underflow_flag.is_some() || helper_args.clamp_range {
+            return Error::new_spanned(
+                &function.sig,
+                "float policy flags are supported only on owned tensor composition helpers; `clamp_range` is currently invocation-only",
+            )
+            .into_compile_error()
+            .into();
         }
         return match expand_pcu_scalar_helper(function, &helper_args.crate_path) {
             Ok(tokens) => tokens.into(),
@@ -1144,8 +1422,13 @@ fn expand_pcu_dispatch_inner(
     } else {
         function_ident.clone()
     };
+    let policy_builder_ident = format_ident!("__{}_with_float_underflow_policy", builder_ident);
     let bindings_ident = format_ident!("{}_bindings", function_ident);
     let crate_path = args.crate_path;
+    let underflow_flag = args.underflow_flag;
+    // Invocation operators already enforce the strict scalar contract.
+    let _numerical_mode = args.numerical_mode;
+    let clamp_range = args.clamp_range;
     let const_generics = validate_const_generics(function)?;
     let generic_scalar = generic_scalar_type(function)?;
     let invocation_expr = lower_invocation_expr(&args.invocations, &const_generics)?;
@@ -1162,6 +1445,16 @@ fn expand_pcu_dispatch_inner(
         &const_generics,
     )?;
     validate_binding_shapes(&binding_specs)?;
+    if clamp_range
+        && !binding_specs
+            .iter()
+            .all(|binding| matches!(binding.scalar, ScalarKind::F32 | ScalarKind::F64))
+    {
+        return Err(Error::new_spanned(
+            function,
+            "`flag(clamp_range)` is supported only by concrete f32/f64 invocation kernels; integer and generic profiles do not support range recovery",
+        ));
+    }
     let mut runtime_helper_body = None;
     let (loop_extent, data_ops) = if let Some((extent, data_ops)) =
         checked_div_rem::lower(function, &binding_specs, &crate_path)?
@@ -1244,7 +1537,9 @@ fn expand_pcu_dispatch_inner(
                 (extent, data_ops)
             }
         } else {
-            if expr_contains_call(&assignment.right) {
+            if expr_contains_call(&assignment.right)
+                || matches!(output_binding.scalar, ScalarKind::F32 | ScalarKind::F64)
+            {
                 if !matches!(output_binding.scalar, ScalarKind::F32 | ScalarKind::F64) {
                     return Err(Error::new(
                         assignment.right.span(),
@@ -1275,7 +1570,8 @@ fn expand_pcu_dispatch_inner(
                     quote! { InvocationId }
                 };
                 runtime_helper_body = Some(quote! {
-                    let mut __pcu_context = #pcu::PcuScalarLowering::new(builder, 1);
+                    let mut __pcu_context = #pcu::PcuScalarLowering::with_float_underflow_policy(builder, 1, __pcu_float_underflow_policy)
+                        .with_range_policy(__pcu_float_range_policy);
                     #(#statements)*
                     __pcu_context.store_value(
                         #pcu::PcuBindingRef::new(0, #output_slot),
@@ -1500,6 +1796,11 @@ fn expand_pcu_dispatch_inner(
             GenericParam::Lifetime(_) => None,
         })
         .collect::<Vec<_>>();
+    let supports_float_range = generic_scalar.is_none()
+        && !binding_specs.is_empty()
+        && binding_specs
+            .iter()
+            .all(|binding| matches!(binding.scalar, ScalarKind::F32 | ScalarKind::F64));
     let bindings_call = generic_scalar.map_or_else(
         || quote! { #bindings_ident() },
         |scalar_ident| quote! { #bindings_ident::<#scalar_ident>() },
@@ -1537,6 +1838,27 @@ fn expand_pcu_dispatch_inner(
             }
         })
         .collect::<Vec<_>>();
+    let explicit_policy = underflow_flag.map(|flag| match flag {
+        PcuOwnedFlag::IeeeUnderflow => quote! { #pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding },
+        PcuOwnedFlag::AllowGradualUnderflow => {
+            quote! { #pcu::PcuFloatUnderflowPolicy::AllowGradualUnderflow }
+        }
+        PcuOwnedFlag::RejectSubnormalResult => {
+            quote! { #pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult }
+        }
+    });
+    let explicit_range_policy = clamp_range.then(|| quote! { #pcu::PcuRangePolicy::Clamp });
+    let public_policy = explicit_policy
+        .clone()
+        .unwrap_or_else(|| quote! { #pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding });
+    let public_range_policy = explicit_range_policy
+        .clone()
+        .unwrap_or_else(|| quote! { #pcu::PcuRangePolicy::Reject });
+    let policy_builder_direct_call = if generic_arguments.is_empty() {
+        quote! { #policy_builder_ident(bindings, #public_policy, #public_range_policy) }
+    } else {
+        quote! { #policy_builder_ident::<#(#generic_arguments),*>(bindings, #public_policy, #public_range_policy) }
+    };
     let prepared_input = prepared::Input {
         pcu,
         function,
@@ -1547,6 +1869,10 @@ fn expand_pcu_dispatch_inner(
         prepare_error: &builder_result,
         bindings_call,
         builder_call,
+        policy_builder_ident: policy_builder_ident.clone(),
+        explicit_policy,
+        explicit_range_policy,
+        supports_float_range,
     };
     let direct = direct_entry.then(|| hosted::generate(&prepared_input));
     let generated = prepared::generate(prepared_input);
@@ -1558,6 +1884,15 @@ fn expand_pcu_dispatch_inner(
 
         #vis fn #builder_ident #generated_generics(
             bindings: &#builder_lifetime [#pcu::PcuBinding<#builder_lifetime>],
+        ) -> ::core::result::Result<#builder_type, #builder_result> {
+            #policy_builder_direct_call
+        }
+
+        #[doc(hidden)]
+        #vis fn #policy_builder_ident #generated_generics(
+            bindings: &#builder_lifetime [#pcu::PcuBinding<#builder_lifetime>],
+            __pcu_float_underflow_policy: #pcu::PcuFloatUnderflowPolicy,
+            __pcu_float_range_policy: #pcu::PcuRangePolicy,
         ) -> ::core::result::Result<#builder_type, #builder_result> {
             let invocations: u32 = const {
                 let count: usize = #invocation_expr;
@@ -2205,6 +2540,7 @@ fn parse_binding_type(
         lower_invocation_expr(&matrix.rows, const_generics)?;
         lower_invocation_expr(&matrix.columns, const_generics)?;
     }
+    let element_type = transparent_type(element_type);
     let Type::Path(element) = element_type else {
         return Err(Error::new(
             element_type.span(),
@@ -2927,10 +3263,187 @@ fn binding_tokens(binding: &BindingSpec, pcu: &Path) -> TokenStream2 {
 mod tests {
     #[rustfmt::skip]
     use super::{
+        PcuOwnedFlag,
+        PcuScalarHelperArgs,
         PcuDispatchArgs,
         expand_pcu_dispatch,
+        expand_pcu_scalar_helper,
     };
     use syn::ItemFn;
+
+    #[test]
+    fn numerical_flags_are_independent_and_unambiguous() {
+        for (flag, strict) in [("strict", true), ("non_strict", false)] {
+            let args = syn::parse_str::<PcuScalarHelperArgs>(&format!(
+                "flag({flag}), flag(allow_gradual_underflow)"
+            ))
+            .unwrap();
+            assert_eq!(args.numerical_mode, Some(strict));
+            assert_eq!(
+                args.underflow_flag,
+                Some(PcuOwnedFlag::AllowGradualUnderflow)
+            );
+            let args = syn::parse_str::<PcuDispatchArgs>(&format!(
+                "invocations = 4, flag({flag}), flag(clamp_range)"
+            ))
+            .unwrap();
+            assert_eq!(args.numerical_mode, Some(strict));
+            assert!(args.clamp_range);
+        }
+        for flags in [
+            "flag(strict), flag(strict)",
+            "flag(non_strict), flag(non_strict)",
+            "flag(strict), flag(non_strict)",
+            "flag(non_strict), flag(strict)",
+        ] {
+            assert!(syn::parse_str::<PcuScalarHelperArgs>(flags).is_err());
+            assert!(syn::parse_str::<PcuDispatchArgs>(&format!("invocations=4, {flags}")).is_err());
+        }
+    }
+
+    #[test]
+    fn invocation_mode_flags_preserve_checked_scalar_lowering() {
+        let source: ItemFn = syn::parse_quote! {
+            fn kernel(input: &[f32], rhs: &[f32], output: &mut [f32]) {
+                let invocation = context.global_invocation_id;
+                output[invocation] = input[invocation] * rhs[invocation];
+            }
+        };
+        let default = expand_pcu_dispatch(syn::parse_str("invocations=4").unwrap(), &source)
+            .unwrap()
+            .to_string();
+        for flag in ["strict", "non_strict"] {
+            let args =
+                syn::parse_str::<PcuDispatchArgs>(&format!("invocations=4, flag({flag})")).unwrap();
+            assert_eq!(
+                expand_pcu_dispatch(args, &source).unwrap().to_string(),
+                default
+            );
+        }
+        assert!(default.contains("checked_binary_value"));
+    }
+
+    #[test]
+    fn owned_numerical_flags_emit_scoped_overrides() {
+        let source: ItemFn = syn::parse_quote! {
+            fn multiply(lhs: &[[f32; 2]; 2], rhs: &[[f32; 2]; 2]) -> Result<PcuTensor<f32>, PcuExecutionError> {
+                Ok(pcu::matmul(lhs, rhs)?)
+            }
+        };
+        for (mode, token) in [
+            (None, "None"),
+            (Some(true), "Strict"),
+            (Some(false), "Boundary"),
+        ] {
+            let generated = super::owned::expand_owned_return_with_policies(
+                &source,
+                &syn::parse_quote!(::fusion_pcu),
+                None,
+                mode,
+            )
+            .unwrap()
+            .to_string();
+            assert!(generated.contains("with_numerical_mode"));
+            assert!(generated.contains(token));
+        }
+    }
+
+    #[test]
+    fn parses_owned_float_policy_flags_and_rejects_ambiguous_values() {
+        let allowed = syn::parse_str::<PcuScalarHelperArgs>(
+            "flag(allow_gradual_underflow), crate_path = ::pcu_alias",
+        )
+        .expect("the gradual-underflow flag parses");
+        assert_eq!(
+            allowed.underflow_flag,
+            Some(PcuOwnedFlag::AllowGradualUnderflow)
+        );
+        assert!(allowed.crate_path.leading_colon.is_some());
+        assert_eq!(
+            allowed.crate_path.segments.last().unwrap().ident,
+            "pcu_alias"
+        );
+
+        let rejected = syn::parse_str::<PcuScalarHelperArgs>("flag(reject_subnormal_result)")
+            .expect("the subnormal-result flag parses");
+        assert_eq!(
+            rejected.underflow_flag,
+            Some(PcuOwnedFlag::RejectSubnormalResult)
+        );
+        let ieee = syn::parse_str::<PcuScalarHelperArgs>("flag(ieee_underflow)")
+            .expect("the explicit IEEE flag parses");
+        assert_eq!(ieee.underflow_flag, Some(PcuOwnedFlag::IeeeUnderflow));
+
+        for (arguments, diagnostic) in [
+            ("flag(unknown)", "unknown `pcu` float flag"),
+            (
+                "flag(allow_gradual_underflow), flag(allow_gradual_underflow)",
+                "duplicate `pcu` float flag",
+            ),
+            (
+                "flag(allow_gradual_underflow), flag(reject_subnormal_result)",
+                "conflicting `pcu` float flags",
+            ),
+        ] {
+            let Err(error) = syn::parse_str::<PcuScalarHelperArgs>(arguments) else {
+                panic!("invalid policy flag is rejected: {arguments}");
+            };
+            assert!(
+                error.to_string().contains(diagnostic),
+                "{arguments}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_kernel_flags_parse_and_reject_ambiguous_values() {
+        let allowed =
+            syn::parse_str::<PcuDispatchArgs>("flag(allow_gradual_underflow), invocations = 64")
+                .expect("invocation kernels accept an explicit checked-float policy");
+        assert_eq!(
+            allowed.underflow_flag,
+            Some(PcuOwnedFlag::AllowGradualUnderflow)
+        );
+        let clamp = syn::parse_str::<PcuDispatchArgs>(
+            "flag(clamp_range), flag(allow_gradual_underflow), invocations = 64",
+        )
+        .expect("clamp and underflow policies are independent");
+        assert!(clamp.clamp_range);
+        assert_eq!(
+            clamp.underflow_flag,
+            Some(PcuOwnedFlag::AllowGradualUnderflow)
+        );
+        let helper_clamp = syn::parse_str::<PcuScalarHelperArgs>("flag(clamp_range)").expect(
+            "the parser recognizes clamp so expansion can issue its bounded-profile diagnostic",
+        );
+        assert!(helper_clamp.clamp_range);
+        for (arguments, diagnostic) in [
+            (
+                "flag(unknown), invocations = 64",
+                "unknown `pcu` float flag",
+            ),
+            (
+                "flag(allow_gradual_underflow), flag(allow_gradual_underflow), invocations = 64",
+                "duplicate `pcu` float flag",
+            ),
+            (
+                "flag(allow_gradual_underflow), flag(reject_subnormal_result), invocations = 64",
+                "conflicting `pcu` float flags",
+            ),
+            (
+                "flag(clamp_range), flag(clamp_range), invocations = 64",
+                "duplicate `pcu` clamp flag",
+            ),
+        ] {
+            let Err(error) = syn::parse_str::<PcuDispatchArgs>(arguments) else {
+                panic!("invalid invocation policy is rejected: {arguments}");
+            };
+            assert!(
+                error.to_string().contains(diagnostic),
+                "{arguments}: {error}"
+            );
+        }
+    }
 
     fn expand(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
         let function = syn::parse_str::<ItemFn>(&format!(
@@ -2947,9 +3460,11 @@ mod tests {
         let tokens = expand("let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0;")
             .expect("supported map lowers");
         let generated = tokens.to_string();
-        assert!(generated.contains("BindingLoad"));
-        assert!(generated.contains("BindingStore"));
-        assert!(generated.contains("PcuDispatchAluOp :: Mul"));
+        assert!(generated.contains("load_value"));
+        assert!(generated.contains("store_value"));
+        assert!(generated.contains("checked_binary_value"), "{generated}");
+        assert!(generated.contains("PcuDispatchFloatBinaryOp :: Mul"));
+        assert!(generated.contains("with_float_underflow_policy"));
         assert!(generated.contains(":: fusion_pcu :: PcuBinding"));
     }
 
@@ -2961,8 +3476,15 @@ mod tests {
         let generated = expand_pcu_dispatch(args, &function)
             .expect("f64 map lowers")
             .to_string();
-        assert!(generated.contains("PcuValueType :: f64"), "{generated}");
-        assert!(generated.contains("PcuDispatchAluOp :: Add"), "{generated}");
+        assert!(
+            generated.contains("PcuBinding :: scalar :: < f64 >"),
+            "{generated}"
+        );
+        assert!(generated.contains("checked_binary_value"), "{generated}");
+        assert!(
+            generated.contains("PcuDispatchFloatBinaryOp :: Add"),
+            "{generated}"
+        );
     }
 
     fn expand_u32(body: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
@@ -3288,6 +3810,9 @@ mod tests {
                 kernel_id: 1,
                 invocations: syn::parse_quote!(8),
                 crate_path: syn::parse_quote!(::fusion_pcu),
+                underflow_flag: None,
+                numerical_mode: None,
+                clamp_range: false,
             },
             &function,
         )
@@ -3305,6 +3830,9 @@ mod tests {
                 kernel_id: 1,
                 invocations: syn::parse_quote!(8),
                 crate_path: syn::parse_quote!(::fusion_pcu),
+                underflow_flag: None,
+                numerical_mode: None,
+                clamp_range: false,
             },
             &function,
         )
@@ -3348,9 +3876,9 @@ mod tests {
         )
         .expect("canonical grid-stride loop lowers to a loop region");
         let generated = tokens.to_string();
-        assert!(generated.contains("BindingLoad"));
-        assert!(generated.contains("BindingStore"));
-        assert!(generated.contains("GridStrideLoop"));
+        assert!(generated.contains("load_value"));
+        assert!(generated.contains("store_value"));
+        assert!(generated.contains("PcuGridStrideKernelBuilder"));
         assert!(generated.contains("GridStrideId"));
     }
 
@@ -3363,7 +3891,7 @@ mod tests {
         let args = syn::parse_str::<PcuDispatchArgs>("invocations = 32").expect("attribute parses");
         let tokens = expand_pcu_dispatch(args, &function)
             .expect("a smaller launch is represented by loop IR");
-        assert!(tokens.to_string().contains("GridStrideLoop"));
+        assert!(tokens.to_string().contains("PcuGridStrideKernelBuilder"));
     }
 
     #[test]
@@ -3376,6 +3904,283 @@ mod tests {
             .expect("invocation spelling parses");
         let tokens = expand_pcu_dispatch(args, &function).expect("invocation spelling expands");
         assert!(tokens.to_string().contains("64"));
+    }
+
+    #[test]
+    fn invocation_f64_to_f32_cast_uses_checked_conversion_and_captured_policy() {
+        for (flag, variant) in [
+            ("ieee_underflow", "IeeeAfterRounding"),
+            ("allow_gradual_underflow", "AllowGradualUnderflow"),
+            ("reject_subnormal_result", "RejectSubnormalResult"),
+        ] {
+            let source = "fn kernel(input: &[f64], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f32; }";
+            let function = syn::parse_str::<ItemFn>(source).expect("function parses");
+            let args = syn::parse_str::<PcuDispatchArgs>(&format!("invocations = 8, flag({flag})"))
+                .expect("policy parses");
+            let generated = expand_pcu_dispatch(args, &function)
+                .expect("concrete f64 to f32 cast lowers")
+                .to_string();
+            assert!(
+                generated.contains("checked_f64_to_f32_value"),
+                "{generated}"
+            );
+            assert!(generated.contains(variant), "{generated}");
+            assert!(
+                !generated.contains("PcuDispatchDataOp :: Convert"),
+                "{generated}"
+            );
+        }
+
+        for literal in ["1.0_f64", "1.0"] {
+            let source = format!(
+                "fn kernel(output: &mut [f32]) {{ let invocation = context.global_invocation_id; output[invocation] = {literal} as f32; }}"
+            );
+            let function = syn::parse_str::<ItemFn>(&source).expect("literal cast function parses");
+            let args = syn::parse_str::<PcuDispatchArgs>("invocations = 8")
+                .expect("default policy parses");
+            let generated = expand_pcu_dispatch(args, &function)
+                .expect("f64 literal cast lowers")
+                .to_string();
+            assert!(generated.contains("constant_f64_value"), "{generated}");
+            assert!(
+                generated.contains("checked_f64_to_f32_value"),
+                "{generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_f32_to_f64_cast_uses_checked_conversion_and_scoped_source_kind() {
+        for (source, expect_f32_literal) in [
+            (
+                "fn kernel(input: &[f32], output: &mut [f64]) { let invocation = context.global_invocation_id; output[invocation] = (input[invocation] + 1.0) as f64 + 1.0_f64; }",
+                false,
+            ),
+            (
+                "fn kernel(output: &mut [f64]) { let invocation = context.global_invocation_id; output[invocation] = 1.0_f32 as f64; }",
+                true,
+            ),
+        ] {
+            let function = syn::parse_str::<ItemFn>(source).expect("function parses");
+            let args =
+                syn::parse_str::<PcuDispatchArgs>("invocations = 8, flag(reject_subnormal_result)")
+                    .expect("policy parses");
+            let generated = expand_pcu_dispatch(args, &function)
+                .expect("concrete f32 to f64 cast lowers")
+                .to_string();
+            assert!(
+                generated.contains("checked_f32_to_f64_value"),
+                "{generated}"
+            );
+            assert!(
+                generated.contains("PcuFloatUnderflowPolicy :: RejectSubnormalResult"),
+                "{generated}"
+            );
+            assert!(
+                !generated.contains("PcuDispatchDataOp :: Convert"),
+                "{generated}"
+            );
+            if expect_f32_literal {
+                assert!(generated.contains("constant_f32_value"), "{generated}");
+                assert!(!generated.contains("constant_f64_value"), "{generated}");
+            } else {
+                assert!(
+                    generated.contains("PcuDispatchFloatBinaryOp :: Add"),
+                    "{generated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f32_to_f64_cast_in_helper_inherits_scalar_lowering_policy() {
+        let helper =
+            syn::parse_str::<ItemFn>("fn helper(value: f64) -> f64 { 1.0_f32 as f64 + value }")
+                .expect("helper parses");
+        let path = syn::parse_quote!(::pcu);
+        let generated = expand_pcu_scalar_helper(helper, &path)
+            .expect("helper widening cast lowers into companion context")
+            .to_string();
+        assert!(
+            generated.contains("checked_f32_to_f64_value"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("__pcu_float_underflow_policy"),
+            "{generated}"
+        );
+        assert!(generated.contains("checked_binary_value"), "{generated}");
+    }
+
+    #[test]
+    fn f64_to_f32_cast_in_helper_inherits_scalar_lowering_policy() {
+        let helper =
+            syn::parse_str::<ItemFn>("fn helper(value: f32) -> f32 { 1.0_f64 as f32 + value }")
+                .expect("helper parses");
+        let path = syn::parse_quote!(::pcu);
+        let generated = expand_pcu_scalar_helper(helper, &path)
+            .expect("helper cast lowers into companion context")
+            .to_string();
+        assert!(
+            generated.contains("checked_f64_to_f32_value"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("__pcu_float_underflow_policy"),
+            "{generated}"
+        );
+        assert!(generated.contains("checked_binary_value"), "{generated}");
+
+        let mixed = syn::parse_str::<ItemFn>("fn helper(value: f64) -> f32 { value as f32 }")
+            .expect("mixed helper signature parses as Rust syntax");
+        let error = expand_pcu_scalar_helper(mixed, &path)
+            .expect_err("the existing homogeneous helper signature contract remains");
+        assert!(
+            error
+                .to_string()
+                .contains("helper parameters must match the declared f32 or f64 result type"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_f64_to_f32_invocation_casts() {
+        for (source, expected) in [
+            (
+                "fn kernel(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f32; }",
+                "PCU checked cast to f32 requires a concrete f64 source",
+            ),
+            (
+                "fn kernel(input: &[i32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f32; }",
+                "f32 or f64 bindings",
+            ),
+            (
+                "fn kernel(input: &[f64], output: &mut [f64]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f64; }",
+                "PCU checked cast to f64 requires an explicitly typed f32 source",
+            ),
+            (
+                "fn kernel(input: &[i32], output: &mut [f64]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f64; }",
+                "explicitly typed f32 source",
+            ),
+            (
+                "fn kernel(output: &mut [f64]) { let invocation = context.global_invocation_id; output[invocation] = 1.0 as f64; }",
+                "unsuffixed float literals default to f64",
+            ),
+            (
+                "fn kernel(input: &[f64], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as u32; }",
+                "explicit `f64 as f32` and `f32 as f64`",
+            ),
+            (
+                "fn kernel<T: PcuScalar>(input: &[T], output: &mut [T]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] as f32; }",
+                "indexed identity copy",
+            ),
+        ] {
+            let function = syn::parse_str::<ItemFn>(source).expect("function parses");
+            let args =
+                syn::parse_str::<PcuDispatchArgs>("invocations = 8").expect("arguments parse");
+            let error = expand_pcu_dispatch(args, &function).expect_err("unsupported cast rejects");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn invocation_policy_reaches_runtime_float_lowering_and_nested_helpers() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel(input: &[f32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = helper(input[invocation]) + input[invocation]; }",
+        )
+        .expect("test function parses");
+        let args =
+            syn::parse_str::<PcuDispatchArgs>("invocations = 64, flag(reject_subnormal_result)")
+                .expect("policy flag parses");
+        let generated = expand_pcu_dispatch(args, &function)
+            .expect("checked float helper expansion lowers")
+            .to_string();
+        assert!(
+            generated.contains("__kernel_with_float_underflow_policy"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("PcuFloatUnderflowPolicy :: RejectSubnormalResult"),
+            "{generated}"
+        );
+        assert!(generated.contains("checked_binary_value"), "{generated}");
+        assert!(generated.contains("__pcu_lower"), "{generated}");
+
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 64")
+            .expect("default invocation arguments parse");
+        let hosted = super::expand_pcu_direct(args, &function)
+            .expect("hosted entry expansion lowers")
+            .to_string();
+        assert!(hosted.contains("float_underflow_policy"), "{hosted}");
+        assert!(
+            hosted.contains("__kernel_ir_with_float_underflow_policy"),
+            "{hosted}"
+        );
+
+        let clamp_args = syn::parse_str::<PcuDispatchArgs>(
+            "invocations = 64, flag(allow_gradual_underflow), flag(clamp_range)",
+        )
+        .expect("the independent policies parse");
+        let generated = expand_pcu_dispatch(clamp_args, &function)
+            .expect("range policy reaches generated lowering")
+            .to_string();
+        assert!(generated.contains("with_range_policy"), "{generated}");
+        assert!(generated.contains("PcuRangePolicy :: Clamp"), "{generated}");
+        assert!(
+            generated.contains("PcuFloatUnderflowPolicy :: AllowGradualUnderflow"),
+            "{generated}"
+        );
+
+        let clamp_args = syn::parse_str::<PcuDispatchArgs>("invocations = 64, flag(clamp_range)")
+            .expect("clamp flag parses");
+        let hosted = super::expand_pcu_direct(clamp_args, &function)
+            .expect("hosted range flag expands")
+            .to_string();
+        assert!(hosted.contains("range_policy"), "{hosted}");
+        assert!(hosted.contains("PcuRangePolicy :: Clamp"), "{hosted}");
+    }
+
+    #[test]
+    fn clamp_range_rejects_integer_invocation_profiles() {
+        let function = syn::parse_str::<ItemFn>(
+            "fn kernel(input: &[u32], output: &mut [u32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation]; }",
+        )
+        .expect("test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 8, flag(clamp_range)")
+            .expect("clamp flag parses");
+        let error = expand_pcu_dispatch(args, &function)
+            .expect_err("integer invocation profiles cannot request float range recovery");
+        assert!(
+            error.to_string().contains("integer and generic profiles"),
+            "{error}"
+        );
+
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 8")
+            .expect("unflagged invocation arguments parse");
+        let hosted = super::expand_pcu_direct(args, &function)
+            .expect("integer invocation wrapper expands")
+            .to_string();
+        assert!(
+            hosted.contains("PcuExecutionError :: UnsupportedRangePolicy"),
+            "global clamp is rejected by the cold hosted entry: {hosted}"
+        );
+
+        // A float operation does not make a mixed binding profile safe: clamp
+        // applies to the invocation as a whole, and integer arithmetic in the
+        // same body must not silently retain reject-only semantics.
+        let mixed = syn::parse_str::<ItemFn>(
+            "fn kernel(input: &[f32], _offset: &[u32], output: &mut [f32]) { let invocation = context.global_invocation_id; output[invocation] = input[invocation] * 2.0_f32; }",
+        )
+        .expect("mixed test function parses");
+        let args = syn::parse_str::<PcuDispatchArgs>("invocations = 8")
+            .expect("unflagged invocation arguments parse");
+        let hosted = super::expand_pcu_direct(args, &mixed)
+            .expect("mixed invocation wrapper still expands under default reject policy")
+            .to_string();
+        assert!(
+            hosted.contains("PcuExecutionError :: UnsupportedRangePolicy"),
+            "mixed float/integer bindings reject global clamp at cold admission: {hosted}"
+        );
     }
 
     #[test]
@@ -3452,7 +4257,7 @@ mod tests {
         let tokens = expand_pcu_dispatch(args, &function).expect("alias path expands");
         let generated = tokens.to_string();
         assert!(generated.contains(":: pcu_alias :: PcuBinding"));
-        assert!(generated.contains(":: pcu_alias :: PcuDispatchDataOp"));
+        assert!(generated.contains(":: pcu_alias :: PcuDispatchFloatBinaryOp"));
         assert!(!generated.contains("fusion_pcu"));
     }
 

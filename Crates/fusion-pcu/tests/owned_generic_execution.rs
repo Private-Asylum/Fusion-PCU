@@ -47,7 +47,7 @@ fn through_slice<T: PcuScalar>(input: &[T]) -> Result<PcuTensor<T>, PcuExecution
     Ok(slice_identity(input)?)
 }
 
-#[pcu]
+#[pcu(flag(strict))]
 fn matrix_product<T: PcuScalar, const R: usize, const K: usize, const C: usize>(
     lhs: &[[T; K]; R],
     rhs: &[[T; C]; K],
@@ -64,7 +64,7 @@ fn add_pair<T: PcuScalar, const N: usize>(
 }
 
 #[test]
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
 fn generic_f32_f64_and_other_scalars_typecheck_without_host_fallback() {
     let f32_values = [1.0_f32, -2.0, 3.5];
     let f64_values = [16_777_217.0_f64, -2.0, 3.5];

@@ -1816,6 +1816,7 @@ fn verify_owned_execution_fault_gate(
                     node: 0,
                     outcome: fusion_pcu::PcuCompletionOutcome::Fault(
                         fusion_pcu::PcuExecutionFault {
+                            recovered: false,
                             kind,
                             invocation_id: 0,
                         },
@@ -2592,6 +2593,11 @@ fn verify_fault(
             divisors[first] = -1;
             divisors[second] = -1;
         }
+        fusion_pcu::PcuExecutionFaultKind::ArithmeticOverflow
+        | fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow
+        | fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand => {
+            unreachable!("division benchmark only creates division faults")
+        }
     }
     let mut pcu_lhs = backend.allocate(n * 4)?;
     let mut pcu_rhs = backend.allocate(n * 4)?;
@@ -2639,12 +2645,13 @@ fn verify_fault(
     checked_batch.submit_checked_last(prepared, &fault_bindings)?;
     if !matches!(
         checked_batch.submit_unchecked(prepared, &fault_bindings),
-        Err(fusion_pcu_rocm::RocmOwnedDispatchError::CheckedDivisionBatchClosed)
+        Err(fusion_pcu_rocm::RocmOwnedDispatchError::CheckedArithmeticBatchClosed)
     ) {
         return Err("checked-last batch admitted a subsequent launch".into());
     }
     let mut batch_completion = checked_batch.finish()?;
     let expected_fault = fusion_pcu::PcuExecutionFault {
+        recovered: false,
         kind: fault_kind,
         invocation_id: expected_id,
     };
@@ -2678,8 +2685,13 @@ fn verify_fault(
     let fault_tag = match fault_kind {
         fusion_pcu::PcuExecutionFaultKind::DivideByZero => 1,
         fusion_pcu::PcuExecutionFaultKind::SignedDivisionOverflow => 2,
+        fusion_pcu::PcuExecutionFaultKind::ArithmeticOverflow
+        | fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow
+        | fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand => {
+            unreachable!("division benchmark only creates division faults")
+        }
     };
-    let expected = (expected_id << 2) | fault_tag;
+    let expected = (expected_id << 3) | fault_tag;
     if u64::from_le_bytes(word) != expected {
         return Err(format!(
             "native first-fault word was {}, expected {expected}",
@@ -2718,7 +2730,7 @@ fn native_source(extent: u32, invocations: u32, grid_stride: bool) -> String {
     };
     let close = "}";
     format!(
-        "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void native_checked_i32_div_rem(const int* a,const int* b,int* q,int* r,unsigned long long* fault_word) {{\nunsigned int base=blockIdx.x*blockDim.x+threadIdx.x; if (base >= {invocations}u) return; {iteration} if (b[i] == 0) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 2u) | 1ull); }} else if (a[i] == (-2147483647 - 1) && b[i] == -1) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 2u) | 2ull); }} else {{ q[i]=a[i]/b[i]; r[i]=a[i]%b[i]; }} {close} }}\n"
+        "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void native_checked_i32_div_rem(const int* a,const int* b,int* q,int* r,unsigned long long* fault_word) {{\nunsigned int base=blockIdx.x*blockDim.x+threadIdx.x; if (base >= {invocations}u) return; {iteration} if (b[i] == 0) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 3u) | 1ull); }} else if (a[i] == (-2147483647 - 1) && b[i] == -1) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 3u) | 2ull); }} else {{ q[i]=a[i]/b[i]; r[i]=a[i]%b[i]; }} {close} }}\n"
     )
 }
 

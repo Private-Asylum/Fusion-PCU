@@ -3,8 +3,10 @@ use super::*;
 use crate::{
     PcuBf16Bits,
     PcuF16Bits,
+    PcuFloatUnderflowPolicy,
     core::PcuScalarType,
 };
+
 #[rustfmt::skip]
 use crate::{
     PcuMemoryAccess,
@@ -15,19 +17,392 @@ use crate::{
     PcuMemoryResourceOrigin,
 };
 
+// These planner-only fixtures model legacy/unverified F64 arithmetic. Normal Graph builders
+// always attach a checked-float policy, so executable graph tests must not call this helper.
+fn clear_float_policy_for_unchecked_planner_fixture(graph: &mut Graph) {
+    for node in &mut graph.nodes {
+        if node.scalar_type == PcuScalarType::F64
+            && matches!(node.op, Op::Add(..) | Op::Sub(..) | Op::Mul(..))
+        {
+            node.float_underflow_policy = None;
+        }
+    }
+}
+
+#[test]
+fn f32_underflow_policy_is_frozen_per_node_and_used_by_reference() {
+    let mut graph = Graph::default();
+    let min_normal = graph
+        .constant_typed::<f32>(Tensor::scalar(f32::MIN_POSITIVE))
+        .erase();
+    let half = graph.constant_typed::<f32>(Tensor::scalar(0.5)).erase();
+    let gradual = graph
+        .mul_with_underflow_policy(
+            min_normal,
+            half,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        )
+        .unwrap();
+    let tiny_inexact = graph
+        .constant_typed::<f32>(Tensor::scalar(f32::from_bits(1)))
+        .erase();
+    let ieee = graph.mul(tiny_inexact, half).unwrap();
+
+    assert_eq!(
+        graph.node(gradual).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow)
+    );
+    assert_eq!(
+        graph.node(ieee).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
+    let error = graph.evaluate(&[]).unwrap_err();
+    assert!(matches!(
+        error,
+        TensorError::ArithmeticFault { value, .. } if value == ieee
+    ));
+
+    let mut strict_graph = Graph::default();
+    let min_normal = strict_graph
+        .constant_typed::<f32>(Tensor::scalar(f32::MIN_POSITIVE))
+        .erase();
+    let half = strict_graph
+        .constant_typed::<f32>(Tensor::scalar(0.5))
+        .erase();
+    let strict = strict_graph
+        .mul_with_underflow_policy(
+            min_normal,
+            half,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        )
+        .unwrap();
+    assert!(matches!(
+        strict_graph.evaluate(&[]),
+        Err(TensorError::ArithmeticFault { value, .. }) if value == strict
+    ));
+}
+
+#[test]
+fn f64_underflow_policy_is_frozen_per_node_and_used_by_reference() {
+    let mut graph = Graph::default();
+    let min_normal = graph
+        .constant_typed::<f64>(Tensor::scalar(f64::MIN_POSITIVE))
+        .erase();
+    let predecessor_of_one = graph
+        .constant_typed::<f64>(Tensor::scalar(f64::from_bits(1.0_f64.to_bits() - 1)))
+        .erase();
+    let default = graph.mul(min_normal, predecessor_of_one).unwrap();
+    let gradual = graph
+        .mul_with_underflow_policy(
+            min_normal,
+            predecessor_of_one,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        )
+        .unwrap();
+    assert_eq!(
+        graph.node(default).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
+    assert_eq!(
+        graph.node(gradual).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow)
+    );
+    assert!(matches!(
+        graph.evaluate(&[]),
+        Err(TensorError::ArithmeticFault { value, kind: crate::PcuExecutionFaultKind::ArithmeticUnderflow, .. })
+            if value == default
+    ));
+    let mut gradual_graph = Graph::default();
+    let min_normal = gradual_graph
+        .constant_typed::<f64>(Tensor::scalar(f64::MIN_POSITIVE))
+        .erase();
+    let predecessor_of_one = gradual_graph
+        .constant_typed::<f64>(Tensor::scalar(f64::from_bits(1.0_f64.to_bits() - 1)))
+        .erase();
+    let gradual = gradual_graph
+        .mul_with_underflow_policy(
+            min_normal,
+            predecessor_of_one,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        )
+        .unwrap();
+    let gradual_execution = gradual_graph.evaluate(&[]).unwrap();
+    let gradual_value = gradual_execution.value_typed::<f64>(gradual).unwrap();
+    assert_eq!(
+        gradual_value.data()[0].to_bits(),
+        f64::MIN_POSITIVE.to_bits()
+    );
+
+    let mut strict_graph = Graph::default();
+    let min_normal = strict_graph
+        .constant_typed::<f64>(Tensor::scalar(f64::MIN_POSITIVE))
+        .erase();
+    let half = strict_graph
+        .constant_typed::<f64>(Tensor::scalar(0.5))
+        .erase();
+    let strict = strict_graph
+        .mul_with_underflow_policy(
+            min_normal,
+            half,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        )
+        .unwrap();
+    assert!(matches!(
+        strict_graph.evaluate(&[]),
+        Err(TensorError::ArithmeticFault { value, kind: crate::PcuExecutionFaultKind::ArithmeticUnderflow, .. })
+            if value == strict
+    ));
+}
+
+#[test]
+fn checked_f32_division_uses_default_and_explicit_underflow_policies() {
+    let mut f32_graph = Graph::default();
+    let numerator = f32_graph
+        .constant_typed::<f32>(Tensor::scalar(f32::from_bits(1)))
+        .erase();
+    let denominator = f32_graph.constant_typed::<f32>(Tensor::scalar(2.0)).erase();
+    let default = f32_graph.div(numerator, denominator).unwrap();
+    assert_eq!(
+        f32_graph.node(default).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
+    assert!(matches!(
+        f32_graph.evaluate(&[]),
+        Err(TensorError::ArithmeticFault {
+            value,
+            kind: crate::PcuExecutionFaultKind::ArithmeticUnderflow,
+            ..
+        }) if value == default
+    ));
+
+    let mut gradual_graph = Graph::default();
+    let numerator = gradual_graph
+        .constant_typed::<f32>(Tensor::scalar(f32::from_bits(1)))
+        .erase();
+    let denominator = gradual_graph
+        .constant_typed::<f32>(Tensor::scalar(2.0))
+        .erase();
+    let gradual = gradual_graph
+        .div_with_underflow_policy(
+            numerator,
+            denominator,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        )
+        .unwrap();
+    assert_eq!(
+        gradual_graph.node(gradual).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow)
+    );
+    assert_eq!(
+        gradual_graph
+            .evaluate(&[])
+            .unwrap()
+            .value_typed::<f32>(gradual)
+            .unwrap()
+            .data(),
+        &[0.0]
+    );
+}
+
+#[test]
+fn checked_f64_division_handles_exact_and_tiny_results() {
+    let mut f64_graph = Graph::default();
+    let left = f64_graph.input_typed::<f64>([1]).unwrap();
+    let right = f64_graph.input_typed::<f64>([1]).unwrap();
+    let quotient = f64_graph.div_typed(left, right).unwrap();
+    assert_eq!(
+        f64_graph
+            .node(quotient.erase())
+            .unwrap()
+            .float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
+    let execution = f64_graph
+        .evaluate(&[
+            (
+                left.erase(),
+                TensorValue::from(Tensor::new([1], vec![7.5_f64]).unwrap()),
+            ),
+            (
+                right.erase(),
+                TensorValue::from(Tensor::new([1], vec![2.5_f64]).unwrap()),
+            ),
+        ])
+        .unwrap();
+    assert_eq!(
+        execution
+            .value_typed::<f64>(quotient.erase())
+            .unwrap()
+            .data(),
+        &[3.0]
+    );
+
+    let mut f64_underflow_graph = Graph::default();
+    let tiny = f64_underflow_graph
+        .constant_typed::<f64>(Tensor::scalar(f64::from_bits(1)))
+        .erase();
+    let two = f64_underflow_graph
+        .constant_typed::<f64>(Tensor::scalar(2.0))
+        .erase();
+    let rounded_tiny = f64_underflow_graph.div(tiny, two).unwrap();
+    assert!(matches!(
+        f64_underflow_graph.evaluate(&[]),
+        Err(TensorError::ArithmeticFault {
+            value,
+            kind: crate::PcuExecutionFaultKind::ArithmeticUnderflow,
+            ..
+        }) if value == rounded_tiny
+    ));
+}
+
+#[test]
+fn checked_float_division_rejects_integer_types() {
+    let mut integer_graph = Graph::default();
+    let left = integer_graph.input_typed::<u32>([1]).unwrap();
+    let right = integer_graph.input_typed::<u32>([1]).unwrap();
+    assert!(matches!(
+        integer_graph.div_typed(left, right),
+        Err(TensorError::UnsupportedScalarType { .. })
+    ));
+    assert!(matches!(
+        integer_graph.div_with_underflow_policy(
+            left.erase(),
+            right.erase(),
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        ),
+        Err(TensorError::UnsupportedScalarType { .. })
+    ));
+}
+
+#[test]
+fn checked_float_division_fault_effects_survive_output_selection() {
+    let mut graph = Graph::default();
+    let numerator = graph.input_typed::<f32>([1]).unwrap();
+    let denominator = graph
+        .constant_typed::<f32>(Tensor::new([1], vec![0.0]).unwrap())
+        .erase();
+    let quotient = graph.div(numerator.erase(), denominator).unwrap();
+    let plan = graph
+        .execution_plan_for_outputs(&[numerator.erase()])
+        .unwrap();
+    assert!(plan.node_order().contains(&quotient));
+    assert!(plan.node_order().contains(&denominator));
+    assert_eq!(
+        graph.node(quotient).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
+    assert!(matches!(
+        graph.evaluate(&[(
+            numerator.erase(),
+            TensorValue::from(Tensor::new([1], vec![1.0_f32]).unwrap()),
+        )]),
+        Err(TensorError::ArithmeticFault {
+            value,
+            kind: crate::PcuExecutionFaultKind::DivideByZero,
+            ..
+        }) if value == quotient
+    ));
+}
+
+#[test]
+fn division_is_explicitly_unsupported_by_current_gradient_profile() {
+    let mut graph = Graph::default();
+    let numerator = graph.input_typed::<f32>([]).unwrap();
+    let denominator = graph.input_typed::<f32>([]).unwrap();
+    let quotient = graph.div_typed(numerator, denominator).unwrap();
+    let zero = graph.constant_typed::<f32>(Tensor::scalar(0.0)).erase();
+    let loss = graph.mean_squared_error(quotient.erase(), zero).unwrap();
+    let node_count = graph.nodes.len();
+    assert!(matches!(
+        graph.backward_mse(loss),
+        Err(TensorError::UnsupportedGradient(value)) if value == quotient.erase()
+    ));
+    assert_eq!(graph.nodes.len(), node_count);
+}
+
+#[test]
+fn typed_policy_builders_accept_f32_and_f64_and_pin_each_arithmetic_node() {
+    let mut graph = Graph::default();
+    let left = graph.input_typed::<f32>([1]).unwrap();
+    let right = graph.input_typed::<f32>([1]).unwrap();
+    let add = graph
+        .add_typed_with_underflow_policy(
+            left,
+            right,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        )
+        .unwrap();
+    let sub = graph
+        .sub_typed_with_underflow_policy(
+            left,
+            right,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        )
+        .unwrap();
+    let mul = graph
+        .mul_typed_with_underflow_policy(left, right, PcuFloatUnderflowPolicy::IeeeAfterRounding)
+        .unwrap();
+    assert_eq!(
+        graph.node(add.erase()).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow)
+    );
+    assert_eq!(
+        graph.node(sub.erase()).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::RejectSubnormalResult)
+    );
+    assert_eq!(
+        graph.node(mul.erase()).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
+
+    let mut f64_graph = Graph::default();
+    let left = f64_graph.input_typed::<f64>([1]).unwrap();
+    let right = f64_graph.input_typed::<f64>([1]).unwrap();
+    let add = f64_graph
+        .add_typed_with_underflow_policy(
+            left,
+            right,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        )
+        .unwrap();
+    let sub = f64_graph
+        .sub_typed_with_underflow_policy(
+            left,
+            right,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        )
+        .unwrap();
+    let mul = f64_graph
+        .mul_typed_with_underflow_policy(left, right, PcuFloatUnderflowPolicy::IeeeAfterRounding)
+        .unwrap();
+    assert_eq!(
+        f64_graph.node(add.erase()).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow)
+    );
+    assert_eq!(
+        f64_graph.node(sub.erase()).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::RejectSubnormalResult)
+    );
+    assert_eq!(
+        f64_graph.node(mul.erase()).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
+}
+
 #[test]
 fn owned_selected_program_matches_borrowed_plan_without_rebuilding_reference_semantics() {
     let mut graph = Graph::default();
-    let input = graph.input([2], PcuScalarType::F32).unwrap();
+    let input = graph.input([2], PcuScalarType::F64).unwrap();
     let bias = graph
-        .constant_typed::<f32>(Tensor::new([2], vec![-2.0, 1.0]).unwrap())
+        .constant_typed::<f64>(Tensor::new([2], vec![-2.0, 1.0]).unwrap())
         .erase();
     let sum = graph.add(input, bias).unwrap();
     let activated = graph.relu(sum).unwrap();
     let output = graph.mul(activated, activated).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let inputs = [(
         input,
-        TensorValue::from(Tensor::<f32>::new([2], vec![1.0, 3.0]).unwrap()),
+        TensorValue::from(Tensor::<f64>::new([2], vec![1.0, 3.0]).unwrap()),
     )];
     let reference = graph.evaluate(&inputs).unwrap();
 
@@ -77,9 +452,9 @@ fn owned_selected_program_matches_borrowed_plan_without_rebuilding_reference_sem
         program
             .execute_reference(&inputs)
             .unwrap()
-            .value_typed::<f32>(output)
+            .value_typed::<f64>(output)
             .unwrap(),
-        reference.value_typed::<f32>(output).unwrap()
+        reference.value_typed::<f64>(output).unwrap()
     );
     assert_eq!(program.graph().node(output).unwrap().value, output);
 }
@@ -180,21 +555,18 @@ fn consumed_relu_reuse_proof_rejects_fanout_pins_wrong_ops_and_foreign_values() 
 }
 
 #[test]
-fn consumed_relu_reuse_ignores_graph_branches_pruned_from_selected_program() {
+fn consumed_relu_reuse_retains_faulting_branches_and_rejects_early_donation() {
     let mut graph = Graph::default();
     let input = graph.input([2], PcuScalarType::F32).unwrap();
     let selected_output = graph.relu(input).unwrap();
     let unused_branch = graph.add(input, input).unwrap();
     let program = selected_program(graph, &[selected_output]);
 
-    assert!(!program.selected_nodes().contains(&unused_branch));
-    assert_eq!(
-        program
-            .prove_consumed_relu_reuse(input, selected_output)
-            .unwrap()
-            .input(),
-        input
-    );
+    assert!(program.selected_nodes().contains(&unused_branch));
+    assert!(matches!(
+        program.prove_consumed_relu_reuse(input, selected_output),
+        Err(TensorStorageReuseError::InputUseCount { value, actual: 3 }) if value == input
+    ));
 }
 
 #[test]
@@ -459,6 +831,7 @@ fn selected_fused_program_preserves_scalar_layout_facts() {
     for node in &mut graph.nodes {
         node.scalar_type = PcuScalarType::F64;
     }
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
 
     let plan = graph.execution_plan_for_outputs(&[output]).unwrap();
     let requirements = plan.value_storage_requirements().unwrap();
@@ -1511,12 +1884,16 @@ fn selected_output_plan_prunes_unrelated_nodes_and_pins_outputs() {
 }
 
 #[test]
-fn selected_add_relu_group_suppresses_intermediate_only_when_opted_in() {
+fn selected_f64_add_relu_keeps_checked_intermediate_even_when_grouping_is_requested() {
     let mut graph = Graph::default();
-    let left = graph.input(vec![2, 2], PcuScalarType::F32).unwrap();
-    let right = graph.input(vec![2, 2], PcuScalarType::F32).unwrap();
+    let left = graph.input(vec![2, 2], PcuScalarType::F64).unwrap();
+    let right = graph.input(vec![2, 2], PcuScalarType::F64).unwrap();
     let add = graph.add(left, right).unwrap();
     let relu = graph.relu(add).unwrap();
+    assert_eq!(
+        graph.node(add).unwrap().float_underflow_policy,
+        Some(PcuFloatUnderflowPolicy::IeeeAfterRounding)
+    );
     let plan = graph.execution_plan_for_outputs(&[relu]).unwrap();
 
     let default = plan.select_lowering(
@@ -1533,50 +1910,93 @@ fn selected_add_relu_group_suppresses_intermediate_only_when_opted_in() {
         TensorArithmeticCapability::Strict,
         TensorPointwiseGroupingPolicy::SingleUseAddRelu,
     );
-    assert_eq!(grouped.pointwise_fusion_groups().len(), 1);
-    assert_eq!(grouped.operations().len(), 3);
-    assert_eq!(grouped.operation_index_of(add), None);
-    assert_eq!(grouped.operation_index_of(relu), Some(2));
-    assert_eq!(grouped.operation_use_counts(), &[1, 1, 1]);
-    assert!(matches!(
-        grouped.operations()[2],
-        TensorSelectedOperation::FusedAddRelu {
-            add_output,
-            relu_output,
-            left: lhs,
-            right: rhs,
-            shape: [2, 2],
-        } if add_output == add && relu_output == relu && lhs == left && rhs == right
-    ));
-    assert_eq!(grouped.pointwise_fusion_groups()[0].shape, vec![2, 2]);
+    assert!(grouped.pointwise_fusion_groups().is_empty());
+    assert_eq!(grouped.operations().len(), grouped.nodes().len());
+    assert_eq!(grouped.operation_index_of(add), Some(2));
+    assert_eq!(grouped.operation_index_of(relu), Some(3));
+    assert_eq!(grouped.operation_use_counts(), &[1, 1, 1, 1]);
     assert!(
         grouped
             .operation_storage_constraints()
             .unwrap()
             .iter()
-            .all(|constraint| constraint.left != add && constraint.right != add)
+            .any(|constraint| constraint.left == add || constraint.right == add)
     );
 
     // Selection describes a backend schedule; the graph and reference evaluator stay intact.
     let inputs = [
         (
             left,
-            TensorValue::from(Tensor::<f32>::new(vec![2, 2], vec![-2.0, 1.0, 0.0, 3.0]).unwrap()),
+            TensorValue::from(Tensor::<f64>::new(vec![2, 2], vec![-2.0, 1.0, 0.0, 3.0]).unwrap()),
         ),
         (
             right,
-            TensorValue::from(Tensor::<f32>::new(vec![2, 2], vec![1.0, 2.0, -0.0, -4.0]).unwrap()),
+            TensorValue::from(Tensor::<f64>::new(vec![2, 2], vec![1.0, 2.0, -0.0, -4.0]).unwrap()),
         ),
     ];
     assert_eq!(
         graph
             .evaluate(&inputs)
             .unwrap()
-            .value_typed::<f32>(relu)
+            .value_typed::<f64>(relu)
             .unwrap()
             .data(),
         &[0.0, 3.0, 0.0, 0.0]
     );
+}
+
+#[test]
+fn strict_f32_checked_arithmetic_never_collapses_into_unchecked_fusions() {
+    let mut add_graph = Graph::default();
+    let left = add_graph.input([1], PcuScalarType::F32).unwrap();
+    let right = add_graph.input([1], PcuScalarType::F32).unwrap();
+    let add = add_graph.add(left, right).unwrap();
+    let output = add_graph.relu(add).unwrap();
+    let selected = add_graph
+        .execution_plan_for_outputs(&[output])
+        .unwrap()
+        .select_lowering_with_grouping(
+            TensorArithmeticRewritePolicy::Disabled,
+            TensorArithmeticCapability::Strict,
+            TensorPointwiseGroupingPolicy::SingleUseAddRelu,
+        );
+    assert!(selected.pointwise_fusion_groups().is_empty());
+    assert!(selected.operation_index_of(add).is_some());
+
+    let mut multiply_graph = Graph::default();
+    let left = multiply_graph.input([1], PcuScalarType::F32).unwrap();
+    let right = multiply_graph.input([1], PcuScalarType::F32).unwrap();
+    let first = multiply_graph.mul(left, right).unwrap();
+    let second = multiply_graph.mul(first, right).unwrap();
+    let selected = multiply_graph
+        .execution_plan_for_outputs(&[second])
+        .unwrap()
+        .select_lowering_with_grouping(
+            TensorArithmeticRewritePolicy::Disabled,
+            TensorArithmeticCapability::Strict,
+            TensorPointwiseGroupingPolicy::BoundedMulIdentity,
+        );
+    assert!(selected.bounded_mul_fusion_groups().is_empty());
+    assert!(selected.operation_index_of(first).is_some());
+    assert!(selected.operation_index_of(second).is_some());
+
+    let mut add_sub_graph = Graph::default();
+    let left = add_sub_graph.input([1], PcuScalarType::F32).unwrap();
+    let right = add_sub_graph.input([1], PcuScalarType::F32).unwrap();
+    let added = add_sub_graph.add(left, right).unwrap();
+    let subtracted = add_sub_graph.sub(added, right).unwrap();
+    let output = add_sub_graph.relu(subtracted).unwrap();
+    let selected = add_sub_graph
+        .execution_plan_for_outputs(&[output])
+        .unwrap()
+        .select_lowering_with_grouping(
+            TensorArithmeticRewritePolicy::Disabled,
+            TensorArithmeticCapability::Strict,
+            TensorPointwiseGroupingPolicy::BoundedAddSubRelu,
+        );
+    assert!(selected.bounded_pointwise_fusion_groups().is_empty());
+    assert!(selected.operation_index_of(added).is_some());
+    assert!(selected.operation_index_of(subtracted).is_some());
 }
 
 #[test]
@@ -1609,13 +2029,14 @@ fn selected_add_relu_group_respects_fanout_and_output_pins() {
 #[test]
 fn bounded_mul_identity_preserves_order_repeated_leaves_uniforms_and_downstream_use() {
     let mut graph = Graph::default();
-    let value = graph.input(vec![3], PcuScalarType::F32).unwrap();
+    let value = graph.input(vec![3], PcuScalarType::F64).unwrap();
     let scale = graph
-        .uniform_value(vec![3], TensorScalarValue::F32(0.5))
+        .uniform_value(vec![3], TensorScalarValue::F64(0.5))
         .unwrap();
     let first = graph.mul(value, value).unwrap();
     let second = graph.mul(first, scale).unwrap();
     let output = graph.add(second, value).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let selected = graph
         .execution_plan_for_outputs(&[output])
         .unwrap()
@@ -1721,12 +2142,13 @@ fn bounded_mul_identity_respects_pins_fanout_and_caps() {
 #[test]
 fn bounded_add_sub_relu_group_preserves_chain_order_and_unique_leaves() {
     let mut graph = Graph::default();
-    let left = graph.input(vec![4], PcuScalarType::F32).unwrap();
-    let right = graph.input(vec![4], PcuScalarType::F32).unwrap();
-    let bias = graph.input(vec![4], PcuScalarType::F32).unwrap();
+    let left = graph.input(vec![4], PcuScalarType::F64).unwrap();
+    let right = graph.input(vec![4], PcuScalarType::F64).unwrap();
+    let bias = graph.input(vec![4], PcuScalarType::F64).unwrap();
     let difference = graph.sub(left, right).unwrap();
     let adjusted = graph.sub(bias, difference).unwrap();
     let output = graph.relu(adjusted).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let plan = graph.execution_plan_for_outputs(&[output]).unwrap();
     let selected = plan.select_lowering_with_grouping(
         TensorArithmeticRewritePolicy::Disabled,
@@ -1780,10 +2202,11 @@ fn bounded_add_sub_relu_group_preserves_chain_order_and_unique_leaves() {
 #[test]
 fn bounded_add_sub_relu_group_keeps_duplicate_leaf_operand_order() {
     let mut graph = Graph::default();
-    let value = graph.input(vec![3], PcuScalarType::F32).unwrap();
+    let value = graph.input(vec![3], PcuScalarType::F64).unwrap();
     let doubled = graph.add(value, value).unwrap();
     let difference = graph.sub(doubled, value).unwrap();
     let output = graph.relu(difference).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let selected = graph
         .execution_plan_for_outputs(&[output])
         .unwrap()
@@ -1805,14 +2228,15 @@ fn bounded_add_sub_relu_group_keeps_duplicate_leaf_operand_order() {
 #[test]
 fn bounded_add_sub_identity_preserves_terminal_output_and_downstream_consumers() {
     let mut graph = Graph::default();
-    let left = graph.input(vec![4], PcuScalarType::F32).unwrap();
+    let left = graph.input(vec![4], PcuScalarType::F64).unwrap();
     let uniform = graph
-        .uniform_value(vec![4], TensorScalarValue::F32(0.25))
+        .uniform_value(vec![4], TensorScalarValue::F64(0.25))
         .unwrap();
-    let bias = graph.input(vec![4], PcuScalarType::F32).unwrap();
+    let bias = graph.input(vec![4], PcuScalarType::F64).unwrap();
     let first = graph.sub(left, uniform).unwrap();
     let output = graph.add(first, bias).unwrap();
     let downstream = graph.sub(output, uniform).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let plan = graph
         .execution_plan_for_outputs(&[output, downstream])
         .unwrap();
@@ -2010,11 +2434,12 @@ fn external_read_only_storage_stays_disjoint_after_its_graph_lifetime() {
 #[test]
 fn bounded_add_sub_identity_keeps_requested_terminal_for_pin_and_fanout() {
     let mut graph = Graph::default();
-    let left = graph.input(vec![2], PcuScalarType::F32).unwrap();
-    let right = graph.input(vec![2], PcuScalarType::F32).unwrap();
+    let left = graph.input(vec![2], PcuScalarType::F64).unwrap();
+    let right = graph.input(vec![2], PcuScalarType::F64).unwrap();
     let first = graph.add(left, right).unwrap();
     let terminal = graph.sub(first, right).unwrap();
     let branch = graph.add(terminal, left).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let selected = graph
         .execution_plan_for_outputs(&[terminal, branch])
         .unwrap()
@@ -2040,8 +2465,8 @@ fn bounded_add_sub_identity_keeps_requested_terminal_for_pin_and_fanout() {
     );
 
     let mut pinned_graph = Graph::default();
-    let left = pinned_graph.input(vec![2], PcuScalarType::F32).unwrap();
-    let right = pinned_graph.input(vec![2], PcuScalarType::F32).unwrap();
+    let left = pinned_graph.input(vec![2], PcuScalarType::F64).unwrap();
+    let right = pinned_graph.input(vec![2], PcuScalarType::F64).unwrap();
     let pinned_intermediate = pinned_graph.add(left, right).unwrap();
     let terminal = pinned_graph.sub(pinned_intermediate, right).unwrap();
     let selected = pinned_graph
@@ -2060,15 +2485,16 @@ fn bounded_add_sub_identity_keeps_requested_terminal_for_pin_and_fanout() {
 #[test]
 fn bounded_add_sub_identity_respects_step_and_leaf_limits() {
     let mut graph = Graph::default();
-    let first = graph.input(vec![1], PcuScalarType::F32).unwrap();
+    let first = graph.input(vec![1], PcuScalarType::F64).unwrap();
     let second = graph
-        .uniform_value(vec![1], TensorScalarValue::F32(0.5))
+        .uniform_value(vec![1], TensorScalarValue::F64(0.5))
         .unwrap();
-    let third = graph.input(vec![1], PcuScalarType::F32).unwrap();
-    let fourth = graph.input(vec![1], PcuScalarType::F32).unwrap();
+    let third = graph.input(vec![1], PcuScalarType::F64).unwrap();
+    let fourth = graph.input(vec![1], PcuScalarType::F64).unwrap();
     let mut accumulator = graph.add(first, second).unwrap();
     accumulator = graph.sub(accumulator, third).unwrap();
     accumulator = graph.add(accumulator, fourth).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let accepted = graph
         .execution_plan_for_outputs(&[accumulator])
         .unwrap()
@@ -2083,12 +2509,13 @@ fn bounded_add_sub_identity_respects_step_and_leaf_limits() {
     assert_eq!(group.output, accumulator);
 
     let mut too_many_steps = Graph::default();
-    let lhs = too_many_steps.input(vec![1], PcuScalarType::F32).unwrap();
-    let rhs = too_many_steps.input(vec![1], PcuScalarType::F32).unwrap();
+    let lhs = too_many_steps.input(vec![1], PcuScalarType::F64).unwrap();
+    let rhs = too_many_steps.input(vec![1], PcuScalarType::F64).unwrap();
     let mut accumulator = too_many_steps.add(lhs, rhs).unwrap();
     for _ in 0..8 {
         accumulator = too_many_steps.sub(accumulator, rhs).unwrap();
     }
+    clear_float_policy_for_unchecked_planner_fixture(&mut too_many_steps);
     let rejected = too_many_steps
         .execution_plan_for_outputs(&[accumulator])
         .unwrap()
@@ -2101,12 +2528,13 @@ fn bounded_add_sub_identity_respects_step_and_leaf_limits() {
 
     let mut too_many_leaves = Graph::default();
     let leaves = (0..5)
-        .map(|_| too_many_leaves.input(vec![1], PcuScalarType::F32).unwrap())
+        .map(|_| too_many_leaves.input(vec![1], PcuScalarType::F64).unwrap())
         .collect::<Vec<_>>();
     let mut accumulator = too_many_leaves.add(leaves[0], leaves[1]).unwrap();
     for leaf in leaves.iter().skip(2) {
         accumulator = too_many_leaves.add(accumulator, *leaf).unwrap();
     }
+    clear_float_policy_for_unchecked_planner_fixture(&mut too_many_leaves);
     let rejected = too_many_leaves
         .execution_plan_for_outputs(&[accumulator])
         .unwrap()
@@ -2121,13 +2549,14 @@ fn bounded_add_sub_identity_respects_step_and_leaf_limits() {
 #[test]
 fn bounded_add_sub_relu_respects_step_and_leaf_limits() {
     let mut graph = Graph::default();
-    let left = graph.input(vec![1], PcuScalarType::F32).unwrap();
-    let right = graph.input(vec![1], PcuScalarType::F32).unwrap();
+    let left = graph.input(vec![1], PcuScalarType::F64).unwrap();
+    let right = graph.input(vec![1], PcuScalarType::F64).unwrap();
     let mut accumulator = graph.add(left, right).unwrap();
     for _ in 0..7 {
         accumulator = graph.sub(accumulator, right).unwrap();
     }
     let within_limit = graph.relu(accumulator).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut graph);
     let accepted = graph
         .execution_plan_for_outputs(&[within_limit])
         .unwrap()
@@ -2139,13 +2568,14 @@ fn bounded_add_sub_relu_respects_step_and_leaf_limits() {
     assert_eq!(accepted.bounded_pointwise_fusion_groups()[0].steps.len(), 8);
 
     let mut over_limit_graph = Graph::default();
-    let first = over_limit_graph.input(vec![1], PcuScalarType::F32).unwrap();
-    let second = over_limit_graph.input(vec![1], PcuScalarType::F32).unwrap();
+    let first = over_limit_graph.input(vec![1], PcuScalarType::F64).unwrap();
+    let second = over_limit_graph.input(vec![1], PcuScalarType::F64).unwrap();
     let mut accumulator = over_limit_graph.add(first, second).unwrap();
     for _ in 0..8 {
         accumulator = over_limit_graph.sub(accumulator, second).unwrap();
     }
     let output = over_limit_graph.relu(accumulator).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut over_limit_graph);
     let rejected = over_limit_graph
         .execution_plan_for_outputs(&[output])
         .unwrap()
@@ -2160,7 +2590,7 @@ fn bounded_add_sub_relu_respects_step_and_leaf_limits() {
     let values = (0..5)
         .map(|_| {
             too_many_leaves_graph
-                .input(vec![1], PcuScalarType::F32)
+                .input(vec![1], PcuScalarType::F64)
                 .unwrap()
         })
         .collect::<Vec<_>>();
@@ -2173,6 +2603,7 @@ fn bounded_add_sub_relu_respects_step_and_leaf_limits() {
         };
     }
     let output = too_many_leaves_graph.relu(accumulator).unwrap();
+    clear_float_policy_for_unchecked_planner_fixture(&mut too_many_leaves_graph);
     let rejected = too_many_leaves_graph
         .execution_plan_for_outputs(&[output])
         .unwrap()

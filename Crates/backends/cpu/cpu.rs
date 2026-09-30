@@ -1,7 +1,7 @@
 //! Opt-in CPU execution oracle for the bounded scalar Dispatch and U32 Stream profiles.
 //!
 //! The implementation is split by semantic concern: integer maps, floating-point maps,
-//! stream transforms, and f32 program validation/execution.
+//! stream transforms, checked F32/F64 invocation maps, and explicit unchecked float oracles.
 
 #![no_std]
 
@@ -28,6 +28,16 @@ mod stream;
 mod typed_conversion;
 #[path = "cpu/validation.rs"]
 mod validation;
+
+#[path = "checked_float/checked_float.rs"]
+mod checked_float;
+#[rustfmt::skip]
+pub use checked_float::{
+    PcuCheckedFloatReference,
+    PcuCheckedFloatReferenceError,
+    PcuCheckedF32Reference,
+    PcuCheckedF64Reference,
+};
 
 const VALUE_SLOTS: usize = 256;
 
@@ -342,6 +352,7 @@ mod tests {
                     outcome,
                     Err(super::PcuU32MapReferenceError::Fault(
                         fusion_pcu::PcuExecutionFault {
+                            recovered: false,
                             kind: fusion_pcu::PcuExecutionFaultKind::DivideByZero,
                             invocation_id: 3
                         }
@@ -519,6 +530,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuU64MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: 3,
             }))
@@ -882,6 +894,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                 invocation_id: 2,
             }))
@@ -923,6 +936,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                 invocation_id: 0,
             }))
@@ -964,6 +978,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI16MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: 0,
             }))
@@ -1042,6 +1057,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI32MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                 invocation_id: 2,
             }))
@@ -1083,6 +1099,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI32MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                 invocation_id: 0,
             }))
@@ -1124,6 +1141,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI32MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: 0,
             }))
@@ -1202,6 +1220,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                 invocation_id: 2,
             }))
@@ -1243,6 +1262,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                 invocation_id: 0,
             }))
@@ -1284,6 +1304,7 @@ mod tests {
                 PcuInvocationParameters::empty()
             ),
             Err(super::PcuI64MapReferenceError::Fault(PcuExecutionFault {
+                recovered: false,
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: 0,
             }))
@@ -1524,6 +1545,7 @@ mod tests {
                 assert_eq!(
                     result,
                     Err(super::PcuU16MapReferenceError::Fault(PcuExecutionFault {
+                        recovered: false,
                         kind: PcuExecutionFaultKind::DivideByZero,
                         invocation_id: 3
                     }))
@@ -1672,7 +1694,8 @@ mod tests {
                     result,
                     Err(super::PcuU8MapReferenceError::Fault(PcuExecutionFault {
                         kind: PcuExecutionFaultKind::DivideByZero,
-                        invocation_id: if extent.is_some() { 3 } else { 1 }
+                        invocation_id: if extent.is_some() { 3 } else { 1 },
+                        recovered: false,
                     }))
                 );
             } else {
@@ -1824,13 +1847,15 @@ mod tests {
                     result,
                     Err(super::PcuI8MapReferenceError::Fault(PcuExecutionFault {
                         kind: PcuExecutionFaultKind::DivideByZero,
-                        invocation_id: if extent.is_some() { 3 } else { 1 }
+                        invocation_id: if extent.is_some() { 3 } else { 1 },
+                        recovered: false,
                     }))
                 );
             } else if b.iter().all(|value| *value == -1) {
                 assert_eq!(
                     result,
                     Err(super::PcuI8MapReferenceError::Fault(PcuExecutionFault {
+                        recovered: false,
                         kind: PcuExecutionFaultKind::SignedDivisionOverflow,
                         invocation_id: 0,
                     }))

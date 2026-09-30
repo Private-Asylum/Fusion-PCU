@@ -6,6 +6,7 @@ use core::{
     num::NonZeroU32,
 };
 use std::error::Error;
+use crate::owned_dispatch::FaultWordState;
 
 #[rustfmt::skip]
 use fusion_pcu::{
@@ -270,6 +271,7 @@ pub struct RocmPreparedHostKernel {
     memory: RocmMemoryProvider,
     pool: PcuMemoryPoolId,
     fault_word: Option<DeviceBuffer>,
+    fault_word_state: FaultWordState,
     slots: Vec<HostBindingSlot>,
     bindings: Vec<PcuOwnedBinding<DeviceBuffer>>,
     poisoned: bool,
@@ -332,6 +334,7 @@ impl PcuHostKernelBackend for RocmOwnedDispatchBackend {
             memory: self.memory_provider(pool),
             pool,
             fault_word,
+            fault_word_state: FaultWordState::NeedsReset,
             slots,
             bindings: Vec::with_capacity(binding_count),
             poisoned: false,
@@ -480,8 +483,9 @@ impl RocmPreparedHostKernel {
         }
 
         let submission = if let Some(fault_word) = self.fault_word.as_mut() {
+            let reset_fault_word = self.fault_word_state.begin_submission();
             self.dispatch
-                .submit_with_fault_word(&self.bindings, fault_word)
+                .submit_with_fault_word_state(&self.bindings, fault_word, reset_fault_word)
         } else {
             self.dispatch.submit(&self.bindings)
         };
@@ -506,15 +510,19 @@ impl RocmPreparedHostKernel {
             }
         };
         self.bindings.clear();
-        match outcome {
-            PcuCompletionOutcome::Succeeded => {}
+        if self.fault_word.is_some() {
+            self.fault_word_state = FaultWordState::after_terminal(outcome);
+        }
+        let recovered_fault = match outcome {
+            PcuCompletionOutcome::Succeeded => None,
+            PcuCompletionOutcome::Fault(fault) if fault.recovered => Some(fault),
             PcuCompletionOutcome::Fault(fault) => {
                 return Err(RocmHostKernelError::CheckedExecutionFault(fault));
             }
             PcuCompletionOutcome::Failed => {
                 return Err(RocmHostKernelError::CheckedExecutionFailed);
             }
-        }
+        };
 
         for (slot, requirement) in requirements.iter().enumerate() {
             let Some(argument) = arguments
@@ -543,6 +551,9 @@ impl RocmPreparedHostKernel {
                 self.slots[slot].resource = None;
                 return Err(RocmHostKernelError::Memory(error));
             }
+        }
+        if let Some(fault) = recovered_fault {
+            return Err(RocmHostKernelError::CheckedExecutionFault(fault));
         }
         Ok(())
     }

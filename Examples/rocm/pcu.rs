@@ -81,32 +81,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let candidates = rank_devices(&available, preferred)?;
     let bindings = grid_stride_add_bindings();
     let builder = grid_stride_add::<COUNT>(&bindings)?;
-    let kernel = builder.ir();
-    let submission = PcuDispatchSubmission {
-        kernel: &kernel,
-        shape: PcuInvocationShape::invocations(NonZeroU32::new(INVOCATIONS).expect("nonzero")),
-    };
     let mut selection_failures = Vec::new();
-    let mut opened = None;
-    for candidate in candidates {
-        match RocmOwnedDispatchBackend::open(&rocm, candidate.reference, 64) {
-            Ok(session) => {
-                match session.prepare_dispatch_owned(submission, PcuInvocationParameters::empty()) {
-                    Ok(prepared) => {
-                        opened = Some((session, candidate.clone(), prepared));
-                        break;
+    let opened = builder.with_ir(|kernel| {
+        let submission = PcuDispatchSubmission {
+            kernel,
+            shape: PcuInvocationShape::invocations(NonZeroU32::new(INVOCATIONS).expect("nonzero")),
+        };
+        let mut opened = None;
+        for candidate in candidates {
+            match RocmOwnedDispatchBackend::open(&rocm, candidate.reference, 64) {
+                Ok(session) => {
+                    match session
+                        .prepare_dispatch_owned(submission, PcuInvocationParameters::empty())
+                    {
+                        Ok(prepared) => {
+                            opened = Some((session, candidate.clone(), prepared));
+                            break;
+                        }
+                        Err(error) => selection_failures.push(format!(
+                            "device {} dispatch preparation: {error:?}",
+                            candidate.reference.id
+                        )),
                     }
-                    Err(error) => selection_failures.push(format!(
-                        "device {} dispatch preparation: {error:?}",
-                        candidate.reference.id
-                    )),
+                }
+                Err(error) => {
+                    selection_failures
+                        .push(format!("device {} open: {error}", candidate.reference.id));
                 }
             }
-            Err(error) => {
-                selection_failures.push(format!("device {} open: {error}", candidate.reference.id));
-            }
         }
-    }
+        opened
+    });
     let (session, selected, prepared) = opened.ok_or_else(|| {
         format!(
             "no ROCm device could prepare the dispatch: {}",

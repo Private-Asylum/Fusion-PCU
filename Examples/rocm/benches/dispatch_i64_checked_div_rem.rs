@@ -820,6 +820,11 @@ fn verify_fault(
             divisors[first] = -1;
             divisors[second] = -1;
         }
+        fusion_pcu::PcuExecutionFaultKind::ArithmeticOverflow
+        | fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow
+        | fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand => {
+            unreachable!("division benchmark only creates division faults")
+        }
     }
     let mut pcu_lhs = backend.allocate(n * 8)?;
     let mut pcu_rhs = backend.allocate(n * 8)?;
@@ -886,8 +891,13 @@ fn verify_fault(
     let fault_tag = match fault_kind {
         fusion_pcu::PcuExecutionFaultKind::DivideByZero => 1,
         fusion_pcu::PcuExecutionFaultKind::SignedDivisionOverflow => 2,
+        fusion_pcu::PcuExecutionFaultKind::ArithmeticOverflow
+        | fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow
+        | fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand => {
+            unreachable!("division benchmark only creates division faults")
+        }
     };
-    let expected = (expected_id << 2) | fault_tag;
+    let expected = (expected_id << 3) | fault_tag;
     if u64::from_le_bytes(word) != expected {
         return Err(format!(
             "native first-fault word was {}, expected {expected}",
@@ -926,7 +936,7 @@ fn native_source(extent: u32, invocations: u32, grid_stride: bool) -> String {
     };
     let close = "}";
     format!(
-        "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void native_checked_i64_div_rem(const long long* a,const long long* b,long long* q,long long* r,unsigned long long* fault_word) {{\nunsigned int base=blockIdx.x*blockDim.x+threadIdx.x; if (base >= {invocations}u) return; {iteration} if (b[i] == 0) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 2u) | 1ull); }} else if (a[i] == (-9223372036854775807LL - 1LL) && b[i] == -1) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 2u) | 2ull); }} else {{ q[i]=a[i]/b[i]; r[i]=a[i]%b[i]; }} {close} }}\n"
+        "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void native_checked_i64_div_rem(const long long* a,const long long* b,long long* q,long long* r,unsigned long long* fault_word) {{\nunsigned int base=blockIdx.x*blockDim.x+threadIdx.x; if (base >= {invocations}u) return; {iteration} if (b[i] == 0) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 3u) | 1ull); }} else if (a[i] == (-9223372036854775807LL - 1LL) && b[i] == -1) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 3u) | 2ull); }} else {{ q[i]=a[i]/b[i]; r[i]=a[i]%b[i]; }} {close} }}\n"
     )
 }
 

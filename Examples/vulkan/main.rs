@@ -151,23 +151,22 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
 
     let bindings = parallel_float_kernel_bindings();
     let builder = parallel_float_kernel::<ELEMENT_COUNT>(&bindings).map_err(ExampleError::Pcu)?;
-    let kernel = builder.ir();
     let runtime = PcuRuntime::auto().map_err(ExampleError::Runner)?;
     let invocations = NonZeroU32::new(INVOCATIONS).ok_or(ExampleError::BufferTooLarge)?;
-    let dispatch = {
+    let dispatch = builder.with_ir(|kernel| {
         let mut invocation_bindings =
             parallel_float_invocation_bindings(&source, &bias, &mut output);
         runtime
             .submit_dispatch(
                 PcuDispatchSubmission {
-                    kernel: &kernel,
+                    kernel,
                     shape: PcuInvocationShape::invocations(invocations),
                 },
                 &mut invocation_bindings,
                 PcuInvocationParameters::empty(),
             )
-            .map_err(ExampleError::Runner)?
-    };
+            .map_err(ExampleError::Runner)
+    })?;
     verify_parallel_float_output(&source, &bias, &output)?;
     let sample_output = last_output_sample(&output)?;
 

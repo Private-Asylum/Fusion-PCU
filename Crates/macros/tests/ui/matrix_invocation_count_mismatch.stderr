@@ -2,7 +2,7 @@ error[E0080]: evaluation panicked: PCU invocation count must equal matrix rows t
  --> tests/ui/matrix_invocation_count_mismatch.rs:5:1
   |
 5 | #[pcu_dispatch(invocations = R * C + 1)]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `kernel::<2, 3>::{constant#1}` failed here
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `__kernel_with_float_underflow_policy::<2, 3>::{constant#1}` failed here
 
 note: erroneous constant encountered
  --> tests/ui/matrix_invocation_count_mismatch.rs:5:1
@@ -12,8 +12,10 @@ note: erroneous constant encountered
   |
   = note: this note originates in the attribute macro `pcu_dispatch` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-note: the above error was encountered while instantiating `fn kernel::<2, 3>`
-  --> tests/ui/matrix_invocation_count_mismatch.rs:16:13
-   |
-16 |     let _ = kernel::<2, 3>(&bindings);
-   |             ^^^^^^^^^^^^^^^^^^^^^^^^^
+note: the above error was encountered while instantiating `fn __kernel_with_float_underflow_policy::<2, 3>`
+ --> tests/ui/matrix_invocation_count_mismatch.rs:5:1
+  |
+5 | #[pcu_dispatch(invocations = R * C + 1)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the attribute macro `pcu_dispatch` (in Nightly builds, run with -Z macro-backtrace for more info)

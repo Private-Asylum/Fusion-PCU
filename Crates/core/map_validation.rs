@@ -3,6 +3,9 @@
 //! The public per-profile modules remain available at the crate root for compatibility, while
 //! their implementation files live together under `map_validation/`.
 
+mod checked_float_binary_validation;
+mod checked_float_conversion_map_validation;
+mod checked_float_map_validation;
 pub mod f16_bf16_identity_validation;
 pub mod f32_map_validation;
 pub mod f64_map_validation;
@@ -11,6 +14,7 @@ pub mod i32_map_validation;
 pub mod i64_map_validation;
 pub mod i8_map_validation;
 mod integer_map_validation;
+pub use integer_map_validation::{validate_integer_checked_binary_kernel, IntegerMapValidationError};
 pub mod scalar_identity_validation;
 pub mod typed_dispatch;
 pub mod u16_map_validation;
@@ -21,6 +25,9 @@ pub mod u64_map_validation;
 pub mod u8_map_validation;
 
 pub use f32_map_validation::*;
+pub use checked_float_binary_validation::*;
+pub use checked_float_map_validation::*;
+pub use checked_float_conversion_map_validation::*;
 pub use f64_map_validation::*;
 pub use f16_bf16_identity_validation::*;
 pub use i16_map_validation::*;

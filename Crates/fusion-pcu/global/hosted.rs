@@ -2,15 +2,14 @@
 
 use core::any::TypeId;
 use std::ffi::OsString;
-#[rustfmt::skip]
-use core::sync::atomic::{
-    AtomicU64,
-    Ordering,
-};
+use core::sync::atomic::Ordering;
 use std::cell::RefCell;
 use std::rc::Rc;
 use super::session::RocmSession;
-use std::sync::RwLock;
+use super::policy;
+#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", not(feature = "cuda")))]
+use super::policy::PolicySnapshot;
 
 #[rustfmt::skip]
 use fusion_pcu_rocm::{
@@ -43,36 +42,6 @@ use super::{
     PcuHostCallSite,
     PcuHostPreparation,
 };
-
-struct PolicySnapshot {
-    generation: u64,
-    policy: PcuExecutionPolicy,
-}
-static GENERATION: AtomicU64 = AtomicU64::new(1);
-static POLICY: RwLock<PolicySnapshot> = RwLock::new(PolicySnapshot {
-    generation: 1,
-    policy: PcuExecutionPolicy {
-        backend: super::PcuBackendChoice::Automatic,
-        device: None,
-        cache_capacity: 64,
-        block_size: 256,
-        score_device: super::default_device_score,
-    },
-});
-
-pub(super) fn configure(policy: PcuExecutionPolicy) -> Result<(), PcuExecutionError> {
-    let mut state = POLICY
-        .write()
-        .map_err(|_| PcuExecutionError::PolicyUnavailable)?;
-    state.generation = state
-        .generation
-        .checked_add(1)
-        .ok_or(PcuExecutionError::PolicyUnavailable)?;
-    state.policy = policy;
-    GENERATION.store(state.generation, Ordering::Release);
-    drop(state);
-    Ok(())
-}
 
 struct Entry {
     specialization: TypeId,
@@ -139,6 +108,14 @@ pub(super) struct Preparation {
 }
 
 impl Preparation {
+    pub(super) const fn float_underflow_policy(&self) -> crate::PcuFloatUnderflowPolicy {
+        self.policy.float_underflow
+    }
+
+    pub(super) const fn range_policy(&self) -> crate::PcuRangePolicy {
+        self.policy.range_policy
+    }
+
     pub(super) fn prepare(
         &mut self,
         kernel: &PcuDispatchKernelIr<'_>,
@@ -151,7 +128,7 @@ impl Preparation {
                 session
                     .backend()
                     .prepare_host_kernel(kernel)
-                    .map_err(PcuExecutionError::Execution)
+                    .map_err(PcuExecutionError::from)
             },
         )?;
         self.session = Some(session);
@@ -223,23 +200,15 @@ fn prepare_in_arena<R>(
     Err(PcuExecutionError::NoCompatibleDevice(rejected))
 }
 
-#[cfg(feature = "tensor")]
-pub(super) fn current_generation() -> u64 {
-    GENERATION.load(Ordering::Acquire)
-}
-
 /// Cold typed graph preparation shares the same selection and retained roots as Dispatch.
-#[cfg(feature = "tensor")]
+#[cfg(all(feature = "tensor", not(feature = "cuda")))]
 pub(super) fn prepare_tensor<R>(
+    snapshot: PolicySnapshot,
     affinity: Option<&Rc<RocmSession>>,
     prepare: impl FnMut(&Rc<RocmSession>) -> Result<R, PcuExecutionError>,
 ) -> Result<(Rc<RocmSession>, R, u64, usize), PcuExecutionError> {
-    let snapshot = POLICY
-        .read()
-        .map_err(|_| PcuExecutionError::PolicyUnavailable)?;
     let policy = snapshot.policy;
     let generation = snapshot.generation;
-    drop(snapshot);
     STATE
         .try_with(|state| {
             let mut state = state
@@ -288,11 +257,12 @@ pub(super) fn call_host(
         entry
             .prepared
             .call(arguments)
-            .map_err(PcuExecutionError::Execution)
+            .map_err(PcuExecutionError::from)
     })
 }
 
 /// Convert one fixed source argument set without a heap-backed projection vector.
+#[cfg(not(feature = "cuda"))]
 pub(super) fn call_arguments<'a, const N: usize>(
     site: &PcuHostCallSite,
     specialization: TypeId,
@@ -312,6 +282,7 @@ pub(super) fn call_arguments<'a, const N: usize>(
             PcuCallArgumentKind::ResidentRead(resident) => resident.session,
             PcuCallArgumentKind::ResidentWrite(resident) => resident.session,
         };
+        let super::resident::Session::Rocm(root) = root.as_ref();
         if affinity.is_some_and(|selected| !Rc::ptr_eq(selected, root)) {
             return Err(super::argument_error(
                 super::PcuArgumentError::SessionMismatch,
@@ -326,11 +297,13 @@ pub(super) fn call_arguments<'a, const N: usize>(
         let binding = match kind {
             PcuCallArgumentKind::Host(host) => RocmMixedHostArgument::Host(host),
             PcuCallArgumentKind::ResidentRead(resident) => {
-                RocmMixedHostArgument::Resident(resident.argument)
+                let super::resident::DeviceArgument::Rocm(argument) = resident.argument;
+                RocmMixedHostArgument::Resident(argument)
             }
             PcuCallArgumentKind::ResidentWrite(resident) => {
                 guards[index] = Some(resident.guard);
-                RocmMixedHostArgument::Resident(resident.argument)
+                let super::resident::DeviceArgument::Rocm(argument) = resident.argument;
+                RocmMixedHostArgument::Resident(argument)
             }
         };
         index += 1;
@@ -350,7 +323,7 @@ pub(super) fn call_arguments<'a, const N: usize>(
                 guard.mark_known_partial();
             }
         }
-        result.map_err(PcuExecutionError::Execution)
+        result.map_err(PcuExecutionError::from)
     })
 }
 
@@ -366,7 +339,7 @@ fn with_entry<R>(
             let mut state = state
                 .try_borrow_mut()
                 .map_err(|_| PcuExecutionError::ReentrantCall)?;
-            let generation = GENERATION.load(Ordering::Acquire);
+            let generation = policy::generation();
             if state.generation != generation {
                 state.entries.clear();
                 state.arena = SessionArena::default();
@@ -378,12 +351,9 @@ fn with_entry<R>(
                 slot
             } else {
                 // Only cold misses take a policy lock; the snapshot pins preparation preferences.
-                let snapshot = POLICY
-                    .read()
-                    .map_err(|_| PcuExecutionError::PolicyUnavailable)?;
+                let snapshot = policy::snapshot()?;
                 let policy = snapshot.policy;
                 let snapshot_generation = snapshot.generation;
-                drop(snapshot);
                 if state.generation != snapshot_generation {
                     state.entries.clear();
                     state.arena = SessionArena::default();
@@ -400,22 +370,27 @@ fn with_entry<R>(
                     };
                 }
                 let mut context = PcuHostPreparation {
-                    inner: Preparation {
+                    #[cfg(feature = "cuda")]
+                    cuda: None,
+                    inner: Some(Preparation {
                         policy,
                         prepared: None,
                         session: None,
                         affinity: affinity.map(Rc::clone),
                         arena: core::mem::take(&mut state.arena),
-                    },
+                    }),
                 };
                 let preparation_result = prepare(&mut context);
                 let prepared = context
                     .inner
+                    .as_mut()
+                    .expect("ROCm preparation context")
                     .prepared
                     .take()
                     .ok_or(PcuExecutionError::PreparationDidNotProduceKernel);
-                let session = context.inner.session.take();
-                state.arena = core::mem::take(&mut context.inner.arena);
+                let inner = context.inner.as_mut().expect("ROCm preparation context");
+                let session = inner.session.take();
+                state.arena = core::mem::take(&mut inner.arena);
                 drop(context);
                 preparation_result?;
                 let prepared = prepared?;

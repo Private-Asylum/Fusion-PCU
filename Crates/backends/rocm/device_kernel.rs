@@ -6,6 +6,7 @@ use core::{
     num::NonZeroU32,
 };
 use std::error::Error;
+use crate::owned_dispatch::FaultWordState;
 
 #[rustfmt::skip]
 use fusion_pcu::{
@@ -148,6 +149,7 @@ impl From<RocmOwnedDispatchError> for RocmDeviceKernelError {
 pub struct RocmPreparedDeviceKernel {
     dispatch: RocmPreparedDispatch,
     fault_word: Option<crate::DeviceBuffer>,
+    fault_word_state: FaultWordState,
     bindings: Vec<PcuOwnedBinding<crate::DeviceBuffer>>,
     poisoned: bool,
 }
@@ -182,6 +184,7 @@ impl PcuDeviceKernelBackend for RocmOwnedDispatchBackend {
         Ok(RocmPreparedDeviceKernel {
             dispatch,
             fault_word,
+            fault_word_state: FaultWordState::NeedsReset,
             bindings: Vec::with_capacity(kernel.bindings.len()),
             poisoned: false,
         })
@@ -282,8 +285,9 @@ impl PcuPreparedDeviceKernel for RocmPreparedDeviceKernel {
             ));
         }
         let submission = if let Some(fault_word) = self.fault_word.as_mut() {
+            let reset_fault_word = self.fault_word_state.begin_submission();
             self.dispatch
-                .submit_with_fault_word(&self.bindings, fault_word)
+                .submit_with_fault_word_state(&self.bindings, fault_word, reset_fault_word)
         } else {
             self.dispatch.submit(&self.bindings)
         };
@@ -306,6 +310,9 @@ impl PcuPreparedDeviceKernel for RocmPreparedDeviceKernel {
             }
         };
         self.bindings.clear();
+        if self.fault_word.is_some() {
+            self.fault_word_state = FaultWordState::after_terminal(outcome);
+        }
         match outcome {
             PcuCompletionOutcome::Succeeded => Ok(()),
             PcuCompletionOutcome::Fault(fault) => {

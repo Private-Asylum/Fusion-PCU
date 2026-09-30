@@ -5,17 +5,30 @@
 #[rustfmt::skip]
 use alloc::{
     vec,
+    vec::Vec,
 };
 #[rustfmt::skip]
 use super::{
     BinaryOp,
     Graph,
     Tensor,
+    TensorElement,
     TensorError,
     TensorValue,
     ValueId,
 };
 use crate::core::PcuScalarType;
+#[rustfmt::skip]
+use crate::{
+    PcuFloatUnderflowPolicy,
+    PcuNumericalMode,
+};
+use crate::scalar_checked::PcuCheckedInteger;
+use crate::scalar_checked_float::PcuCheckedFloat;
+
+#[path = "reference/strict_matmul/strict_matmul.rs"]
+mod strict_matmul;
+use strict_matmul::checked_matmul;
 
 pub(super) const fn unsupported_value(
     graph_id: u64,
@@ -42,28 +55,48 @@ pub(super) fn binary_value(
     right: &TensorValue,
     output: ValueId,
     operation: BinaryOp,
+    float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
 ) -> Result<TensorValue, TensorError> {
     match (left, right) {
-        (TensorValue::F32(left), TensorValue::F32(right)) => {
-            let result = binary(left, right, |a, b| match operation {
-                BinaryOp::Add => a + b,
-                BinaryOp::Sub => a - b,
-                BinaryOp::Mul => a * b,
-            });
-            Ok(TensorValue::F32(result))
+        (TensorValue::F32(left), TensorValue::F32(right)) => checked_float_value(
+            left,
+            right,
+            output,
+            operation,
+            float_underflow_policy.unwrap_or_default(),
+        )
+        .map(TensorValue::F32),
+        (TensorValue::F64(left), TensorValue::F64(right)) => checked_float_value(
+            left,
+            right,
+            output,
+            operation,
+            float_underflow_policy.unwrap_or_default(),
+        )
+        .map(TensorValue::F64),
+        (TensorValue::U8(left), TensorValue::U8(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::U8)
         }
-        (TensorValue::F64(left), TensorValue::F64(right)) => {
-            let data = left
-                .data
-                .iter()
-                .zip(&right.data)
-                .map(|(a, b)| match operation {
-                    BinaryOp::Add => a + b,
-                    BinaryOp::Sub => a - b,
-                    BinaryOp::Mul => a * b,
-                })
-                .collect();
-            Ok(TensorValue::F64(Tensor::new(left.shape.clone(), data)?))
+        (TensorValue::U16(left), TensorValue::U16(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::U16)
+        }
+        (TensorValue::U32(left), TensorValue::U32(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::U32)
+        }
+        (TensorValue::U64(left), TensorValue::U64(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::U64)
+        }
+        (TensorValue::I8(left), TensorValue::I8(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::I8)
+        }
+        (TensorValue::I16(left), TensorValue::I16(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::I16)
+        }
+        (TensorValue::I32(left), TensorValue::I32(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::I32)
+        }
+        (TensorValue::I64(left), TensorValue::I64(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::I64)
         }
         (left, right) if left.scalar_type() != right.scalar_type() => {
             Err(TensorError::ScalarTypeMismatch {
@@ -80,16 +113,109 @@ pub(super) fn binary_value(
     }
 }
 
+fn checked_float_value<T: PcuCheckedFloat + TensorElement>(
+    left: &Tensor<T>,
+    right: &Tensor<T>,
+    output: ValueId,
+    operation: BinaryOp,
+    underflow_policy: PcuFloatUnderflowPolicy,
+) -> Result<Tensor<T>, TensorError> {
+    let data = left
+        .data
+        .iter()
+        .zip(&right.data)
+        .enumerate()
+        .map(|(element_index, (left, right))| {
+            let result = match operation {
+                BinaryOp::Add => left.pcu_checked_add_with_policy(*right, underflow_policy),
+                BinaryOp::Sub => left.pcu_checked_sub_with_policy(*right, underflow_policy),
+                BinaryOp::Mul => left.pcu_checked_mul_with_policy(*right, underflow_policy),
+                BinaryOp::Div => left.pcu_checked_div_with_policy(*right, underflow_policy),
+            };
+            result.map_err(|kind| TensorError::ArithmeticFault {
+                value: output,
+                element_index,
+                kind,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Tensor {
+        shape: left.shape.clone(),
+        data,
+        known_uniform_value: None,
+    })
+}
+
+fn checked_integer_value<T: PcuCheckedInteger>(
+    left: &Tensor<T>,
+    right: &Tensor<T>,
+    output: ValueId,
+    operation: BinaryOp,
+) -> Result<Tensor<T>, TensorError> {
+    let data = left
+        .data
+        .iter()
+        .zip(&right.data)
+        .enumerate()
+        .map(|(element_index, (left, right))| {
+            let result = match operation {
+                BinaryOp::Add => left.pcu_checked_add(*right),
+                BinaryOp::Sub => left.pcu_checked_sub(*right),
+                BinaryOp::Mul => left.pcu_checked_mul(*right),
+                BinaryOp::Div => {
+                    return Err(unsupported_value(output.graph_id, output.index, T::TYPE));
+                }
+            };
+            result.map_err(|kind| TensorError::ArithmeticFault {
+                value: output,
+                element_index,
+                kind,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Tensor {
+        shape: left.shape.clone(),
+        data,
+        known_uniform_value: None,
+    })
+}
+
 pub(super) fn relu_value(input: &TensorValue, output: ValueId) -> Result<TensorValue, TensorError> {
     match input {
-        TensorValue::F32(tensor) => Ok(TensorValue::F32(Tensor::new(
-            tensor.shape.clone(),
-            tensor.data.iter().map(|value| value.max(0.0)).collect(),
-        )?)),
-        TensorValue::F64(tensor) => Ok(TensorValue::F64(Tensor::new(
-            tensor.shape.clone(),
-            tensor.data.iter().map(|value| value.max(0.0)).collect(),
-        )?)),
+        TensorValue::F32(tensor) => {
+            let data = tensor
+                .data
+                .iter()
+                .enumerate()
+                .map(|(element_index, value)| {
+                    value
+                        .pcu_checked_relu()
+                        .map_err(|kind| TensorError::ArithmeticFault {
+                            value: output,
+                            element_index,
+                            kind,
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(TensorValue::F32(Tensor::new(tensor.shape.clone(), data)?))
+        }
+        TensorValue::F64(tensor) => {
+            let data = tensor
+                .data
+                .iter()
+                .enumerate()
+                .map(|(element_index, value)| {
+                    value
+                        .pcu_checked_relu()
+                        .map_err(|kind| TensorError::ArithmeticFault {
+                            value: output,
+                            element_index,
+                            kind,
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(TensorValue::F64(Tensor::new(tensor.shape.clone(), data)?))
+        }
         other => Err(unsupported_value(
             output.graph_id,
             output.index,
@@ -134,20 +260,40 @@ pub(super) fn matmul_value(
     transpose_left: bool,
     transpose_right: bool,
     output: ValueId,
+    numerical_mode: PcuNumericalMode,
+    underflow_policy: PcuFloatUnderflowPolicy,
 ) -> Result<TensorValue, TensorError> {
     match (left, right) {
-        (TensorValue::F32(left), TensorValue::F32(right)) => Ok(TensorValue::F32(matmul(
-            left,
-            right,
-            transpose_left,
-            transpose_right,
-        ))),
-        (TensorValue::F64(left), TensorValue::F64(right)) => Ok(TensorValue::F64(matmul_f64(
-            left,
-            right,
-            transpose_left,
-            transpose_right,
-        ))),
+        (TensorValue::F32(left), TensorValue::F32(right)) => {
+            Ok(TensorValue::F32(match numerical_mode {
+                PcuNumericalMode::Strict => checked_matmul(
+                    left,
+                    right,
+                    transpose_left,
+                    transpose_right,
+                    output,
+                    underflow_policy,
+                    0.0,
+                )?,
+                PcuNumericalMode::Boundary => matmul(left, right, transpose_left, transpose_right),
+            }))
+        }
+        (TensorValue::F64(left), TensorValue::F64(right)) => {
+            Ok(TensorValue::F64(match numerical_mode {
+                PcuNumericalMode::Strict => checked_matmul(
+                    left,
+                    right,
+                    transpose_left,
+                    transpose_right,
+                    output,
+                    underflow_policy,
+                    0.0,
+                )?,
+                PcuNumericalMode::Boundary => {
+                    matmul_f64(left, right, transpose_left, transpose_right)
+                }
+            }))
+        }
         (left, right) if left.scalar_type() != right.scalar_type() => {
             Err(TensorError::ScalarTypeMismatch {
                 value: output,
@@ -311,3 +457,11 @@ pub(super) fn matmul_f64(
 pub(super) const fn mean_denominator(element_count: usize) -> f32 {
     element_count as f32
 }
+
+#[cfg(test)]
+#[path = "reference/integer_tests.rs"]
+mod integer_tests;
+
+#[cfg(test)]
+#[path = "reference/float_tests.rs"]
+mod float_tests;

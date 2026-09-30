@@ -38,7 +38,7 @@ fn sum_relu(left: &[f64], right: &[f64]) -> Result<PcuTensor<f64>, PcuExecutionE
     Ok(activate(&(left + right))?)
 }
 
-#[pcu]
+#[pcu(flag(strict))]
 fn matrix<const R: usize, const K: usize, const C: usize>(
     left: &[[f64; K]; R],
     right: &[[f64; C]; K],
@@ -106,7 +106,7 @@ fn f64_source_owners_preserve_precision_current_inputs_and_root_lifetime() {
 
 #[test]
 #[cfg(feature = "rocm")]
-#[ignore = "requires a working ROCm device with FP64 and rocBLAS"]
+#[ignore = "requires a working ROCm device with FP64 and HIPRTC"]
 fn f64_source_matmul_uses_double_precision_and_const_shapes() {
     let _guard = POLICY_TEST_LOCK.lock().unwrap();
     global::use_defaults().unwrap();
@@ -127,7 +127,7 @@ fn f64_source_matmul_uses_double_precision_and_const_shapes() {
 }
 
 #[test]
-#[cfg(not(feature = "rocm"))]
+#[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
 fn f64_source_never_substitutes_host_execution_for_a_disabled_backend() {
     assert!(matches!(
         retain(&[16_777_217.0_f64]),

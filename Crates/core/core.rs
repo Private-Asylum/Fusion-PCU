@@ -17,12 +17,27 @@ use core::ops::{
 };
 
 /// Kind of deterministic arithmetic fault reported by a completed execution.
+///
+/// Floating range classification references IEEE Std 754-2019, clauses 7.4/7.5.
+/// PCU's default error delivery and finite-input restriction are separate policies;
+/// these variants do not represent every IEEE exception or status flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuExecutionFaultKind {
-    /// An integer division or remainder used a zero divisor.
+    /// An integer division/remainder or checked floating division used a zero divisor.
+    /// Floating zero-divisor rejection is PCU policy; IEEE clauses 7.2/7.3
+    /// distinguish invalid zero/zero from division of finite nonzero operands by zero.
     DivideByZero,
+    /// An integer result exceeded its maximum, or floating-point rounding exceeded
+    /// the finite exponent range (for either sign).
+    ArithmeticOverflow,
+    /// An integer result fell below its minimum, or a floating result violated the
+    /// resolved underflow policy (tiny and inexact under the IEEE default).
+    ArithmeticUnderflow,
     /// Signed division or remainder evaluated the minimum value with divisor `-1`.
     SignedDivisionOverflow,
+    /// Checked floating arithmetic received a NaN or infinity operand.
+    /// This is a PCU finite-input policy violation, not necessarily IEEE clause 7.2 invalid arithmetic.
+    InvalidFloatingOperand,
 }
 
 /// A deterministic arithmetic fault attributed to the first affected logical invocation.
@@ -30,6 +45,9 @@ pub enum PcuExecutionFaultKind {
 pub struct PcuExecutionFault {
     pub kind: PcuExecutionFaultKind,
     pub invocation_id: u64,
+    /// True when execution completed with a defined continuation value after this fault.
+    /// This does not by itself imply that a graph produced or published a fresh owner.
+    pub recovered: bool,
 }
 
 /// Scalar element types surfaced by the current PCU core.

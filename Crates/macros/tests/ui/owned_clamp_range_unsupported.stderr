@@ -1,0 +1,5 @@
+error: `flag(clamp_range)` is not supported on owned tensor composition helpers yet
+ --> tests/ui/owned_clamp_range_unsupported.rs:4:1
+  |
+4 | fn unsupported(input: &[f32]) -> Result<pcu_alias::PcuTensor<f32>, pcu_alias::PcuExecutionError> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

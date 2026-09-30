@@ -1,0 +1,5 @@
+error: duplicate `pcu` numerical mode flag
+ --> tests/ui/numerical_mode_duplicate.rs:3:26
+  |
+3 | #[pcu(flag(strict), flag(strict))]
+  |                          ^^^^^^

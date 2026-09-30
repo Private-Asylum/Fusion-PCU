@@ -23,7 +23,12 @@ use fusion_pcu::{
     PcuValueTypeCaps,
 };
 
-use super::{RocmTensorExecutionError, TensorDispatchKind, TensorPointwiseScalarType};
+#[rustfmt::skip]
+use super::{
+    RocmTensorExecutionError,
+    TensorDispatchKind,
+    TensorPointwiseScalarType,
+};
 #[rustfmt::skip]
 use fusion_pcu::dialect::tensor::{
     TensorBinaryOperand,
@@ -466,6 +471,7 @@ const fn consuming_binary_profile(
             CONSUMING_MUL_F64_RIGHT,
             PcuValueTypeCaps::FLOAT64,
         ),
+        _ => panic!("checked integer tensors cannot use consuming binary profiles"),
     }
 }
 
@@ -488,6 +494,7 @@ pub(super) fn consuming_relu_kernel(
             CONSUMING_RELU_F64_OPS,
             PcuValueTypeCaps::FLOAT64,
         ),
+        _ => panic!("checked integer tensors cannot use consuming ReLU profiles"),
     };
     PcuDispatchKernelIr {
         id: fusion_pcu::PcuKernelId(id),
@@ -694,11 +701,38 @@ const RELU_OPS: &[PcuDispatchOp<'static>] = &[
     PcuDispatchOp::Control(PcuDispatchControlOp::Return),
 ];
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn kernel(
     kind: TensorDispatchKind,
     logical_count: u32,
     scalar_mask: u8,
 ) -> Result<PcuDispatchKernelIr<'static>, RocmTensorExecutionError> {
+    if let Some(op) = kind.checked_float_op() {
+        if scalar_mask != 0 {
+            return Err(RocmTensorExecutionError::InvalidPointwiseProfile);
+        }
+        return super::checked_float::kernel(
+            op,
+            fusion_pcu::PcuScalarType::F64,
+            fusion_pcu::PcuFloatUnderflowPolicy::default(),
+            logical_count,
+        );
+    }
+    if kind == TensorDispatchKind::Relu && scalar_mask == 0 {
+        return super::checked_float::relu_kernel(
+            fusion_pcu::PcuScalarType::F64,
+            fusion_pcu::PcuFloatUnderflowPolicy::default(),
+            logical_count,
+        );
+    }
+    if kind == TensorDispatchKind::AddRelu {
+        return super::checked_float::add_relu_kernel(
+            fusion_pcu::PcuScalarType::F64,
+            fusion_pcu::PcuFloatUnderflowPolicy::default(),
+            logical_count,
+            scalar_mask,
+        );
+    }
     let (name, id, bindings, ops) = match kind {
         TensorDispatchKind::Add => (
             "tensor_add_f64",
@@ -750,6 +784,15 @@ pub(super) fn kernel(
             return Err(RocmTensorExecutionError::UnsupportedScalarType(
                 fusion_pcu::PcuScalarType::F64,
             ));
+        }
+        TensorDispatchKind::CheckedIntegerAdd
+        | TensorDispatchKind::CheckedIntegerSub
+        | TensorDispatchKind::CheckedIntegerMul
+        | TensorDispatchKind::CheckedFloatAdd
+        | TensorDispatchKind::CheckedFloatSub
+        | TensorDispatchKind::CheckedFloatMul
+        | TensorDispatchKind::CheckedFloatDiv => {
+            return Err(RocmTensorExecutionError::InvalidPointwiseProfile);
         }
     };
 
@@ -822,7 +865,6 @@ mod tests {
         PcuScalar,
         PcuTargetDescriptor,
         PcuValueType,
-        PcuValueTypeCaps,
     };
     use core::num::NonZeroU32;
 
@@ -1055,97 +1097,6 @@ mod tests {
         read_f64_output(&output, 3)
     }
 
-    #[allow(clippy::too_many_lines)] // Keep the explicit F64 Min IR and real dispatch lifecycle together.
-    fn dispatch_min(session: &RocmOwnedDispatchBackend, values: &[f64]) -> Vec<f64> {
-        assert_eq!(values.len(), 3);
-        let bindings_ir = [
-            fusion_pcu::PcuBinding::value(
-                Some("input"),
-                0,
-                0,
-                fusion_pcu::PcuBindingStorageClass::Storage,
-                PcuBindingAccess::ReadOnly,
-                PcuValueType::f64(),
-            ),
-            fusion_pcu::PcuBinding::value(
-                Some("output"),
-                0,
-                1,
-                fusion_pcu::PcuBindingStorageClass::Storage,
-                PcuBindingAccess::WriteOnly,
-                PcuValueType::f64(),
-            ),
-        ];
-        let ops = [
-            fusion_pcu::PcuDispatchOp::Data(fusion_pcu::PcuDispatchDataOp::Constant {
-                result: fusion_pcu::PcuDispatchValueId(4),
-                value: fusion_pcu::PcuParameterValue::F64(0.0_f64.to_bits()),
-            }),
-            fusion_pcu::PcuDispatchOp::Data(fusion_pcu::PcuDispatchDataOp::BindingLoad {
-                result: fusion_pcu::PcuDispatchValueId(1),
-                binding: PcuBindingRef::new(0, 0),
-                index: fusion_pcu::PcuDispatchIndex::InvocationId,
-            }),
-            fusion_pcu::PcuDispatchOp::Data(fusion_pcu::PcuDispatchDataOp::Alu {
-                value_type: PcuValueType::f64(),
-                result: fusion_pcu::PcuDispatchValueId(3),
-                op: fusion_pcu::PcuDispatchAluOp::Min,
-                lhs: fusion_pcu::PcuDispatchValueId(1),
-                rhs: fusion_pcu::PcuDispatchValueId(4),
-            }),
-            fusion_pcu::PcuDispatchOp::Data(fusion_pcu::PcuDispatchDataOp::BindingStore {
-                binding: PcuBindingRef::new(0, 1),
-                index: fusion_pcu::PcuDispatchIndex::InvocationId,
-                value: fusion_pcu::PcuDispatchValueId(3),
-            }),
-            fusion_pcu::PcuDispatchOp::Control(fusion_pcu::PcuDispatchControlOp::Return),
-        ];
-        let kernel = fusion_pcu::PcuDispatchKernelIr {
-            id: fusion_pcu::PcuKernelId(0x4644_0050),
-            entry: fusion_pcu::PcuDispatchEntryPoint {
-                name: "tensor_min_f64_hardware_test",
-                logical_shape: [3, 1, 1],
-            },
-            bindings: &bindings_ir,
-            ports: &[],
-            parameters: &[],
-            ops: &ops,
-            type_caps: PcuValueTypeCaps::FLOAT64.union(PcuValueTypeCaps::SCALAR_VALUES),
-            feature_caps: fusion_pcu::PcuDispatchFeatureCaps::default(),
-        };
-        let mut input = session.allocate(3 * 8).unwrap();
-        input.copy_from(&f64_bytes(values)).unwrap();
-        let output_buffer = session.allocate(3 * 8).unwrap();
-        let bindings = [
-            session
-                .binding(
-                    PcuBindingRef::new(0, 0),
-                    PcuBindingAccess::ReadOnly,
-                    PcuBindingType::Value(PcuValueType::f64()),
-                    input,
-                )
-                .unwrap(),
-            session
-                .binding(
-                    PcuBindingRef::new(0, 1),
-                    PcuBindingAccess::WriteOnly,
-                    PcuBindingType::Value(PcuValueType::f64()),
-                    output_buffer,
-                )
-                .unwrap(),
-        ];
-        let prepared = session
-            .prepare_dispatch(PcuDispatchSubmission {
-                kernel: &kernel,
-                shape: fusion_pcu::PcuInvocationShape::invocations(NonZeroU32::new(3).unwrap()),
-            })
-            .unwrap();
-        let mut completion = prepared.submit(&bindings).unwrap();
-        completion.wait().unwrap();
-        let output = bindings.into_iter().nth(1).unwrap().into_resource();
-        read_f64_output(&output, 3)
-    }
-
     fn assert_bits(actual: &[f64], expected: &[f64]) {
         assert_eq!(
             actual
@@ -1236,7 +1187,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a working ROCm device and F64 pointwise support"]
-    fn consuming_binary_reuses_exclusive_rhs() {
+    fn consuming_checked_binary_keeps_exclusive_rhs_unchanged() {
         let (_discovery, session) = device_session();
         let pool = PcuMemoryPoolId(0x4352_0002);
         let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
@@ -1274,15 +1225,15 @@ mod tests {
                 &mut memory,
             )
             .expect("consume right operand");
-        assert_eq!(
+        assert_ne!(
             result.buffer().resource().allocation_identity_for_test(),
             donor_identity,
-            "exclusive right-hand donor should be physically reused"
+            "checked arithmetic needs fresh output until its fault status is known"
         );
         let mut observed = [0.0_f64; 4];
         session
             .download_buffer(pool, result.buffer(), &mut observed)
-            .expect("read reused result");
+            .expect("read checked result");
         assert_bits(&observed, &[-7.0, -16.0, 7.0, -4.0]);
         let mut unchanged_left = [0.0_f64; 4];
         session
@@ -1346,7 +1297,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a working ROCm device and F64 pointwise support"]
-    fn consuming_binary_pair_uses_second_exclusive_donor() {
+    fn consuming_checked_binary_pair_keeps_second_exclusive_input_unchanged() {
         let (_discovery, session) = device_session();
         let pool = PcuMemoryPoolId(0x4352_0004);
         let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
@@ -1376,15 +1327,15 @@ mod tests {
                 &mut memory,
             )
             .expect("second exclusive input should be selected as donor");
-        assert_eq!(
+        assert_ne!(
             result.buffer().resource().allocation_identity_for_test(),
             second_identity,
-            "the first shared input must be skipped in favor of the exclusive second input"
+            "checked arithmetic cannot donate an input before fault publication"
         );
         let mut observed = [0.0_f64; 4];
         session
             .download_buffer(pool, result.buffer(), &mut observed)
-            .expect("read reused result");
+            .expect("read checked result");
         assert_bits(&observed, &[9.0, 18.0, 27.0, 36.0]);
         let mut unchanged_alias = [0.0_f64; 4];
         session
@@ -1455,76 +1406,69 @@ mod tests {
         let (_discovery, session) = device_session();
         let exact = 16_777_217.0_f64;
 
-        for mask in 0..=3 {
-            let left = if mask & 1 == 0 {
-                vec![exact, -3.5, 4.25]
-            } else {
-                vec![exact]
-            };
-            let right = if mask & 2 == 0 {
-                vec![1.0, 2.25, -8.0]
-            } else {
-                vec![1.0]
-            };
-            let actual = dispatch_binary(&session, TensorDispatchKind::Add, mask, &left, &right);
-            let expected = (0..3)
-                .map(|index| {
-                    left[if mask & 1 == 0 { index } else { 0 }]
-                        + right[if mask & 2 == 0 { index } else { 0 }]
-                })
-                .collect::<Vec<_>>();
-            assert_bits(&actual, &expected);
-        }
+        let actual = dispatch_binary(
+            &session,
+            TensorDispatchKind::CheckedFloatAdd,
+            0,
+            &[exact, -3.5, 4.25],
+            &[1.0, 2.25, -8.0],
+        );
+        assert_bits(&actual, &[16_777_218.0, -1.25, -3.75]);
 
         let actual = dispatch_binary(
             &session,
-            TensorDispatchKind::Sub,
-            0b10,
+            TensorDispatchKind::CheckedFloatSub,
+            0,
             &[exact, -3.5, 4.25],
-            &[16_777_216.0],
+            &[16_777_216.0, 16_777_216.0, 16_777_216.0],
         );
         assert_bits(&actual, &[1.0, -16_777_219.5, -16_777_211.75]);
 
         let actual = dispatch_binary(
             &session,
-            TensorDispatchKind::Mul,
+            TensorDispatchKind::CheckedFloatMul,
             0,
             &[exact, 0.5, -1.25],
             &[1.0, 2.0, -4.0],
         );
         assert_bits(&actual, &[exact, 1.0, 5.0]);
 
-        let actual = dispatch_binary(&session, TensorDispatchKind::Mul, 0b11, &[1.5], &[2.0]);
+        let actual = dispatch_binary(
+            &session,
+            TensorDispatchKind::CheckedFloatMul,
+            0,
+            &[1.5, 1.5, 1.5],
+            &[2.0, 2.0, 2.0],
+        );
         assert_bits(&actual, &[3.0, 3.0, 3.0]);
 
         let actual = dispatch_relu(&session, &[-exact, exact, -1.0]);
         assert_bits(&actual, &[0.0, exact, 0.0]);
 
-        let actual = dispatch_binary(
+        let sum = dispatch_binary(
             &session,
-            TensorDispatchKind::AddRelu,
+            TensorDispatchKind::CheckedFloatAdd,
             0,
             &[exact, -3.5, 4.25],
             &[1.0, 2.25, -8.0],
         );
+        let actual = dispatch_relu(&session, &sum);
         assert_bits(&actual, &[16_777_218.0, 0.0, 0.0]);
 
-        let actual = dispatch_binary(
+        let sum = dispatch_binary(
             &session,
-            TensorDispatchKind::AddRelu,
-            0b10,
+            TensorDispatchKind::CheckedFloatAdd,
+            0,
             &[-exact, exact, 2.0],
-            &[1.0],
+            &[1.0, 1.0, 1.0],
         );
+        let actual = dispatch_relu(&session, &sum);
         assert_bits(&actual, &[0.0, 16_777_218.0, 3.0]);
-
-        let actual = dispatch_min(&session, &[-16_777_217.0, -1.0e-10, 3.0]);
-        assert_bits(&actual, &[-16_777_217.0, -1.0e-10, 0.0]);
     }
 
     #[test]
     #[ignore = "requires a working ROCm device"]
-    fn consuming_relu_reuses_only_exclusive_input_storage() {
+    fn consuming_relu_keeps_input_storage_fresh_even_when_exclusive() {
         let (_discovery, session) = device_session();
         let pool = PcuMemoryPoolId(0x4352_0001);
         let assessor = RocmTensorAssessor::new(&session).expect("tensor assessor");
@@ -1556,10 +1500,10 @@ mod tests {
         let result = assessor
             .execute_owned_program_consuming_input(&prepared, source, pool, &mut memory)
             .expect("consume exclusive input");
-        assert_eq!(
+        assert_ne!(
             result.buffer().resource().allocation_identity_for_test(),
             source_identity,
-            "the terminal ReLU should return the exact consumed allocation"
+            "checked ReLU must keep a fresh output so failure cannot overwrite the input"
         );
         let mut observed = [0.0_f32; 4];
         session

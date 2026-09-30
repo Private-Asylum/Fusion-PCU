@@ -278,6 +278,14 @@ impl PcuDispatchOpCaps {
     pub const BINDING_LOAD_ELEMENT_ZERO: Self = Self(1 << 51);
     /// Checked scalar integer quotient and remainder with completion-level domain faults.
     pub const ALU_CHECKED_DIV_REM: Self = Self(1 << 52);
+    /// Checked scalar integer Add/Sub/Mul with completion-level overflow faults.
+    pub const ALU_CHECKED_INTEGER_BINARY: Self = Self(1 << 53);
+    /// Checked F32/F64 Add/Sub/Mul/Div with an explicit floating underflow policy.
+    pub const ALU_CHECKED_FLOAT_BINARY: Self = Self(1 << 54);
+    /// Checked binary64-to-binary32 conversion with an explicit underflow policy.
+    pub const ALU_CHECKED_FLOAT_CONVERT: Self = Self(1 << 55);
+    /// Checked F32/F64 unary operations with explicit underflow and range policies.
+    pub const ALU_CHECKED_FLOAT_UNARY: Self = Self(1 << 56);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -286,7 +294,7 @@ impl PcuDispatchOpCaps {
 
     #[must_use]
     pub const fn all() -> Self {
-        Self((1u64 << 53) - 1)
+        Self((1u64 << 57) - 1)
     }
 
     #[must_use]

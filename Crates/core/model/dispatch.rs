@@ -31,6 +31,7 @@ use crate::{
     PcuPort,
     PcuInvocationModel,
     PcuIrKind,
+    PcuFloatUnderflowPolicy,
 };
 
 #[rustfmt::skip]
@@ -48,6 +49,59 @@ pub use crate::ir::{
     PcuTraceRayOp,
     PcuValueOp as PcuDispatchValueOp,
 };
+
+/// Exact integer operation admitted by checked binary arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuDispatchIntegerBinaryOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// Exact binary operation admitted by checked F32/F64 arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuDispatchFloatBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// Exact unary operation admitted by checked F32/F64 arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuDispatchFloatUnaryOp {
+    /// PCU `ReLU` selection: finite positive values pass through, while finite nonpositive values
+    /// produce positive zero. Nonfinite inputs are rejected.
+    Relu,
+}
+
+/// Checked floating conversion implemented by the core scalar conversion contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcuDispatchCheckedFloatConversion {
+    /// Convert finite binary64 to binary32 using RN-even; nonfinite input or overflow faults.
+    F64ToF32,
+    /// Widen finite binary32 to binary64 exactly; nonfinite input faults.
+    F32ToF64,
+}
+
+impl PcuDispatchCheckedFloatConversion {
+    #[must_use]
+    pub const fn source_type(self) -> PcuValueType {
+        match self {
+            Self::F64ToF32 => PcuValueType::Scalar(crate::PcuScalarType::F64),
+            Self::F32ToF64 => PcuValueType::Scalar(crate::PcuScalarType::F32),
+        }
+    }
+
+    #[must_use]
+    pub const fn target_type(self) -> PcuValueType {
+        match self {
+            Self::F64ToF32 => PcuValueType::Scalar(crate::PcuScalarType::F32),
+            Self::F32ToF64 => PcuValueType::Scalar(crate::PcuScalarType::F64),
+        }
+    }
+}
+
 pub use crate::validation::PcuSampleValidationError;
 
 const DEFAULT_OP_CAPACITY: usize = 32;
@@ -69,6 +123,8 @@ impl PcuDispatchFeatureCaps {
     pub const READ_ONLY_RESOURCES: Self = Self(1 << 1);
     pub const INLINE_PARAMETERS: Self = Self(1 << 2);
     pub const COOPERATIVE_SCRATCHPAD: Self = Self(1 << 3);
+    /// Requires defined recovery from checked floating result-range faults.
+    pub const RANGE_CLAMP: Self = Self(1 << 4);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -192,6 +248,44 @@ pub enum PcuDispatchDataOp {
         lhs: PcuDispatchValueId,
         rhs: PcuDispatchValueId,
     },
+    /// Computes checked exact-width integer Add/Sub/Mul. Overflow or underflow is an
+    /// execution fault reported by completion; the result payload is undefined on fault.
+    CheckedIntegerBinary {
+        value_type: PcuValueType,
+        op: PcuDispatchIntegerBinaryOp,
+        result: PcuDispatchValueId,
+        lhs: PcuDispatchValueId,
+        rhs: PcuDispatchValueId,
+    },
+    /// Computes checked floating Add/Sub/Mul/Div. Non-finite inputs and zero divisors fault;
+    /// underflow classification and range recovery follow the independent policies carried here.
+    CheckedFloatBinary {
+        value_type: PcuValueType,
+        op: PcuDispatchFloatBinaryOp,
+        underflow_policy: PcuFloatUnderflowPolicy,
+        range_policy: crate::PcuRangePolicy,
+        result: PcuDispatchValueId,
+        lhs: PcuDispatchValueId,
+        rhs: PcuDispatchValueId,
+    },
+    /// Selects a checked floating unary result using explicit underflow and range policies.
+    CheckedFloatUnary {
+        value_type: PcuValueType,
+        op: PcuDispatchFloatUnaryOp,
+        underflow_policy: PcuFloatUnderflowPolicy,
+        range_policy: crate::PcuRangePolicy,
+        result: PcuDispatchValueId,
+        value: PcuDispatchValueId,
+    },
+    /// Converts floating values with checked invalid, overflow, and underflow faults, following
+    /// the independent arithmetic policies carried here.
+    CheckedFloatConvert {
+        conversion: PcuDispatchCheckedFloatConversion,
+        underflow_policy: PcuFloatUnderflowPolicy,
+        range_policy: crate::PcuRangePolicy,
+        result: PcuDispatchValueId,
+        value: PcuDispatchValueId,
+    },
     BindingStore {
         binding: PcuBindingRef,
         index: PcuDispatchIndex,
@@ -215,6 +309,10 @@ impl PcuDispatchDataOp {
             Self::Convert { .. } => PcuDispatchOpCaps::VALUE_CAST,
             Self::Alu { op, .. } => op.support_flag(),
             Self::CheckedDivRem { .. } => PcuDispatchOpCaps::ALU_CHECKED_DIV_REM,
+            Self::CheckedIntegerBinary { .. } => PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY,
+            Self::CheckedFloatBinary { .. } => PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY,
+            Self::CheckedFloatUnary { .. } => PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY,
+            Self::CheckedFloatConvert { .. } => PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT,
             Self::BindingStore { .. } => PcuDispatchOpCaps::BINDING_STORE,
         }
     }
@@ -569,7 +667,10 @@ impl PcuDispatchKernelIr<'_> {
                 }
                 PcuDispatchOp::Data(
                     PcuDispatchDataOp::Alu { value_type, .. }
-                    | PcuDispatchDataOp::CheckedDivRem { value_type, .. },
+                    | PcuDispatchDataOp::CheckedDivRem { value_type, .. }
+                    | PcuDispatchDataOp::CheckedIntegerBinary { value_type, .. }
+                    | PcuDispatchDataOp::CheckedFloatBinary { value_type, .. }
+                    | PcuDispatchDataOp::CheckedFloatUnary { value_type, .. },
                 ) => {
                     required = required.union(PcuValueTypeCaps::for_value_type(*value_type));
                 }
@@ -578,11 +679,21 @@ impl PcuDispatchKernelIr<'_> {
                         .union(PcuValueTypeCaps::for_value_type(conversion.source_type()))
                         .union(PcuValueTypeCaps::for_value_type(conversion.target_type()));
                 }
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+                    conversion, ..
+                }) => {
+                    required = required
+                        .union(PcuValueTypeCaps::for_value_type(conversion.source_type()))
+                        .union(PcuValueTypeCaps::for_value_type(conversion.target_type()));
+                }
                 PcuDispatchOp::GridStrideLoop { body, .. } => {
                     for body_op in *body {
                         if let PcuDispatchOp::Data(
                             PcuDispatchDataOp::Alu { value_type, .. }
-                            | PcuDispatchDataOp::CheckedDivRem { value_type, .. },
+                            | PcuDispatchDataOp::CheckedDivRem { value_type, .. }
+                            | PcuDispatchDataOp::CheckedIntegerBinary { value_type, .. }
+                            | PcuDispatchDataOp::CheckedFloatBinary { value_type, .. }
+                            | PcuDispatchDataOp::CheckedFloatUnary { value_type, .. },
                         ) = body_op
                         {
                             required =
@@ -590,6 +701,15 @@ impl PcuDispatchKernelIr<'_> {
                         }
                         if let PcuDispatchOp::Data(PcuDispatchDataOp::Convert {
                             conversion, ..
+                        }) = body_op
+                        {
+                            required = required
+                                .union(PcuValueTypeCaps::for_value_type(conversion.source_type()))
+                                .union(PcuValueTypeCaps::for_value_type(conversion.target_type()));
+                        }
+                        if let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+                            conversion,
+                            ..
                         }) = body_op
                         {
                             required = required
@@ -607,7 +727,11 @@ impl PcuDispatchKernelIr<'_> {
     /// Returns the dispatch-only feature floor required to execute this kernel honestly.
     #[must_use]
     pub fn required_feature_support(&self) -> PcuDispatchFeatureCaps {
-        self.derived_feature_support().union(self.feature_caps)
+        let mut required = self.derived_feature_support().union(self.feature_caps);
+        if contains_range_clamp(self.ops) {
+            required = required.union(PcuDispatchFeatureCaps::RANGE_CLAMP);
+        }
+        required
     }
 
     fn derived_feature_support(&self) -> PcuDispatchFeatureCaps {
@@ -640,6 +764,27 @@ impl PcuDispatchKernelIr<'_> {
     }
 }
 
+fn contains_range_clamp(ops: &[PcuDispatchOp<'_>]) -> bool {
+    ops.iter().any(|op| match op {
+        PcuDispatchOp::Data(
+            PcuDispatchDataOp::CheckedFloatBinary {
+                range_policy: crate::PcuRangePolicy::Clamp,
+                ..
+            }
+            | PcuDispatchDataOp::CheckedFloatUnary {
+                range_policy: crate::PcuRangePolicy::Clamp,
+                ..
+            }
+            | PcuDispatchDataOp::CheckedFloatConvert {
+                range_policy: crate::PcuRangePolicy::Clamp,
+                ..
+            },
+        ) => true,
+        PcuDispatchOp::GridStrideLoop { body, .. } => contains_range_clamp(body),
+        _ => false,
+    })
+}
+
 const fn collect_alu_support(
     op: PcuDispatchOp<'_>,
     support: &mut crate::PcuDispatchScalarAluSupport,
@@ -662,11 +807,57 @@ const fn collect_alu_support(
                 .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
         );
     }
+    if let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary { value_type, .. }) = op {
+        let scalar = value_type.scalar_type();
+        *support = support.with(
+            scalar,
+            support
+                .for_scalar(scalar)
+                .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY),
+        );
+    }
+    if let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary { value_type, .. }) = op {
+        let scalar = value_type.scalar_type();
+        *support = support.with(
+            scalar,
+            support
+                .for_scalar(scalar)
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY),
+        );
+    }
+    if let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary { value_type, .. }) = op {
+        let scalar = value_type.scalar_type();
+        *support = support.with(
+            scalar,
+            support
+                .for_scalar(scalar)
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        );
+    }
+    if let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert { conversion, .. }) = op {
+        let source = conversion.source_type().scalar_type();
+        let target = conversion.target_type().scalar_type();
+        *support = support.with(
+            source,
+            support
+                .for_scalar(source)
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT),
+        );
+        *support = support.with(
+            target,
+            support
+                .for_scalar(target)
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT),
+        );
+    }
 }
 
 const fn is_non_scalar_alu_type(op: PcuDispatchOp<'_>) -> bool {
     matches!(op, PcuDispatchOp::Data(PcuDispatchDataOp::Alu { value_type, .. }
-        | PcuDispatchDataOp::CheckedDivRem { value_type, .. })
+        | PcuDispatchDataOp::CheckedDivRem { value_type, .. }
+        | PcuDispatchDataOp::CheckedIntegerBinary { value_type, .. }
+        | PcuDispatchDataOp::CheckedFloatBinary { value_type, .. }
+        | PcuDispatchDataOp::CheckedFloatUnary { value_type, .. })
         if !matches!(value_type, PcuValueType::Scalar(_)))
 }
 
@@ -1016,6 +1207,7 @@ mod tests {
         PcuDispatchOp,
         PcuDispatchValueId,
         PcuDispatchPolicyCaps,
+        PcuFloatUnderflowPolicy,
         PcuIrKind,
         PcuKernel,
         PcuKernelIrContract,
@@ -1127,6 +1319,288 @@ mod tests {
             loop_kernel
                 .required_instruction_support()
                 .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+        );
+    }
+
+    #[test]
+    fn checked_float_capabilities_follow_the_declared_scalar_type() {
+        let ops = [PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+            value_type: PcuValueType::f64(),
+            op: crate::PcuDispatchFloatBinaryOp::Mul,
+            underflow_policy: PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: crate::PcuRangePolicy::Reject,
+            result: PcuDispatchValueId(3),
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        })];
+        let kernel = PcuDispatchKernelIr {
+            id: crate::PcuKernelId(5),
+            entry: PcuDispatchEntryPoint {
+                name: "checked-f64-capability",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        assert!(
+            kernel
+                .required_type_support()
+                .contains(PcuValueTypeCaps::FLOAT64)
+        );
+        assert_eq!(
+            kernel
+                .required_scalar_alu_support()
+                .for_scalar(crate::PcuScalarType::F64),
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+        );
+        assert_eq!(
+            kernel
+                .required_scalar_alu_support()
+                .for_scalar(crate::PcuScalarType::F32),
+            PcuDispatchOpCaps::empty()
+        );
+    }
+
+    #[test]
+    fn checked_float_clamp_requires_range_recovery_feature_even_in_nested_regions() {
+        let checked = PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+            value_type: PcuValueType::f32(),
+            op: crate::PcuDispatchFloatBinaryOp::Add,
+            underflow_policy: PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: crate::PcuRangePolicy::Clamp,
+            result: PcuDispatchValueId(3),
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        });
+        let body = [checked];
+        let direct_ops = [
+            checked,
+            PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
+        ];
+        let nested_ops = [
+            PcuDispatchOp::GridStrideLoop {
+                extent: 8,
+                body: &body,
+            },
+            PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
+        ];
+        let direct = PcuDispatchKernelIr {
+            id: crate::PcuKernelId(8),
+            entry: PcuDispatchEntryPoint {
+                name: "range-clamp-direct",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &direct_ops,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        let nested = PcuDispatchKernelIr {
+            entry: PcuDispatchEntryPoint {
+                name: "range-clamp-loop",
+                logical_shape: [1, 1, 1],
+            },
+            ops: &nested_ops,
+            ..direct
+        };
+        assert!(
+            direct
+                .required_feature_support()
+                .contains(PcuDispatchFeatureCaps::RANGE_CLAMP)
+        );
+        assert!(
+            nested
+                .required_feature_support()
+                .contains(PcuDispatchFeatureCaps::RANGE_CLAMP)
+        );
+
+        let reject = PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+            value_type: PcuValueType::f32(),
+            op: crate::PcuDispatchFloatBinaryOp::Add,
+            underflow_policy: PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: crate::PcuRangePolicy::Reject,
+            result: PcuDispatchValueId(3),
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        });
+        assert_ne!(
+            checked, reject,
+            "range policy is part of checked IR identity"
+        );
+        let operation_keys = std::collections::HashSet::from([checked, reject]);
+        assert_eq!(
+            operation_keys.len(),
+            2,
+            "range policy distinguishes cache keys"
+        );
+        let reject_ops = [
+            reject,
+            PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
+        ];
+        let rejecting = PcuDispatchKernelIr {
+            ops: &reject_ops,
+            ..direct
+        };
+        assert!(
+            !rejecting
+                .required_feature_support()
+                .contains(PcuDispatchFeatureCaps::RANGE_CLAMP)
+        );
+    }
+
+    #[test]
+    fn checked_integer_binary_contributes_its_typed_requirement() {
+        let checked = PcuDispatchDataOp::CheckedIntegerBinary {
+            value_type: PcuValueType::i32(),
+            op: super::PcuDispatchIntegerBinaryOp::Add,
+            result: PcuDispatchValueId(3),
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        };
+        assert_eq!(
+            checked.support_flag(),
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+        );
+        let ops = [PcuDispatchOp::Data(checked)];
+        let kernel = PcuDispatchKernelIr {
+            id: crate::PcuKernelId(3),
+            entry: PcuDispatchEntryPoint {
+                name: "checked-integer-binary",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        assert!(
+            kernel
+                .required_instruction_support()
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+        );
+        assert_eq!(
+            kernel
+                .required_scalar_alu_support()
+                .for_scalar(crate::PcuScalarType::I32),
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+        );
+        assert!(
+            kernel
+                .required_type_support()
+                .contains(PcuValueTypeCaps::INT32 | PcuValueTypeCaps::SCALAR_VALUES)
+        );
+    }
+
+    #[test]
+    fn checked_float_binary_advertises_only_f32_checked_support() {
+        let checked = PcuDispatchDataOp::CheckedFloatBinary {
+            value_type: PcuValueType::f32(),
+            op: super::PcuDispatchFloatBinaryOp::Mul,
+            underflow_policy: PcuFloatUnderflowPolicy::RejectSubnormalResult,
+            range_policy: crate::PcuRangePolicy::Reject,
+            result: PcuDispatchValueId(3),
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        };
+        assert_eq!(
+            checked.support_flag(),
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+        );
+        let ops = [PcuDispatchOp::Data(checked)];
+        let kernel = PcuDispatchKernelIr {
+            id: crate::PcuKernelId(4),
+            entry: PcuDispatchEntryPoint {
+                name: "checked-float-binary",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        assert!(
+            kernel
+                .required_instruction_support()
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+        );
+        assert_eq!(
+            kernel
+                .required_scalar_alu_support()
+                .for_scalar(crate::PcuScalarType::F32),
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY,
+        );
+        assert_eq!(
+            kernel
+                .required_scalar_alu_support()
+                .for_scalar(crate::PcuScalarType::F64),
+            PcuDispatchOpCaps::empty(),
+        );
+        assert!(
+            kernel
+                .required_type_support()
+                .contains(PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::SCALAR_VALUES)
+        );
+        assert!(PcuDispatchOpCaps::all().contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY));
+    }
+
+    #[test]
+    fn checked_float_unary_advertises_typed_and_range_policy_support() {
+        let checked = PcuDispatchDataOp::CheckedFloatUnary {
+            value_type: PcuValueType::f64(),
+            op: super::PcuDispatchFloatUnaryOp::Relu,
+            underflow_policy: PcuFloatUnderflowPolicy::RejectSubnormalResult,
+            range_policy: crate::PcuRangePolicy::Clamp,
+            result: PcuDispatchValueId(2),
+            value: PcuDispatchValueId(1),
+        };
+        assert_eq!(
+            checked.support_flag(),
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY
+        );
+        let ops = [PcuDispatchOp::Data(checked)];
+        let kernel = PcuDispatchKernelIr {
+            id: crate::PcuKernelId(5),
+            entry: PcuDispatchEntryPoint {
+                name: "checked-float-unary",
+                logical_shape: [1, 1, 1],
+            },
+            bindings: &[],
+            ports: &[],
+            parameters: &[],
+            ops: &ops,
+            type_caps: PcuValueTypeCaps::empty(),
+            feature_caps: PcuDispatchFeatureCaps::empty(),
+        };
+        assert!(
+            kernel
+                .required_instruction_support()
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+        );
+        assert!(
+            kernel
+                .required_scalar_alu_support()
+                .for_scalar(crate::PcuScalarType::F64)
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+        );
+        assert!(
+            kernel
+                .required_type_support()
+                .contains(PcuValueTypeCaps::FLOAT64 | PcuValueTypeCaps::SCALAR_VALUES)
+        );
+        assert!(
+            kernel
+                .required_feature_support()
+                .contains(PcuDispatchFeatureCaps::RANGE_CLAMP)
         );
     }
 

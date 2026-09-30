@@ -14,6 +14,7 @@ use crate::{
     PcuCapabilitySnapshot,
     PcuContextDescriptor,
     PcuDeviceDescriptor,
+    PcuDeviceFacts,
     PcuExecutorDescriptor,
     PcuMemoryDomainDescriptor,
     PcuObjectRef,
@@ -33,6 +34,7 @@ pub enum PcuDiscoveryOperation {
     MemoryDomains,
     TargetCapabilities,
     DeviceCapabilities,
+    DeviceFacts,
     Executors,
 }
 
@@ -116,6 +118,7 @@ type Domains = for<'a> fn(
     &mut [PcuMemoryDomainDescriptor<'a>],
 ) -> Result<usize, PcuRegistryError>;
 type Caps = fn(*const (), PcuObjectRef) -> Result<PcuCapabilitySnapshot, PcuRegistryError>;
+type Facts = fn(*const (), PcuObjectRef) -> Result<PcuDeviceFacts, PcuRegistryError>;
 type Executors =
     fn(*const (), PcuObjectRef, &mut [PcuExecutorDescriptor]) -> Result<usize, PcuRegistryError>;
 
@@ -128,6 +131,7 @@ struct Vtable {
     domains: Domains,
     target_caps: Caps,
     device_caps: Caps,
+    device_facts: Facts,
     executors: Executors,
 }
 #[derive(Clone, Copy)]
@@ -222,6 +226,7 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
                 domains: domains::<D>,
                 target_caps: target_caps::<D>,
                 device_caps: device_caps::<D>,
+                device_facts: device_facts::<D>,
                 executors: executors::<D>,
             },
         };
@@ -328,6 +333,18 @@ impl<'a, const N: usize> PcuRuntimeDiscoveryRegistry<'a, N> {
     ) -> Result<PcuCapabilitySnapshot, PcuRegistryError> {
         let e = self.find(device.provider)?;
         (e.vtable.device_caps)(e.context, device)
+    }
+    /// Queries optional cold physical-device facts from the reference's provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider is unknown, the reference is invalid, or the query fails.
+    pub fn device_facts(&self, device: PcuObjectRef) -> Result<PcuDeviceFacts, PcuRegistryError> {
+        let e = self.find(device.provider).map_err(|mut error| {
+            error.operation = PcuDiscoveryOperation::DeviceFacts;
+            error
+        })?;
+        (e.vtable.device_facts)(e.context, device)
     }
     /// Enumerates executor descriptors for one discovered object.
     ///
@@ -474,6 +491,17 @@ where
         .device_capabilities(r)
         .map_err(|e| call_error(e, r.provider, PcuDiscoveryOperation::DeviceCapabilities))
 }
+fn device_facts<D: PcuRuntimeDiscovery>(
+    x: *const (),
+    r: PcuObjectRef,
+) -> Result<PcuDeviceFacts, PcuRegistryError>
+where
+    D::Error: fmt::Display,
+{
+    unsafe { cast::<D>(x) }
+        .device_facts(r)
+        .map_err(|e| call_error(e, r.provider, PcuDiscoveryOperation::DeviceFacts))
+}
 fn executors<D: PcuRuntimeDiscovery>(
     x: *const (),
     r: PcuObjectRef,
@@ -585,6 +613,22 @@ mod tests {
         ) -> Result<PcuCapabilitySnapshot, Self::Error> {
             self.target_capabilities(r)
         }
+        fn device_facts(&self, device: PcuObjectRef) -> Result<PcuDeviceFacts, Self::Error> {
+            if device.provider != self.id
+                || device.generation != 1
+                || device.kind != crate::PcuObjectKind::Device
+                || device.id != 0
+            {
+                return Err("invalid device reference");
+            }
+            if self.fail_targets {
+                return Err("facts probe failed");
+            }
+            Ok(PcuDeviceFacts {
+                compute_unit_count: Some(self.id.0),
+                ..PcuDeviceFacts::default()
+            })
+        }
         fn executors(
             &self,
             _: PcuObjectRef,
@@ -592,6 +636,68 @@ mod tests {
         ) -> Result<usize, Self::Error> {
             Ok(0)
         }
+    }
+
+    #[test]
+    fn facts_route_by_provider_and_preserve_validation_and_diagnostics() {
+        let a = Mock {
+            id: PcuProviderId(1),
+            fail_targets: false,
+        };
+        let b = Mock {
+            id: PcuProviderId(2),
+            fail_targets: true,
+        };
+        let mut registry = PcuRuntimeDiscoveryRegistry::<2>::new();
+        registry.register(&a).unwrap();
+        registry.register(&b).unwrap();
+        let device = PcuObjectRef {
+            provider: a.id,
+            generation: 1,
+            kind: crate::PcuObjectKind::Device,
+            id: 0,
+        };
+        assert_eq!(
+            registry.device_facts(device).unwrap().compute_unit_count,
+            Some(1)
+        );
+        let failed = registry
+            .device_facts(PcuObjectRef {
+                provider: b.id,
+                ..device
+            })
+            .unwrap_err();
+        assert_eq!(failed.provider, Some(b.id));
+        assert_eq!(failed.operation, PcuDiscoveryOperation::DeviceFacts);
+        assert_eq!(failed.message(), "facts probe failed");
+        for invalid in [
+            PcuObjectRef {
+                generation: 0,
+                ..device
+            },
+            PcuObjectRef {
+                kind: crate::PcuObjectKind::Context,
+                ..device
+            },
+            PcuObjectRef { id: 1, ..device },
+        ] {
+            let error = registry.device_facts(invalid).unwrap_err();
+            assert_eq!(error.operation, PcuDiscoveryOperation::DeviceFacts);
+            assert_eq!(error.message(), "invalid device reference");
+        }
+        let unknown = registry
+            .device_facts(PcuObjectRef {
+                provider: PcuProviderId(99),
+                ..device
+            })
+            .unwrap_err();
+        assert_eq!(unknown.provider, Some(PcuProviderId(99)));
+        assert_eq!(unknown.operation, PcuDiscoveryOperation::DeviceFacts);
+        assert_eq!(unknown.message(), "unknown provider id");
+        assert_eq!(
+            registry.device_facts(device).unwrap().compute_unit_count,
+            Some(1)
+        );
     }
 
     #[test]

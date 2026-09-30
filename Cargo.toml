@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "Crates/core",
     "Crates/fusion-pcu",
-    "Crates/core",
     "Crates/macros",
     "Crates/backends/rocm",
     "Crates/backends/cuda",
@@ -19,6 +18,7 @@ members = [
     "Crates/backends/opengl",
     "Crates/runner",
     "Examples/rocm",
+    "Examples/cuda",
     "Examples/vulkan",
 ]
 

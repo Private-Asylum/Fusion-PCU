@@ -37,6 +37,10 @@ pub struct Input<'a> {
     pub prepare_error: &'a TokenStream,
     pub bindings_call: TokenStream,
     pub builder_call: TokenStream,
+    pub policy_builder_ident: Ident,
+    pub explicit_policy: Option<TokenStream>,
+    pub explicit_range_policy: Option<TokenStream>,
+    pub supports_float_range: bool,
 }
 
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
@@ -51,6 +55,10 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         prepare_error,
         bindings_call,
         builder_call,
+        policy_builder_ident: _,
+        explicit_policy: _,
+        explicit_range_policy: _,
+        supports_float_range: _,
     } = input;
     let host_prepare_fn = format_ident!("{}_prepare", function_ident);
     let device_prepare_fn = format_ident!("{}_device", host_prepare_fn);

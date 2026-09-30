@@ -6,6 +6,7 @@ mod alloc;
 
 #[rustfmt::skip]
 use std::{
+    any::Any,
     error::Error,
     hint::black_box,
     time::{
@@ -24,6 +25,9 @@ use criterion::{
 use fusion_pcu::{
     PcuBindingRef,
     PcuDeviceBuffer,
+    PcuExecutionError,
+    PcuExecutionFault,
+    PcuExecutionFaultKind,
     PcuHostArgument,
     PcuMemoryPoolId,
 };
@@ -38,7 +42,9 @@ use fusion_pcu_rocm::{
     RocmDiscovery,
     RocmMemoryResource,
     RocmOwnedDispatchBackend,
+    RocmHostKernelError,
     compile_hip_source,
+    lower_dispatch_to_hip_source,
 };
 
 #[pcu(invocations = N)]
@@ -103,7 +109,7 @@ fn run_case<const N: usize>(
 ) -> Result<(), Box<dyn Error>> {
     println!("Typed kernel shape {N} on {device}");
     println!(
-        "Matched complete-writer host boundary: input upload, launch, terminal wait, output readback; neither route uploads old output contents."
+        "Matched checked complete-writer host boundary: input upload, fault reset, launch, terminal wait, fault status and output readback; neither route uploads old output contents."
     );
     let mut host_call = crate::support::cold_once("typed PCU host preparation", || {
         transform_prepare::<N, _>(backend)
@@ -111,9 +117,11 @@ fn run_case<const N: usize>(
     let mut resident_call = crate::support::cold_once("typed PCU resident preparation", || {
         transform_prepare_device::<N, _>(backend)
     })?;
-    let native_source = format!(
-        "#include <hip/hip_runtime.h>\n#pragma clang fp contract(off)\nextern \"C\" __global__ void native_transform(const float* input, float* output) {{ const unsigned int id = blockIdx.x * blockDim.x + threadIdx.x; if (id < {N}u) output[id] = input[id] * 2.0f + 1.0f; }}\n"
-    );
+    let bindings = transform_bindings();
+    let native_ir = transform_ir::<N>(&bindings)?;
+    let native_source = native_ir
+        .with_ir(lower_dispatch_to_hip_source)?
+        .replace("fusion_kernel", "native_transform");
     let image = crate::support::cold_once("native HIP compilation", || {
         compile_hip_source(&native_source, architecture)
     })?;
@@ -124,10 +132,27 @@ fn run_case<const N: usize>(
     let mut cpu_output = vec![0.0_f32; N];
     let initial_output = vec![-5.0_f32; N];
     let mut host_output = initial_output.clone();
-    let mut native_input = runtime.allocate(N * core::mem::size_of::<f32>())?;
+    let native_input = runtime.allocate(N * core::mem::size_of::<f32>())?;
     let native_output = runtime.allocate(N * core::mem::size_of::<f32>())?;
+    let native_fault = runtime.allocate(core::mem::size_of::<u64>())?;
     let mut native_result = vec![0.0_f32; N];
     let grid = u32::try_from(N)?.div_ceil(256);
+    let mut native = NativeContext {
+        input: native_input,
+        output: native_output,
+        fault: native_fault,
+        fault_word_is_sentinel: false,
+        function,
+        stream,
+        grid,
+    };
+
+    preflight_checked_faults::<N, _>(
+        &mut host_call,
+        &mut native,
+        &mut host_output,
+        &mut native_result,
+    )?;
 
     preflight_host::<N, _>(&mut host_call, &mut host_output, &mut cpu_output)?;
     sample_host::<N, _>(
@@ -137,11 +162,7 @@ fn run_case<const N: usize>(
         &mut host_output,
         &mut cpu_output,
         &initial_output,
-        &mut native_input,
-        &native_output,
-        &function,
-        &stream,
-        grid,
+        &mut native,
     )?;
     balanced_host_diagnostic::<N, _>(
         &mut host_call,
@@ -149,22 +170,14 @@ fn run_case<const N: usize>(
         &mut host_output,
         &mut cpu_output,
         &initial_output,
-        &mut native_input,
-        &native_output,
-        &function,
-        &stream,
-        grid,
+        &mut native,
     )?;
     allocation_diagnostic::<N, _>(
         &mut host_call,
         &mut host_output,
         &initial_output,
-        &mut native_input,
-        &native_output,
+        &mut native,
         &mut native_result,
-        &function,
-        &stream,
-        grid,
     )?;
 
     println!("Direct facade allocation control:");
@@ -172,17 +185,11 @@ fn run_case<const N: usize>(
         &mut |input: &[f32], output: &mut [f32]| transform::<N>(input, output),
         &mut host_output,
         &initial_output,
-        &mut native_input,
-        &native_output,
+        &mut native,
         &mut native_result,
-        &function,
-        &stream,
-        grid,
     )?;
     let mut resident_input = backend.upload_buffer(pool, &fresh_input::<N>(0))?;
     let mut resident_output = backend.upload_buffer(pool, &initial_output)?;
-    let mut native_resident_input = runtime.allocate(N * core::mem::size_of::<f32>())?;
-    let native_resident_output = runtime.allocate(N * core::mem::size_of::<f32>())?;
     // Warm up the reusable paths and inspect benchmark-thread Rust allocations around a call.
     host_call(&fresh_input::<N>(1), &mut host_output)?;
     backend.refresh_buffer(pool, &mut resident_input, &fresh_input::<N>(1))?;
@@ -203,13 +210,9 @@ fn run_case<const N: usize>(
         pool,
         &mut resident_input,
         &mut resident_output,
-        &mut native_resident_input,
-        &native_resident_output,
-        &function,
-        &stream,
+        &mut native,
         &mut native_result,
         &mut cpu_output,
-        grid,
     )?;
     Ok(())
 }
@@ -227,6 +230,70 @@ fn preflight_host<const N: usize, E: Error + 'static>(
     Ok(())
 }
 
+fn preflight_checked_faults<const N: usize, E: Error + 'static>(
+    prepared: &mut impl FnMut(&[f32], &mut [f32]) -> Result<(), E>,
+    native: &mut NativeContext,
+    source_output: &mut [f32],
+    native_output: &mut [f32],
+) -> Result<(), Box<dyn Error>> {
+    for (input_value, kind) in [
+        (f32::NAN, PcuExecutionFaultKind::InvalidFloatingOperand),
+        (f32::MAX, PcuExecutionFaultKind::ArithmeticOverflow),
+    ] {
+        let mut input = vec![1.0_f32; N];
+        input[1] = input_value;
+
+        let source_error = transform::<N>(&input, source_output)
+            .expect_err("source checked transform must surface arithmetic faults");
+        let PcuExecutionError::ArithmeticFault(source_fault) = source_error else {
+            panic!("expected source checked-float fault, got {source_error}");
+        };
+        assert_fault(source_fault, kind, 1);
+
+        let prepared_error = prepared(&input, source_output)
+            .expect_err("prepared checked transform must surface arithmetic faults");
+        assert_prepared_fault(&prepared_error, kind, 1);
+
+        let native_error = native_host_call(&input, native_output, native)
+            .expect_err("native checked transform must surface arithmetic faults");
+        let native_error = native_error
+            .downcast::<PcuExecutionError>()
+            .unwrap_or_else(|error| panic!("expected native checked-float fault, got {error}"));
+        let PcuExecutionError::ArithmeticFault(native_fault) = *native_error else {
+            panic!("expected native checked-float fault");
+        };
+        assert_fault(native_fault, kind, 1);
+    }
+
+    let input = fresh_input::<N>(0);
+    let mut expected = vec![0.0_f32; N];
+    fill_oracle(&input, &mut expected);
+    transform::<N>(&input, source_output).expect("source checked retry succeeds");
+    prepared(&input, source_output).map_err(|error| Box::new(error) as Box<dyn Error>)?;
+    native_host_call(&input, native_output, native)?;
+    verify("source checked retry", source_output, &expected)?;
+    verify("native checked retry", native_output, &expected)?;
+    Ok(())
+}
+
+fn assert_fault(fault: PcuExecutionFault, kind: PcuExecutionFaultKind, invocation_id: u64) {
+    assert_eq!(fault.kind, kind);
+    assert_eq!(fault.invocation_id, invocation_id);
+}
+
+fn assert_prepared_fault<E: Error + 'static>(
+    error: &E,
+    kind: PcuExecutionFaultKind,
+    invocation_id: u64,
+) {
+    let Some(RocmHostKernelError::CheckedExecutionFault(fault)) =
+        (error as &dyn Any).downcast_ref::<RocmHostKernelError>()
+    else {
+        panic!("expected prepared checked-float fault, got {error}");
+    };
+    assert_fault(*fault, kind, invocation_id);
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(unsafe_code)]
 // These borrow-only fixtures are clearer separately than nested in one mutable context object.
@@ -239,11 +306,7 @@ fn sample_host<const N: usize, E: Error + 'static>(
     output: &mut [f32],
     oracle: &mut [f32],
     initial: &[f32],
-    native_input: &mut DeviceBuffer,
-    native_output: &DeviceBuffer,
-    function: &HipKernel,
-    stream: &HipStreamHandle,
-    grid: u32,
+    native: &mut NativeContext,
 ) -> Result<(), Box<dyn Error>> {
     // Cold facade resolution/compilation must not enter the warm Criterion interval.
     transform::<N>(&fresh_input::<N>(0), output)?;
@@ -272,16 +335,8 @@ fn sample_host<const N: usize, E: Error + 'static>(
                     } else if target == 1 {
                         transform::<N>(input, &mut *output).expect("direct typed host call");
                     } else {
-                        native_host_call(
-                            input,
-                            &mut *output,
-                            native_input,
-                            native_output,
-                            function,
-                            stream,
-                            grid,
-                        )
-                        .expect("native HIP full host boundary");
+                        native_host_call(input, &mut *output, native)
+                            .expect("native HIP full host boundary");
                     }
                     elapsed += started.elapsed();
                     assert!(
@@ -298,31 +353,89 @@ fn sample_host<const N: usize, E: Error + 'static>(
     Ok(())
 }
 
-#[allow(unsafe_code)]
+struct NativeContext {
+    input: DeviceBuffer,
+    output: DeviceBuffer,
+    fault: DeviceBuffer,
+    fault_word_is_sentinel: bool,
+    function: HipKernel,
+    stream: HipStreamHandle,
+    grid: u32,
+}
+
+impl NativeContext {
+    #[allow(unsafe_code)]
+    fn launch_and_check_fault(&mut self) -> Result<(), Box<dyn Error>> {
+        let reset = !self.fault_word_is_sentinel;
+        // Consume the proof before any launch attempt; only terminal status MAX restores it.
+        self.fault_word_is_sentinel = false;
+        if reset {
+            self.fault.copy_from(&u64::MAX.to_le_bytes())?;
+        }
+        let arguments = [
+            HipKernelArgument::Buffer(&self.input),
+            HipKernelArgument::Buffer(&self.output),
+            HipKernelArgument::Buffer(&self.fault),
+        ];
+        // SAFETY: Generated transform IR declares two f32 buffers plus an 8-byte checked fault
+        // word; direct invocation indices are bounded by the validated logical extent.
+        let mut completion = unsafe {
+            self.function
+                .launch(&self.stream, [self.grid, 1, 1], [256, 1, 1], 0, &arguments)
+        }?;
+        completion.wait()?;
+        drop(completion);
+
+        let mut fault_bytes = [0_u8; core::mem::size_of::<u64>()];
+        self.fault.copy_to(&mut fault_bytes)?;
+        let word = u64::from_le_bytes(fault_bytes);
+        decode_native_fault(word)?;
+        self.fault_word_is_sentinel = true;
+        Ok(())
+    }
+
+    fn readback(&self, output: &mut [f32]) -> Result<(), Box<dyn Error>> {
+        let mut result = PcuHostArgument::read_write(PcuBindingRef::new(0, 0), output);
+        self.output
+            .copy_to(result.bytes_mut().expect("mutable output bytes"))?;
+        Ok(())
+    }
+
+    fn launch_and_readback(&mut self, output: &mut [f32]) -> Result<(), Box<dyn Error>> {
+        self.launch_and_check_fault()?;
+        self.readback(output)
+    }
+}
+
 fn native_host_call(
     input: &[f32],
     output: &mut [f32],
-    native_input: &mut DeviceBuffer,
-    native_output: &DeviceBuffer,
-    function: &HipKernel,
-    stream: &HipStreamHandle,
-    grid: u32,
+    native: &mut NativeContext,
 ) -> Result<(), Box<dyn Error>> {
     let input_view = PcuHostArgument::read(PcuBindingRef::new(0, 0), input);
-    native_input.copy_from(input_view.bytes())?;
-    // This independent native kernel writes every output element without reading old contents.
-    // Match PCU's admitted complete-writer plan: only the input needs an incoming transfer.
-    let arguments = [
-        HipKernelArgument::Buffer(native_input),
-        HipKernelArgument::Buffer(native_output),
-    ];
-    // SAFETY: The HIP source ABI has two f32 buffers and guards every indexed access by N.
-    let mut completion =
-        unsafe { function.launch(stream, [grid, 1, 1], [256, 1, 1], 0, &arguments) }?;
-    completion.wait()?;
-    let mut result = PcuHostArgument::read_write(PcuBindingRef::new(0, 0), output);
-    native_output.copy_to(result.bytes_mut().expect("mutable output bytes"))?;
-    Ok(())
+    native.input.copy_from(input_view.bytes())?;
+    native.launch_and_readback(output)
+}
+
+fn decode_native_fault(word: u64) -> Result<(), Box<dyn Error>> {
+    if word == u64::MAX {
+        return Ok(());
+    }
+    let kind = match word & 0b111 {
+        1 => PcuExecutionFaultKind::DivideByZero,
+        2 => PcuExecutionFaultKind::SignedDivisionOverflow,
+        3 => PcuExecutionFaultKind::ArithmeticOverflow,
+        4 => PcuExecutionFaultKind::ArithmeticUnderflow,
+        5 => PcuExecutionFaultKind::InvalidFloatingOperand,
+        _ => return Err(format!("invalid native checked-fault word {word:#x}").into()),
+    };
+    Err(Box::new(PcuExecutionError::ArithmeticFault(
+        PcuExecutionFault {
+            recovered: false,
+            kind,
+            invocation_id: word >> 3,
+        },
+    )))
 }
 
 // The borrowed fixtures are the inputs to the paired routes and stay explicit at this boundary.
@@ -333,11 +446,7 @@ fn balanced_host_diagnostic<const N: usize, E: Error + 'static>(
     output: &mut [f32],
     oracle: &mut [f32],
     initial: &[f32],
-    native_input: &mut DeviceBuffer,
-    native_output: &DeviceBuffer,
-    function: &HipKernel,
-    stream: &HipStreamHandle,
-    grid: u32,
+    native: &mut NativeContext,
 ) -> Result<(), Box<dyn Error>> {
     const PERMUTATIONS: [[usize; 3]; 6] = [
         [0, 1, 2],
@@ -369,15 +478,7 @@ fn balanced_host_diagnostic<const N: usize, E: Error + 'static>(
                     0 => prepared(input, output)
                         .map_err(|error| Box::new(error) as Box<dyn Error>)?,
                     1 => transform::<N>(input, output)?,
-                    _ => native_host_call(
-                        input,
-                        output,
-                        native_input,
-                        native_output,
-                        function,
-                        stream,
-                        grid,
-                    )?,
+                    _ => native_host_call(input, output, native)?,
                 }
                 let elapsed = started.elapsed();
                 match route {
@@ -435,13 +536,9 @@ fn sample_resident<const N: usize, E: Error + 'static>(
     pool: PcuMemoryPoolId,
     input: &mut PcuDeviceBuffer<f32, RocmMemoryResource>,
     output: &mut PcuDeviceBuffer<f32, RocmMemoryResource>,
-    native_input: &mut DeviceBuffer,
-    native_output: &DeviceBuffer,
-    function: &HipKernel,
-    stream: &HipStreamHandle,
+    native: &mut NativeContext,
     native_result: &mut [f32],
     oracle: &mut [f32],
-    grid: u32,
 ) -> Result<(), Box<dyn Error>> {
     let mut group = criterion.benchmark_group(format!("typed-resident-{N}"));
     group.throughput(Throughput::Elements(u64::try_from(N)?));
@@ -473,28 +570,17 @@ fn sample_resident<const N: usize, E: Error + 'static>(
                     } else {
                         let input_view =
                             PcuHostArgument::read(PcuBindingRef::new(0, 0), &input_values);
-                        native_input
+                        native
+                            .input
                             .copy_from(input_view.bytes())
                             .expect("resident HIP input upload");
-                        let arguments = [
-                            HipKernelArgument::Buffer(native_input),
-                            HipKernelArgument::Buffer(native_output),
-                        ];
-                        // SAFETY: The native kernel and resident PCU kernel have the same extent,
-                        // bindings, and geometry; uploads and readback stay outside this timer.
                         let started = Instant::now();
-                        let mut completion = unsafe {
-                            function.launch(stream, [grid, 1, 1], [256, 1, 1], 0, &arguments)
-                        }
-                        .expect("resident HIP launch");
-                        completion.wait().expect("resident HIP completion");
+                        native
+                            .launch_and_check_fault()
+                            .expect("resident HIP checked launch and fault status");
                         elapsed += started.elapsed();
-                        let mut result = PcuHostArgument::read_write(
-                            PcuBindingRef::new(0, 0),
-                            &mut *native_result,
-                        );
-                        native_output
-                            .copy_to(result.bytes_mut().expect("mutable native result bytes"))
+                        native
+                            .readback(native_result)
                             .expect("resident HIP result download");
                     }
                     verify(label, native_result, oracle)
@@ -507,7 +593,7 @@ fn sample_resident<const N: usize, E: Error + 'static>(
     }
     group.finish();
     // Alternate adjacent routes to check whether sequential Criterion groups hide clock/order
-    // effects. Fresh inputs, uploads, result verification and readback remain outside each timer.
+    // effects. Resident payload readback and verification remain outside each timer.
     let mut pcu_walls = [Duration::ZERO; 32];
     let mut native_walls = [Duration::ZERO; 32];
     let mut paired_ratios = [0.0_f64; 32];
@@ -523,20 +609,11 @@ fn sample_resident<const N: usize, E: Error + 'static>(
                 backend.download_buffer(pool, output, native_result)?;
             } else {
                 let view = PcuHostArgument::read(PcuBindingRef::new(0, 0), &values);
-                native_input.copy_from(view.bytes())?;
-                let arguments = [
-                    HipKernelArgument::Buffer(native_input),
-                    HipKernelArgument::Buffer(native_output),
-                ];
+                native.input.copy_from(view.bytes())?;
                 let started = Instant::now();
-                // SAFETY: Identical native ABI, live allocations and extent as the timed group.
-                let mut completion =
-                    unsafe { function.launch(stream, [grid, 1, 1], [256, 1, 1], 0, &arguments)? };
-                completion.wait()?;
+                native.launch_and_check_fault()?;
                 native_walls[sample] = started.elapsed();
-                let mut result =
-                    PcuHostArgument::read_write(PcuBindingRef::new(0, 0), &mut *native_result);
-                native_output.copy_to(result.bytes_mut().expect("mutable native result bytes"))?;
+                native.readback(native_result)?;
             }
             verify("paired resident diagnostic", native_result, oracle)?;
             black_box(&*native_result);
@@ -594,19 +671,13 @@ fn verify(label: &str, actual: &[f32], expected: &[f32]) -> Result<(), Box<dyn E
 }
 
 #[allow(clippy::too_many_lines)]
-#[allow(unsafe_code)]
 // This one-off diagnostic deliberately compares the same two host-call boundaries.
-#[allow(clippy::too_many_arguments)]
 fn allocation_diagnostic<const N: usize, E: Error + 'static>(
     call: &mut impl FnMut(&[f32], &mut [f32]) -> Result<(), E>,
     pcu_output: &mut [f32],
     initial: &[f32],
-    native_input: &mut DeviceBuffer,
-    native_output: &DeviceBuffer,
+    native: &mut NativeContext,
     native_result: &mut [f32],
-    function: &HipKernel,
-    stream: &HipStreamHandle,
-    grid: u32,
 ) -> Result<(), Box<dyn Error>> {
     let input = fresh_input::<N>(u64::MAX - 8);
     let mut expected = vec![0.0_f32; N];
@@ -618,19 +689,8 @@ fn allocation_diagnostic<const N: usize, E: Error + 'static>(
     drop(capture);
     verify("PCU heap census", pcu_output, &expected)?;
 
-    let input_view = PcuHostArgument::read(PcuBindingRef::new(0, 0), &input);
     let capture = alloc::AllocationCapture::start();
-    native_input.copy_from(input_view.bytes())?;
-    let arguments = [
-        HipKernelArgument::Buffer(native_input),
-        HipKernelArgument::Buffer(native_output),
-    ];
-    // SAFETY: The native kernel ABI and buffer extents match the PCU specialization.
-    let mut completion =
-        unsafe { function.launch(stream, [grid, 1, 1], [256, 1, 1], 0, &arguments) }?;
-    completion.wait()?;
-    let mut result = PcuHostArgument::read_write(PcuBindingRef::new(0, 0), native_result);
-    native_output.copy_to(result.bytes_mut().expect("mutable native result bytes"))?;
+    native_host_call(&input, native_result, native)?;
     let native_counts = alloc::AllocationCapture::finish();
     drop(capture);
     verify("native HIP heap census", native_result, &expected)?;

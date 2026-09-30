@@ -40,7 +40,8 @@ pub enum PcuF32ReferenceError {
     MissingStore,
 }
 
-/// CPU oracle for the bounded `f32` indexed-map profile.
+/// Explicit unchecked host-arithmetic oracle for the bounded `f32` indexed-map profile.
+/// Use [`crate::PcuCheckedF32Reference`] for checked arithmetic and terminal fault semantics.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PcuF32Reference;
 
@@ -162,7 +163,8 @@ unsafe impl PcuSynchronousHostDispatchBackend<f32> for PcuF32Reference {
     }
 }
 
-/// CPU oracle for direct and grid-stride f64 arithmetic maps, including min/max.
+/// Explicit unchecked host-arithmetic oracle for direct and grid-stride f64 maps, including min/max.
+/// Use [`crate::PcuCheckedF64Reference`] for checked arithmetic and terminal fault semantics.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PcuF64Reference;
 

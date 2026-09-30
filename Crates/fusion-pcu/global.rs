@@ -5,13 +5,21 @@
 
 use core::any::TypeId;
 use core::fmt;
-#[cfg(feature = "rocm")]
+#[cfg(feature = "std")]
+mod policy;
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 use core::sync::atomic::AtomicUsize;
 
+#[cfg(feature = "cuda")]
+#[path = "global/cuda_hosted.rs"]
+mod cuda_hosted;
 #[cfg(feature = "rocm")]
 #[path = "global/hosted.rs"]
 mod hosted;
 
+#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[path = "global/resident/resident.rs"]
+mod resident;
 #[cfg(feature = "rocm")]
 mod session;
 
@@ -59,6 +67,9 @@ pub enum PcuBackendChoice {
     Automatic,
     /// Require `ROCm`, failing if it is disabled or no compatible device can be opened.
     Rocm,
+    /// Require `CUDA`, failing if it is disabled or no compatible device can be opened.
+    #[cfg(feature = "cuda")]
+    Cuda,
 }
 
 /// Runtime preferences for later calls; an already executing call retains its selected state.
@@ -71,6 +82,14 @@ pub struct PcuExecutionPolicy {
     pub cache_capacity: usize,
     /// Backend launch block size, checked by device preparation.
     pub block_size: u32,
+    /// Default for checked F32/F64 tensor arithmetic in unannotated owned source functions.
+    /// Explicit function flags override this value without changing other helpers.
+    pub float_underflow: crate::PcuFloatUnderflowPolicy,
+    /// Default range handling for checked invocation floating arithmetic.
+    /// Owned tensor graph calls currently require `Reject` and fail explicitly for `Clamp`.
+    pub range_policy: crate::PcuRangePolicy,
+    /// Default compound numerical contract; explicit owned helper flags override this value.
+    pub numerical_mode: crate::PcuNumericalMode,
     /// Cold candidate scoring after explicit device filtering; higher scores rank first.
     pub score_device: fn(&crate::PcuDeviceDescriptor<'_>, u64) -> i128,
 }
@@ -82,6 +101,9 @@ impl Default for PcuExecutionPolicy {
             device: None,
             cache_capacity: 64,
             block_size: 256,
+            float_underflow: crate::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: crate::PcuRangePolicy::Reject,
+            numerical_mode: crate::PcuNumericalMode::Boundary,
             score_device: default_device_score,
         }
     }
@@ -96,10 +118,15 @@ pub fn default_device_score(_device: &crate::PcuDeviceDescriptor<'_>, total_memo
 /// Failures at the hosted boundary, separate from generic IR validation errors.
 #[derive(Debug)]
 pub enum PcuExecutionError {
+    /// A terminal arithmetic fault, independent of the selected backend.
+    ArithmeticFault(crate::PcuExecutionFault),
     NoBackendEnabled,
+    BackendFailure(alloc::string::String),
     ReentrantCall,
     ThreadUnavailable,
     InvalidPolicy,
+    /// The selected clamped range mode is not supported by this execution profile.
+    UnsupportedRangePolicy,
     ResidentPolicyConflict,
     PolicyUnavailable,
     KernelBuild,
@@ -119,16 +146,21 @@ pub enum PcuExecutionError {
     TensorBuild(crate::dialect::tensor::TensorError),
     RecursiveTensorSource,
     TensorSourceNestingLimit,
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     Memory(crate::PcuMemoryProviderError),
     #[cfg(feature = "rocm")]
     DeviceExecution(fusion_pcu_rocm::RocmDeviceKernelError),
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     TensorStorage(crate::PcuDeviceTensorError),
     #[cfg(all(feature = "rocm", feature = "tensor"))]
     TensorInitialization(fusion_pcu_rocm::RocblasError),
     #[cfg(all(feature = "rocm", feature = "tensor"))]
     TensorExecution(fusion_pcu_rocm::RocmTensorExecutionError),
+    #[cfg(all(feature = "cuda", feature = "tensor"))]
+    CudaTensorExecution(fusion_pcu_cuda::CudaTensorExecutionError),
+    /// Cold candidate failures retain provider identity and structured native rejection reasons.
+    #[cfg(all(feature = "cuda", feature = "tensor"))]
+    NoCompatibleResidentDevice(alloc::vec::Vec<(crate::PcuObjectRef, Self)>),
     PreparationDidNotProduceKernel,
     #[cfg(feature = "rocm")]
     KernelBuildDetails(std::string::String),
@@ -145,7 +177,15 @@ pub enum PcuExecutionError {
 impl fmt::Display for PcuExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ArithmeticFault(fault) => write!(
+                f,
+                "PCU {}arithmetic fault {:?} at logical invocation {}",
+                if fault.recovered { "recovered " } else { "" },
+                fault.kind,
+                fault.invocation_id
+            ),
             Self::NoBackendEnabled => f.write_str("no executable backend is enabled"),
+            Self::BackendFailure(error) => f.write_str(error),
             Self::ReentrantCall => {
                 f.write_str("the thread's PCU execution environment is already in use")
             }
@@ -156,6 +196,9 @@ impl fmt::Display for PcuExecutionError {
                 "explicit execution policy conflicts with the resident value execution domain",
             ),
             Self::InvalidPolicy => f.write_str("PCU cache capacity and block size must be nonzero"),
+            Self::UnsupportedRangePolicy => {
+                f.write_str("clamped range handling is unsupported by this PCU execution profile")
+            }
             Self::PolicyUnavailable => {
                 f.write_str("PCU policy is unavailable or its generation is exhausted")
             }
@@ -183,11 +226,11 @@ impl fmt::Display for PcuExecutionError {
                 f.write_str("PCU tensor source helper nesting exceeds the limit of 64")
             }
             Self::EmptyTensorInput => f.write_str("owned tensor operations require nonempty input"),
-            #[cfg(feature = "rocm")]
+            #[cfg(any(feature = "rocm", feature = "cuda"))]
             Self::Memory(error) => write!(f, "PCU memory operation failed: {error:?}"),
             #[cfg(feature = "rocm")]
             Self::DeviceExecution(error) => write!(f, "PCU device operation failed: {error}"),
-            #[cfg(feature = "rocm")]
+            #[cfg(any(feature = "rocm", feature = "cuda"))]
             Self::TensorStorage(error) => error.fmt(f),
             #[cfg(all(feature = "rocm", feature = "tensor"))]
             Self::TensorInitialization(error) => {
@@ -195,6 +238,12 @@ impl fmt::Display for PcuExecutionError {
             }
             #[cfg(all(feature = "rocm", feature = "tensor"))]
             Self::TensorExecution(error) => write!(f, "PCU tensor execution failed: {error}"),
+            #[cfg(all(feature = "cuda", feature = "tensor"))]
+            Self::CudaTensorExecution(error) => {
+                write!(f, "PCU CUDA tensor execution failed: {error}")
+            }
+            #[cfg(all(feature = "cuda", feature = "tensor"))]
+            Self::NoCompatibleResidentDevice(errors) => format_resident_rejections(f, errors),
             Self::KernelBuild => f.write_str("PCU kernel construction failed"),
             Self::PreparationDidNotProduceKernel => {
                 f.write_str("PCU cold preparation produced no executable")
@@ -220,11 +269,36 @@ impl fmt::Display for PcuExecutionError {
         }
     }
 }
+
+impl PcuExecutionError {
+    /// Returns the first recovered range fault when an invocation completed with a clamped value.
+    ///
+    /// Fatal arithmetic faults and non-arithmetic execution errors return `None`.
+    #[must_use]
+    pub const fn recovered_range_fault(&self) -> Option<crate::PcuExecutionFault> {
+        match self {
+            Self::ArithmeticFault(fault) if fault.recovered => Some(*fault),
+            _ => None,
+        }
+    }
+}
 impl core::error::Error for PcuExecutionError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         #[cfg(feature = "tensor")]
         if let Self::TensorBuild(error) = self {
             return Some(error);
+        }
+        #[cfg(any(feature = "rocm", feature = "cuda"))]
+        if let Self::TensorStorage(error) = self {
+            return Some(error);
+        }
+        #[cfg(all(feature = "cuda", feature = "tensor"))]
+        match self {
+            Self::CudaTensorExecution(error) => return Some(error),
+            Self::NoCompatibleResidentDevice(errors) => {
+                return errors.first().map(|(_, error)| error as _);
+            }
+            _ => {}
         }
         #[cfg(feature = "rocm")]
         match self {
@@ -235,7 +309,6 @@ impl core::error::Error for PcuExecutionError {
             Self::Discovery(error) => return Some(error),
             Self::Execution(error) => return Some(error),
             Self::DeviceExecution(error) => return Some(error),
-            Self::TensorStorage(error) => return Some(error),
             #[cfg(feature = "tensor")]
             Self::TensorInitialization(error) => return Some(error),
             #[cfg(feature = "tensor")]
@@ -246,18 +319,58 @@ impl core::error::Error for PcuExecutionError {
     }
 }
 
+#[cfg(feature = "rocm")]
+impl From<fusion_pcu_rocm::RocmHostKernelError> for PcuExecutionError {
+    fn from(error: fusion_pcu_rocm::RocmHostKernelError) -> Self {
+        match error {
+            fusion_pcu_rocm::RocmHostKernelError::CheckedExecutionFault(fault) => {
+                Self::ArithmeticFault(fault)
+            }
+            other => Self::Execution(other),
+        }
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl From<fusion_pcu_rocm::RocmDeviceKernelError> for PcuExecutionError {
+    fn from(error: fusion_pcu_rocm::RocmDeviceKernelError) -> Self {
+        match error {
+            fusion_pcu_rocm::RocmDeviceKernelError::CheckedExecutionFault(fault) => {
+                Self::ArithmeticFault(fault)
+            }
+            other => Self::DeviceExecution(other),
+        }
+    }
+}
+
+#[cfg(all(feature = "rocm", feature = "tensor"))]
+impl From<fusion_pcu_rocm::RocmTensorExecutionError> for PcuExecutionError {
+    fn from(error: fusion_pcu_rocm::RocmTensorExecutionError) -> Self {
+        match error {
+            fusion_pcu_rocm::RocmTensorExecutionError::ExecutionFault(fault) => {
+                Self::ArithmeticFault(fault)
+            }
+            other => Self::TensorExecution(other),
+        }
+    }
+}
+
 /// Per-source-function cache hint. A hint is never trusted without checking specialization identity.
 #[doc(hidden)]
 pub struct PcuHostCallSite {
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", all(feature = "cuda", feature = "tensor")))]
     slot: AtomicUsize,
+    #[cfg(feature = "cuda")]
+    cuda_slot: AtomicUsize,
 }
 impl PcuHostCallSite {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            #[cfg(feature = "rocm")]
+            #[cfg(any(feature = "rocm", all(feature = "cuda", feature = "tensor")))]
             slot: AtomicUsize::new(usize::MAX),
+            #[cfg(feature = "cuda")]
+            cuda_slot: AtomicUsize::new(usize::MAX),
         }
     }
 }
@@ -271,9 +384,69 @@ impl Default for PcuHostCallSite {
 #[doc(hidden)]
 pub struct PcuHostPreparation {
     #[cfg(feature = "rocm")]
-    inner: hosted::Preparation,
+    inner: Option<hosted::Preparation>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<cuda_hosted::Preparation>,
 }
 impl PcuHostPreparation {
+    /// Returns the policy captured for this cold preparation, without reading global state.
+    #[must_use]
+    pub const fn float_underflow_policy(&self) -> crate::PcuFloatUnderflowPolicy {
+        #[cfg(feature = "rocm")]
+        {
+            #[cfg(feature = "cuda")]
+            if let Some(cuda) = &self.cuda {
+                return cuda.float_underflow_policy();
+            }
+            if let Some(inner) = &self.inner {
+                inner.float_underflow_policy()
+            } else {
+                crate::PcuFloatUnderflowPolicy::IeeeAfterRounding
+            }
+        }
+        #[cfg(all(not(feature = "rocm"), feature = "cuda"))]
+        {
+            if let Some(cuda) = &self.cuda {
+                cuda.float_underflow_policy()
+            } else {
+                crate::PcuFloatUnderflowPolicy::IeeeAfterRounding
+            }
+        }
+        #[cfg(all(not(feature = "rocm"), not(feature = "cuda")))]
+        {
+            crate::PcuFloatUnderflowPolicy::IeeeAfterRounding
+        }
+    }
+
+    /// Returns the range policy captured for this cold preparation, without reading global state.
+    #[must_use]
+    pub const fn range_policy(&self) -> crate::PcuRangePolicy {
+        #[cfg(feature = "rocm")]
+        {
+            #[cfg(feature = "cuda")]
+            if let Some(cuda) = &self.cuda {
+                return cuda.range_policy();
+            }
+            if let Some(inner) = &self.inner {
+                inner.range_policy()
+            } else {
+                crate::PcuRangePolicy::Reject
+            }
+        }
+        #[cfg(all(not(feature = "rocm"), feature = "cuda"))]
+        {
+            if let Some(cuda) = &self.cuda {
+                cuda.range_policy()
+            } else {
+                crate::PcuRangePolicy::Reject
+            }
+        }
+        #[cfg(all(not(feature = "rocm"), not(feature = "cuda")))]
+        {
+            crate::PcuRangePolicy::Reject
+        }
+    }
+
     /// Admit, select and compile the concrete kernel against runtime devices.
     ///
     /// # Errors
@@ -285,9 +458,23 @@ impl PcuHostPreparation {
     ) -> Result<(), PcuExecutionError> {
         #[cfg(feature = "rocm")]
         {
-            self.inner.prepare(kernel)
+            #[cfg(feature = "cuda")]
+            if let Some(cuda) = &mut self.cuda {
+                return cuda.prepare(kernel);
+            }
+            self.inner
+                .as_mut()
+                .ok_or(PcuExecutionError::NoBackendEnabled)?
+                .prepare(kernel)
         }
-        #[cfg(not(feature = "rocm"))]
+        #[cfg(all(not(feature = "rocm"), feature = "cuda"))]
+        {
+            self.cuda
+                .as_mut()
+                .ok_or(PcuExecutionError::NoBackendEnabled)?
+                .prepare(kernel)
+        }
+        #[cfg(all(not(feature = "rocm"), not(feature = "cuda")))]
         {
             let _ = kernel;
             Err(PcuExecutionError::NoBackendEnabled)
@@ -304,11 +491,11 @@ pub fn configure(policy: PcuExecutionPolicy) -> Result<(), PcuExecutionError> {
     if policy.cache_capacity == 0 || policy.block_size == 0 {
         return Err(PcuExecutionError::InvalidPolicy);
     }
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "std")]
     {
-        hosted::configure(policy)
+        policy::configure(policy)
     }
-    #[cfg(not(feature = "rocm"))]
+    #[cfg(not(feature = "std"))]
     {
         let _ = policy;
         Err(PcuExecutionError::NoBackendEnabled)
@@ -323,7 +510,7 @@ pub fn use_defaults() -> Result<(), PcuExecutionError> {
     configure(PcuExecutionPolicy::default())
 }
 
-/// Clear this thread's prepared entries, selected `ROCm` sessions and discovery snapshot.
+/// Clear this thread's prepared entries, provider session roots and discovery snapshots.
 ///
 /// Direct hosted calls complete synchronously, so no command or device-resource lease escapes
 /// this cache today.
@@ -332,10 +519,15 @@ pub fn use_defaults() -> Result<(), PcuExecutionError> {
 /// Rejects clearing during a nested active call.
 #[allow(clippy::missing_const_for_fn)] // Hosted implementations perform runtime IO/state mutation.
 pub fn clear_thread_cache() -> Result<(), PcuExecutionError> {
+    #[cfg(feature = "cuda")]
+    cuda_hosted::clear_thread_cache()?;
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
+    {
+        tensor::clear_cache()?;
+        resident::clear_roots()?;
+    }
     #[cfg(feature = "rocm")]
     {
-        #[cfg(feature = "tensor")]
-        tensor::clear_cache()?;
         hosted::clear_thread_cache()
     }
     #[cfg(not(feature = "rocm"))]
@@ -384,11 +576,15 @@ pub fn call_arguments<const N: usize>(
     arguments: [PcuCallArgument<'_>; N],
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
 ) -> Result<(), PcuExecutionError> {
-    #[cfg(feature = "rocm")]
+    #[cfg(feature = "cuda")]
+    {
+        cuda_hosted::call_arguments(site, specialization, arguments, prepare)
+    }
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
     {
         hosted::call_arguments(site, specialization, arguments, prepare)
     }
-    #[cfg(not(feature = "rocm"))]
+    #[cfg(not(any(feature = "rocm", feature = "cuda")))]
     {
         let _ = (site, specialization, arguments, prepare);
         Err(PcuExecutionError::NoBackendEnabled)
@@ -406,6 +602,19 @@ pub fn call_host(
     arguments: &mut [crate::PcuHostArgument<'_>],
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
 ) -> Result<(), PcuExecutionError> {
+    #[cfg(feature = "cuda")]
+    {
+        let route = policy::route();
+        if matches!(
+            route.backend,
+            PcuBackendChoice::Cuda | PcuBackendChoice::Automatic
+        ) {
+            return cuda_hosted::call_host(site, specialization, arguments, prepare);
+        }
+        if matches!(route.backend, PcuBackendChoice::Rocm) && !cfg!(feature = "rocm") {
+            return Err(PcuExecutionError::NoBackendEnabled);
+        }
+    }
     #[cfg(feature = "rocm")]
     {
         hosted::call_host(site, specialization, arguments, prepare)
@@ -417,9 +626,99 @@ pub fn call_host(
     }
 }
 
+#[cfg(all(feature = "cuda", feature = "tensor"))]
+fn format_resident_rejections(
+    f: &mut fmt::Formatter<'_>,
+    errors: &[(crate::PcuObjectRef, PcuExecutionError)],
+) -> fmt::Result {
+    f.write_str("no compatible resident device")?;
+    for (device, error) in errors {
+        write!(
+            f,
+            "; provider {:?} device {}: {error}",
+            device.provider, device.id
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invocation_range_policy_defaults_to_rejection() {
+        assert_eq!(
+            PcuExecutionPolicy::default().range_policy,
+            crate::PcuRangePolicy::Reject
+        );
+    }
+
+    #[test]
+    fn compound_numerical_mode_defaults_to_boundary() {
+        assert_eq!(
+            PcuExecutionPolicy::default().numerical_mode,
+            crate::PcuNumericalMode::Boundary
+        );
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn terminal_arithmetic_faults_have_a_backend_neutral_consuming_error() {
+        for kind in [
+            crate::PcuExecutionFaultKind::DivideByZero,
+            crate::PcuExecutionFaultKind::SignedDivisionOverflow,
+            crate::PcuExecutionFaultKind::ArithmeticOverflow,
+            crate::PcuExecutionFaultKind::ArithmeticUnderflow,
+            crate::PcuExecutionFaultKind::InvalidFloatingOperand,
+        ] {
+            let fault = crate::PcuExecutionFault {
+                kind,
+                invocation_id: 37,
+                recovered: false,
+            };
+            let host = PcuExecutionError::from(
+                fusion_pcu_rocm::RocmHostKernelError::CheckedExecutionFault(fault),
+            );
+            let device = PcuExecutionError::from(
+                fusion_pcu_rocm::RocmDeviceKernelError::CheckedExecutionFault(fault),
+            );
+            assert!(matches!(host, PcuExecutionError::ArithmeticFault(actual) if actual == fault));
+            assert!(
+                matches!(device, PcuExecutionError::ArithmeticFault(actual) if actual == fault)
+            );
+            #[cfg(feature = "tensor")]
+            {
+                let tensor = PcuExecutionError::from(
+                    fusion_pcu_rocm::RocmTensorExecutionError::ExecutionFault(fault),
+                );
+                assert!(
+                    matches!(tensor, PcuExecutionError::ArithmeticFault(actual) if actual == fault)
+                );
+            }
+        }
+        let recovered = crate::PcuExecutionFault {
+            kind: crate::PcuExecutionFaultKind::ArithmeticOverflow,
+            invocation_id: 12,
+            recovered: true,
+        };
+        let error = PcuExecutionError::ArithmeticFault(recovered);
+        assert_eq!(error.recovered_range_fault(), Some(recovered));
+        let fatal = PcuExecutionError::ArithmeticFault(crate::PcuExecutionFault {
+            recovered: false,
+            ..recovered
+        });
+        assert_eq!(fatal.recovered_range_fault(), None);
+        let unavailable = PcuExecutionError::from(
+            fusion_pcu_rocm::RocmHostKernelError::PoisonedAfterUncertainCompletion,
+        );
+        assert!(matches!(
+            unavailable,
+            PcuExecutionError::Execution(
+                fusion_pcu_rocm::RocmHostKernelError::PoisonedAfterUncertainCompletion
+            )
+        ));
+    }
 
     #[test]
     fn zero_capacity_or_geometry_is_rejected_before_policy_changes() {
@@ -483,7 +782,7 @@ mod tests {
         assert!(core::error::Error::source(&error).is_some());
     }
 
-    #[cfg(not(feature = "rocm"))]
+    #[cfg(not(any(feature = "rocm", feature = "cuda")))]
     #[test]
     fn disabled_provider_does_not_build_or_fall_back_to_cpu() {
         let mut constructed = false;

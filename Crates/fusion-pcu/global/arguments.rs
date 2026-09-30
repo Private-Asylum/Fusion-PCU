@@ -10,14 +10,13 @@ use crate::{
     PcuHostArgument,
     PcuScalar,
 };
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 #[rustfmt::skip]
-use crate::{
-    PcuDeviceArgument,
-    PcuDeviceTensor,
+use super::resident::{
+    DeviceArgument,
+    DeviceTensor,
+    Session,
 };
-#[cfg(feature = "rocm")]
-use super::session::RocmSession;
 use core::marker::PhantomData;
 
 /// Semantic source shape, retaining rank and source role instead of only a flattened element
@@ -87,23 +86,23 @@ pub enum PcuArgumentError {
 
 /// Opaque per-argument carrier passed from generated source signatures to the hosted dispatcher.
 #[doc(hidden)]
-#[cfg_attr(not(feature = "rocm"), allow(dead_code))] // The disabled facade never inspects mixed arguments.
+#[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))] // The disabled facade never inspects mixed arguments.
 pub struct PcuCallArgument<'a> {
     shape: PcuSourceShape,
     kind: PcuCallArgumentKind<'a>,
 }
 
 #[doc(hidden)]
-#[cfg_attr(not(feature = "rocm"), allow(dead_code))] // Resident/host discrimination runs only with a provider.
+#[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))] // Resident/host discrimination runs only with a provider.
 pub(super) enum PcuCallArgumentKind<'a> {
     Host(PcuHostArgument<'a>),
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     ResidentRead(PcuResidentReadArgument<'a>),
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     ResidentWrite(PcuResidentWriteArgument<'a>),
 }
 
-#[cfg_attr(not(feature = "rocm"), allow(dead_code))] // Used by the provider-backed stack splitter.
+#[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))] // Used by the provider-backed stack splitter.
 impl<'a> PcuCallArgument<'a> {
     #[allow(clippy::missing_const_for_fn)] // Resident variants own drop guards and backend borrows.
     pub(super) fn into_parts(self) -> (PcuSourceShape, PcuCallArgumentKind<'a>) {
@@ -506,7 +505,7 @@ macro_rules! shared_matrix_storage {
 shared_matrix_storage!(alloc::rc::Rc);
 shared_matrix_storage!(alloc::sync::Arc);
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResidentValidity {
     Ready,
@@ -535,20 +534,20 @@ enum ResidentValidity {
 /// }
 /// ```
 pub struct PcuTensor<T: PcuScalar> {
-    #[cfg(feature = "rocm")]
-    tensor: PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource>,
-    #[cfg(feature = "rocm")]
-    session: std::rc::Rc<RocmSession>,
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    tensor: DeviceTensor<T>,
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    session: std::rc::Rc<Session>,
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     validity: ResidentValidity,
     marker: PhantomData<fn() -> T>,
 }
 
 impl<T: PcuScalar> PcuTensor<T> {
-    #[cfg(all(feature = "rocm", feature = "tensor"))]
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     pub(super) fn from_successful_output(
-        tensor: PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource>,
-        session: std::rc::Rc<RocmSession>,
+        tensor: DeviceTensor<T>,
+        session: std::rc::Rc<Session>,
     ) -> Self {
         Self {
             tensor,
@@ -558,29 +557,22 @@ impl<T: PcuScalar> PcuTensor<T> {
         }
     }
 
-    #[cfg(feature = "rocm")]
-    pub(super) const fn device_tensor(
-        &self,
-    ) -> &PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource> {
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    pub(super) const fn device_tensor(&self) -> &DeviceTensor<T> {
         &self.tensor
     }
 
-    #[cfg(feature = "rocm")]
-    pub(super) const fn session(&self) -> &std::rc::Rc<RocmSession> {
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    pub(super) const fn session(&self) -> &std::rc::Rc<Session> {
         &self.session
     }
 
-    #[cfg(all(feature = "rocm", feature = "tensor"))]
-    pub(super) fn into_device_parts(
-        self,
-    ) -> (
-        PcuDeviceTensor<T, fusion_pcu_rocm::RocmMemoryResource>,
-        std::rc::Rc<RocmSession>,
-    ) {
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
+    pub(super) fn into_device_parts(self) -> (DeviceTensor<T>, std::rc::Rc<Session>) {
         (self.tensor, self.session)
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     pub(super) const fn validate_initialized(&self) -> Result<(), PcuArgumentError> {
         match self.validity {
             ResidentValidity::Ready => Ok(()),
@@ -588,7 +580,7 @@ impl<T: PcuScalar> PcuTensor<T> {
         }
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     pub(super) fn validate_read(
         &self,
         expected_shape: PcuSourceShape,
@@ -601,7 +593,7 @@ impl<T: PcuScalar> PcuTensor<T> {
         self.validate_initialized()
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     fn read_argument(
         &self,
         target: PcuBindingRef,
@@ -616,7 +608,7 @@ impl<T: PcuScalar> PcuTensor<T> {
         .into_call_argument())
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     fn write_argument(
         &mut self,
         target: PcuBindingRef,
@@ -640,9 +632,9 @@ impl<T: PcuScalar> PcuTensor<T> {
     }
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, Shape> sealed::Sealed<T, Shape> for PcuTensor<T> {}
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> PcuReadStorage<T, ScalarShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &self,
@@ -651,17 +643,17 @@ impl<T: PcuScalar> PcuReadStorage<T, ScalarShape> for PcuTensor<T> {
         self.read_argument(target, PcuSourceShape::Scalar)
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> PcuReadStorage<T, SliceShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &self,
         target: PcuBindingRef,
     ) -> Result<PcuCallArgument<'_>, PcuArgumentError> {
-        let length = self.tensor.buffer().len();
+        let length = self.tensor.len();
         self.read_argument(target, PcuSourceShape::Slice { length })
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const N: usize> PcuReadStorage<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &self,
@@ -670,7 +662,7 @@ impl<T: PcuScalar, const N: usize> PcuReadStorage<T, FixedArrayShape<N>> for Pcu
         self.read_argument(target, PcuSourceShape::FixedArray { length: N })
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuReadStorage<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -687,7 +679,7 @@ impl<T: PcuScalar, const R: usize, const C: usize> PcuReadStorage<T, FixedMatrix
         )
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> PcuWriteStorage<T, ScalarShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &mut self,
@@ -696,17 +688,17 @@ impl<T: PcuScalar> PcuWriteStorage<T, ScalarShape> for PcuTensor<T> {
         self.write_argument(target, PcuSourceShape::Scalar)
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar> PcuWriteStorage<T, SliceShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &mut self,
         target: PcuBindingRef,
     ) -> Result<PcuCallArgument<'_>, PcuArgumentError> {
-        let length = self.tensor.buffer().len();
+        let length = self.tensor.len();
         self.write_argument(target, PcuSourceShape::Slice { length })
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const N: usize> PcuWriteStorage<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &mut self,
@@ -715,7 +707,7 @@ impl<T: PcuScalar, const N: usize> PcuWriteStorage<T, FixedArrayShape<N>> for Pc
         self.write_argument(target, PcuSourceShape::FixedArray { length: N })
     }
 }
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuWriteStorage<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -733,14 +725,14 @@ impl<T: PcuScalar, const R: usize, const C: usize> PcuWriteStorage<T, FixedMatri
     }
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 pub(super) struct PcuResidentReadArgument<'a> {
-    pub(super) argument: PcuDeviceArgument<'a, fusion_pcu_rocm::RocmMemoryResource>,
+    pub(super) argument: DeviceArgument<'a>,
     pub(super) shape: PcuSourceShape,
-    pub(super) session: &'a std::rc::Rc<RocmSession>,
+    pub(super) session: &'a std::rc::Rc<Session>,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<'a> PcuResidentReadArgument<'a> {
     const fn into_call_argument(self) -> PcuCallArgument<'a> {
         PcuCallArgument {
@@ -750,15 +742,15 @@ impl<'a> PcuResidentReadArgument<'a> {
     }
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 pub(super) struct PcuResidentWriteArgument<'a> {
-    pub(super) argument: PcuDeviceArgument<'a, fusion_pcu_rocm::RocmMemoryResource>,
+    pub(super) argument: DeviceArgument<'a>,
     pub(super) shape: PcuSourceShape,
-    pub(super) session: &'a std::rc::Rc<RocmSession>,
+    pub(super) session: &'a std::rc::Rc<Session>,
     pub(super) guard: ResidentWriteGuard<'a>,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<'a> PcuResidentWriteArgument<'a> {
     const fn into_call_argument(self) -> PcuCallArgument<'a> {
         PcuCallArgument {
@@ -768,7 +760,7 @@ impl<'a> PcuResidentWriteArgument<'a> {
     }
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResidentWriteDisposition {
     NotSubmitted,
@@ -780,14 +772,14 @@ enum ResidentWriteDisposition {
 /// Tracks whether a mutable resident value remains readable across failure. The caller marks
 /// possible submission only after preflight; Drop restores the prior state for prelaunch errors,
 /// preserves initialized storage after a quiescent partial error, and blocks uncertain completion.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 pub(super) struct ResidentWriteGuard<'a> {
     validity: &'a mut ResidentValidity,
     prior: ResidentValidity,
     disposition: ResidentWriteDisposition,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl<'a> ResidentWriteGuard<'a> {
     const fn new(validity: &'a mut ResidentValidity) -> Self {
         let prior = *validity;
@@ -811,7 +803,7 @@ impl<'a> ResidentWriteGuard<'a> {
     }
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "cuda"))]
 impl Drop for ResidentWriteGuard<'_> {
     fn drop(&mut self) {
         *self.validity = match self.disposition {
@@ -860,11 +852,11 @@ mod tests {
         )
         .expect("host scalar conversion succeeds");
         assert_eq!(argument.shape, PcuSourceShape::Scalar);
-        #[cfg(feature = "rocm")]
+        #[cfg(any(feature = "rocm", feature = "cuda"))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind else {
             panic!("host scalar conversion remains host-backed");
         };
-        #[cfg(not(feature = "rocm"))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind;
         assert_eq!(host_argument.access(), crate::PcuBindingAccess::ReadOnly);
 
@@ -881,17 +873,17 @@ mod tests {
                 columns: 3
             }
         );
-        #[cfg(feature = "rocm")]
+        #[cfg(any(feature = "rocm", feature = "cuda"))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind else {
             panic!("host matrix conversion remains host-backed");
         };
-        #[cfg(not(feature = "rocm"))]
+        #[cfg(not(any(feature = "rocm", feature = "cuda")))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind;
         assert_eq!(host_argument.access(), crate::PcuBindingAccess::ReadWrite);
         assert_eq!(host_argument.bytes().len(), 6 * core::mem::size_of::<u32>());
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
     #[test]
     fn resident_write_guard_preserves_initialized_values_but_blocks_uncertain_completion() {
         let mut validity = ResidentValidity::Ready;

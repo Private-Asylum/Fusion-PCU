@@ -5,17 +5,21 @@
 
 #[rustfmt::skip]
 use crate::{
-    PcuDispatchAluOp,
     PcuDispatchDataOp,
+    PcuDispatchCheckedFloatConversion,
+    PcuDispatchFloatBinaryOp,
+    PcuDispatchFloatUnaryOp,
     PcuDispatchIndex,
     PcuDispatchValueId,
     PcuError,
     PcuParameterValue,
+    PcuRangePolicy,
     PcuScalar,
+    PcuFloatUnderflowPolicy,
     PcuValueType,
 };
-use core::marker::PhantomData;
 use crate::model::PcuDispatchKernelBuilder;
+use core::marker::PhantomData;
 
 /// Maximum nested helper depth admitted during generated IR construction.
 pub const PCU_SCALAR_HELPER_MAX_DEPTH: u8 = 32;
@@ -64,6 +68,8 @@ pub struct PcuScalarLowering<'a, const MAX_OPS: usize> {
     builder: Option<PcuDispatchKernelBuilder<'a, MAX_OPS>>,
     next_value: u16,
     depth: u8,
+    float_underflow_policy: PcuFloatUnderflowPolicy,
+    range_policy: PcuRangePolicy,
 }
 
 impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
@@ -74,7 +80,38 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
             builder: Some(builder),
             next_value,
             depth: 0,
+            float_underflow_policy: PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            range_policy: PcuRangePolicy::Reject,
         }
+    }
+
+    /// Starts scalar lowering with the requested checked-float underflow policy.
+    #[must_use]
+    pub const fn with_float_underflow_policy(
+        builder: PcuDispatchKernelBuilder<'a, MAX_OPS>,
+        next_value: u16,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Self {
+        Self {
+            builder: Some(builder),
+            next_value,
+            depth: 0,
+            float_underflow_policy: policy,
+            range_policy: PcuRangePolicy::Reject,
+        }
+    }
+
+    /// Sets the checked floating range-recovery policy for subsequently emitted operations.
+    #[must_use]
+    pub const fn with_range_policy(mut self, policy: PcuRangePolicy) -> Self {
+        self.range_policy = policy;
+        self
+    }
+
+    /// Returns the checked floating range-recovery policy for this lowering context.
+    #[must_use]
+    pub const fn range_policy(&self) -> PcuRangePolicy {
+        self.range_policy
     }
 
     /// Enters one generated helper. Excessive nesting, including recursion, is rejected.
@@ -124,19 +161,90 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         Ok(PcuScalarValue::from_id(result))
     }
 
-    /// Emits a floating arithmetic operation, preserving the scalar type through the helper ABI.
+    /// Emits checked floating Add/Sub/Mul/Div, preserving type and both arithmetic policies.
     ///
     /// # Errors
     ///
     /// Returns `ResourceExhausted` when values or builder operations are exhausted.
-    pub fn alu_value<T: PcuFloatScalar>(
+    pub fn checked_binary_value<T: PcuFloatScalar>(
         &mut self,
-        op: PcuDispatchAluOp,
+        op: PcuDispatchFloatBinaryOp,
         lhs: PcuScalarValue<T>,
         rhs: PcuScalarValue<T>,
     ) -> Result<PcuScalarValue<T>, PcuError> {
-        self.alu_typed(T::VALUE_TYPE, op, lhs.id(), rhs.id())
-            .map(PcuScalarValue::from_id)
+        let result = self.fresh_value()?;
+        self.push(PcuDispatchDataOp::CheckedFloatBinary {
+            value_type: T::VALUE_TYPE,
+            op,
+            underflow_policy: self.float_underflow_policy,
+            range_policy: self.range_policy,
+            result,
+            lhs: lhs.id(),
+            rhs: rhs.id(),
+        })?;
+        Ok(PcuScalarValue::from_id(result))
+    }
+
+    /// Emits checked floating `ReLU` with the context's arithmetic policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceExhausted` when values or builder operations are exhausted.
+    pub fn checked_unary_value<T: PcuFloatScalar>(
+        &mut self,
+        op: PcuDispatchFloatUnaryOp,
+        value: PcuScalarValue<T>,
+    ) -> Result<PcuScalarValue<T>, PcuError> {
+        let result = self.fresh_value()?;
+        self.push(PcuDispatchDataOp::CheckedFloatUnary {
+            value_type: T::VALUE_TYPE,
+            op,
+            underflow_policy: self.float_underflow_policy,
+            range_policy: self.range_policy,
+            result,
+            value: value.id(),
+        })?;
+        Ok(PcuScalarValue::from_id(result))
+    }
+
+    /// Emits a checked F64-to-F32 conversion with the context's arithmetic policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceExhausted` when values or builder operations are exhausted.
+    pub fn checked_f64_to_f32_value(
+        &mut self,
+        value: PcuScalarValue<f64>,
+    ) -> Result<PcuScalarValue<f32>, PcuError> {
+        let result = self.fresh_value()?;
+        self.push(PcuDispatchDataOp::CheckedFloatConvert {
+            conversion: PcuDispatchCheckedFloatConversion::F64ToF32,
+            underflow_policy: self.float_underflow_policy,
+            range_policy: self.range_policy,
+            result,
+            value: value.id(),
+        })?;
+        Ok(PcuScalarValue::from_id(result))
+    }
+
+    /// Emits a checked exact F32-to-F64 widening, inheriting the context's policy metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceExhausted` when values or builder operations are exhausted.
+    pub fn checked_f32_to_f64_value(
+        &mut self,
+        value: PcuScalarValue<f32>,
+    ) -> Result<PcuScalarValue<f64>, PcuError> {
+        let result = self.fresh_value()?;
+        self.push(PcuDispatchDataOp::CheckedFloatConvert {
+            conversion: PcuDispatchCheckedFloatConversion::F32ToF64,
+            underflow_policy: self.float_underflow_policy,
+            range_policy: self.range_policy,
+            result,
+            value: value.id(),
+        })?;
+        Ok(PcuScalarValue::from_id(result))
     }
 
     /// Emits an indexed floating binding load with a compile-time scalar type.
@@ -184,24 +292,6 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         Ok(PcuDispatchValueId(id))
     }
 
-    fn alu_typed(
-        &mut self,
-        value_type: PcuValueType,
-        op: PcuDispatchAluOp,
-        lhs: PcuDispatchValueId,
-        rhs: PcuDispatchValueId,
-    ) -> Result<PcuDispatchValueId, PcuError> {
-        let result = self.fresh_value()?;
-        self.push(PcuDispatchDataOp::Alu {
-            value_type,
-            result,
-            op,
-            lhs,
-            rhs,
-        })?;
-        Ok(result)
-    }
-
     fn load_typed(
         &mut self,
         binding: crate::PcuBindingRef,
@@ -244,72 +334,525 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
 #[cfg(test)]
 mod tests {
     #[rustfmt::skip]
-    use super::PcuScalarLowering;
+    use super::{PcuFloatScalar, PcuScalarLowering};
     #[rustfmt::skip]
     use crate::{
         PcuBinding,
         PcuBindingAccess,
         PcuBindingRef,
         PcuBindingStorageClass,
-        PcuDispatchAluOp,
+        PcuDispatchDataOp,
+        PcuDispatchCheckedFloatConversion,
+        PcuDispatchFloatBinaryOp,
+        PcuDispatchFloatUnaryOp,
         PcuDispatchControlOp,
         PcuDispatchIndex,
+        PcuFloatUnderflowPolicy,
+        PcuRangePolicy,
         PcuValueType,
         validate_typed_dispatch_value_flow,
     };
     use crate::model::PcuDispatchKernelBuilder;
 
-    #[test]
-    fn f64_typed_helper_values_preserve_scalar_type_through_ir() {
+    #[allow(clippy::too_many_lines)] // Keeps typed construction and IR assertions in one fixture.
+    fn assert_checked_ops_for_type<T: PcuFloatScalar>(
+        expected_type: PcuValueType,
+        policy: Option<PcuFloatUnderflowPolicy>,
+    ) {
         let bindings = [
-            PcuBinding::scalar::<f64>(
-                Some("seed"),
+            PcuBinding::scalar::<T>(
+                Some("lhs"),
                 0,
                 0,
                 PcuBindingStorageClass::Storage,
                 PcuBindingAccess::ReadOnly,
             ),
-            PcuBinding::scalar::<f64>(
-                Some("output"),
+            PcuBinding::scalar::<T>(
+                Some("rhs"),
                 0,
                 1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<T>(
+                Some("output"),
+                0,
+                2,
                 PcuBindingStorageClass::Storage,
                 PcuBindingAccess::ReadWrite,
             ),
         ];
+        for op in [
+            PcuDispatchFloatBinaryOp::Add,
+            PcuDispatchFloatBinaryOp::Sub,
+            PcuDispatchFloatBinaryOp::Mul,
+            PcuDispatchFloatBinaryOp::Div,
+        ] {
+            let make_builder = || {
+                PcuDispatchKernelBuilder::<5>::new(1, "main", [4, 1, 1]).with_bindings(&bindings)
+            };
+            let mut lowering = policy.map_or_else(
+                || PcuScalarLowering::new(make_builder(), 1),
+                |policy| PcuScalarLowering::with_float_underflow_policy(make_builder(), 1, policy),
+            );
+            let lhs = lowering
+                .load_value::<T>(
+                    PcuBindingRef::new(0, 0),
+                    PcuDispatchIndex::BindingElementZero,
+                )
+                .expect("typed lhs load");
+            let rhs = lowering
+                .load_value::<T>(
+                    PcuBindingRef::new(0, 1),
+                    PcuDispatchIndex::BindingElementZero,
+                )
+                .expect("typed rhs load");
+            let result = lowering
+                .checked_binary_value(op, lhs, rhs)
+                .expect("typed checked-float binary");
+            assert_eq!(result.id().0, 3);
+            lowering
+                .store_value(
+                    PcuBindingRef::new(0, 2),
+                    PcuDispatchIndex::InvocationId,
+                    result,
+                )
+                .expect("typed result store");
+            let builder = lowering
+                .finish()
+                .expect("builder returned")
+                .with_control_op(PcuDispatchControlOp::Return)
+                .expect("return added");
+            builder.with_ir(|ir| {
+                assert_eq!(
+                    ir.bindings[0].binding_type.value_type(),
+                    Some(expected_type)
+                );
+                let checked = ir.ops.iter().find_map(|instruction| match instruction {
+                    crate::PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+                        value_type,
+                        op: actual_op,
+                        underflow_policy,
+                        range_policy,
+                        result,
+                        lhs,
+                        rhs,
+                    }) => Some((
+                        *value_type,
+                        *actual_op,
+                        *underflow_policy,
+                        *range_policy,
+                        *result,
+                        *lhs,
+                        *rhs,
+                    )),
+                    _ => None,
+                });
+                assert_eq!(
+                    checked,
+                    Some((
+                        expected_type,
+                        op,
+                        policy.unwrap_or_default(),
+                        PcuRangePolicy::Reject,
+                        crate::PcuDispatchValueId(3),
+                        crate::PcuDispatchValueId(1),
+                        crate::PcuDispatchValueId(2),
+                    ))
+                );
+                assert_eq!(validate_typed_dispatch_value_flow(ir), Ok(()));
+            });
+        }
+    }
+
+    #[test]
+    fn checked_typed_helper_values_preserve_type_operations_and_underflow_policy() {
+        for policy in [
+            None,
+            Some(PcuFloatUnderflowPolicy::IeeeAfterRounding),
+            Some(PcuFloatUnderflowPolicy::RejectSubnormalResult),
+            Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow),
+        ] {
+            assert_checked_ops_for_type::<f32>(PcuValueType::f32(), policy);
+            assert_checked_ops_for_type::<f64>(PcuValueType::f64(), policy);
+        }
+    }
+
+    #[test]
+    fn checked_unary_helper_stamps_type_and_both_policies() {
+        let bindings = [
+            PcuBinding::scalar::<f32>(
+                Some("input"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f32>(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
         let builder =
-            PcuDispatchKernelBuilder::<5>::new(1, "main", [4, 1, 1]).with_bindings(&bindings);
-        let mut lowering = PcuScalarLowering::new(builder, 1);
-        let seed = lowering
-            .load_value::<f64>(
-                PcuBindingRef::new(0, 0),
-                PcuDispatchIndex::BindingElementZero,
-            )
-            .expect("f64 seed load");
-        let one = lowering
-            .constant_f64_value(1.0_f64.to_bits())
-            .expect("f64 constant");
-        let result = lowering
-            .alu_value(PcuDispatchAluOp::Add, seed, one)
-            .expect("f64 arithmetic");
+            PcuDispatchKernelBuilder::<4>::new(1, "relu", [4, 1, 1]).with_bindings(&bindings);
+        let mut lowering = PcuScalarLowering::with_float_underflow_policy(
+            builder,
+            1,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        )
+        .with_range_policy(PcuRangePolicy::Clamp);
+        let input = lowering
+            .load_value::<f32>(PcuBindingRef::new(0, 0), PcuDispatchIndex::InvocationId)
+            .expect("typed input load");
+        let output = lowering
+            .checked_unary_value(PcuDispatchFloatUnaryOp::Relu, input)
+            .expect("checked ReLU");
+        assert_eq!(output.id().0, 2);
         lowering
             .store_value(
                 PcuBindingRef::new(0, 1),
                 PcuDispatchIndex::InvocationId,
-                result,
+                output,
             )
-            .expect("f64 store");
+            .expect("typed output store");
         let builder = lowering
             .finish()
             .expect("builder returned")
             .with_control_op(PcuDispatchControlOp::Return)
             .expect("return added");
         builder.with_ir(|ir| {
+            assert!(ir.ops.iter().any(|instruction| matches!(
+                instruction,
+                crate::PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
+                    value_type: PcuValueType::Scalar(crate::PcuScalarType::F32),
+                    op: PcuDispatchFloatUnaryOp::Relu,
+                    underflow_policy: PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                    range_policy: PcuRangePolicy::Clamp,
+                    result: crate::PcuDispatchValueId(2),
+                    value: crate::PcuDispatchValueId(1),
+                })
+            )));
+            assert_eq!(validate_typed_dispatch_value_flow(ir), Ok(()));
+        });
+    }
+
+    #[test]
+    fn checked_f64_to_f32_helper_preserves_conversion_types_policy_and_capability() {
+        for policy in [
+            PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        ] {
+            let bindings = [
+                PcuBinding::scalar::<f64>(
+                    Some("input"),
+                    0,
+                    0,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<f32>(
+                    Some("output"),
+                    0,
+                    1,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+            ];
+            let builder = PcuDispatchKernelBuilder::<4>::new(1, "convert", [1, 1, 1])
+                .with_bindings(&bindings);
+            let mut lowering = PcuScalarLowering::with_float_underflow_policy(builder, 1, policy);
+            let value = lowering
+                .load_value::<f64>(
+                    PcuBindingRef::new(0, 0),
+                    PcuDispatchIndex::BindingElementZero,
+                )
+                .expect("typed f64 load");
+            let converted = lowering
+                .checked_f64_to_f32_value(value)
+                .expect("checked typed conversion");
+            assert_eq!(converted.id().0, 2);
+            lowering
+                .store_value(
+                    PcuBindingRef::new(0, 1),
+                    PcuDispatchIndex::InvocationId,
+                    converted,
+                )
+                .expect("typed f32 store");
+            let builder = lowering.finish().expect("builder returned");
+            builder.with_ir(|ir| {
+                assert_eq!(validate_typed_dispatch_value_flow(ir), Ok(()));
+                let operation = ir.ops.iter().find_map(|op| match op {
+                    crate::PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+                        conversion,
+                        underflow_policy,
+                        range_policy,
+                        result,
+                        value,
+                    }) => Some((
+                        *conversion,
+                        *underflow_policy,
+                        *range_policy,
+                        *result,
+                        *value,
+                    )),
+                    _ => None,
+                });
+                assert_eq!(
+                    operation,
+                    Some((
+                        PcuDispatchCheckedFloatConversion::F64ToF32,
+                        policy,
+                        PcuRangePolicy::Reject,
+                        crate::PcuDispatchValueId(2),
+                        crate::PcuDispatchValueId(1),
+                    ))
+                );
+                assert!(
+                    ir.required_instruction_support()
+                        .contains(crate::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
+                );
+                assert!(
+                    crate::PcuDispatchOpCaps::all()
+                        .contains(crate::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
+                );
+                assert!(
+                    ir.required_type_support().contains(
+                        crate::PcuValueTypeCaps::for_value_type(PcuValueType::f64())
+                            .union(crate::PcuValueTypeCaps::for_value_type(PcuValueType::f32()))
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn checked_f32_to_f64_helper_preserves_width_policy_and_capability() {
+        for policy in [
+            PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        ] {
+            let bindings = [
+                PcuBinding::scalar::<f32>(
+                    Some("input"),
+                    0,
+                    0,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::ReadOnly,
+                ),
+                PcuBinding::scalar::<f64>(
+                    Some("output"),
+                    0,
+                    1,
+                    PcuBindingStorageClass::Storage,
+                    PcuBindingAccess::WriteOnly,
+                ),
+            ];
+            let builder =
+                PcuDispatchKernelBuilder::<4>::new(1, "widen", [1, 1, 1]).with_bindings(&bindings);
+            let mut lowering = PcuScalarLowering::with_float_underflow_policy(builder, 1, policy);
+            let value = lowering
+                .load_value::<f32>(
+                    PcuBindingRef::new(0, 0),
+                    PcuDispatchIndex::BindingElementZero,
+                )
+                .expect("typed f32 load");
+            let widened = lowering
+                .checked_f32_to_f64_value(value)
+                .expect("checked exact widening");
+            assert_eq!(widened.id().0, 2);
+            lowering
+                .store_value(
+                    PcuBindingRef::new(0, 1),
+                    PcuDispatchIndex::InvocationId,
+                    widened,
+                )
+                .expect("typed f64 store");
+            let builder = lowering.finish().expect("builder returned");
+            builder.with_ir(|ir| {
+                assert_eq!(validate_typed_dispatch_value_flow(ir), Ok(()));
+                let operation = ir.ops.iter().find_map(|op| match op {
+                    crate::PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+                        conversion,
+                        underflow_policy,
+                        range_policy,
+                        result,
+                        value,
+                    }) => Some((
+                        *conversion,
+                        *underflow_policy,
+                        *range_policy,
+                        *result,
+                        *value,
+                    )),
+                    _ => None,
+                });
+                assert_eq!(
+                    operation,
+                    Some((
+                        PcuDispatchCheckedFloatConversion::F32ToF64,
+                        policy,
+                        PcuRangePolicy::Reject,
+                        crate::PcuDispatchValueId(2),
+                        crate::PcuDispatchValueId(1),
+                    ))
+                );
+                assert!(
+                    ir.required_instruction_support()
+                        .contains(crate::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
+                );
+                assert!(
+                    ir.required_type_support().contains(
+                        crate::PcuValueTypeCaps::for_value_type(PcuValueType::f32())
+                            .union(crate::PcuValueTypeCaps::for_value_type(PcuValueType::f64()))
+                    )
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn range_policy_defaults_to_reject_and_is_emitted_independently_of_underflow_policy() {
+        let bindings = [
+            PcuBinding::scalar::<f64>(
+                Some("input"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f32>(
+                Some("output"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let builder = PcuDispatchKernelBuilder::<4>::new(1, "clamped_convert", [1, 1, 1])
+            .with_bindings(&bindings);
+        {
+            let default_lowering = PcuScalarLowering::new(builder, 1);
+            assert_eq!(default_lowering.range_policy(), PcuRangePolicy::Reject);
+        }
+
+        let builder = PcuDispatchKernelBuilder::<4>::new(1, "clamped_convert", [1, 1, 1])
+            .with_bindings(&bindings);
+        let mut lowering = PcuScalarLowering::with_float_underflow_policy(
+            builder,
+            1,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        )
+        .with_range_policy(PcuRangePolicy::Clamp);
+        assert_eq!(lowering.range_policy(), PcuRangePolicy::Clamp);
+        let input = lowering
+            .load_value::<f64>(
+                PcuBindingRef::new(0, 0),
+                PcuDispatchIndex::BindingElementZero,
+            )
+            .expect("typed input load");
+        let converted = lowering
+            .checked_f64_to_f32_value(input)
+            .expect("checked conversion");
+        lowering
+            .store_value(
+                PcuBindingRef::new(0, 1),
+                PcuDispatchIndex::InvocationId,
+                converted,
+            )
+            .expect("typed output store");
+        let builder = lowering.finish().expect("builder returned");
+        builder.with_ir(|ir| {
+            let policies = ir.ops.iter().find_map(|op| match op {
+                crate::PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert {
+                    underflow_policy,
+                    range_policy,
+                    ..
+                }) => Some((*underflow_policy, *range_policy)),
+                _ => None,
+            });
             assert_eq!(
-                ir.bindings[0].binding_type.value_type(),
-                Some(PcuValueType::f64())
+                policies,
+                Some((
+                    PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                    PcuRangePolicy::Clamp,
+                ))
             );
-            assert_eq!(validate_typed_dispatch_value_flow(ir), Ok(()),);
+            assert!(
+                ir.required_feature_support()
+                    .contains(crate::PcuDispatchFeatureCaps::RANGE_CLAMP)
+            );
+        });
+    }
+
+    #[test]
+    fn range_policy_is_emitted_for_checked_float_binary_operations() {
+        let binary_bindings = [
+            PcuBinding::scalar::<f32>(
+                Some("lhs"),
+                0,
+                0,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f32>(
+                Some("rhs"),
+                0,
+                1,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::ReadOnly,
+            ),
+            PcuBinding::scalar::<f32>(
+                Some("output"),
+                0,
+                2,
+                PcuBindingStorageClass::Storage,
+                PcuBindingAccess::WriteOnly,
+            ),
+        ];
+        let builder = PcuDispatchKernelBuilder::<5>::new(1, "clamped_add", [1, 1, 1])
+            .with_bindings(&binary_bindings);
+        let mut lowering =
+            PcuScalarLowering::new(builder, 1).with_range_policy(PcuRangePolicy::Clamp);
+        let lhs = lowering
+            .load_value::<f32>(
+                PcuBindingRef::new(0, 0),
+                PcuDispatchIndex::BindingElementZero,
+            )
+            .expect("typed lhs load");
+        let rhs = lowering
+            .load_value::<f32>(
+                PcuBindingRef::new(0, 1),
+                PcuDispatchIndex::BindingElementZero,
+            )
+            .expect("typed rhs load");
+        let sum = lowering
+            .checked_binary_value(PcuDispatchFloatBinaryOp::Add, lhs, rhs)
+            .expect("checked addition");
+        lowering
+            .store_value(
+                PcuBindingRef::new(0, 2),
+                PcuDispatchIndex::InvocationId,
+                sum,
+            )
+            .expect("typed sum store");
+        let builder = lowering.finish().expect("builder returned");
+        builder.with_ir(|ir| {
+            assert!(ir.ops.iter().any(|op| matches!(
+                op,
+                crate::PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+                    range_policy: PcuRangePolicy::Clamp,
+                    ..
+                })
+            )));
+            assert!(
+                ir.required_feature_support()
+                    .contains(crate::PcuDispatchFeatureCaps::RANGE_CLAMP)
+            );
         });
     }
 }

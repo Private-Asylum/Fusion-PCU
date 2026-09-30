@@ -16,6 +16,7 @@ use fusion_pcu::{
     PcuContextDescriptor,
     PcuContextKind,
     PcuDeviceClass,
+    PcuDeviceFacts,
     PcuDeviceDescriptor,
     PcuDeviceLocation,
     PcuDeviceActivation,
@@ -63,26 +64,19 @@ const PROVIDER: PcuProviderId = PcuProviderId(0x524f_434d);
 const TARGET_ID: u32 = 0;
 
 const fn f32_alu_caps() -> PcuDispatchOpCaps {
-    PcuDispatchOpCaps::ALU_ADD
-        .union(PcuDispatchOpCaps::ALU_SUB)
-        .union(PcuDispatchOpCaps::ALU_MUL)
-        .union(PcuDispatchOpCaps::ALU_DIV)
-        .union(PcuDispatchOpCaps::ALU_MAX)
+    PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
 }
 
 const fn f64_alu_caps() -> PcuDispatchOpCaps {
-    PcuDispatchOpCaps::ALU_ADD
-        .union(PcuDispatchOpCaps::ALU_SUB)
-        .union(PcuDispatchOpCaps::ALU_MUL)
-        .union(PcuDispatchOpCaps::ALU_DIV)
-        .union(PcuDispatchOpCaps::ALU_MIN)
-        .union(PcuDispatchOpCaps::ALU_MAX)
+    PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
 }
 
 const fn int_alu_caps() -> PcuDispatchOpCaps {
-    PcuDispatchOpCaps::ALU_ADD
-        .union(PcuDispatchOpCaps::ALU_SUB)
-        .union(PcuDispatchOpCaps::ALU_MUL)
+    PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
 }
 
 const fn checked_u32_alu_caps() -> PcuDispatchOpCaps {
@@ -423,6 +417,11 @@ impl PcuRuntimeDiscovery for RocmDiscovery {
         Ok(PcuCapabilitySnapshot { support })
     }
 
+    fn device_facts(&self, device: PcuObjectRef) -> Result<PcuDeviceFacts, Self::Error> {
+        let info = self.device_info(device)?;
+        crate::device_facts::query(info)
+    }
+
     fn device_capabilities(
         &self,
         device: PcuObjectRef,
@@ -503,20 +502,19 @@ impl RocmDiscovery {
         support.value_type_support = PcuFeatureSupport::new(types, PcuValueTypeCaps::empty());
         let instructions = PcuDispatchOpCaps::VALUE_CONSTANT
             .union(PcuDispatchOpCaps::VALUE_CAST)
-            .union(PcuDispatchOpCaps::ALU_ADD)
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL)
-            .union(PcuDispatchOpCaps::ALU_DIV)
-            .union(PcuDispatchOpCaps::ALU_MIN)
-            .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
             .union(PcuDispatchOpCaps::CONTROL_LOOP)
             .union(PcuDispatchOpCaps::BINDING_LOAD)
             .union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
             .union(PcuDispatchOpCaps::BINDING_STORE);
         let features = PcuDispatchFeatureCaps::MUTABLE_RESOURCES
-            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES);
+            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES)
+            .union(PcuDispatchFeatureCaps::RANGE_CLAMP);
         support.dispatch_support = PcuDispatchSupport {
             flags: PcuDispatchPolicyCaps::SERIAL.union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION),
             instructions: PcuFeatureSupport::new(instructions, PcuDispatchOpCaps::empty()),
@@ -606,13 +604,11 @@ const ROCM_EXECUTOR: PcuExecutorDescriptor = PcuExecutorDescriptor {
             .union(PcuValueTypeCaps::SCALAR_VALUES),
         dispatch_instructions: PcuDispatchOpCaps::VALUE_CONSTANT
             .union(PcuDispatchOpCaps::VALUE_CAST)
-            .union(PcuDispatchOpCaps::ALU_ADD)
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL)
-            .union(PcuDispatchOpCaps::ALU_DIV)
-            .union(PcuDispatchOpCaps::ALU_MIN)
-            .union(PcuDispatchOpCaps::ALU_MAX)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
             .union(PcuDispatchOpCaps::CONTROL_RETURN)
             .union(PcuDispatchOpCaps::CONTROL_LOOP)
             .union(PcuDispatchOpCaps::BINDING_LOAD)
@@ -630,7 +626,8 @@ const ROCM_EXECUTOR: PcuExecutorDescriptor = PcuExecutorDescriptor {
             .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
             .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
         dispatch_features: PcuDispatchFeatureCaps::MUTABLE_RESOURCES
-            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES),
+            .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES)
+            .union(PcuDispatchFeatureCaps::RANGE_CLAMP),
         stream_instructions: fusion_pcu::PcuStreamCapabilities::empty(),
         command_instructions: fusion_pcu::PcuCommandOpCaps::empty(),
         transaction_features: fusion_pcu::PcuTransactionFeatureCaps::empty(),
@@ -663,122 +660,80 @@ mod tests {
     }
 
     #[test]
-    fn discovery_advertises_f64_type_with_its_alu_operations() {
-        let required = PcuValueTypeCaps::FLOAT64.union(PcuValueTypeCaps::SCALAR_VALUES);
-        assert!(
-            sample()
-                .support(true)
-                .value_type_support
-                .direct
-                .contains(required)
-        );
-        assert!(ROCM_EXECUTOR.support.value_types.contains(required));
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::F64)
-                .contains(PcuDispatchOpCaps::ALU_ADD)
-        );
+    fn hardware_facts_reject_invalid_references_before_querying_hip() {
+        let discovery = sample();
+        let valid = discovery.reference(PcuObjectKind::Device, 2);
+        for reference in [
+            PcuObjectRef {
+                provider: PcuProviderId(0),
+                ..valid
+            },
+            PcuObjectRef {
+                generation: 78,
+                ..valid
+            },
+            PcuObjectRef {
+                kind: PcuObjectKind::Context,
+                ..valid
+            },
+            PcuObjectRef { id: 3, ..valid },
+        ] {
+            assert_eq!(
+                discovery.device_facts(reference),
+                Err(HipError::InvalidDiscoveryReference)
+            );
+        }
     }
 
     #[test]
-    fn discovery_advertises_lowered_f32_max() {
+    fn discovery_rejects_legacy_raw_value_alu_capabilities() {
+        let raw = PcuDispatchOpCaps::ALU_ADD
+            .union(PcuDispatchOpCaps::ALU_SUB)
+            .union(PcuDispatchOpCaps::ALU_MUL)
+            .union(PcuDispatchOpCaps::ALU_DIV)
+            .union(PcuDispatchOpCaps::ALU_MIN)
+            .union(PcuDispatchOpCaps::ALU_MAX);
         let support = sample().support(true);
-        assert!(
-            support
-                .dispatch_support
-                .scalar_alu
-                .direct
-                .for_scalar(fusion_pcu::PcuScalarType::F32)
-                .contains(PcuDispatchOpCaps::ALU_MAX)
+        assert_eq!(
+            support.dispatch_support.instructions.direct.bits() & raw.bits(),
+            0
         );
-        assert!(
-            support
-                .dispatch_support
-                .instructions
-                .direct
-                .contains(PcuDispatchOpCaps::ALU_MAX)
+        assert_eq!(
+            ROCM_EXECUTOR.support.dispatch_instructions.bits() & raw.bits(),
+            0
         );
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::F32)
-                .contains(PcuDispatchOpCaps::ALU_MAX)
-        );
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .dispatch_instructions
-                .contains(PcuDispatchOpCaps::ALU_MAX)
-        );
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::F64)
-                .contains(PcuDispatchOpCaps::ALU_MAX)
-        );
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::F64)
-                .contains(PcuDispatchOpCaps::ALU_MIN)
-        );
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .dispatch_instructions
-                .contains(PcuDispatchOpCaps::ALU_MIN)
-        );
-        let max = [fusion_pcu::PcuDispatchOp::Data(
-            fusion_pcu::PcuDispatchDataOp::Alu {
-                value_type: fusion_pcu::PcuValueType::f32(),
-                result: fusion_pcu::PcuDispatchValueId(3),
-                op: fusion_pcu::PcuDispatchAluOp::Max,
-                lhs: fusion_pcu::PcuDispatchValueId(1),
-                rhs: fusion_pcu::PcuDispatchValueId(2),
-            },
-        )];
-        let kernel = fusion_pcu::PcuDispatchKernelIr {
-            id: fusion_pcu::PcuKernelId(1),
-            entry: fusion_pcu::PcuDispatchEntryPoint {
-                name: "f32-max-capability",
-                logical_shape: [1, 1, 1],
-            },
-            bindings: &[],
-            ports: &[],
-            parameters: &[],
-            ops: &max,
-            type_caps: PcuValueTypeCaps::empty(),
-            feature_caps: PcuDispatchFeatureCaps::empty(),
-        };
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .supports_kernel_direct(fusion_pcu::PcuKernel::Dispatch(kernel))
-        );
-        let f64_max = [fusion_pcu::PcuDispatchOp::Data(
-            fusion_pcu::PcuDispatchDataOp::Alu {
-                value_type: fusion_pcu::PcuValueType::f64(),
-                result: fusion_pcu::PcuDispatchValueId(3),
-                op: fusion_pcu::PcuDispatchAluOp::Max,
-                lhs: fusion_pcu::PcuDispatchValueId(1),
-                rhs: fusion_pcu::PcuDispatchValueId(2),
-            },
-        )];
-        assert!(
-            ROCM_EXECUTOR
-                .support
-                .supports_kernel_direct(fusion_pcu::PcuKernel::Dispatch(
-                    fusion_pcu::PcuDispatchKernelIr {
-                        ops: &f64_max,
-                        ..kernel
-                    }
-                ))
-        );
+        for scalar in [
+            fusion_pcu::PcuScalarType::F32,
+            fusion_pcu::PcuScalarType::F64,
+            fusion_pcu::PcuScalarType::I8,
+            fusion_pcu::PcuScalarType::U8,
+            fusion_pcu::PcuScalarType::I16,
+            fusion_pcu::PcuScalarType::U16,
+            fusion_pcu::PcuScalarType::I32,
+            fusion_pcu::PcuScalarType::U32,
+            fusion_pcu::PcuScalarType::I64,
+            fusion_pcu::PcuScalarType::U64,
+        ] {
+            assert_eq!(
+                support
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar)
+                    .bits()
+                    & raw.bits(),
+                0
+            );
+            assert_eq!(
+                ROCM_EXECUTOR
+                    .support
+                    .dispatch_scalar_alu
+                    .for_scalar(scalar)
+                    .bits()
+                    & raw.bits(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -877,103 +832,6 @@ mod tests {
     }
 
     #[test]
-    fn discovery_advertises_u16_wrapping_alu_support() {
-        let support = sample().support(true);
-        assert!(
-            support
-                .value_type_support
-                .direct
-                .contains(PcuValueTypeCaps::UINT16.union(PcuValueTypeCaps::SCALAR_VALUES))
-        );
-        let alu = ROCM_EXECUTOR
-            .support
-            .dispatch_scalar_alu
-            .for_scalar(fusion_pcu::PcuScalarType::U16);
-        let expected = PcuDispatchOpCaps::ALU_ADD
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL);
-        assert!(alu.contains(expected));
-        assert!(!alu.contains(PcuDispatchOpCaps::ALU_DIV));
-        let device_alu = support
-            .dispatch_support
-            .scalar_alu
-            .direct
-            .for_scalar(fusion_pcu::PcuScalarType::U16);
-        assert!(device_alu.contains(expected));
-        assert!(!device_alu.contains(PcuDispatchOpCaps::ALU_DIV));
-    }
-
-    #[test]
-    fn discovery_advertises_u8_wrapping_alu_support() {
-        let support = sample().support(true);
-        assert!(
-            support
-                .value_type_support
-                .direct
-                .contains(PcuValueTypeCaps::UINT8.union(PcuValueTypeCaps::SCALAR_VALUES))
-        );
-        let expected = PcuDispatchOpCaps::ALU_ADD
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL);
-        for alu in [
-            ROCM_EXECUTOR
-                .support
-                .dispatch_scalar_alu
-                .for_scalar(fusion_pcu::PcuScalarType::U8),
-            support
-                .dispatch_support
-                .scalar_alu
-                .direct
-                .for_scalar(fusion_pcu::PcuScalarType::U8),
-        ] {
-            assert!(alu.contains(expected));
-            assert!(!alu.contains(PcuDispatchOpCaps::ALU_DIV));
-        }
-    }
-
-    #[test]
-    fn discovery_advertises_i16_wrapping_alu_support() {
-        let support = sample().support(true);
-        assert!(
-            support
-                .value_type_support
-                .direct
-                .contains(PcuValueTypeCaps::INT16.union(PcuValueTypeCaps::SCALAR_VALUES))
-        );
-        let expected = PcuDispatchOpCaps::ALU_ADD
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL);
-        let alu = support
-            .dispatch_support
-            .scalar_alu
-            .direct
-            .for_scalar(fusion_pcu::PcuScalarType::I16);
-        assert!(alu.contains(expected));
-        assert!(!alu.contains(PcuDispatchOpCaps::ALU_DIV));
-    }
-
-    #[test]
-    fn discovery_advertises_i8_wrapping_alu_support() {
-        let support = sample().support(true);
-        assert!(
-            support
-                .value_type_support
-                .direct
-                .contains(PcuValueTypeCaps::INT8.union(PcuValueTypeCaps::SCALAR_VALUES))
-        );
-        let expected = PcuDispatchOpCaps::ALU_ADD
-            .union(PcuDispatchOpCaps::ALU_SUB)
-            .union(PcuDispatchOpCaps::ALU_MUL);
-        let alu = support
-            .dispatch_support
-            .scalar_alu
-            .direct
-            .for_scalar(fusion_pcu::PcuScalarType::I8);
-        assert!(alu.contains(expected));
-        assert!(!alu.contains(PcuDispatchOpCaps::ALU_DIV));
-    }
-
-    #[test]
     fn bounded_snapshot_traversal_and_device_scoped_executor_are_consistent() {
         let discovery = sample();
         let mut provider = [PcuProviderDescriptor {
@@ -1064,6 +922,13 @@ mod tests {
         assert!(support.dispatch_support.instructions.direct.contains(
             PcuDispatchOpCaps::BINDING_LOAD.union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
         ));
+        assert!(
+            support
+                .dispatch_support
+                .instructions
+                .direct
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
+        );
     }
 
     #[test]

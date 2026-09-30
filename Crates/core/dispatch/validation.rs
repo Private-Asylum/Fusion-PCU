@@ -1,7 +1,7 @@
 //! Structural admission checks for PCU submissions.
 
-use crate::contract::PcuKernelIrContract;
 use super::submission::PcuDispatchSubmission;
+use crate::contract::PcuKernelIrContract;
 #[rustfmt::skip]
 use crate::contract::{
     PcuBinding,
@@ -160,7 +160,11 @@ pub fn validate_dispatch_submission(submission: PcuDispatchSubmission<'_>) -> Re
 
 fn contains_conversion(ops: &[PcuDispatchOp<'_>]) -> bool {
     ops.iter().any(|op| match op {
-        PcuDispatchOp::Data(PcuDispatchDataOp::Convert { .. }) => true,
+        PcuDispatchOp::Data(
+            PcuDispatchDataOp::Convert { .. }
+            | PcuDispatchDataOp::CheckedFloatConvert { .. }
+            | PcuDispatchDataOp::CheckedFloatUnary { .. },
+        ) => true,
         PcuDispatchOp::GridStrideLoop { body, .. } => contains_conversion(body),
         _ => false,
     })

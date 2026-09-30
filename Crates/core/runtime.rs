@@ -12,6 +12,8 @@ pub mod discovery;
 pub mod execution;
 pub mod host_kernel;
 pub mod kernel;
+#[cfg(feature = "alloc")]
+pub mod owned_shape;
 pub mod registry;
 pub mod scalar_lowering;
 
@@ -24,5 +26,7 @@ pub use device_kernel::*;
 pub use execution::*;
 pub use host_kernel::*;
 pub use kernel::*;
+#[cfg(feature = "alloc")]
+pub use owned_shape::*;
 pub use registry::*;
 pub use scalar_lowering::*;

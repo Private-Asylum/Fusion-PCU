@@ -733,7 +733,7 @@ fn verify_fault(
         let _sample = run_direct(function, stream, &args, grid)?;
         status.copy_to(&mut word)?;
     }
-    let expected = (expected_id << 2) | 1;
+    let expected = (expected_id << 3) | 1;
     if u64::from_le_bytes(word) != expected {
         return Err(format!(
             "native first-fault word was {}, expected {expected}",
@@ -772,7 +772,7 @@ fn native_source(extent: u32, invocations: u32, grid_stride: bool) -> String {
     };
     let close = "}";
     format!(
-        "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void native_checked_u32_div_rem(const unsigned int* a,const unsigned int* b,unsigned int* q,unsigned int* r,unsigned long long* fault_word) {{\nunsigned int base=blockIdx.x*blockDim.x+threadIdx.x; if (base >= {invocations}u) return; {iteration} if (b[i] == 0u) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 2u) | 1ull); }} else {{ q[i]=a[i]/b[i]; r[i]=a[i]%b[i]; }} {close} }}\n"
+        "#include <hip/hip_runtime.h>\nextern \"C\" __global__ void native_checked_u32_div_rem(const unsigned int* a,const unsigned int* b,unsigned int* q,unsigned int* r,unsigned long long* fault_word) {{\nunsigned int base=blockIdx.x*blockDim.x+threadIdx.x; if (base >= {invocations}u) return; {iteration} if (b[i] == 0u) {{ atomicMin(fault_word, (static_cast<unsigned long long>(i) << 3u) | 1ull); }} else {{ q[i]=a[i]/b[i]; r[i]=a[i]%b[i]; }} {close} }}\n"
     )
 }
 
