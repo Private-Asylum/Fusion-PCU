@@ -541,7 +541,8 @@ version = "0.0.4"
 dependencies = [
  "fusion-pcu",
  "fusion-pcu-macros",
- "fusion-pcu-runner",
+ "fusion-pcu-spirv",
+ "fusion-pcu-vulkan",
  "winit",
 ]
 
@@ -604,15 +605,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fusion-pcu-runner"
-version = "0.0.4"
-dependencies = [
- "ash",
- "fusion-pcu",
- "fusion-pcu-spirv",
-]
-
-[[package]]
 name = "fusion-pcu-spirv"
 version = "0.0.4"
 dependencies = [
@@ -623,7 +615,9 @@ dependencies = [
 name = "fusion-pcu-vulkan"
 version = "0.0.4"
 dependencies = [
+ "ash",
  "fusion-pcu-core",
+ "fusion-pcu-spirv",
 ]
 
 [[package]]

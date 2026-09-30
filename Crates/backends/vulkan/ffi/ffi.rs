@@ -1,28 +1,31 @@
-//! Vulkan runner for PCU SPIR-V dispatch modules.
-//!
-//! This module is execution glue, not SPIR-V lowering. It owns Vulkan device selection,
-//! runner capability detection, fixed-descriptor execution, and the runtime mess so callers do
-//! not have to duplicate Vulkan reference graphs by hand.
-
-use core::fmt;
-use core::mem;
-use core::ptr;
-use std::boxed::Box;
-use std::error::Error;
-use std::ffi::CStr;
-use std::string::String;
-
-use ash::vk;
-
+//! Vulkan handles, foreign calls, and synchronous fixed-buffer execution.
+#[rustfmt::skip]
+use core::{
+    mem,
+    ptr,
+};
+#[rustfmt::skip]
+use std::{
+    ffi::CStr,
+    string::String,
+};
+#[rustfmt::skip]
+use ash::{
+    vk,
+};
 #[rustfmt::skip]
 use crate::{
-    PcuComputeRunner,
-    PcuLoweredSpirvDispatch,
-    PcuResourceAddressingModel,
-    PcuRunnerDescriptor,
-    PcuRunnerError,
-    PcuRunnerExecutionReport,
-    PcuRunnerHandle,
+    error::PcuVulkanError,
+    types::{
+        PcuVulkanBufferDeviceAddressCaps,
+        PcuVulkanCaps,
+        PcuVulkanDescriptorHeapBudget,
+        PcuVulkanDescriptorIndexingCaps,
+        PcuVulkanExecutionReport,
+        PcuVulkanLoweredSpirvDispatch,
+        PcuVulkanPushConstantCaps,
+        PcuVulkanResourceAddressingModel,
+    },
 };
 #[rustfmt::skip]
 use fusion_pcu::{
@@ -30,178 +33,27 @@ use fusion_pcu::{
     PcuDispatchOp,
     PcuInvocationBinding,
     PcuInvocationBuffer,
-    PcuInvocationParameters,
     PcuInvocationTarget,
 };
 
-const RUNNER_APP_NAME: &CStr = c"fusion-pcu-vulkan-runner";
-const RUNNER_ENGINE_NAME: &CStr = c"fusion-pcu";
+const BACKEND_APP_NAME: &CStr = c"fusion-pcu-vulkan-prototype";
+const BACKEND_ENGINE_NAME: &CStr = c"fusion-pcu";
 const SHADER_ENTRY_POINT: &CStr = c"main";
 
-pub const PCU_VULKAN_RUNNER_ID: &str = "Vulkan";
-pub const PCU_VULKAN_RUNNER_PRIORITY: i32 = 1000;
-
-pub const PCU_VULKAN_RUNNER_DESCRIPTOR: PcuRunnerDescriptor = PcuRunnerDescriptor {
-    id: PCU_VULKAN_RUNNER_ID,
-    priority: PCU_VULKAN_RUNNER_PRIORITY,
-    probe: probe_runner,
-    open: open_runner,
-};
-
-/// Descriptor class used for heap budgeting and registration failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PcuVulkanDescriptorClass {
-    SampledImage,
-    StorageBuffer,
-    StorageImage,
-    Sampler,
-}
-
-/// Conservative descriptor-heap budget requested by the runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PcuVulkanDescriptorHeapBudget {
-    pub sampled_images: u32,
-    pub storage_buffers: u32,
-    pub storage_images: u32,
-    pub samplers: u32,
-}
-
-impl PcuVulkanDescriptorHeapBudget {
-    pub const PORTABLE_DEFAULT: Self = Self {
-        sampled_images: 16 * 1024,
-        storage_buffers: 8 * 1024,
-        storage_images: 8 * 1024,
-        samplers: 1024,
-    };
-
-    #[must_use]
-    pub const fn portable_default() -> Self {
-        Self::PORTABLE_DEFAULT
-    }
-
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            sampled_images: 0,
-            storage_buffers: 0,
-            storage_images: 0,
-            samplers: 0,
-        }
-    }
-
-    #[must_use]
-    pub const fn clamp_to(self, limits: Self) -> Self {
-        Self {
-            sampled_images: min_u32(self.sampled_images, limits.sampled_images),
-            storage_buffers: min_u32(self.storage_buffers, limits.storage_buffers),
-            storage_images: min_u32(self.storage_images, limits.storage_images),
-            samplers: min_u32(self.samplers, limits.samplers),
-        }
-    }
-}
-
-impl Default for PcuVulkanDescriptorHeapBudget {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-/// Vulkan descriptor-indexing support relevant to PCU resource routing.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct PcuVulkanDescriptorIndexingCaps {
-    pub runtime_descriptor_array: bool,
-    pub sampled_image_non_uniform_indexing: bool,
-    pub storage_buffer_non_uniform_indexing: bool,
-    pub storage_image_non_uniform_indexing: bool,
-    pub partially_bound: bool,
-    pub update_unused_while_pending: bool,
-    pub variable_descriptor_count: bool,
-    pub mutable_descriptor_type: bool,
-    pub requested_heap_budget: PcuVulkanDescriptorHeapBudget,
-    pub actual_heap_budget: PcuVulkanDescriptorHeapBudget,
-}
-
-impl PcuVulkanDescriptorIndexingCaps {
-    #[must_use]
-    pub const fn supports_storage_buffer_heap(self) -> bool {
-        self.runtime_descriptor_array && self.storage_buffer_non_uniform_indexing
-    }
-
-    #[must_use]
-    pub const fn supports_sampled_image_heap(self) -> bool {
-        self.runtime_descriptor_array && self.sampled_image_non_uniform_indexing
-    }
-
-    #[must_use]
-    pub const fn supports_storage_image_heap(self) -> bool {
-        self.runtime_descriptor_array && self.storage_image_non_uniform_indexing
-    }
-}
-
-/// Vulkan buffer-device-address support relevant to PCU buffer routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct PcuVulkanBufferDeviceAddressCaps {
-    pub supported: bool,
-    pub capture_replay: bool,
-    pub multi_device: bool,
-}
-
-/// Vulkan push-constant support surfaced to PCU invocation metadata routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct PcuVulkanPushConstantCaps {
-    pub max_size_bytes: u32,
-}
-
-/// Runtime-selected Vulkan runner capability truth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PcuVulkanRunnerCaps {
-    pub api_version: u32,
-    pub descriptor_indexing: PcuVulkanDescriptorIndexingCaps,
-    pub buffer_device_address: PcuVulkanBufferDeviceAddressCaps,
-    pub push_constants: PcuVulkanPushConstantCaps,
-    pub selected_storage_buffer_model: PcuResourceAddressingModel,
-}
-
-/// Result metadata returned by the current fixed-descriptor dispatch path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PcuVulkanDispatchReport {
-    pub invocations: u32,
-    pub dispatch_groups: [u32; 3],
-    pub bound_byte_len: usize,
-    pub resource_model: PcuResourceAddressingModel,
-}
-
-/// Vulkan PCU runner.
-pub struct PcuVulkanRunner {
+/// Vulkan PCU prototype.
+pub struct VulkanDevice {
     _entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
     queue: vk::Queue,
-    caps: PcuVulkanRunnerCaps,
+    caps: PcuVulkanCaps,
     physical_device_name: String,
 }
 
-fn probe_runner() -> Result<(), PcuRunnerError> {
-    PcuVulkanRunner::probe().map_err(|error| PcuRunnerError::RunnerUnavailable {
-        id: PCU_VULKAN_RUNNER_ID,
-        reason: error.to_string(),
-    })?;
-    Ok(())
-}
-
-fn open_runner() -> Result<PcuRunnerHandle, PcuRunnerError> {
-    let runner = PcuVulkanRunner::new().map_err(|error| PcuRunnerError::RunnerUnavailable {
-        id: PCU_VULKAN_RUNNER_ID,
-        reason: error.to_string(),
-    })?;
-    Ok(PcuRunnerHandle::new(Box::new(runner)))
-}
-
-impl PcuVulkanRunner {
-    /// Creates a Vulkan runner using the first compute-capable physical device.
+impl VulkanDevice {
+    /// Creates a Vulkan prototype using the first compute-capable physical device.
     ///
     /// # Errors
     ///
@@ -210,23 +62,23 @@ impl PcuVulkanRunner {
         Self::with_descriptor_heap_budget(PcuVulkanDescriptorHeapBudget::portable_default())
     }
 
-    /// Probes whether a Vulkan runner can be opened without keeping a live device.
+    /// Probes whether a Vulkan prototype can be opened without keeping a live device.
     ///
     /// # Errors
     ///
     /// Returns loader/device/queue errors when Vulkan is unavailable for compute.
-    pub fn probe() -> Result<PcuVulkanRunnerCaps, PcuVulkanError> {
+    pub fn probe() -> Result<PcuVulkanCaps, PcuVulkanError> {
         Self::probe_with_descriptor_heap_budget(PcuVulkanDescriptorHeapBudget::portable_default())
     }
 
-    /// Probes whether a Vulkan runner can be opened with a caller-specified heap budget.
+    /// Probes whether a Vulkan prototype can be opened with a caller-specified heap budget.
     ///
     /// # Errors
     ///
     /// Returns loader/device/queue errors when Vulkan is unavailable for compute.
     pub fn probe_with_descriptor_heap_budget(
         requested_heap_budget: PcuVulkanDescriptorHeapBudget,
-    ) -> Result<PcuVulkanRunnerCaps, PcuVulkanError> {
+    ) -> Result<PcuVulkanCaps, PcuVulkanError> {
         let entry = unsafe {
             // SAFETY: Loading the Vulkan loader is process-local and ash validates entry points.
             ash::Entry::load()
@@ -236,7 +88,7 @@ impl PcuVulkanRunner {
         let instance = create_instance(&entry, instance_api_version)?;
         let instance = VulkanProbeInstance { handle: instance };
         let selected = select_compute_device(&instance.handle)?;
-        let caps = query_runner_caps(
+        let caps = query_backend_caps(
             &instance.handle,
             selected.physical_device,
             &selected.properties,
@@ -246,7 +98,7 @@ impl PcuVulkanRunner {
         Ok(caps)
     }
 
-    /// Creates a Vulkan runner with a caller-specified descriptor-heap budget request.
+    /// Creates a Vulkan prototype with a caller-specified descriptor-heap budget request.
     ///
     /// # Errors
     ///
@@ -262,7 +114,7 @@ impl PcuVulkanRunner {
         let instance_api_version = choose_instance_api_version(&entry)?;
         let instance = create_instance(&entry, instance_api_version)?;
         let selected = select_compute_device(&instance)?;
-        let caps = query_runner_caps(
+        let caps = query_backend_caps(
             &instance,
             selected.physical_device,
             &selected.properties,
@@ -292,23 +144,13 @@ impl PcuVulkanRunner {
     }
 
     #[must_use]
-    pub const fn caps(&self) -> PcuVulkanRunnerCaps {
+    pub const fn caps(&self) -> PcuVulkanCaps {
         self.caps
     }
 
     #[must_use]
-    pub fn physical_device_name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.physical_device_name
-    }
-
-    #[must_use]
-    pub const fn queue_family_index(&self) -> u32 {
-        self.queue_family_index
-    }
-
-    #[must_use]
-    pub const fn physical_device_raw(&self) -> vk::PhysicalDevice {
-        self.physical_device
     }
 
     /// Executes one PCU-generated SPIR-V dispatch through the current fixed-descriptor path.
@@ -321,11 +163,10 @@ impl PcuVulkanRunner {
     /// Returns shape, memory, Vulkan, or output-transfer failures.
     pub fn submit_dispatch_spirv(
         &self,
-        dispatch: &PcuLoweredSpirvDispatch<'_>,
+        dispatch: &PcuVulkanLoweredSpirvDispatch<'_>,
         submission: PcuDispatchSubmission<'_>,
         bindings: &mut [PcuInvocationBinding<'_>],
-        _parameters: PcuInvocationParameters<'_>,
-    ) -> Result<PcuVulkanDispatchReport, PcuVulkanError> {
+    ) -> Result<PcuVulkanExecutionReport, PcuVulkanError> {
         let execution = fixed_descriptor_execution(dispatch, submission, bindings)?;
 
         let source_buffer = VulkanBuffer::new_storage_buffer(
@@ -388,46 +229,11 @@ impl PcuVulkanRunner {
         submit_and_wait(&self.device, self.queue, command_buffer, fence.handle)?;
         read_binding_buffer(bindings, 2, &output_buffer)?;
 
-        Ok(PcuVulkanDispatchReport {
+        Ok(PcuVulkanExecutionReport {
             invocations: execution.invocations,
             dispatch_groups: execution.dispatch_groups,
             bound_byte_len: execution.bound_byte_len,
             resource_model: self.caps.selected_storage_buffer_model,
-        })
-    }
-}
-
-impl PcuComputeRunner for PcuVulkanRunner {
-    fn id(&self) -> &'static str {
-        PCU_VULKAN_RUNNER_ID
-    }
-
-    fn priority(&self) -> i32 {
-        PCU_VULKAN_RUNNER_PRIORITY
-    }
-
-    fn device_name(&self) -> Option<&str> {
-        Some(self.physical_device_name())
-    }
-
-    fn submit_spirv_dispatch(
-        &self,
-        dispatch: &PcuLoweredSpirvDispatch<'_>,
-        submission: PcuDispatchSubmission<'_>,
-        bindings: &mut [PcuInvocationBinding<'_>],
-        parameters: PcuInvocationParameters<'_>,
-    ) -> Result<PcuRunnerExecutionReport, PcuRunnerError> {
-        let report = self
-            .submit_dispatch_spirv(dispatch, submission, bindings, parameters)
-            .map_err(|error| PcuRunnerError::RunnerExecution {
-                id: PCU_VULKAN_RUNNER_ID,
-                reason: error.to_string(),
-            })?;
-
-        Ok(PcuRunnerExecutionReport {
-            invocations: report.invocations,
-            dispatch_groups: report.dispatch_groups,
-            resource_model: report.resource_model,
         })
     }
 }
@@ -439,7 +245,7 @@ struct FixedDescriptorExecution {
 }
 
 fn fixed_descriptor_execution(
-    dispatch: &PcuLoweredSpirvDispatch<'_>,
+    dispatch: &PcuVulkanLoweredSpirvDispatch<'_>,
     submission: PcuDispatchSubmission<'_>,
     bindings: &[PcuInvocationBinding<'_>],
 ) -> Result<FixedDescriptorExecution, PcuVulkanError> {
@@ -644,93 +450,16 @@ const fn equal_byte_len(left: usize, right: usize) -> Result<usize, PcuVulkanErr
     }
 }
 
-impl Drop for PcuVulkanRunner {
+impl Drop for VulkanDevice {
     fn drop(&mut self) {
         unsafe {
-            // SAFETY: The runner owns the logical device and instance and destroys them exactly once.
+            // SAFETY: The prototype owns the logical device and instance and destroys them exactly once.
             let _ = self.device.device_wait_idle();
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
     }
 }
-
-#[derive(Debug)]
-pub enum PcuVulkanError {
-    Loader(ash::LoadingError),
-    Vulkan {
-        context: &'static str,
-        result: vk::Result,
-    },
-    NoPhysicalDevice,
-    NoComputeQueueFamily,
-    NoHostVisibleCoherentMemory,
-    NoDescriptorSet,
-    NoCommandBuffer,
-    NoComputePipeline,
-    InvalidDispatchShape,
-    InvalidInvocationBinding,
-    BufferTooLarge,
-    BufferTooSmall,
-    DescriptorHeapFull {
-        class: PcuVulkanDescriptorClass,
-        capacity: u32,
-    },
-    UnsupportedResourceAddressing {
-        requested: PcuResourceAddressingModel,
-        available: PcuResourceAddressingModel,
-    },
-}
-
-impl fmt::Display for PcuVulkanError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Loader(error) => write!(formatter, "Vulkan loader error: {error}"),
-            Self::Vulkan { context, result } => write!(formatter, "{context}: {result:?}"),
-            Self::NoPhysicalDevice => formatter.write_str("no Vulkan physical device found"),
-            Self::NoComputeQueueFamily => {
-                formatter.write_str("no Vulkan compute-capable queue family found")
-            }
-            Self::NoHostVisibleCoherentMemory => {
-                formatter.write_str("no host-visible coherent Vulkan memory type found")
-            }
-            Self::NoDescriptorSet => {
-                formatter.write_str("Vulkan descriptor set allocation returned no sets")
-            }
-            Self::NoCommandBuffer => {
-                formatter.write_str("Vulkan command buffer allocation returned no buffers")
-            }
-            Self::NoComputePipeline => {
-                formatter.write_str("Vulkan compute pipeline creation returned no pipelines")
-            }
-            Self::InvalidDispatchShape => formatter.write_str("invalid Vulkan dispatch shape"),
-            Self::InvalidInvocationBinding => {
-                formatter.write_str("invalid Vulkan invocation binding")
-            }
-            Self::BufferTooLarge => {
-                formatter.write_str("buffer size does not fit Vulkan device size")
-            }
-            Self::BufferTooSmall => {
-                formatter.write_str("buffer is too small for the requested transfer")
-            }
-            Self::DescriptorHeapFull { class, capacity } => {
-                write!(
-                    formatter,
-                    "Vulkan descriptor heap {class:?} is full at capacity {capacity}"
-                )
-            }
-            Self::UnsupportedResourceAddressing {
-                requested,
-                available,
-            } => write!(
-                formatter,
-                "Vulkan resource addressing {requested:?} unsupported; available path is {available:?}"
-            ),
-        }
-    }
-}
-
-impl Error for PcuVulkanError {}
 
 struct SelectedPhysicalDevice {
     physical_device: vk::PhysicalDevice,
@@ -770,9 +499,9 @@ fn choose_instance_api_version(entry: &ash::Entry) -> Result<u32, PcuVulkanError
 
 fn create_instance(entry: &ash::Entry, api_version: u32) -> Result<ash::Instance, PcuVulkanError> {
     let application_info = vk::ApplicationInfo::default()
-        .application_name(RUNNER_APP_NAME)
+        .application_name(BACKEND_APP_NAME)
         .application_version(1)
-        .engine_name(RUNNER_ENGINE_NAME)
+        .engine_name(BACKEND_ENGINE_NAME)
         .engine_version(1)
         .api_version(api_version);
 
@@ -828,13 +557,13 @@ fn create_device(
     })
 }
 
-fn query_runner_caps(
+fn query_backend_caps(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     properties: &vk::PhysicalDeviceProperties,
     instance_api_version: u32,
     requested_heap_budget: PcuVulkanDescriptorHeapBudget,
-) -> Result<PcuVulkanRunnerCaps, PcuVulkanError> {
+) -> Result<PcuVulkanCaps, PcuVulkanError> {
     let mut descriptor_indexing = PcuVulkanDescriptorIndexingCaps {
         requested_heap_budget,
         ..PcuVulkanDescriptorIndexingCaps::default()
@@ -905,12 +634,12 @@ fn query_runner_caps(
             bool32(buffer_address_features.buffer_device_address_multi_device);
     }
 
-    Ok(PcuVulkanRunnerCaps {
+    Ok(PcuVulkanCaps {
         api_version: instance_api_version,
         descriptor_indexing,
         buffer_device_address,
         push_constants,
-        selected_storage_buffer_model: PcuResourceAddressingModel::FixedDescriptors,
+        selected_storage_buffer_model: PcuVulkanResourceAddressingModel::FixedDescriptors,
     })
 }
 
@@ -1228,10 +957,6 @@ const fn bool32(value: vk::Bool32) -> bool {
     value == vk::TRUE
 }
 
-const fn min_u32(left: u32, right: u32) -> u32 {
-    if left < right { left } else { right }
-}
-
 struct VulkanShaderModule<'a> {
     device: &'a ash::Device,
     handle: vk::ShaderModule,
@@ -1417,7 +1142,7 @@ impl<'a> VulkanBuffer<'a> {
             return Err(PcuVulkanError::BufferTooSmall);
         }
         let mapped = vk_try("map Vulkan buffer memory for write", unsafe {
-            // SAFETY: The memory is host-visible and this runner maps the whole write range exclusively.
+            // SAFETY: The memory is host-visible and this prototype maps the whole write range exclusively.
             self.device
                 .map_memory(self.memory, 0, byte_len_device, vk::MemoryMapFlags::empty())
         })?;

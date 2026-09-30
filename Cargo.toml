@@ -16,7 +16,6 @@ members = [
     "Crates/backends/ilz",
     "Crates/backends/wgpu",
     "Crates/backends/opengl",
-    "Crates/runner",
     "Examples/rocm",
     "Examples/cuda",
     "Examples/vulkan",
@@ -51,7 +50,6 @@ fusion-pcu-opencl = { version = "0.0.4", path = "Crates/backends/opencl", defaul
 fusion-pcu-ilz = { version = "0.0.4", path = "Crates/backends/ilz", default-features = false }
 fusion-pcu-wgpu = { version = "0.0.4", path = "Crates/backends/wgpu", default-features = false }
 fusion-pcu-opengl = { version = "0.0.4", path = "Crates/backends/opengl", default-features = false }
-fusion-pcu-runner = { version = "0.0.4", path = "Crates/runner", default-features = false }
 
 ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
 proc-macro2 = "1.0.103"

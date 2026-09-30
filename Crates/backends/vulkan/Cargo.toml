@@ -1,6 +1,6 @@
 [package]
 name = "fusion-pcu-vulkan"
-description = "Vulkan backend scaffold for Fusion PCU"
+description = "Limited synchronous Vulkan SPIR-V prototype for Fusion PCU"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -18,9 +18,12 @@ path = "vulkan.rs"
 
 [features]
 default = []
+hosted = ["dep:ash", "dep:fusion-pcu-spirv"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
+fusion-pcu-spirv = { workspace = true, optional = true }
+ash = { workspace = true, optional = true }
 
 [lints]
 workspace = true

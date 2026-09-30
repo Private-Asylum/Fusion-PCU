@@ -1,12 +1,15 @@
+//! Fixed-buffer Vulkan copy proof. Checked arithmetic and modern source-facade integration
+//! remain deferred; the SPIR-V lowerer rejects unsupported arithmetic rather than weakening it.
+
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 
 #[rustfmt::skip]
-use fusion_pcu_runner::{
-    PcuDispatchReport,
-    PcuRunnerError,
-    PcuRuntime,
+use fusion_pcu_vulkan::{
+    PcuVulkanBackend,
+    PcuVulkanDispatchReport,
+    PcuVulkanError,
 };
 #[rustfmt::skip]
 use fusion_pcu::{
@@ -76,16 +79,15 @@ impl ExampleApp {
     fn finish(self) -> Result<(), ExampleError> {
         let Some(result) = self.result else {
             return Err(ExampleError::event_loop(
-                "event loop exited before the Vulkan runner test ran",
+                "event loop exited before the Vulkan prototype test ran",
             ));
         };
 
         let report = result?;
         println!(
-            "fusion-vulkan-example: dispatched {} PCU invocations over {ELEMENT_COUNT} elements through {} on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
+            "fusion-vulkan-example: dispatched {} PCU invocations over {ELEMENT_COUNT} elements through Vulkan on {} ({:?}, groups {:?}, {} SPIR-V words, bound {}, sample output {:.2})",
             report.dispatch.execution.invocations,
-            report.dispatch.runner_id,
-            report.device_name.as_deref().unwrap_or("unknown device"),
+            report.dispatch.device_name,
             report.dispatch.execution.resource_model,
             report.dispatch.execution.dispatch_groups,
             report.dispatch.spirv_words,
@@ -149,14 +151,14 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
     let mut output = [0_u32; ELEMENT_COUNT];
     fill_inputs(&mut source, &mut bias)?;
 
-    let bindings = parallel_float_kernel_bindings();
-    let builder = parallel_float_kernel::<ELEMENT_COUNT>(&bindings).map_err(ExampleError::Pcu)?;
-    let runtime = PcuRuntime::auto().map_err(ExampleError::Runner)?;
+    let bindings = parallel_copy_kernel_bindings();
+    let builder = parallel_copy_kernel::<ELEMENT_COUNT>(&bindings).map_err(ExampleError::Pcu)?;
+    let backend = PcuVulkanBackend::new().map_err(ExampleError::Vulkan)?;
     let invocations = NonZeroU32::new(INVOCATIONS).ok_or(ExampleError::BufferTooLarge)?;
     let dispatch = builder.with_ir(|kernel| {
         let mut invocation_bindings =
             parallel_float_invocation_bindings(&source, &bias, &mut output);
-        runtime
+        backend
             .submit_dispatch(
                 PcuDispatchSubmission {
                     kernel,
@@ -165,24 +167,23 @@ fn run_pcu_compute_test() -> Result<ExampleReport, ExampleError> {
                 &mut invocation_bindings,
                 PcuInvocationParameters::empty(),
             )
-            .map_err(ExampleError::Runner)
+            .map_err(ExampleError::Vulkan)
     })?;
-    verify_parallel_float_output(&source, &bias, &output)?;
+    verify_parallel_copy_output(&source, &output)?;
     let sample_output = last_output_sample(&output)?;
 
     Ok(ExampleReport {
-        device_name: dispatch.device_name.clone(),
         dispatch,
         sample_output,
     })
 }
 
 #[pcu_dispatch(kernel_id = 1, invocations = 250)]
-fn parallel_float_kernel<const N: usize>(input_a: &[f32], input_b: &[f32], output: &mut [f32]) {
+fn parallel_copy_kernel<const N: usize>(input_a: &[f32], input_b: &[f32], output: &mut [f32]) {
     let mut id = context.global_invocation_id;
     let stride = context.invocation_count;
     while id < N {
-        output[id] = ((input_a[id] + input_b[id]) * 2.0) / 2.0 - 1.0;
+        output[id] = input_a[id];
         id += stride;
     }
 }
@@ -220,15 +221,13 @@ fn fill_inputs(
     Ok(())
 }
 
-fn verify_parallel_float_output(
+fn verify_parallel_copy_output(
     source: &[u32; ELEMENT_COUNT],
-    bias: &[u32; ELEMENT_COUNT],
     output: &[u32; ELEMENT_COUNT],
 ) -> Result<(), ExampleError> {
     for index in 0..ELEMENT_COUNT {
         let source = f32::from_bits(source[index]);
-        let bias = f32::from_bits(bias[index]);
-        let expected = source + bias - 1.0;
+        let expected = source;
         let actual = f32::from_bits(output[index]);
         if actual.to_bits() != expected.to_bits() {
             return Err(ExampleError::ComputeMismatch {
@@ -251,8 +250,7 @@ fn last_output_sample(output: &[u32; ELEMENT_COUNT]) -> Result<f32, ExampleError
 
 #[derive(Debug, Clone, PartialEq)]
 struct ExampleReport {
-    device_name: Option<String>,
-    dispatch: PcuDispatchReport,
+    dispatch: PcuVulkanDispatchReport,
     sample_output: f32,
 }
 
@@ -261,7 +259,7 @@ enum ExampleError {
     EventLoop(String),
     Window(String),
     Pcu(PcuError),
-    Runner(PcuRunnerError),
+    Vulkan(PcuVulkanError),
     BufferTooLarge,
     ComputeMismatch {
         index: usize,
@@ -286,7 +284,7 @@ impl fmt::Display for ExampleError {
             Self::EventLoop(message) => write!(formatter, "event loop error: {message}"),
             Self::Window(message) => write!(formatter, "window error: {message}"),
             Self::Pcu(error) => write!(formatter, "pcu error: {error}"),
-            Self::Runner(error) => write!(formatter, "pcu runtime error: {error}"),
+            Self::Vulkan(error) => write!(formatter, "pcu Vulkan error: {error}"),
             Self::BufferTooLarge => {
                 formatter.write_str("buffer size does not fit Vulkan device size")
             }

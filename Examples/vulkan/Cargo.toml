@@ -22,9 +22,12 @@ std = ["fusion-pcu/std"]
 
 [dependencies]
 fusion-pcu.workspace = true
-fusion-pcu-runner = { workspace = true, features = ["runner-vulkan"] }
+fusion-pcu-vulkan = { workspace = true, features = ["hosted"] }
 fusion-pcu-macros.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+fusion-pcu-spirv.workspace = true
 
 [lints]
 workspace = true
