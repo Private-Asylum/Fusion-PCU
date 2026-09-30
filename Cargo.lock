@@ -476,7 +476,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "fusion-pcu"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
  "fusion-pcu-cuda",
@@ -488,18 +488,18 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-core"
-version = "0.0.4"
+version = "0.0.5"
 
 [[package]]
 name = "fusion-pcu-cpu"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
 ]
 
 [[package]]
 name = "fusion-pcu-cuda"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "criterion",
  "fusion-pcu",
@@ -510,21 +510,21 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-dx12"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
 ]
 
 [[package]]
 name = "fusion-pcu-ilz"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
 ]
 
 [[package]]
 name = "fusion-pcu-macros"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu",
  "fusion-pcu-cpu",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-metal"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "criterion",
  "fusion-pcu",
@@ -550,28 +550,28 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-mlx"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
 ]
 
 [[package]]
 name = "fusion-pcu-opencl"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
 ]
 
 [[package]]
 name = "fusion-pcu-opengl"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
 ]
 
 [[package]]
 name = "fusion-pcu-rocm"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-spirv"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
  "fusion-pcu-macros",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-vulkan"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "ash",
  "fusion-pcu-core",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "fusion-pcu-wgpu"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fusion-pcu-core",
 ]
