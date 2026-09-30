@@ -39,8 +39,10 @@ comparisons live in the corresponding backend's `benches/`, with allocation
 census and insights separate from primary timing. The independent Snake
 application remains a submodule under the repository's `Examples/ai/`.
 
-The facade's usage examples are included in its package. Backend tests and
-comparisons that depend on the facade use shared path-only development aliases
-to avoid a backend/facade publication cycle. Run those targets from the
-repository checkout; their facade development dependency is intentionally
-omitted from normalized registry manifests.
+The facade's usage examples are included in its package. Backend tests, examples
+and comparisons use path-only development links to avoid test-only publication
+cycles between the facade, macros and providers. Run those targets from the
+repository checkout; Cargo omits those links from normalized registry manifests.
+Production dependencies remain versioned. Shared aliases cover renamed facade
+links; links that preserve a production dependency's crate name are declared
+locally because inheritance cannot replace its version policy.

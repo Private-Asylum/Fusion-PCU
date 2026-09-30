@@ -23,7 +23,8 @@ fusion-pcu-core.workspace = true
 workspace = true
 
 [dev-dependencies]
-fusion-pcu-macros.workspace = true
+# Test-only path dependencies stay out of the published dependency graph.
+fusion-pcu-macros = { path = "../../macros" }
 
 [[test]]
 name = "checked_float_rejection"

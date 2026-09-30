@@ -723,8 +723,10 @@ comparison.
 ## Development dependency and publication
 
 The actual-source tests and PCU/native Criterion comparisons run from this
-repository checkout. They use a shared path-only facade development dependency
-to avoid a backend/facade publication cycle. Cargo omits that dependency and its
-feature forwarding from normalized registry manifests; the library's production
-dependencies remain versioned. The standalone backend archive does not provide
-a self-contained harness for these facade-dependent development targets.
+repository checkout. They use a shared path-only facade link and a local
+path-only macros link to avoid test-only publication cycles. The macros link
+keeps its canonical crate name; workspace inheritance cannot replace the
+production macros dependency's version policy. Cargo omits those development
+links and their feature forwarding from normalized registry manifests; the
+library's production dependencies remain versioned. The standalone backend
+archive does not provide a self-contained harness for these development targets.

@@ -7,7 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
@@ -35,7 +35,8 @@ workspace = true
 
 [dev-dependencies]
 pcu-facade = { workspace = true, features = ["rocm"] }
-fusion-pcu-macros.workspace = true
+# Test-only path dependencies stay out of the published dependency graph.
+fusion-pcu-macros = { path = "../../macros" }
 libloading.workspace = true
 libc.workspace = true
 bytemuck.workspace = true
