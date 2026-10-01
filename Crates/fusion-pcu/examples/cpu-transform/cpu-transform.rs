@@ -2,7 +2,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! fusion-pcu = { version = "0.0.5", features = ["cpu"] }
+//! fusion-pcu = { version = "0.0.6", features = ["cpu"] }
 //! ```
 //! Run: cargo run -p fusion-pcu --features cpu --example cpu-transform
 

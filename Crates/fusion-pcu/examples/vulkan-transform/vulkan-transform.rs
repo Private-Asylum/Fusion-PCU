@@ -2,7 +2,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! fusion-pcu = { version = "0.0.5", features = ["vulkan"] }
+//! fusion-pcu = { version = "0.0.6", features = ["vulkan"] }
 //! ```
 //! Run: cargo run -p fusion-pcu --features vulkan --example vulkan-transform
 
