@@ -106,10 +106,9 @@ fn annotated_native_permissions_preserve_strict_and_portable_rejection() {
 }
 
 #[test]
-#[ignore = "requires pinned MLX GPU bridge and an external GPU activity check"]
+#[ignore = "requires pinned safety-patched MLX C library and an external GPU activity check"]
 fn captured_annotated_source_replays_changing_inputs_and_escapes_completed_output() {
-    let path = std::env::var_os("PCU_MLX_BRIDGE").expect("set isolated pinned bridge path");
-    let runtime = MlxRuntime::load(path).unwrap();
+    let runtime = MlxRuntime::load_default().unwrap();
     let session = runtime.open_gpu(0).unwrap();
     let capture = captured();
     let [a, b] = <[_; 2]>::try_from(capture.input_values()).unwrap();
@@ -154,4 +153,77 @@ fn captured_annotated_source_replays_changing_inputs_and_escapes_completed_outpu
         );
         assert_eq!(host[4].to_bits(), (-41.0_f32).to_bits());
     }
+}
+
+#[pcu(crate_path = pcu_facade, flag(native_compound), flag(backend_precision))]
+fn shaped_source<const ROWS: usize, const INNER: usize, const COLUMNS: usize>(
+    left: &[[f32; INNER]; ROWS],
+    right: &[[f32; COLUMNS]; INNER],
+) -> Result<PcuTensor<f32>, PcuExecutionError> {
+    pcu::matmul(left, right)
+}
+
+fn check_shaped_source<const ROWS: usize, const INNER: usize, const COLUMNS: usize>(
+    session: &fusion_pcu_mlx::MlxSession,
+) {
+    let capture = global::__pcu_capture_tensor_program(
+        [
+            global::PcuSourceShape::FixedMatrix {
+                rows: ROWS,
+                columns: INNER,
+            },
+            global::PcuSourceShape::FixedMatrix {
+                rows: INNER,
+                columns: COLUMNS,
+            },
+        ],
+        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        PcuNumericalMode::Boundary,
+        PcuNumericalOptions::default(),
+        shaped_source::__pcu_capture_entry::<ROWS, INNER, COLUMNS>,
+    )
+    .unwrap();
+    let prepared = session
+        .prepare_program(std::sync::Arc::clone(capture.program()))
+        .unwrap();
+    let [a, b] = prepared.matmul().plan().inputs();
+    for phase in [1.0_f32, 2.0] {
+        let left: Vec<_> = (0..ROWS * INNER)
+            .map(|index| f32::from(u16::try_from(index % 7 + 1).unwrap()) * phase)
+            .collect();
+        let right: Vec<_> = (0..INNER * COLUMNS)
+            .map(|index| f32::from(u16::try_from(index % 5 + 1).unwrap()) + phase)
+            .collect();
+        let lhs = session.upload_f32([ROWS, INNER], &left).unwrap();
+        let rhs = session.upload_f32([INNER, COLUMNS], &right).unwrap();
+        let output = session
+            .execute_program(&prepared, &[(a, &lhs), (b, &rhs)])
+            .unwrap();
+        let mut host = vec![-73.0; ROWS * COLUMNS + 1];
+        output.read_into_f32(&mut host).unwrap();
+        for row in 0..ROWS {
+            for column in 0..COLUMNS {
+                let oracle: f32 = (0..INNER)
+                    .map(|inner| left[row * INNER + inner] * right[inner * COLUMNS + column])
+                    .sum();
+                assert_eq!(host[row * COLUMNS + column].to_bits(), oracle.to_bits());
+            }
+        }
+        assert_eq!(host[ROWS * COLUMNS].to_bits(), (-73.0_f32).to_bits());
+    }
+    assert_eq!(prepared.matmul().compilation_trace_count(), 1);
+}
+
+#[test]
+#[ignore = "requires exact production C library and an external GPU activity check"]
+fn captured_singleton_and_rectangular_shape_borders() {
+    let runtime = MlxRuntime::load_default().unwrap();
+    let session = runtime.open_gpu(0).unwrap();
+    check_shaped_source::<1, 1, 1>(&session);
+    check_shaped_source::<1, 3, 1>(&session);
+    check_shaped_source::<1, 3, 4>(&session);
+    check_shaped_source::<4, 3, 1>(&session);
+    check_shaped_source::<3, 1, 5>(&session);
+    check_shaped_source::<7, 13, 5>(&session);
+    check_shaped_source::<3, 7, 9>(&session);
 }

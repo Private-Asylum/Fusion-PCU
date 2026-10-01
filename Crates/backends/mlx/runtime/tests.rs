@@ -5,12 +5,16 @@ use super::{
 };
 
 #[test]
-fn absent_bridge_is_an_explicit_error_without_fallback() {
-    let result = MlxRuntime::load("/__fusion_pcu_absent_mlx_bridge__");
+fn absent_library_is_an_explicit_error_without_fallback() {
+    let result = MlxRuntime::load("/__fusion_pcu_absent_mlx_library__");
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         assert!(matches!(result, Err(MlxError::Unavailable(_))));
     } else {
         assert!(matches!(result, Err(MlxError::UnsupportedPlatform)));
+        assert!(matches!(
+            MlxRuntime::load_default(),
+            Err(MlxError::UnsupportedPlatform)
+        ));
     }
 }
 
@@ -36,9 +40,7 @@ mod gpu {
     use fusion_pcu::dialect::tensor::Graph;
 
     fn runtime() -> MlxRuntime {
-        let path = std::env::var_os("PCU_MLX_BRIDGE")
-            .expect("set PCU_MLX_BRIDGE to the isolated pinned bridge");
-        MlxRuntime::load(path).unwrap()
+        MlxRuntime::load_default().unwrap()
     }
 
     fn prepared(session: &MlxSession) -> crate::MlxPreparedMatmul {
@@ -57,7 +59,7 @@ mod gpu {
     }
 
     #[test]
-    #[ignore = "requires pinned MLX GPU bridge and an external GPU activity check"]
+    #[ignore = "requires pinned safety-patched MLX C library and an external GPU activity check"]
     fn changing_matrices_terminal_readback_and_host_tails() {
         let runtime = runtime();
         assert_eq!(runtime.version(), "0.32.3");
@@ -107,7 +109,7 @@ mod gpu {
     }
 
     #[test]
-    #[ignore = "requires pinned MLX GPU bridge and an external GPU activity check"]
+    #[ignore = "requires pinned safety-patched MLX C library and an external GPU activity check"]
     fn compiled_program_bindings_retain_source_and_retry_before_publication() {
         #[rustfmt::skip]
         use fusion_pcu::dialect::tensor::{
@@ -164,7 +166,7 @@ mod gpu {
     }
 
     #[test]
-    #[ignore = "requires pinned MLX GPU bridge and an external GPU activity check"]
+    #[ignore = "requires pinned safety-patched MLX C library and an external GPU activity check"]
     fn session_shape_guards_retry_and_escaped_array_owners() {
         let runtime = runtime();
         let session = runtime.open_gpu(0).unwrap();
@@ -204,7 +206,7 @@ mod gpu {
     }
 
     #[test]
-    #[ignore = "requires pinned MLX GPU bridge and an external GPU activity check"]
+    #[ignore = "requires pinned safety-patched MLX C library and an external GPU activity check"]
     fn copied_transport_preserves_encodings_and_native_exceptions_are_explicit() {
         let runtime = runtime();
         let session = runtime.open_gpu(0).unwrap();
@@ -243,7 +245,7 @@ mod gpu {
     }
 
     #[test]
-    #[ignore = "requires pinned MLX GPU bridge and an external GPU activity check"]
+    #[ignore = "requires pinned safety-patched MLX C library and an external GPU activity check"]
     fn discovery_generation_exact_offers_and_prepared_identity() {
         #[rustfmt::skip]
         use fusion_pcu::{
@@ -260,8 +262,7 @@ mod gpu {
             PcuObjectKind,
             PcuRangePolicy,
         };
-        let path = std::env::var_os("PCU_MLX_BRIDGE").unwrap();
-        let discovery = crate::MlxDiscovery::discover(path).unwrap();
+        let discovery = crate::MlxDiscovery::discover_default().unwrap();
         let reference = discovery.device_reference(0).unwrap();
         let mut stale = reference;
         stale.generation += 1;

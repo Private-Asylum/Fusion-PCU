@@ -16,9 +16,6 @@ pub use discovery::MlxMatmulRequest;
 
 #[path = "ffi/ffi.rs"]
 mod ffi;
-#[cfg(feature = "c-api-evaluation")]
-#[doc(hidden)]
-pub use ffi::c_api_evaluation;
 #[path = "runtime/runtime.rs"]
 mod runtime;
 #[rustfmt::skip]

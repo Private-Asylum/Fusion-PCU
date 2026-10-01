@@ -4,6 +4,8 @@
 use super::{
     HostBank,
     Prepared,
+    ROUTE_NAMES,
+    ROUTES,
     prepare,
     verify,
 };
@@ -47,7 +49,7 @@ fn batch<const SIZE: usize, const HOST: bool>(
 }
 
 fn size<const SIZE: usize, const HOST: bool>(session: &MlxSession) {
-    let plans: Vec<_> = (0..3)
+    let plans: Vec<_> = (0..ROUTES)
         .map(|route| prepare::<SIZE>(session, route))
         .collect();
     let hosts: Vec<_> = [1.0_f32, 2.0, 3.0]
@@ -71,25 +73,29 @@ fn size<const SIZE: usize, const HOST: bool>(session: &MlxSession) {
         .collect();
     verify::<SIZE>(&plans, &hosts, &arrays, session);
     let mut host = vec![0.0; SIZE * SIZE];
-    for warmup in 0..6 {
-        for position in 0..3 {
-            let route = (warmup + position) % 3;
+    for warmup in 0..10 {
+        for position in 0..ROUTES {
+            let route = (warmup + position) % ROUTES;
             batch::<SIZE, HOST>(&plans[route], session, &hosts, &arrays, warmup, &mut host);
         }
     }
 
-    // Each route sees the same changing-input sequence within each paired round. The six
-    // permutations balance both position and predecessor; formatting stays outside timing.
-    let orders = [
-        [0, 1, 2],
-        [1, 2, 0],
-        [2, 0, 1],
-        [2, 1, 0],
-        [1, 0, 2],
-        [0, 2, 1],
-    ];
+    // Ten Williams-design orders balance every position and every ordered predecessor
+    // pair across five routes; each sees the same changing bank sequence per round.
+    // This is a balanced subset of the120 permutations, not an exhaustive order sample.
+    let base = [0, 1, 4, 2, 3];
+    let orders: [[usize; ROUTES]; 10] = std::array::from_fn(|order| {
+        std::array::from_fn(|position| {
+            let position = if order < ROUTES {
+                position
+            } else {
+                ROUTES - 1 - position
+            };
+            (base[position] + order % ROUTES) % ROUTES
+        })
+    });
     let started = Instant::now();
-    let mut samples = Vec::with_capacity(ROUNDS * 3);
+    let mut samples = Vec::with_capacity(ROUNDS * ROUTES);
     for round in 0..ROUNDS {
         for (position, route) in orders[round % orders.len()].into_iter().enumerate() {
             let sample = Instant::now();
@@ -105,17 +111,18 @@ fn size<const SIZE: usize, const HOST: bool>(session: &MlxSession) {
     };
     verify::<SIZE>(&plans, &hosts, &arrays, session);
     eprintln!(
-        "MLX_PAIRED_METADATA n={SIZE} boundary={boundary} rounds={ROUNDS} batch={BATCH} timed_calls={} loop_ns={elapsed} orders=all6 balanced_positions_and_predecessors",
-        ROUNDS * 3 * BATCH
+        "MLX_PAIRED_METADATA n={SIZE} boundary={boundary} rounds={ROUNDS} batch={BATCH} timed_calls={} loop_ns={elapsed} orders=10_williams balanced_positions_and_predecessors",
+        ROUNDS * ROUTES * BATCH
     );
     for (round, position, route, nanoseconds) in samples {
+        let name = ROUTE_NAMES[route];
         eprintln!(
-            "MLX_PAIRED_SAMPLE n={SIZE} boundary={boundary} round={round} position={position} route={route} batch_ns={nanoseconds}"
+            "MLX_PAIRED_SAMPLE n={SIZE} boundary={boundary} round={round} position={position} route={route} name={name} batch_ns={nanoseconds}"
         );
     }
 }
 
-pub(super) fn run(session: &MlxSession) {
+pub fn run(session: &MlxSession) {
     size::<32, false>(session);
     size::<32, true>(session);
     size::<128, false>(session);

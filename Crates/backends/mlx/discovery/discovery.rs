@@ -47,7 +47,7 @@ use crate::{
 const PROVIDER: PcuProviderId = PcuProviderId(0x4d4c_5831);
 pub const EXECUTOR: PcuExecutorId = PcuExecutorId(0);
 #[cfg(feature = "tensor")]
-pub const MATMUL_REVISION: u64 = 0x0002_0020_0003_0001;
+pub const MATMUL_REVISION: u64 = 0x0003_0020_0003_0001;
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Cold MLX GPU inventory with separately admitted tensor offers.
@@ -62,12 +62,23 @@ pub struct MlxDiscovery {
 }
 
 impl MlxDiscovery {
-    /// Loads the explicitly selected pinned bridge and snapshots actual GPU facts.
+    /// Loads the explicitly selected pinned C library and snapshots actual GPU facts.
     ///
     /// # Errors
     /// Returns unavailable/unsupported ABI/SDK/backend or native discovery errors.
-    pub fn discover(bridge: impl AsRef<Path>) -> Result<Self, MlxError> {
-        let runtime = MlxRuntime::load(bridge)?;
+    pub fn discover(library: impl AsRef<Path>) -> Result<Self, MlxError> {
+        Self::from_runtime(MlxRuntime::load(library)?)
+    }
+
+    /// Loads Cargo's matching runtime, honoring an optional `PCU_MLX_LIBRARY` override.
+    ///
+    /// # Errors
+    /// Returns unavailable/unsupported runtime or native discovery errors.
+    pub fn discover_default() -> Result<Self, MlxError> {
+        Self::from_runtime(MlxRuntime::load_default()?)
+    }
+
+    fn from_runtime(runtime: MlxRuntime) -> Result<Self, MlxError> {
         let devices = runtime.devices()?;
         u32::try_from(devices.len()).map_err(|_| MlxError::InvalidExtent)?;
         let generation = GENERATION

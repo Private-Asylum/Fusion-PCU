@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
+build = "ffi/rust/build/build.rs"
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
@@ -21,15 +22,22 @@ default = []
 tensor = ["fusion-pcu-core/tensor"]
 benchmark-control = ["tensor"]
 allocation-census = []
-c-api-evaluation = ["benchmark-control"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
 libloading.workspace = true
 
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
+sha2.workspace = true
 pcu-facade = { workspace = true, features = ["tensor"] }
 criterion.workspace = true
+
+[[test]]
+name = "native_prepare"
+path = "tests/native_prepare/native_prepare.rs"
 
 [[test]]
 name = "source_capture"
@@ -41,12 +49,6 @@ name = "compiled_matmul"
 path = "benches/compiled_matmul/compiled_matmul.rs"
 harness = false
 required-features = ["benchmark-control"]
-
-[[bench]]
-name = "c_api_comparison"
-path = "benches/c_api_comparison/c_api_comparison.rs"
-harness = false
-required-features = ["c-api-evaluation"]
 
 [[example]]
 name = "prepared_matmul"

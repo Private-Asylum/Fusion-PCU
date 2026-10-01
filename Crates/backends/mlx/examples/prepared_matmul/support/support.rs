@@ -3,9 +3,7 @@ use fusion_pcu_mlx::MlxRuntime;
 use std::sync::Arc;
 
 pub fn run() {
-    let path = std::env::var_os("PCU_MLX_BRIDGE")
-        .expect("set an explicitly built exact MLX0.32.3 GPU bridge");
-    let runtime = MlxRuntime::load(path).unwrap();
+    let runtime = MlxRuntime::load_default().unwrap();
     let session = runtime.open_gpu(0).unwrap();
     let captured = source::capture::<2>();
     let prepared = session

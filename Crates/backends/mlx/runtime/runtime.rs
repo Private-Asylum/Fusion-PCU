@@ -15,11 +15,11 @@ use crate::ffi;
 /// by the prepared primitive's selected policy, never inferred from this error type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MlxError {
-    /// The explicitly selected bridge could not be loaded; no CPU tensor work is attempted.
+    /// The explicitly selected native C library could not be loaded; no CPU tensor work is attempted.
     Unavailable(String),
     /// MLX execution is supported only on Apple silicon macOS.
     UnsupportedPlatform,
-    /// The private bridge or pinned SDK identity does not satisfy the adapter contract.
+    /// The C safety ABI or pinned source/runtime identity does not satisfy the adapter contract.
     Abi(String),
     InvalidExtent,
     ForeignSession,
@@ -55,19 +55,27 @@ pub struct MlxDeviceFacts {
     pub architecture: String,
 }
 
-/// A loaded private bridge retained by every session, array and prepared primitive.
+/// A loaded upstream C image retained by every session, array and prepared primitive.
 ///
-/// There is no build/install side effect. Native validation builds `ffi/CMakeLists.txt` against
-/// MLX0.32.3; the caller passes that trusted bridge path explicitly during cold initialization.
+/// Cargo prepares the pinned native runtime on Apple silicon. Loading itself performs no
+/// build/install work; every session and array retains the checked loaded image.
 #[derive(Clone)]
 pub struct MlxRuntime(Rc<ffi::Api>);
 impl MlxRuntime {
-    /// Loads the trusted shipped bridge and checks private ABI/header/runtime compatibility.
+    /// Loads the trusted safety-patched upstream C image and checks its source/ABI/runtime family.
     ///
     /// # Errors
     /// Returns unsupported platform, unavailable library, missing symbol, ABI or SDK mismatch.
-    pub fn load(bridge: impl AsRef<Path>) -> Result<Self, MlxError> {
-        ffi::Api::load(bridge.as_ref()).map(Self)
+    pub fn load(library: impl AsRef<Path>) -> Result<Self, MlxError> {
+        ffi::Api::load(library.as_ref()).map(Self)
+    }
+
+    /// Loads Cargo's matching runtime, honoring an optional `PCU_MLX_LIBRARY` override.
+    ///
+    /// # Errors
+    /// Returns unsupported platform, unavailable runtime, or source/ABI/SDK mismatch.
+    pub fn load_default() -> Result<Self, MlxError> {
+        ffi::Api::load_default().map(Self)
     }
     #[must_use]
     pub fn version(&self) -> &str {
@@ -211,14 +219,13 @@ impl MlxSession {
         })
     }
 
-    /// Measures the native C++ MatMul frontend with the ordinary terminal boundary.
-    /// This diagnostic control constructs a fresh primitive on every call.
+    /// Executes the upstream C frontend for matched benchmark controls.
+    /// Native graph descriptor construction remains part of this route.
     ///
     /// # Errors
-    /// Returns shape/session guards or native execution/quarantine errors.
-    #[cfg(feature = "c-api-evaluation")]
-    #[doc(hidden)]
-    pub fn execute_native_direct_matmul_control(
+    /// Returns foreign session, shape, native error or uncertain completion.
+    #[cfg(feature = "benchmark-control")]
+    pub fn execute_native_frontend_control(
         &self,
         left: &MlxArray,
         right: &MlxArray,
@@ -227,6 +234,33 @@ impl MlxSession {
             .0
             .native
             .matmul(&left.array.native, &right.array.native)?;
+        Ok(MlxArray {
+            session: self.clone(),
+            array: Rc::new(Array {
+                native,
+                residency: Cell::new(MlxArrayResidency::GpuEvaluated),
+            }),
+        })
+    }
+
+    /// Executes the public C compiled wrapper for matched benchmark controls.
+    /// This diagnostic route performs the upstream vector/closure/cache work each call.
+    ///
+    /// # Errors
+    /// Returns foreign session, changed shapes/traces, native error or uncertain completion.
+    #[cfg(feature = "benchmark-control")]
+    pub fn execute_native_compiled_control(
+        &self,
+        control: &MlxNativeMatmulControl,
+        left: &MlxArray,
+        right: &MlxArray,
+    ) -> Result<MlxArray, MlxError> {
+        if !self.same_session(&control.session) {
+            return Err(MlxError::ForeignSession);
+        }
+        let native = control
+            .native
+            .execute_compiled(&left.array.native, &right.array.native)?;
         Ok(MlxArray {
             session: self.clone(),
             array: Rc::new(Array {

@@ -1,4 +1,4 @@
-//! Captured annotated-source preparation/replay, explicit graph, and actual native MLX control.
+//! Captured source/graph replay beside native retained, frontend, and public-C compile controls.
 //! This benchmark does not execute ordinary global/direct source calls.
 
 #[path = "activity/activity.rs"]
@@ -9,7 +9,7 @@ mod census;
 #[path = "paired/paired.rs"]
 mod paired;
 #[rustfmt::skip]
-use activity::{
+pub use activity::{
     gpu_idle_guard,
     gpu_post_guard,
 };
@@ -25,7 +25,6 @@ use fusion_pcu_mlx::{
     MlxNativeMatmulControl,
     MlxPreparedMatmul,
     MlxPreparedProgram,
-    MlxRuntime,
     MlxSession,
 };
 #[rustfmt::skip]
@@ -48,10 +47,21 @@ use std::{
     time::Duration,
 };
 
+const ROUTE_NAMES: [&str; 5] = [
+    "annotated_capture_prepared",
+    "explicit_graph_prepared",
+    "native_c_retained_primitive",
+    "native_c_upstream_frontend",
+    "native_c_public_compiled_wrapper",
+];
+const ROUTES: usize = ROUTE_NAMES.len();
+
 enum Prepared {
     Annotated(MlxPreparedProgram),
     Graph(MlxPreparedMatmul),
     Native(MlxNativeMatmulControl),
+    Frontend,
+    Compiled(MlxNativeMatmulControl),
 }
 
 impl Prepared {
@@ -67,13 +77,20 @@ impl Prepared {
             Self::Native(prepared) => session
                 .execute_native_matmul_control(prepared, a, b)
                 .unwrap(),
+            Self::Frontend => session.execute_native_frontend_control(a, b).unwrap(),
+            Self::Compiled(prepared) => session
+                .execute_native_compiled_control(prepared, a, b)
+                .unwrap(),
         }
     }
-    fn traces(&self) -> usize {
+    fn traces(&self) -> Option<usize> {
         match self {
-            Self::Annotated(prepared) => prepared.matmul().compilation_trace_count(),
-            Self::Graph(prepared) => prepared.compilation_trace_count(),
-            Self::Native(prepared) => prepared.compilation_trace_count(),
+            Self::Annotated(prepared) => Some(prepared.matmul().compilation_trace_count()),
+            Self::Graph(prepared) => Some(prepared.compilation_trace_count()),
+            Self::Native(prepared) | Self::Compiled(prepared) => {
+                Some(prepared.compilation_trace_count())
+            }
+            Self::Frontend => None,
         }
     }
 }
@@ -114,6 +131,12 @@ fn prepare<const N: usize>(session: &MlxSession, route: usize) -> Prepared {
                 .prepare_native_matmul_control([N, N], [N, N])
                 .unwrap(),
         ),
+        3 => Prepared::Frontend,
+        4 => Prepared::Compiled(
+            session
+                .prepare_native_matmul_control([N, N], [N, N])
+                .unwrap(),
+        ),
         _ => unreachable!(),
     }
 }
@@ -128,12 +151,20 @@ fn verify<const N: usize>(
 ) {
     // Full changing-input oracle around measurement, with earlier outputs retained across replay.
     let mut escaped = Vec::new();
-    for plan in plans {
-        assert_eq!(plan.traces(), 1);
+    for (name, plan) in ROUTE_NAMES.iter().zip(plans) {
+        if let Some(traces) = plan.traces() {
+            assert_eq!(traces, 1);
+        }
         for (index, (a, b)) in arrays.iter().enumerate() {
             let result = plan.execute(session, a, b);
             let expected: f32 = (0..N).map(|_| hosts[index].2).sum();
             escaped.push((result, expected));
+        }
+        if let Some(traces) = plan.traces() {
+            assert_eq!(traces, 1);
+            eprintln!("MLX_TRACE n={N} route={name} cold_and_current={traces}");
+        } else {
+            eprintln!("MLX_TRACE n={N} route={name} frontend_no_compiler_trace");
         }
     }
     for (output, expected) in escaped {
@@ -147,7 +178,7 @@ fn verify<const N: usize>(
         assert_eq!(actual[N * N].to_bits(), (-73.0_f32).to_bits());
     }
     eprintln!(
-        "MLX_BOUNDARY n={N}: replay=1 logical_result=1 eval=1 stream_sync=1 wait=1; full_host adds copied_inputs=2 host_materialization=1; driver/C++ allocations remain uncounted"
+        "MLX_BOUNDARY n={N}: logical_result=1 eval=1 stream_sync=1 wait=1; retained routes rebind primitive, frontend constructs graph, compiled route applies public cache wrapper; full_host adds copied_inputs=2 host_materialization=1; driver/C++ allocations remain uncounted"
     );
 }
 
@@ -158,15 +189,16 @@ fn verify<const N: usize>(
         reason = "The shared Criterion harness signature stays identical in the untimed census build."
     )
 )]
-fn benchmark_size<const N: usize>(criterion: &mut Criterion, session: &MlxSession) {
+pub fn benchmark_size<const N: usize>(criterion: &mut Criterion, session: &MlxSession) {
     #[cfg(feature = "allocation-census")]
     let _ = criterion;
-    let plans: Vec<_> = (0..3).map(|route| prepare::<N>(session, route)).collect();
-    let names = [
-        "annotated_capture_prepared",
-        "explicit_graph_prepared",
-        "native_mlx_retained_primitive",
-    ];
+    let plans: Vec<_> = (0..ROUTES)
+        .map(|route| prepare::<N>(session, route))
+        .collect();
+    let names = ROUTE_NAMES;
+    eprintln!(
+        "MLX_COLD_SETUP n={N}: annotated includes capture/admission; graph includes graph/admission; retained/compiled include public compile and retained-control setup; frontend is enum-only setup"
+    );
     let hosts: Vec<_> = [1.0_f32, 2.0, 3.0]
         .into_iter()
         .map(|phase| {
@@ -238,30 +270,13 @@ fn benchmark_size<const N: usize>(criterion: &mut Criterion, session: &MlxSessio
                     });
                 },
             );
-            group.bench_function(
-                format!("cold_capture_or_native_prepare/{name}"),
-                |bencher| {
-                    bencher.iter(|| drop(black_box(prepare::<N>(session, route))));
-                },
-            );
+            group.bench_function(format!("cold_capture_or_native_setup/{name}"), |bencher| {
+                bencher.iter(|| drop(black_box(prepare::<N>(session, route))));
+            });
         }
         group.finish();
     }
     verify::<N>(&plans, &hosts, &arrays, session);
 }
 
-pub fn comparison(criterion: &mut Criterion) {
-    gpu_idle_guard();
-    let path = std::env::var_os("PCU_MLX_BRIDGE").expect("set explicit pinned bridge path");
-    let runtime = MlxRuntime::load(path).unwrap();
-    let session = runtime.open_gpu(0).unwrap();
-    assert_eq!(runtime.version(), "0.32.3");
-    if std::env::var_os("PCU_MLX_PAIRED_DIAGNOSTIC").is_some() {
-        paired::run(&session);
-        gpu_post_guard();
-        return;
-    }
-    benchmark_size::<32>(criterion, &session);
-    benchmark_size::<128>(criterion, &session);
-    gpu_post_guard();
-}
+pub use paired::run as paired_run;
