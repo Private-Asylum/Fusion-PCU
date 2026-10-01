@@ -29,3 +29,7 @@ fusion-pcu-macros = { path = "../../macros" }
 [[test]]
 name = "checked_float_rejection"
 path = "tests/checked_float_rejection/checked_float_rejection.rs"
+
+[[test]]
+name = "bit_map"
+path = "tests/bit_map/bit_map.rs"

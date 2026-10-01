@@ -25,8 +25,14 @@ fn typed_sgd_preserves_rate_bits_and_rejects_invalid_rate_type_shape_and_graph()
         Err(TensorError::ShapeMismatch { .. })
     ));
     let wide = graph.input_typed::<f64>([3]).unwrap();
+    let wide_output = graph.sgd_update_typed(wide, wide, 0.25).unwrap();
+    assert_eq!(
+        graph.node(wide_output.erase()).unwrap().scalar_type,
+        PcuScalarType::F64
+    );
+    let integer = graph.input_typed::<u64>([3]).unwrap();
     assert!(matches!(
-        graph.sgd_update_typed(wide, wide, 0.25),
+        graph.sgd_update_typed(integer, integer, 0.25),
         Err(TensorError::UnsupportedScalarType { .. })
     ));
     let foreign = Graph::default().input_typed::<f32>([3]).unwrap();

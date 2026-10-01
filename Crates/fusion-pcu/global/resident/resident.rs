@@ -747,7 +747,12 @@ pub(super) fn prepare_tensor<R>(
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 impl Session {
     pub(super) fn validate_policy(
         &self,
@@ -854,7 +859,7 @@ fn prepare_candidates<R>(
     if matches!(
         policy.backend,
         super::PcuBackendChoice::Automatic | super::PcuBackendChoice::Cuda
-    ) && let Err(error) = collect_cuda_candidates(&cuda, policy, &mut candidates)
+    ) && let Err(error) = collect_cuda_candidates(&cuda, policy, None, &mut candidates)
     {
         discovery_errors.push(format!("CUDA discovery: {error}"));
     }
@@ -863,7 +868,7 @@ fn prepare_candidates<R>(
         policy.backend,
         super::PcuBackendChoice::Automatic | super::PcuBackendChoice::Rocm
     ) && let Err(error) =
-        super::provider_hosted::collect_rocm_candidates(&rocm, policy, &mut candidates)
+        super::provider_hosted::collect_rocm_candidates(&rocm, policy, None, &mut candidates)
     {
         discovery_errors.push(format!("ROCm discovery: {error}"));
     }
@@ -938,6 +943,10 @@ fn open_candidate(
     match candidate.provider {
         #[cfg(feature = "metal")]
         Provider::Metal => Err(PcuExecutionError::TensorExecutionUnavailable),
+        #[cfg(feature = "vulkan")]
+        Provider::Vulkan => Err(PcuExecutionError::TensorExecutionUnavailable),
+        #[cfg(feature = "cpu")]
+        Provider::Cpu => Err(PcuExecutionError::TensorExecutionUnavailable),
         Provider::Cuda => fusion_pcu_cuda::CudaOwnedDispatchBackend::open(
             cuda,
             candidate.device,

@@ -30,9 +30,11 @@ and thank you for checking it out!
 
 To be clear, this project is experimental. ROCm and CUDA execute hosted invocation 
 kernels and owned tensor compositions, including checked arithmetic and opt-in strict
-F32/F64 MatMul. Other GPU backends are scaffolds. Default-boundary MatMul, MSE,
+F32/F64 MatMul and SGD. Metal, MLX, Vulkan and CPU implement narrower contracts;
+the remaining providers are scaffolds. Default checked boundary MatMul, MSE,
 SGD, ReLU backward and owned tensor clamp remain unsupported until their
-numerical contracts are implemented. The example below targets the current
+numerical contracts are implemented. Explicit native permissions admit additional
+vendor operations. The example below targets the current
 checkout; published versions may lag.
 
 ## Use it today
@@ -52,8 +54,9 @@ features = ["rocm", "cuda", "tensor"]
 default, compound primitives must report faults at their specified result
 boundary. `#[pcu(flag(strict))]` instead checks each prescribed constituent
 operation: strict MatMul visits K in order and separately rounds and checks
-every multiplication and addition. It cannot substitute FMA or reorder those
-steps. Default-boundary MatMul is currently unsupported; turning strict off does
+every multiplication and addition. Strict SGD separately rounds and checks the
+learning-rate multiplication and weight subtraction. Neither substitutes FMA.
+Default checked boundary MatMul is currently unsupported; turning strict off does
 not enable unchecked BLAS.
 
 In both modes, supported integer arithmetic rejects overflow and underflow, and
@@ -171,7 +174,7 @@ The second kernel deliberately starts from the stack readback, so it crosses a
 new RAM/device boundary. Chaining resident values instead avoids that transfer.
 
 `#[pcu]` is per function. Owned compositions currently support bounded helpers,
-homogeneous F32/F64 identity, ReLU, Add/Sub/Mul/Div and strict MatMul.
+homogeneous F32/F64 identity, ReLU, Add/Sub/Mul/Div, strict MatMul and strict SGD.
 Invocation kernels support symbolic invocation counts, context intrinsics,
 bounded scalar helpers, grid-stride loops and checked conversions. This is a
 supported Rust subset, not arbitrary Rust compilation.
@@ -276,6 +279,8 @@ available:
 ```sh
 cargo bench -p fusion-pcu-rocm --bench strict_matmul --features tensor
 cargo bench -p fusion-pcu-cuda --bench strict_matmul --features tensor
+cargo bench -p fusion-pcu-rocm --bench strict_sgd --features tensor
+cargo bench -p fusion-pcu-cuda --bench strict_sgd --features tensor
 ```
 
 The canonical Cargo `benches/` targets use Criterion, with workload composition

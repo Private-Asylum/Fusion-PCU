@@ -4,9 +4,13 @@ use core::{
     cell::Cell,
     marker::PhantomData,
 };
+use std::rc::Rc;
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuDispatchSubmission,
+    PcuDeviceIdentity,
+    PcuDeviceActivation,
+    PcuObjectRef,
     PcuInvocationBinding,
     PcuInvocationBindings,
     PcuInvocationParameters,
@@ -52,7 +56,8 @@ const SPIRV_WORD_CAPACITY: usize = 1024;
 /// requires_sync::<PcuVulkanBackend>();
 /// ```
 pub struct PcuVulkanBackend {
-    device: VulkanDevice,
+    pub(crate) device: Rc<VulkanDevice>,
+    pub(crate) identity: Option<PcuDeviceIdentity>,
     // Queue submission must not be called concurrently through shared backend references.
     _exclusive_queue: PhantomData<Cell<()>>,
 }
@@ -64,7 +69,8 @@ impl PcuVulkanBackend {
     /// Returns loader, discovery, or device creation failures.
     pub fn new() -> Result<Self, PcuVulkanError> {
         VulkanDevice::new().map(|device| Self {
-            device,
+            device: Rc::new(device),
+            identity: None,
             _exclusive_queue: PhantomData,
         })
     }
@@ -87,7 +93,8 @@ impl PcuVulkanBackend {
         requested_heap_budget: PcuVulkanDescriptorHeapBudget,
     ) -> Result<Self, PcuVulkanError> {
         VulkanDevice::with_descriptor_heap_budget(requested_heap_budget).map(|device| Self {
-            device,
+            device: Rc::new(device),
+            identity: None,
             _exclusive_queue: PhantomData,
         })
     }
@@ -104,7 +111,7 @@ impl PcuVulkanBackend {
 
     /// Returns capabilities observed for the selected device.
     #[must_use]
-    pub const fn caps(&self) -> PcuVulkanCaps {
+    pub fn caps(&self) -> PcuVulkanCaps {
         self.device.caps()
     }
 
@@ -112,6 +119,30 @@ impl PcuVulkanBackend {
     #[must_use]
     pub fn name(&self) -> &str {
         self.device.name()
+    }
+
+    /// Opens the explicitly selected generation-bound physical device.
+    ///
+    /// # Errors
+    /// Rejects stale references or changed physical inventory before activating a device.
+    pub fn open(
+        discovery: &crate::PcuVulkanDiscovery,
+        device: PcuObjectRef,
+    ) -> Result<Self, PcuVulkanError> {
+        discovery.open_device(device)
+    }
+
+    #[must_use]
+    pub const fn device_identity(&self) -> Option<PcuDeviceIdentity> {
+        self.identity
+    }
+
+    pub(crate) fn discovered(device: VulkanDevice, identity: PcuDeviceIdentity) -> Self {
+        Self {
+            device: Rc::new(device),
+            identity: Some(identity),
+            _exclusive_queue: PhantomData,
+        }
     }
 
     /// Validates, lowers, and executes one dispatch, copying output before returning.

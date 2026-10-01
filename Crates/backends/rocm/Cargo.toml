@@ -455,3 +455,25 @@ required-features = ["tensor"]
 name = "rocm_native_matmul_source"
 path = "tests/rocm_native_matmul_source/rocm_native_matmul_source.rs"
 required-features = ["tensor"]
+
+[[bench]]
+name = "native_sgd"
+path = "benches/native_sgd/native_sgd.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "strict_sgd"
+path = "benches/strict_sgd/strict_sgd.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "strict_sgd_source"
+path = "tests/strict_sgd_source/strict_sgd_source.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-strict-sgd"
+path = "examples/strict_sgd/strict_sgd.rs"
+required-features = ["tensor"]

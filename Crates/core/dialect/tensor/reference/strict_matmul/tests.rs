@@ -1,5 +1,6 @@
 //! Strict compound numerical contract controls and fault-location regression tests.
 use super::*;
+use alloc::vec::Vec;
 #[rustfmt::skip]
 use crate::{
     PcuExecutionFaultKind,

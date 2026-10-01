@@ -111,7 +111,10 @@ fn validate_kernel_signature(
     kernel: &PcuDispatchKernelIr<'_>,
     options: PcuSpirvLoweringOptions,
 ) -> Result<(), PcuSpirvError> {
-    if kernel.entry.name.is_empty() || kernel.entry.logical_shape.contains(&0) {
+    if kernel.entry.name.is_empty()
+        || kernel.entry.name.as_bytes().contains(&0)
+        || kernel.entry.logical_shape.contains(&0)
+    {
         return Err(PcuSpirvError::InvalidKernelSignature);
     }
 

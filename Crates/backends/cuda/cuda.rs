@@ -5,6 +5,14 @@
 //! here; unsupported PCU operations are rejected by the lowerer.
 
 extern crate fusion_pcu_core as fusion_pcu;
+#[cfg(feature = "allocation-census")]
+#[rustfmt::skip]
+pub use ffi::{
+    CudaApiCensus,
+    cuda_api_census,
+    reset_cuda_api_census,
+};
+
 #[rustfmt::skip]
 use crate::ffi::{
     query_pci_bus_id,
@@ -62,6 +70,14 @@ use fusion_pcu::{
 #[path = "admission/admission.rs"]
 mod admission;
 mod blas;
+#[path = "blas_lt/blas_lt.rs"]
+mod blas_lt;
+#[rustfmt::skip]
+pub use blas_lt::{
+    CublasLtMatmulDescriptor,
+    CublasLtMatmulPlan,
+    CublasLtPlanIdentity,
+};
 #[path = "blas_policy/blas_policy.rs"]
 mod blas_policy;
 #[path = "codegen/codegen.rs"]
@@ -200,6 +216,7 @@ pub use tensor::{
     CudaTensorOwnedOutput,
     CudaTensorPrewarmReport,
     lower_strict_matmul_to_cuda_source,
+    lower_strict_sgd_to_cuda_source,
     CudaTensorScratch,
 };
 
@@ -209,6 +226,14 @@ pub use tensor::{
     CudaTensorBatchedExecutionTiming,
     CudaTensorInsightRecord,
     CudaTensorOperationInsight,
+};
+
+#[cfg(feature = "allocation-census")]
+#[rustfmt::skip]
+pub use ffi::cublaslt::{
+    ApiCensus as CublasLtApiCensus,
+    api_census as cublaslt_api_census,
+    reset_api_census as reset_cublaslt_api_census,
 };
 
 /// Dynamically loaded CUDA runtime and the selected device.

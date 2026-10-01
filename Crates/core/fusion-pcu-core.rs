@@ -57,6 +57,7 @@ pub use runtime::{
     assessment,
     discovery,
     execution,
+    implementation,
     registry,
     scalar_lowering,
 };
@@ -70,6 +71,7 @@ pub use runtime::owned_shape::*;
 pub use runtime::device_kernel::*;
 pub use runtime::execution::*;
 pub use runtime::host_kernel::*;
+pub use runtime::implementation::*;
 pub use runtime::kernel::*;
 pub use runtime::registry::*;
 pub use runtime::scalar_lowering::*;

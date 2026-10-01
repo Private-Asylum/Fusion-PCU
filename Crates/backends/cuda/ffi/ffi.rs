@@ -16,6 +16,8 @@ pub unsafe fn symbol<'library, T>(
     library: &'library Library,
     name: &[u8],
 ) -> Result<Symbol<'library, T>, libloading::Error> {
+    #[cfg(feature = "allocation-census")]
+    census::symbol();
     // SAFETY: the caller establishes the requested ABI and retained-library lifetime.
     unsafe { library.get(name) }
 }
@@ -28,10 +30,16 @@ pub use loader::{
     load_uncached_library,
 };
 
+#[cfg(feature = "allocation-census")]
+#[path = "census/census.rs"]
+mod census;
 pub mod cublas;
+pub mod cublaslt;
 pub mod driver;
 pub mod nvrtc;
 pub mod runtime;
+#[cfg(feature = "allocation-census")]
+pub use census::{CudaApiCensus, cuda_api_census, reset_cuda_api_census};
 
 #[rustfmt::skip]
 use std::ffi::{
@@ -51,6 +59,8 @@ use crate::{
 /// `arg0` must be null or a live allocation from this runtime, with no remaining queued users. It must be released exactly once.
 #[allow(non_snake_case)] // Preserve SDK operation names at the private FFI boundary.
 pub unsafe fn invoke_cudaFree(runtime: &CudaRuntime, arg0: *mut c_void) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaFree", None);
     runtime.call("cudaFree", |f: runtime::RuntimeFree| unsafe { f(arg0) })
 }
 
@@ -64,6 +74,8 @@ pub unsafe fn invoke_cuDeviceGet(
     arg0: *mut CudaDevice,
     arg1: c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuDeviceGet", None);
     runtime.driver_call("cuDeviceGet", |f: driver::DriverGetDevice| unsafe {
         f(arg0, arg1)
     })
@@ -78,6 +90,8 @@ pub unsafe fn invoke_cudaGetDeviceCount(
     runtime: &CudaRuntime,
     arg0: *mut c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaGetDeviceCount", None);
     runtime.call("cudaGetDeviceCount", |f: runtime::GetDeviceCount| unsafe {
         f(arg0)
     })
@@ -93,6 +107,8 @@ pub unsafe fn invoke_cuDeviceTotalMem_v2(
     arg0: *mut usize,
     arg1: CudaDevice,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuDeviceTotalMem_v2", None);
     runtime.driver_call(
         "cuDeviceTotalMem_v2",
         |f: driver::DriverDeviceTotalMem| unsafe { f(arg0, arg1) },
@@ -109,6 +125,8 @@ pub unsafe fn invoke_cudaMemGetInfo(
     arg0: *mut usize,
     arg1: *mut usize,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaMemGetInfo", None);
     runtime.call("cudaMemGetInfo", |f: runtime::MemGetInfo| unsafe {
         f(arg0, arg1)
     })
@@ -124,6 +142,8 @@ pub unsafe fn invoke_cudaMalloc(
     arg0: *mut *mut c_void,
     arg1: usize,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaMalloc", None);
     runtime.call("cudaMalloc", |f: runtime::Malloc| unsafe { f(arg0, arg1) })
 }
 
@@ -137,6 +157,8 @@ pub unsafe fn invoke_cuModuleLoadData(
     arg0: *mut driver::ModuleHandle,
     arg1: *const c_void,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuModuleLoadData", None);
     runtime.driver_call(
         "cuModuleLoadData",
         |f: driver::DriverModuleLoadData| unsafe { f(arg0, arg1) },
@@ -152,6 +174,8 @@ pub unsafe fn invoke_cudaStreamCreate(
     runtime: &CudaRuntime,
     arg0: *mut runtime::CudaStream,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamCreate", None);
     runtime.call("cudaStreamCreate", |f: runtime::StreamCreate| unsafe {
         f(arg0)
     })
@@ -167,6 +191,8 @@ pub unsafe fn invoke_cudaEventCreateWithFlags(
     arg0: *mut runtime::CudaEvent,
     arg1: c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaEventCreateWithFlags", None);
     runtime.call(
         "cudaEventCreateWithFlags",
         |f: runtime::EventCreate| unsafe { f(arg0, arg1) },
@@ -184,6 +210,8 @@ pub unsafe fn invoke_cudaEventElapsedTime(
     arg1: runtime::CudaEvent,
     arg2: runtime::CudaEvent,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaEventElapsedTime", None);
     runtime.call(
         "cudaEventElapsedTime",
         |f: runtime::EventElapsedTime| unsafe { f(arg0, arg1, arg2) },
@@ -201,6 +229,8 @@ pub unsafe fn invoke_cuDeviceGetName(
     arg1: c_int,
     arg2: CudaDevice,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuDeviceGetName", None);
     runtime.driver_call("cuDeviceGetName", |f: driver::DriverDeviceGetName| unsafe {
         f(arg0, arg1, arg2)
     })
@@ -227,6 +257,8 @@ pub unsafe fn invoke_cudaMemcpy(
     arg2: usize,
     arg3: c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaMemcpy", Some(arg3));
     runtime.call("cudaMemcpy", |f: runtime::Memcpy| unsafe {
         f(arg0, arg1, arg2, arg3)
     })
@@ -250,6 +282,8 @@ pub unsafe fn invoke_cudaStreamDestroy(
     runtime: &CudaRuntime,
     arg0: runtime::CudaStream,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamDestroy", None);
     runtime.call("cudaStreamDestroy", |f: runtime::StreamDestroy| unsafe {
         f(arg0)
     })
@@ -264,6 +298,8 @@ pub unsafe fn invoke_cudaStreamSynchronize(
     runtime: &CudaRuntime,
     arg0: runtime::CudaStream,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamSynchronize", None);
     runtime.call(
         "cudaStreamSynchronize",
         |f: runtime::StreamSynchronize| unsafe { f(arg0) },
@@ -280,6 +316,8 @@ pub unsafe fn invoke_cudaEventRecord(
     arg0: runtime::CudaEvent,
     arg1: runtime::CudaStream,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaEventRecord", None);
     runtime.call("cudaEventRecord", |f: runtime::EventRecord| unsafe {
         f(arg0, arg1)
     })
@@ -294,6 +332,8 @@ pub unsafe fn invoke_cudaEventDestroy(
     runtime: &CudaRuntime,
     arg0: runtime::CudaEvent,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaEventDestroy", None);
     runtime.call("cudaEventDestroy", |f: runtime::EventDestroy| unsafe {
         f(arg0)
     })
@@ -308,6 +348,8 @@ pub unsafe fn invoke_cudaEventSynchronize(
     runtime: &CudaRuntime,
     arg0: runtime::CudaEvent,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaEventSynchronize", None);
     runtime.call(
         "cudaEventSynchronize",
         |f: runtime::EventSynchronize| unsafe { f(arg0) },
@@ -323,6 +365,8 @@ pub unsafe fn invoke_cuModuleUnload(
     runtime: &CudaRuntime,
     arg0: driver::ModuleHandle,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuModuleUnload", None);
     runtime.driver_call("cuModuleUnload", |f: driver::DriverModuleUnload| unsafe {
         f(arg0)
     })
@@ -339,6 +383,8 @@ pub unsafe fn invoke_cuModuleGetFunction(
     arg1: driver::ModuleHandle,
     arg2: *const c_char,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuModuleGetFunction", None);
     runtime.driver_call(
         "cuModuleGetFunction",
         |f: driver::DriverModuleGetFunction| unsafe { f(arg0, arg1, arg2) },
@@ -358,6 +404,8 @@ pub unsafe fn invoke_cudaMemcpyAsync(
     arg3: c_int,
     arg4: runtime::CudaStream,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaMemcpyAsync", Some(arg3));
     runtime.call("cudaMemcpyAsync", |f: runtime::MemcpyAsync| unsafe {
         f(arg0, arg1, arg2, arg3, arg4)
     })
@@ -374,6 +422,8 @@ pub unsafe fn invoke_cudaStreamWaitEvent(
     arg1: runtime::CudaEvent,
     arg2: u32,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamWaitEvent", None);
     runtime.call(
         "cudaStreamWaitEvent",
         |f: runtime::StreamWaitEvent| unsafe { f(arg0, arg1, arg2) },
@@ -400,6 +450,8 @@ pub unsafe fn invoke_cuLaunchKernel(
     parameters: *mut *mut c_void,
     extra: *mut *mut c_void,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuLaunchKernel", None);
     runtime.driver_call(
         "cuLaunchKernel",
         |f: driver::DriverModuleLaunchKernel| unsafe {
@@ -431,6 +483,8 @@ pub unsafe fn invoke_cudaStreamCreateWithPriority(
     arg1: u32,
     arg2: c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamCreateWithPriority", None);
     runtime.call(
         "cudaStreamCreateWithPriority",
         |f: runtime::StreamCreateWithPriority| unsafe { f(arg0, arg1, arg2) },
@@ -447,6 +501,8 @@ pub unsafe fn invoke_cudaDeviceGetStreamPriorityRange(
     arg0: *mut c_int,
     arg1: *mut c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaDeviceGetStreamPriorityRange", None);
     runtime.call(
         "cudaDeviceGetStreamPriorityRange",
         |f: runtime::DeviceGetStreamPriorityRange| unsafe { f(arg0, arg1) },
@@ -463,6 +519,8 @@ pub unsafe fn invoke_cudaStreamGetFlags(
     arg0: runtime::CudaStream,
     arg1: *mut u32,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamGetFlags", None);
     runtime.call("cudaStreamGetFlags", |f: runtime::StreamGetFlags| unsafe {
         f(arg0, arg1)
     })
@@ -478,6 +536,8 @@ pub unsafe fn invoke_cudaStreamGetPriority(
     arg0: runtime::CudaStream,
     arg1: *mut c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamGetPriority", None);
     runtime.call(
         "cudaStreamGetPriority",
         |f: runtime::StreamGetPriority| unsafe { f(arg0, arg1) },
@@ -493,6 +553,8 @@ pub unsafe fn invoke_cudaStreamQuery(
     runtime: &CudaRuntime,
     arg0: runtime::CudaStream,
 ) -> Result<crate::control::CudaReadiness, CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamQuery", None);
     runtime.query_readiness("cudaStreamQuery", |f: runtime::StreamQuery| unsafe {
         f(arg0)
     })
@@ -507,6 +569,8 @@ pub unsafe fn invoke_cudaEventQuery(
     runtime: &CudaRuntime,
     arg0: runtime::CudaEvent,
 ) -> Result<crate::control::CudaReadiness, CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaEventQuery", None);
     runtime.query_readiness("cudaEventQuery", |f: runtime::EventQuery| unsafe {
         f(arg0)
     })
@@ -522,6 +586,8 @@ pub unsafe fn invoke_cuDeviceGetUuid_v2(
     arg0: *mut driver::DriverUuid,
     arg1: CudaDevice,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuDeviceGetUuid_v2", None);
     runtime.driver_call(
         "cuDeviceGetUuid_v2",
         |f: driver::DriverDeviceGetUuid| unsafe { f(arg0, arg1) },
@@ -539,6 +605,8 @@ pub unsafe fn invoke_cuDeviceGetAttribute(
     arg1: c_int,
     arg2: CudaDevice,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cuDeviceGetAttribute", None);
     runtime.driver_call(
         "cuDeviceGetAttribute",
         |f: driver::DriverDeviceGetAttribute| unsafe { f(arg0, arg1, arg2) },
@@ -554,6 +622,8 @@ pub unsafe fn invoke_cudaFreeHost(
     runtime: &CudaRuntime,
     arg0: *mut c_void,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaFreeHost", None);
     runtime.call("cudaFreeHost", |f: runtime::FreeHost| unsafe { f(arg0) })
 }
 
@@ -567,6 +637,8 @@ pub unsafe fn invoke_cudaMallocHost(
     arg0: *mut *mut c_void,
     arg1: usize,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaMallocHost", None);
     runtime.call("cudaMallocHost", |f: runtime::MallocHost| unsafe {
         f(arg0, arg1)
     })
@@ -582,6 +654,8 @@ pub unsafe fn invoke_cudaStreamBeginCapture(
     arg0: runtime::CudaStream,
     arg1: c_int,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamBeginCapture", None);
     runtime.call(
         "cudaStreamBeginCapture",
         |f: runtime::StreamBeginCapture| unsafe { f(arg0, arg1) },
@@ -598,6 +672,8 @@ pub unsafe fn invoke_cudaStreamEndCapture(
     arg0: runtime::CudaStream,
     arg1: *mut runtime::CudaGraph,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaStreamEndCapture", None);
     runtime.call(
         "cudaStreamEndCapture",
         |f: runtime::StreamEndCapture| unsafe { f(arg0, arg1) },
@@ -615,6 +691,8 @@ pub unsafe fn invoke_cudaGraphInstantiateWithFlags(
     arg1: runtime::CudaGraph,
     arg2: u64,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaGraphInstantiateWithFlags", None);
     runtime.call(
         "cudaGraphInstantiateWithFlags",
         |f: runtime::GraphInstantiateWithFlags| unsafe { f(arg0, arg1, arg2) },
@@ -630,6 +708,8 @@ pub unsafe fn invoke_cudaGraphDestroy(
     runtime: &CudaRuntime,
     arg0: runtime::CudaGraph,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaGraphDestroy", None);
     runtime.call("cudaGraphDestroy", |f: runtime::GraphDestroy| unsafe {
         f(arg0)
     })
@@ -645,6 +725,8 @@ pub unsafe fn invoke_cudaGraphLaunch(
     arg0: runtime::CudaGraphExec,
     arg1: runtime::CudaStream,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaGraphLaunch", None);
     runtime.call("cudaGraphLaunch", |f: runtime::GraphLaunch| unsafe {
         f(arg0, arg1)
     })
@@ -662,6 +744,8 @@ pub unsafe fn invoke_cudaMemsetAsync(
     arg2: usize,
     arg3: runtime::CudaStream,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaMemsetAsync", None);
     runtime.call("cudaMemsetAsync", |f: runtime::MemsetAsync| unsafe {
         f(arg0, arg1, arg2, arg3)
     })
@@ -676,6 +760,8 @@ pub unsafe fn invoke_cudaGraphExecDestroy(
     runtime: &CudaRuntime,
     arg0: runtime::CudaGraphExec,
 ) -> Result<(), CudaError> {
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaGraphExecDestroy", None);
     runtime.call(
         "cudaGraphExecDestroy",
         |f: runtime::GraphExecDestroy| unsafe { f(arg0) },

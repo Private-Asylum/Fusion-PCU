@@ -119,6 +119,7 @@ pub use codegen::rtc::{
 #[rustfmt::skip]
 pub use tensor::{
     lower_strict_matmul_to_hip_source,
+    lower_strict_sgd_to_hip_source,
     RocmAdmittedTensorFeedbackResources,
     RocmPreparedTensorGraph,
     RocmTensorExecution,
@@ -3193,8 +3194,8 @@ mod memory_snapshot_tests {
         let mut storage = HipReadbackStorage::new();
         let empty = storage.allocate(0);
         assert_eq!(storage.validate_destination(&empty, 0, 0), Ok(()));
-        assert_eq!(storage.read(&empty).unwrap(), &[]);
-        assert_eq!(storage.take(&empty).unwrap().as_ref(), &[]);
+        assert!(storage.read(&empty).unwrap().is_empty());
+        assert!(storage.take(&empty).unwrap().is_empty());
         assert_eq!(storage.read(&empty), Err(HipError::InvalidReadbackId));
     }
 

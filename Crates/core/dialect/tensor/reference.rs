@@ -30,6 +30,10 @@ use crate::scalar_checked_float::PcuCheckedFloat;
 mod strict_matmul;
 use strict_matmul::checked_matmul;
 
+#[path = "reference/strict_sgd/strict_sgd.rs"]
+mod strict_sgd;
+use strict_sgd::checked_sgd;
+
 pub(super) const fn unsupported_value(
     graph_id: u64,
     index: usize,
@@ -39,15 +43,6 @@ pub(super) const fn unsupported_value(
         value: ValueId { graph_id, index },
         scalar_type,
     }
-}
-
-pub(super) fn as_f32_value(
-    value: &TensorValue,
-    operation: ValueId,
-) -> Result<&Tensor, TensorError> {
-    value
-        .as_typed::<f32>()
-        .map_err(|_| unsupported_value(operation.graph_id, operation.index, value.scalar_type()))
 }
 
 pub(super) fn binary_value(
@@ -338,6 +333,60 @@ pub(super) fn mean_squared_error_value(
             output.graph_id,
             output.index,
             prediction.scalar_type(),
+        )),
+    }
+}
+
+/// Typed SGD dispatch. Raw boundary arithmetic remains a legacy reference route only.
+#[allow(clippy::suboptimal_flops)] // Separate product/subtraction preserve the declared rounding.
+pub(super) fn sgd_value(
+    weights: &TensorValue,
+    gradient: &TensorValue,
+    learning_rate: f32,
+    output: ValueId,
+    mode: PcuNumericalMode,
+    policy: PcuFloatUnderflowPolicy,
+) -> Result<TensorValue, TensorError> {
+    match (weights, gradient) {
+        (TensorValue::F32(weights), TensorValue::F32(gradient)) => match mode {
+            PcuNumericalMode::Strict => {
+                checked_sgd(weights, gradient, learning_rate, output, policy).map(TensorValue::F32)
+            }
+            PcuNumericalMode::Boundary => {
+                Ok(TensorValue::F32(binary(weights, gradient, |w, g| {
+                    w - learning_rate * g
+                })))
+            }
+        },
+        (TensorValue::F64(weights), TensorValue::F64(gradient)) => {
+            let rate = f64::from(learning_rate);
+            match mode {
+                PcuNumericalMode::Strict => {
+                    checked_sgd(weights, gradient, rate, output, policy).map(TensorValue::F64)
+                }
+                PcuNumericalMode::Boundary => Tensor::new(
+                    weights.shape.clone(),
+                    weights
+                        .data
+                        .iter()
+                        .zip(&gradient.data)
+                        .map(|(w, g)| w - rate * g)
+                        .collect(),
+                )
+                .map(TensorValue::F64),
+            }
+        }
+        (weights, gradient) if weights.scalar_type() != gradient.scalar_type() => {
+            Err(TensorError::ScalarTypeMismatch {
+                value: output,
+                expected: weights.scalar_type(),
+                actual: gradient.scalar_type(),
+            })
+        }
+        (weights, _) => Err(unsupported_value(
+            output.graph_id,
+            output.index,
+            weights.scalar_type(),
         )),
     }
 }

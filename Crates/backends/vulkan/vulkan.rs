@@ -1,13 +1,19 @@
-//! Limited Vulkan prototype for synchronous PCU SPIR-V dispatch.
+//! Explicit synchronous Vulkan execution of bounded PCU SPIR-V compute profiles.
 //!
 //! Enable `hosted` to opt into loader discovery and execution. The default crate loads no
-//! Vulkan runtime. The prototype lowers legacy dispatch IR and executes exactly three fixed
-//! storage-buffer descriptors (two inputs and one output), waiting for completion before return.
+//! Vulkan runtime. Prepared typed host calls admit exact F32/F64 transport and checked sign-bit Neg,
+//! retaining native storage, pipeline and submission objects. The legacy executor additionally
+//! supports its three-buffer raw F32 dispatch profile, waiting for completion before return.
 //! Capability inspection does not enable descriptor indexing or buffer-device-address execution.
-//! Modern `#[pcu]` source, facade, and owned-backend integration remain deferred.
+//! Per-function `#[pcu]` source supports explicit preparation and ordinary facade calls through
+//! its optional `vulkan` feature. Resident owned-backend integration is a separate slice.
+//! External memory is not imported.
 
 extern crate fusion_pcu_core as fusion_pcu;
 
+#[cfg(feature = "hosted")]
+#[path = "discovery/discovery.rs"]
+mod discovery;
 #[cfg(feature = "hosted")]
 #[path = "dispatch/dispatch.rs"]
 mod dispatch;
@@ -18,6 +24,12 @@ mod error;
 #[path = "ffi/ffi.rs"]
 mod ffi;
 #[cfg(feature = "hosted")]
+#[path = "offers/offers.rs"]
+mod offers;
+#[cfg(feature = "hosted")]
+#[path = "prepared/prepared.rs"]
+mod prepared;
+#[cfg(feature = "hosted")]
 #[path = "types/types.rs"]
 mod types;
 
@@ -26,6 +38,8 @@ mod types;
 pub use crate::{
     dispatch::PcuVulkanBackend,
     error::PcuVulkanError,
+    prepared::PcuVulkanPreparedBitMap,
+    discovery::PcuVulkanDiscovery,
     types::{
         PcuVulkanBufferDeviceAddressCaps,
         PcuVulkanCaps,
@@ -35,6 +49,8 @@ pub use crate::{
         PcuVulkanDispatchReport,
         PcuVulkanExecutionReport,
         PcuVulkanPushConstantCaps,
+        PcuVulkanMemoryRealization,
+        PcuVulkanCallMeasurements,
         PcuVulkanResourceAddressingModel,
     },
 };

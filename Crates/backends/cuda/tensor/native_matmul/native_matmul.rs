@@ -121,18 +121,18 @@ mod tests {
                 native_options(PcuPrecisionPolicy::BackendOptimized),
             )
             .unwrap();
-        graph
-            .set_value_float_underflow_policy(
-                output,
-                PcuFloatUnderflowPolicy::RejectSubnormalResult,
-            )
-            .unwrap();
-        assert_eq!(
-            assess_matmul_numerical_options(graph.node(output).unwrap(), &environment),
-            Err(TensorUnsupportedReason::UnderflowPolicy(
-                PcuFloatUnderflowPolicy::RejectSubnormalResult
-            ))
-        );
+        for policy in [
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        ] {
+            graph
+                .set_value_float_underflow_policy(output, policy)
+                .unwrap();
+            assert_eq!(
+                assess_matmul_numerical_options(graph.node(output).unwrap(), &environment),
+                Err(TensorUnsupportedReason::UnderflowPolicy(policy))
+            );
+        }
     }
 
     #[test]
@@ -200,6 +200,19 @@ mod tests {
             )
             .unwrap();
         let prepared = assessor.prepare_owned_program(program).unwrap();
+        let implementations = prepared.native_matmul_implementations();
+        assert_eq!(implementations.len(), 1);
+        assert_eq!(implementations[0].0, output);
+        assert_eq!(
+            implementations[0].1.compute_type,
+            if T::TYPE == PcuScalarType::F64 {
+                70
+            } else if precision == PcuPrecisionPolicy::BackendOptimized {
+                77
+            } else {
+                68
+            }
+        );
         let pool = PcuMemoryPoolId(0x4e41_4355);
         let marker = left[0];
         let left =
@@ -417,7 +430,7 @@ mod tests {
             )
             .unwrap();
         let prepared = assessor.prepare_owned_program(program).unwrap();
-        assert!(prepared.data.native_matmul_batch);
+        assert_eq!(prepared.native_matmul_implementations().len(), 2);
         let pool = PcuMemoryPoolId(0x4e41_4355);
         let left =
             PcuDeviceTensor::new([2, 2], session.upload_buffer(pool, left).unwrap()).unwrap();

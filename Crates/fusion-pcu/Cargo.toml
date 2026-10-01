@@ -24,16 +24,20 @@ std = ["fusion-pcu-core/std"]
 hosted = ["std"]
 tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor", "fusion-pcu-cuda?/tensor"]
 vm-reference = ["fusion-pcu-core/vm-reference"]
+cpu = ["std", "dep:fusion-pcu-cpu", "fusion-pcu-cpu/std"]
 rocm = ["std", "dep:fusion-pcu-rocm"]
 cuda = ["std", "dep:fusion-pcu-cuda"]
 metal = ["std", "dep:fusion-pcu-metal"]
+vulkan = ["std", "dep:fusion-pcu-vulkan", "fusion-pcu-vulkan/hosted"]
 
 [dependencies]
+fusion-pcu-cpu = { workspace = true, optional = true, default-features = false }
 fusion-pcu-core.workspace = true
 fusion-pcu-macros.workspace = true
 fusion-pcu-rocm = { workspace = true, optional = true }
 fusion-pcu-cuda = { workspace = true, optional = true }
 fusion-pcu-metal = { workspace = true, optional = true }
+fusion-pcu-vulkan = { workspace = true, optional = true }
 smallvec.workspace = true
 
 [lints]
@@ -60,6 +64,25 @@ path = "examples/cuda_transform/cuda_transform.rs"
 required-features = ["cuda"]
 
 [[example]]
+name = "cpu-transform"
+path = "examples/cpu-transform/cpu-transform.rs"
+required-features = ["cpu"]
+
+[[example]]
+name = "vulkan-transform"
+path = "examples/vulkan-transform/vulkan-transform.rs"
+required-features = ["vulkan"]
+
+[[example]]
 name = "owned-tensor-composition"
 path = "examples/owned-tensor-composition/owned-tensor-composition.rs"
 required-features = ["rocm", "tensor"]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "cpu_source"
+path = "benches/cpu_source/cpu_source.rs"
+harness = false
+required-features = ["cpu"]

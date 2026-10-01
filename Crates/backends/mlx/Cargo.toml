@@ -1,13 +1,13 @@
 [package]
 name = "fusion-pcu-mlx"
-description = "MLX backend scaffold for Fusion PCU on Apple silicon"
+description = "Explicit delegated MLX GPU tensor runtime for Fusion PCU"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
@@ -18,9 +18,40 @@ path = "mlx.rs"
 
 [features]
 default = []
+tensor = ["fusion-pcu-core/tensor"]
+benchmark-control = ["tensor"]
+allocation-census = []
+c-api-evaluation = ["benchmark-control"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
+libloading.workspace = true
+
+[dev-dependencies]
+pcu-facade = { workspace = true, features = ["tensor"] }
+criterion.workspace = true
+
+[[test]]
+name = "source_capture"
+path = "tests/source_capture/source_capture.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "compiled_matmul"
+path = "benches/compiled_matmul/compiled_matmul.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[bench]]
+name = "c_api_comparison"
+path = "benches/c_api_comparison/c_api_comparison.rs"
+harness = false
+required-features = ["c-api-evaluation"]
+
+[[example]]
+name = "prepared_matmul"
+path = "examples/prepared_matmul/prepared_matmul.rs"
+required-features = ["tensor"]
 
 [lints]
 workspace = true

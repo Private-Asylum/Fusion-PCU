@@ -19,13 +19,14 @@ use fusion_pcu::{
 };
 use crate::CublasError;
 
-const ENVIRONMENT_NAMES: [&str; 6] = [
+const ENVIRONMENT_NAMES: [&str; 7] = [
     "CUBLAS_EMULATION_STRATEGY",
     "CUBLAS_EMULATION_SPECIAL_VALUES_SUPPORT_MASK",
     "CUBLAS_EMULATE_SINGLE_PRECISION",
     "CUBLAS_EMULATE_DOUBLE_PRECISION",
     "CUBLAS_FIXEDPOINT_EMULATION_MANTISSA_BIT_COUNT",
     "NVIDIA_TF32_OVERRIDE",
+    "CUBLAS_BATCH_INVARIANCE_FLAGS",
 ];
 
 /// The relevant process configuration captured before native compound preparation.
@@ -34,11 +35,11 @@ const ENVIRONMENT_NAMES: [&str; 6] = [
 /// retune a warm handle. Applications must finish process configuration before preparation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CublasEnvironmentSnapshot {
-    values: [Option<OsString>; 6],
+    values: [Option<OsString>; 7],
 }
 
 impl CublasEnvironmentSnapshot {
-    /// Captures the documented precision and emulation override variables without SDK calls.
+    /// Captures precision/emulation overrides and the experimental admission flag without SDK calls.
     #[must_use]
     pub fn capture() -> Self {
         Self {
@@ -163,6 +164,31 @@ mod tests {
                     .filter(|(selected, _)| *selected == name)
                     .map(|(_, value)| (*value).to_owned())
             }),
+        }
+    }
+
+    #[test]
+    fn batch_invariance_presence_rejects_lt_cold_for_both_precisions() {
+        for precision in [
+            PcuPrecisionPolicy::Preserve,
+            PcuPrecisionPolicy::BackendOptimized,
+        ] {
+            for value in ["", "0", "1", "unknown"] {
+                let config = CublasNumericalConfig::new(
+                    PcuScalarType::F32,
+                    precision,
+                    environment(Some(("CUBLAS_BATCH_INVARIANCE_FLAGS", OsStr::new(value)))),
+                );
+                let rejected = config.and_then(|config| {
+                    crate::CublasLtMatmulDescriptor::new([2, 3], [3, 2], [false; 2], config)
+                });
+                assert_eq!(
+                    rejected,
+                    Err(CublasError::UnsupportedNumericalConfiguration(
+                        "CUBLAS_BATCH_INVARIANCE_FLAGS"
+                    ))
+                );
+            }
         }
     }
 

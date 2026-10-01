@@ -129,6 +129,7 @@ impl Preparation {
             &mut self.arena,
             self.policy,
             self.affinity.as_ref(),
+            Some(kernel),
             |session| {
                 session
                     .backend()
@@ -146,6 +147,7 @@ fn prepare_in_arena<R>(
     arena: &mut SessionArena,
     policy: PcuExecutionPolicy,
     affinity: Option<&Rc<RocmSession>>,
+    kernel: Option<&PcuDispatchKernelIr<'_>>,
     mut prepare: impl FnMut(&Rc<RocmSession>) -> Result<R, PcuExecutionError>,
 ) -> Result<(Rc<RocmSession>, R), PcuExecutionError> {
     if let Some(session) = affinity {
@@ -166,7 +168,7 @@ fn prepare_in_arena<R>(
         .expect("cold preparation records its runtime realm")
         .clone();
     let mut rejected = Vec::new();
-    for device in candidates(discovery, policy)? {
+    for device in candidates(discovery, policy, kernel)? {
         let key = SessionKey {
             device,
             pci_bus_id: discovery
@@ -233,7 +235,7 @@ pub(super) fn prepare_tensor<R>(
                 };
             }
             let (session, prepared) =
-                prepare_in_arena(&mut state.arena, policy, affinity, prepare)?;
+                prepare_in_arena(&mut state.arena, policy, affinity, None, prepare)?;
             Ok((session, prepared, generation, policy.cache_capacity))
         })
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?
@@ -267,7 +269,12 @@ pub(super) fn call_host(
 }
 
 /// Convert one fixed source argument set without a heap-backed projection vector.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+)))]
 pub(super) fn call_arguments<'a, const N: usize>(
     site: &PcuHostCallSite,
     specialization: TypeId,
@@ -375,7 +382,12 @@ fn with_entry<R>(
                     };
                 }
                 let mut context = PcuHostPreparation {
-                    #[cfg(feature = "cuda")]
+                    #[cfg(any(
+                        feature = "cuda",
+                        feature = "metal",
+                        feature = "vulkan",
+                        feature = "cpu"
+                    ))]
                     shared: None,
                     inner: Some(Preparation {
                         policy,
@@ -467,6 +479,7 @@ const EMPTY_READINESS: PcuProviderReadiness<'static> = PcuProviderReadiness {
 fn candidates(
     discovery: &RocmDiscovery,
     policy: PcuExecutionPolicy,
+    kernel: Option<&PcuDispatchKernelIr<'_>>,
 ) -> Result<Vec<PcuObjectRef>, PcuExecutionError> {
     let mut providers = [PcuProviderDescriptor {
         id: PcuProviderId(0),
@@ -503,18 +516,29 @@ fn candidates(
         .devices(targets[0].reference, &mut devices)
         .map_err(PcuExecutionError::Discovery)?;
     devices.retain(|device| policy.device.is_none_or(|id| device.reference.id == id));
-    // Concrete kernel preparation hard-filters each candidate before it can execute.
-    devices.sort_by(|a, b| {
-        let memory = |device: &PcuDeviceDescriptor<'_>| {
-            discovery
-                .device_info(device.reference)
-                .map_or(0, |info| info.total_memory)
-        };
-        (policy.score_device)(b, memory(b))
-            .cmp(&(policy.score_device)(a, memory(a)))
-            .then_with(|| a.reference.id.cmp(&b.reference.id))
+    // Score once per cold candidate, never inside sort or a cached warm invocation.
+    // Concrete preparation still hard-filters capability and numerical admission.
+    let mut scored = devices
+        .into_iter()
+        .map(|descriptor| {
+            let memory = discovery
+                .device_info(descriptor.reference)
+                .ok()
+                .map(|info| info.total_memory);
+            let score =
+                super::selection::score_candidate(policy, descriptor, memory, kernel, || {
+                    discovery.device_facts(descriptor.reference)
+                })
+                .map_err(PcuExecutionError::Discovery)?;
+            Ok((descriptor.reference, score))
+        })
+        .collect::<Result<Vec<_>, PcuExecutionError>>()?;
+    scored.sort_by(|(left, left_score), (right, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.id.cmp(&right.id))
     });
-    Ok(devices.into_iter().map(|device| device.reference).collect())
+    Ok(scored.into_iter().map(|(device, _)| device).collect())
 }
 
 #[cfg(test)]

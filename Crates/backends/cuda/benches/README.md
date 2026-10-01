@@ -93,3 +93,13 @@ operands. A successful retry follows every case through the same prepared graph/
 No failed output is read. `--features tensor,allocation-census` selects a separate resident Rust allocation
 census run and skips Criterion timings; device and driver internal allocations are excluded.
 
+
+### Checked Strict SGD benchmark
+
+[Strict SGD](strict_sgd/README.md) compares actual annotated F32/F64 source, a
+frozen graph and the identical native checker at 65 and 1,048,576 lanes. It checks
+separate rate multiplication then weight subtraction, with structured fault
+coordinates, complete changing-input oracles, retained input owners, fresh
+outputs and matched full-host/resident boundaries. A separate diagnostic build
+reports Rust allocation and bounded CUDA FFI API census; primary timing excludes
+those counters. Default checked Boundary SGD remains unsupported.

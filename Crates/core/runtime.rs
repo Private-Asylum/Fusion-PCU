@@ -11,6 +11,8 @@ pub mod device_tensor;
 pub mod discovery;
 pub mod execution;
 pub mod host_kernel;
+#[path = "runtime/implementation/implementation.rs"]
+pub mod implementation;
 pub mod kernel;
 #[cfg(feature = "alloc")]
 pub mod owned_shape;
@@ -25,6 +27,7 @@ pub use device_tensor::*;
 pub use device_kernel::*;
 pub use execution::*;
 pub use host_kernel::*;
+pub use implementation::*;
 pub use kernel::*;
 #[cfg(feature = "alloc")]
 pub use owned_shape::*;

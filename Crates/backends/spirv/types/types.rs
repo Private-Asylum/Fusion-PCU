@@ -12,6 +12,7 @@ use core::ops::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuSpirvCapability {
     Shader,
+    Float64,
     Matrix,
     Image,
     StorageImage,
@@ -25,6 +26,7 @@ pub enum PcuSpirvCapability {
 pub struct PcuSpirvCapabilityCaps(u32);
 
 impl PcuSpirvCapabilityCaps {
+    pub const FLOAT64: Self = Self(1 << 7);
     pub const SHADER: Self = Self(1 << 0);
     pub const MATRIX: Self = Self(1 << 1);
     pub const IMAGE: Self = Self(1 << 2);
@@ -62,6 +64,7 @@ impl PcuSpirvCapabilityCaps {
     pub const fn for_capability(capability: PcuSpirvCapability) -> Self {
         match capability {
             PcuSpirvCapability::Shader => Self::SHADER,
+            PcuSpirvCapability::Float64 => Self::FLOAT64,
             PcuSpirvCapability::Matrix => Self::MATRIX,
             PcuSpirvCapability::Image => Self::IMAGE,
             PcuSpirvCapability::StorageImage => Self::STORAGE_IMAGE,

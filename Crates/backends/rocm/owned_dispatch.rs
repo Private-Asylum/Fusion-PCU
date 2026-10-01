@@ -545,6 +545,51 @@ impl RocmOwnedDispatchBackend {
         })
     }
 
+    /// Prepares only the private, validated checked SGD factory's buffer/fault ABI.
+    /// Arbitrary consumer source cannot enter the safe owned-submission path here.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_strict_sgd_on_stream(
+        &self,
+        spec: crate::tensor::strict_sgd::StrictSgdSpec,
+        stream: &crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
+        }
+        let compiler = self
+            .compiler
+            .ok_or(RocmOwnedDispatchError::CompilerUnavailable)?;
+        let source = spec.source();
+        let image = match crate::compile_hip_source_for_device(&self.runtime, &source) {
+            Ok(image) => image,
+            Err(_) if compiler == crate::discovery::DispatchCompiler::Hipcc => {
+                self.compile_tensor_source(&source)?
+            }
+            Err(error) => return Err(RocmOwnedDispatchError::HipRtc(error)),
+        };
+        let module = self.runtime.load_module(&image)?;
+        let function = module.function(c"fusion_kernel")?;
+        let binding_requirements = spec.requirements().to_vec();
+        let binding_targets = binding_requirements
+            .iter()
+            .map(|requirement| requirement.target)
+            .collect();
+        let shape = spec.shape();
+        let grid_x = launch_grid(shape.invocation_count().get(), self.block_size)?;
+        Ok(RocmPreparedDispatch {
+            runtime: self.runtime.clone(),
+            device: self.device,
+            binding_requirements,
+            shape,
+            grid_x,
+            block_size: self.block_size,
+            function,
+            stream: stream.clone(),
+            binding_targets,
+            checked_arithmetic: true,
+        })
+    }
+
     fn prepare_dispatch_ir(
         &self,
         kernel: fusion_pcu::PcuDispatchKernelIr<'_>,

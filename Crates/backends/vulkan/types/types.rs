@@ -112,6 +112,8 @@ pub struct PcuVulkanPushConstantCaps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuVulkanCaps {
     pub api_version: u32,
+    /// Queried native Float64 support; activation enables it only when present.
+    pub shader_float64: bool,
     pub descriptor_indexing: PcuVulkanDescriptorIndexingCaps,
     pub buffer_device_address: PcuVulkanBufferDeviceAddressCaps,
     pub push_constants: PcuVulkanPushConstantCaps,
@@ -142,6 +144,30 @@ pub struct PcuVulkanLoweredSpirvDispatch<'a> {
     pub local_size: [u32; 3],
 }
 
+/// Reported properties of one actual native allocation, fixed during cold preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PcuVulkanMemoryRealization {
+    pub native_memory_type: u32,
+    /// Exact `VkMemoryPropertyFlagBits` returned for the selected memory type.
+    pub native_property_flags: u32,
+    pub allocation_bytes: u64,
+}
+
+impl PcuVulkanMemoryRealization {
+    #[must_use]
+    pub const fn host_cached(self) -> bool {
+        self.native_property_flags & 8 != 0
+    }
+    #[must_use]
+    pub const fn host_coherent(self) -> bool {
+        self.native_property_flags & 4 != 0
+    }
+    #[must_use]
+    pub const fn device_local(self) -> bool {
+        self.native_property_flags & 1 != 0
+    }
+}
+
 /// Metadata for one synchronous prototype dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PcuVulkanDispatchReport {
@@ -153,4 +179,16 @@ pub struct PcuVulkanDispatchReport {
 
 const fn min_u32(left: u32, right: u32) -> u32 {
     if left < right { left } else { right }
+}
+
+/// Optional successful-call diagnostic timings; ordinary calls read no measurement clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PcuVulkanCallMeasurements {
+    pub upload: std::time::Duration,
+    /// Fence reset, submit-info preparation and native queue submission.
+    pub submission: std::time::Duration,
+    pub completion: std::time::Duration,
+    pub diagnostic_publication: std::time::Duration,
+    /// Native host-boundary time; outer typed argument validation is excluded.
+    pub wall: std::time::Duration,
 }

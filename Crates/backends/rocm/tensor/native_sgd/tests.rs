@@ -3,6 +3,7 @@ use super::*;
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuCheckedFloat,
+    PcuFloatUnderflowPolicy,
     PcuDeviceTensor,
     PcuMemoryPoolId,
     PcuNumericalOptions,
@@ -116,17 +117,20 @@ fn immutable_rate_and_policy_provenance_include_signed_zero() {
             reason: TensorUnsupportedReason::Operation
         }
     );
-    graph
-        .set_value_float_underflow_policy(output, PcuFloatUnderflowPolicy::RejectSubnormalResult)
-        .unwrap();
-    assert_eq!(
-        assess(&graph, graph.node(output).unwrap()),
-        TensorOperationSupport::Unsupported {
-            reason: TensorUnsupportedReason::UnderflowPolicy(
-                PcuFloatUnderflowPolicy::RejectSubnormalResult
-            )
-        }
-    );
+    for policy in [
+        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+    ] {
+        graph
+            .set_value_float_underflow_policy(output, policy)
+            .unwrap();
+        assert_eq!(
+            assess(&graph, graph.node(output).unwrap()),
+            TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::UnderflowPolicy(policy),
+            }
+        );
+    }
 }
 
 #[test]
@@ -147,13 +151,22 @@ fn dense_extent_and_scalar_width_are_admitted_cold() {
     let mut f64_graph = Graph::default();
     let weights = f64_graph.input([17], PcuScalarType::F64).unwrap();
     let gradient = f64_graph.input([17], PcuScalarType::F64).unwrap();
-    assert!(matches!(
-        f64_graph.sgd_update(weights, gradient, 0.5),
-        Err(TensorError::UnsupportedScalarType {
-            scalar_type: PcuScalarType::F64,
-            ..
-        })
-    ));
+    let output = f64_graph.sgd_update(weights, gradient, 0.5).unwrap();
+    f64_graph
+        .set_value_numerical_options(
+            output,
+            PcuNumericalOptions {
+                compound_arithmetic: PcuCompoundArithmeticPolicy::BackendDefined,
+                ..PcuNumericalOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        assess(&f64_graph, f64_graph.node(output).unwrap()),
+        TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::ElementType
+        }
+    );
     let (graph, output) = graph(&[17], PcuScalarType::F32, 0.5);
     let mut forged = graph.node(output).unwrap();
     forged.scalar_type = PcuScalarType::F64;

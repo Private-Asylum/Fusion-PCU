@@ -1,7 +1,7 @@
 //! Opt-in tensor operation assessment for an explicitly selected `CUDA` session.
 //!
 //! This adapter transports typed owned inputs through selected identity graphs and synthesizes
-//! strictly ordered checked row-major f32/f64 matrix multiplication. Selected checked f32/f64
+//! strictly ordered checked row-major f32/f64 matrix multiplication and SGD updates. Selected checked f32/f64
 //! pointwise operations and dense integer Add/Sub/Mul use owned PCU Dispatch. Ordinary boundary
 //! checked matrix multiplication and unproved compound training operations remain unsupported.
 //! Explicit Boundary + `BackendDefined` real matrix multiplication uses immutable cuBLAS precision
@@ -10,6 +10,9 @@
 #[path = "strict_matmul/strict_matmul.rs"]
 pub mod strict_matmul;
 pub use strict_matmul::lower_strict_matmul_to_cuda_source;
+#[path = "strict_sgd/strict_sgd.rs"]
+pub mod strict_sgd;
+pub use strict_sgd::lower_strict_sgd_to_cuda_source;
 
 #[path = "float.rs"]
 mod checked_float;
@@ -696,6 +699,7 @@ impl TensorPointwiseScalarType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TensorDispatchCacheKey {
     StrictMatMul(strict_matmul::Profile),
+    StrictSgd(strict_sgd::Profile),
     Fixed(
         TensorDispatchKind,
         TensorPointwiseScalarType,
@@ -772,6 +776,7 @@ struct TensorDispatchCacheAdmission {
 #[derive(Clone, Debug)]
 enum TensorDispatchRequest<'graph> {
     StrictMatMul(strict_matmul::Profile),
+    StrictSgd(strict_sgd::Profile),
     Fixed {
         kind: TensorDispatchKind,
         scalar_type: TensorPointwiseScalarType,
@@ -797,6 +802,7 @@ impl TensorDispatchRequest<'_> {
     fn key(&self) -> TensorDispatchCacheKey {
         match self {
             Self::StrictMatMul(profile) => TensorDispatchCacheKey::StrictMatMul(*profile),
+            Self::StrictSgd(profile) => TensorDispatchCacheKey::StrictSgd(*profile),
             Self::Fixed {
                 kind,
                 scalar_type,
@@ -1372,7 +1378,14 @@ impl fmt::Display for CudaTensorError {
     }
 }
 
-impl Error for CudaTensorError {}
+impl Error for CudaTensorError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Cublas(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<CublasError> for CudaTensorError {
     fn from(error: CublasError) -> Self {
@@ -1428,7 +1441,17 @@ impl fmt::Display for CudaTensorExecutionError {
     }
 }
 
-impl Error for CudaTensorExecutionError {}
+impl Error for CudaTensorExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Graph(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            Self::Backend(error) => Some(error),
+            Self::Completion(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<TensorError> for CudaTensorExecutionError {
     fn from(error: TensorError) -> Self {
@@ -1737,12 +1760,70 @@ impl<'session> CudaTensorAssessor<'session> {
             .map_err(Clone::clone)
     }
 
+    fn prepare_native_matmul_plans(
+        &self,
+        graph: &Graph,
+        data: &mut CudaPreparedGraphData,
+    ) -> Result<(), CudaTensorExecutionError> {
+        data.native_matmul_plans = vec![None; data.node_values.len()];
+        for (index, &value) in data.node_values.iter().enumerate() {
+            let node = graph.node(value)?;
+            let OpDescriptor::MatMul {
+                transpose_left,
+                transpose_right,
+                ..
+            } = node.op
+            else {
+                continue;
+            };
+            let operands =
+                data.matmul_operands[index].ok_or(CudaTensorExecutionError::InvalidPlan(value))?;
+            if operands.strict_profile.is_some() {
+                continue;
+            }
+            let config = crate::CublasNumericalConfig::new(
+                node.scalar_type,
+                node.numerical_options.precision,
+                self.state().native_cublas.environment.clone(),
+            )
+            .map_err(CudaTensorError::from)?;
+            let descriptor = crate::CublasLtMatmulDescriptor::new(
+                operands.left_shape,
+                operands.right_shape,
+                [transpose_left, transpose_right],
+                config,
+            )
+            .map_err(CudaTensorError::from)?;
+            data.native_matmul_plans[index] = Some(
+                crate::CublasLtMatmulPlan::prepare(
+                    self.session.tensor_runtime(),
+                    &self.state().stream,
+                    descriptor,
+                )
+                .map_err(CudaTensorError::from)?,
+            );
+        }
+        Ok(())
+    }
+
     fn validate_native_compound_handles(
         &self,
         prepared: &CudaPreparedGraphView<'_, '_>,
     ) -> Result<(), CudaTensorExecutionError> {
         for index in 0..prepared.node_values.len() {
             let node = prepared.node(index)?;
+            if let Some(lt) = prepared
+                .native_matmul_plans
+                .get(index)
+                .and_then(Option::as_ref)
+            {
+                lt.validate_for_stream(&self.state().stream)
+                    .map_err(CudaTensorError::from)?;
+                if !lt.is_usable() {
+                    return Err(CudaTensorError::from(CublasError::Busy).into());
+                }
+                continue;
+            }
             if matches!(
                 node.op,
                 OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. }
@@ -2024,8 +2105,8 @@ impl<'session> CudaTensorAssessor<'session> {
     /// Dispatch kernels without allocating, binding, uploading, or requiring provider resources.
     /// A compilation failure may leave earlier keys cached. The per-assessor FIFO cache holds 32
     /// entries; evictions are reported, and `retained_keys` reports how many unique keys from this
-    /// graph remain after the pass. Existing unrelated entries may occupy slots. Strict `MatMul`
-    /// is included in this cache. Other custom CUDA kernels and raw cuBLAS calls are outside it.
+    /// graph remain after the pass. Existing unrelated entries may occupy slots. Strict `MatMul` and SGD
+    /// are included in this cache. Other custom CUDA kernels and raw cuBLAS calls are outside it.
     ///
     /// # Errors
     ///
@@ -2045,6 +2126,9 @@ impl<'session> CudaTensorAssessor<'session> {
             let admission = match request {
                 TensorDispatchRequest::StrictMatMul(profile) => {
                     self.ensure_strict_matmul_cached(*profile)?
+                }
+                TensorDispatchRequest::StrictSgd(profile) => {
+                    self.ensure_strict_sgd_cached(*profile)?
                 }
                 TensorDispatchRequest::Fixed {
                     kind,
@@ -2214,7 +2298,7 @@ impl<'session> CudaTensorAssessor<'session> {
         let plan = prepare_graph_outputs_plan_with_policies(
             graph, outputs, self, policy, arithmetic, grouping,
         )?;
-        let data = CudaPreparedGraphData {
+        let mut data = CudaPreparedGraphData {
             scalar_type: homogeneous_scalar_type(&plan.nodes),
             requires_blas: nodes_require_blas(&plan.nodes),
             native_matmul_batch: nodes_use_native_matmul_batch(&plan.nodes),
@@ -2232,10 +2316,13 @@ impl<'session> CudaTensorAssessor<'session> {
             suppressed_adds: plan.suppressed_adds,
             indexed_storage_constraints: plan.indexed_storage_constraints,
             matmul_operands: plan.matmul_operands,
+            strict_sgd_profiles: plan.strict_sgd_profiles,
+            native_matmul_plans: Vec::new(),
             physical_layouts: plan.physical_layouts,
             rewrites: plan.lowering_plan.rewrites().to_vec(),
             input_values: plan.tensor_plan.input_values().to_vec(),
         };
+        self.prepare_native_matmul_plans(graph, &mut data)?;
         Ok(CudaPreparedTensorGraph {
             graph,
             plan: plan.tensor_plan,
@@ -2274,7 +2361,8 @@ impl<'session> CudaTensorAssessor<'session> {
         &self,
         program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
     ) -> Result<CudaOwnedPreparedTensorGraph, CudaTensorExecutionError> {
-        let data = prepare_owned_graph_data(&program, self)?;
+        let mut data = prepare_owned_graph_data(&program, self)?;
+        self.prepare_native_matmul_plans(program.graph(), &mut data)?;
         Ok(CudaOwnedPreparedTensorGraph { program, data })
     }
 
@@ -4311,6 +4399,25 @@ impl<'session> CudaTensorAssessor<'session> {
                             right_resource,
                             &result,
                         )?;
+                    } else if let Some(lt) =
+                        plan.native_matmul_plans.get(index).and_then(Option::as_ref)
+                    {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            lt.submit_into_batch(
+                                batch,
+                                left_resource.device_buffer(),
+                                right_resource.device_buffer(),
+                                result.device_buffer(),
+                            )
+                            .map_err(CudaTensorError::from)?;
+                        } else {
+                            lt.execute(
+                                left_resource.device_buffer(),
+                                right_resource.device_buffer(),
+                                result.device_buffer(),
+                            )
+                            .map_err(CudaTensorError::from)?;
+                        }
                     } else if let Some(batch) = batch.as_deref_mut() {
                         self.execute_matmul_row_major_flags(
                             left_resource,
@@ -4649,26 +4756,43 @@ impl<'session> CudaTensorAssessor<'session> {
                         output_bank,
                         fresh_outputs,
                     )?;
-                    self.execute_sgd_update(
-                        node.shape,
-                        resources[weights_index]
-                            .as_ref()
-                            .ok_or(CudaTensorExecutionError::MissingResource(weights))?,
-                        resources[gradient_index]
-                            .as_ref()
-                            .ok_or(CudaTensorExecutionError::MissingResource(gradient))?,
-                        SgdUpdateMode {
-                            learning_rate,
-                            contracted: node.numerical_options.precision
-                                == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
-                                || plan
-                                    .rewrites
-                                    .iter()
-                                    .any(|rewrite| rewrite.output == node.value),
-                        },
-                        &output,
-                        batch.as_deref_mut(),
-                    )?;
+                    if let Some(profile) = plan.strict_sgd_profiles[index] {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            tensor_flush_batch!(batch, timings, false)?;
+                        }
+                        self.execute_strict_sgd(
+                            node.value,
+                            profile,
+                            resources[weights_index]
+                                .as_ref()
+                                .ok_or(CudaTensorExecutionError::MissingResource(weights))?,
+                            resources[gradient_index]
+                                .as_ref()
+                                .ok_or(CudaTensorExecutionError::MissingResource(gradient))?,
+                            &output,
+                        )?;
+                    } else {
+                        self.execute_sgd_update(
+                            node.shape,
+                            resources[weights_index]
+                                .as_ref()
+                                .ok_or(CudaTensorExecutionError::MissingResource(weights))?,
+                            resources[gradient_index]
+                                .as_ref()
+                                .ok_or(CudaTensorExecutionError::MissingResource(gradient))?,
+                            SgdUpdateMode {
+                                learning_rate,
+                                contracted: node.numerical_options.precision
+                                    == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
+                                    || plan
+                                        .rewrites
+                                        .iter()
+                                        .any(|rewrite| rewrite.output == node.value),
+                            },
+                            &output,
+                            batch.as_deref_mut(),
+                        )?;
+                    }
                     resources[index] = Some(output);
                     release_after_read(&mut resources, &mut remaining_uses, weights_index)?;
                     release_after_read(&mut resources, &mut remaining_uses, gradient_index)?;
@@ -5462,9 +5586,39 @@ pub struct CudaPreparedGraphData {
     suppressed_adds: HashSet<ValueId>,
     indexed_storage_constraints: Vec<PreparedStorageConstraint>,
     matmul_operands: Vec<Option<PreparedMatMulOperands>>,
+    strict_sgd_profiles: Vec<Option<strict_sgd::Profile>>,
+    native_matmul_plans: Vec<Option<crate::CublasLtMatmulPlan>>,
     physical_layouts: HashMap<ValueId, CudaPhysicalLayout>,
     rewrites: Vec<TensorSgdRewriteCandidate>,
     input_values: Vec<ValueId>,
+}
+
+impl CudaPreparedGraphData {
+    /// Selected cold Lt implementations, in schedule order, including exact algorithm/workspace.
+    #[must_use]
+    pub fn native_matmul_implementations(&self) -> Vec<(ValueId, crate::CublasLtPlanIdentity)> {
+        self.node_values
+            .iter()
+            .copied()
+            .zip(&self.native_matmul_plans)
+            .filter_map(|(value, plan)| plan.as_ref().map(|plan| (value, plan.identity())))
+            .collect()
+    }
+}
+
+impl CudaPreparedTensorGraph<'_> {
+    /// Selected cold Lt algorithms retained by this borrowed schedule.
+    #[must_use]
+    pub fn native_matmul_implementations(&self) -> Vec<(ValueId, crate::CublasLtPlanIdentity)> {
+        self.data.native_matmul_implementations()
+    }
+}
+impl CudaOwnedPreparedTensorGraph {
+    /// Selected cold Lt algorithms retained by this graph-owning schedule.
+    #[must_use]
+    pub fn native_matmul_implementations(&self) -> Vec<(ValueId, crate::CublasLtPlanIdentity)> {
+        self.data.native_matmul_implementations()
+    }
 }
 
 fn homogeneous_scalar_type(nodes: &[NodeDescriptor<'_>]) -> Option<fusion_pcu::PcuScalarType> {
@@ -6791,6 +6945,17 @@ fn collect_dispatch_requests<'graph>(
                     .ok_or(CudaTensorExecutionError::InvalidPlan(node.value))?;
                 Some(TensorDispatchRequest::StrictMatMul(profile))
             }
+            OpDescriptor::SgdUpdate { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                let index = prepared
+                    .index_of(node.value)
+                    .ok_or(CudaTensorExecutionError::InvalidPlan(node.value))?;
+                Some(TensorDispatchRequest::StrictSgd(
+                    prepared.strict_sgd_profiles[index]
+                        .ok_or(CudaTensorExecutionError::InvalidPlan(node.value))?,
+                ))
+            }
             OpDescriptor::Add { left, right } => {
                 if let Some(group) = prepared
                     .bounded_pointwise_by_output
@@ -6953,6 +7118,29 @@ fn bounded_mul_request<'graph>(
     })
 }
 
+fn prepare_strict_sgd_profiles(
+    graph: &Graph,
+    nodes: &[NodeDescriptor<'_>],
+) -> Result<Vec<Option<strict_sgd::Profile>>, CudaTensorExecutionError> {
+    nodes
+        .iter()
+        .map(|&node| {
+            if matches!(node.op, OpDescriptor::SgdUpdate { .. })
+                && node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict)
+            {
+                strict_sgd::assess(graph, node).map(Some).map_err(|reason| {
+                    CudaTensorExecutionError::Unsupported {
+                        value: node.value,
+                        reason,
+                    }
+                })
+            } else {
+                Ok(None)
+            }
+        })
+        .collect()
+}
+
 fn retained_requested_key_count(
     requested: &[TensorDispatchCacheKey],
     cached: &[TensorDispatchCacheKey],
@@ -7018,6 +7206,7 @@ struct GraphExecutionPreflight<'a> {
     storage_constraints: Vec<TensorStorageConstraint>,
     indexed_storage_constraints: Vec<PreparedStorageConstraint>,
     matmul_operands: Vec<Option<PreparedMatMulOperands>>,
+    strict_sgd_profiles: Vec<Option<strict_sgd::Profile>>,
     physical_layouts: HashMap<ValueId, CudaPhysicalLayout>,
 }
 
@@ -7083,16 +7272,16 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     let nodes = lowering_plan.nodes().to_vec();
     for node in &nodes {
         let expected_route = match node.op {
+            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
             OpDescriptor::Input
             | OpDescriptor::Constant(_)
             | OpDescriptor::Uniform { .. }
             | OpDescriptor::ReluBackward { .. }
             | OpDescriptor::SgdUpdate { .. } => TensorExecutionRoute::Native,
-            OpDescriptor::MatMul { .. }
-                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
-            {
-                TensorExecutionRoute::Synthesized
-            }
             OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. } => {
                 TensorExecutionRoute::Library
             }
@@ -7192,6 +7381,7 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     let indexed_storage_constraints =
         prepare_storage_constraint_indices(storage_constraints, &index_by_value, outputs)?;
     let matmul_operands = prepare_matmul_operands(graph, &nodes, &index_by_value)?;
+    let strict_sgd_profiles = prepare_strict_sgd_profiles(graph, &nodes)?;
     Ok(GraphExecutionPreflight {
         tensor_plan: plan,
         lowering_plan,
@@ -7207,6 +7397,7 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
         storage_constraints: test_storage_constraints,
         indexed_storage_constraints,
         matmul_operands,
+        strict_sgd_profiles,
         physical_layouts,
     })
 }
@@ -7263,16 +7454,16 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
     }
     for node in &nodes {
         let expected_route = match node.op {
+            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
             OpDescriptor::Input
             | OpDescriptor::Constant(_)
             | OpDescriptor::Uniform { .. }
             | OpDescriptor::ReluBackward { .. }
             | OpDescriptor::SgdUpdate { .. } => TensorExecutionRoute::Native,
-            OpDescriptor::MatMul { .. }
-                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
-            {
-                TensorExecutionRoute::Synthesized
-            }
             OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. } => {
                 TensorExecutionRoute::Library
             }
@@ -7380,6 +7571,7 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
     let indexed_storage_constraints =
         prepare_storage_constraint_indices(storage_constraints, &index_by_value, outputs)?;
     let matmul_operands = prepare_matmul_operands(graph, &nodes, &index_by_value)?;
+    let strict_sgd_profiles = prepare_strict_sgd_profiles(graph, &nodes)?;
     Ok(CudaPreparedGraphData {
         scalar_type,
         requires_blas: nodes_require_blas(&nodes),
@@ -7398,6 +7590,8 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
         suppressed_adds,
         indexed_storage_constraints,
         matmul_operands,
+        strict_sgd_profiles,
+        native_matmul_plans: Vec::new(),
         physical_layouts,
         rewrites: program.rewrites().to_vec(),
         input_values: program.input_values().to_vec(),
@@ -8397,6 +8591,17 @@ impl TensorOperationAssessor for CudaTensorAssessor<'_> {
             return TensorOperationSupport::Unsupported { reason };
         }
         if matches!(node.op, OpDescriptor::SgdUpdate { .. })
+            && node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict)
+        {
+            return match strict_sgd::assess(graph, node) {
+                Ok(_) => TensorOperationSupport::Supported {
+                    route: TensorExecutionRoute::Synthesized,
+                    workspace_bytes: Some(0),
+                },
+                Err(reason) => TensorOperationSupport::Unsupported { reason },
+            };
+        }
+        if matches!(node.op, OpDescriptor::SgdUpdate { .. })
             && let Err(reason) = native_sgd::assess_graph(graph, node)
         {
             return TensorOperationSupport::Unsupported { reason };
@@ -8468,12 +8673,13 @@ fn assess_matmul_numerical_options(
             fusion_pcu::PcuNumericalRequirement::CompoundArithmetic,
         ));
     }
-    if node.float_underflow_policy
-        == Some(fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult)
+    if let Some(policy) = node.float_underflow_policy
+        && policy != fusion_pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding
     {
-        return Err(TensorUnsupportedReason::UnderflowPolicy(
-            fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult,
-        ));
+        return Err(TensorUnsupportedReason::UnderflowPolicy(policy));
+    }
+    if environment.value("CUBLAS_BATCH_INVARIANCE_FLAGS").is_some() {
+        return Err(unsupported(fusion_pcu::PcuNumericalRequirement::Precision));
     }
     if !matches!(
         node.scalar_type,
@@ -9758,6 +9964,7 @@ mod tests {
             storage_constraints: _,
             indexed_storage_constraints,
             matmul_operands,
+            strict_sgd_profiles,
             physical_layouts,
         } = prepare_graph_outputs_plan_with_policies(
             graph,
@@ -9786,6 +9993,8 @@ mod tests {
             suppressed_adds,
             indexed_storage_constraints,
             matmul_operands,
+            strict_sgd_profiles,
+            native_matmul_plans: Vec::new(),
             physical_layouts,
             rewrites: lowering_plan.rewrites().to_vec(),
             input_values: tensor_plan.input_values().to_vec(),

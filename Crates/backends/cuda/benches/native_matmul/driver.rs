@@ -39,6 +39,7 @@ use fusion_pcu_cuda::{
 #[rustfmt::skip]
 use super::{
     native::Native,
+    native_lt::NativeLt,
     heavy::HeavyScalar,
     oracle,
     source,
@@ -123,15 +124,29 @@ fn case<T: HeavyScalar, const R: usize, const K: usize, const C: usize>(
             TensorPointwiseGroupingPolicy::Disabled,
         )
         .unwrap();
+    let preparation_wall = Instant::now();
     let prepared = assessor.prepare_owned_program(program).unwrap();
+    eprintln!(
+        "cold graph Lt preparation={:?} identities={:?}",
+        preparation_wall.elapsed(),
+        prepared.native_matmul_implementations()
+    );
+    assert_eq!(prepared.native_matmul_implementations().len(), 1);
     let mut memory = backend.memory_provider(pool);
     let mut native = Native::new::<T, R, K, C>(runtime, precision).unwrap();
+    let preparation_wall = Instant::now();
+    let mut native_lt = NativeLt::new::<T, R, K, C>(runtime, precision).unwrap();
+    eprintln!(
+        "cold control Lt preparation={:?}",
+        preparation_wall.elapsed()
+    );
     let nominal = fixture::<T, R, K, C>(0);
     let (left, right) = (&nominal.left, &nominal.right);
     assert!(source::checked_boundary::<T, R, K, C>(left, right).is_err());
     assert!(source::strict_native::<T, R, K, C>(left, right).is_err());
     assert!(source::portable_native::<T, R, K, C>(left, right).is_err());
     assert!(source::tight_native::<T, R, K, C>(left, right).is_err());
+    assert!(source::gradual_native::<T, R, K, C>(left, right).is_err());
     // Hosted source staging retains these two allocations after its first call. Match that
     // physical lifetime rather than compare it against repeated fresh input allocation.
     let mut graph_left = PcuDeviceTensor::new(
@@ -180,12 +195,16 @@ fn case<T: HeavyScalar, const R: usize, const K: usize, const C: usize>(
     let mut native_call = |left: &[[T; K]; R], right: &[[T; C]; K], observed: &mut [T]| {
         native.host(left, right, observed).unwrap();
     };
+    let mut native_lt_call = |left: &[[T; K]; R], right: &[[T; C]; K], observed: &mut [T]| {
+        native_lt.host(left, right, observed).unwrap();
+    };
     for phase in 0..3 {
         let input = fixture::<T, R, K, C>(phase);
         for call in [
             &mut source_call as &mut HostCall<'_, T, R, K, C>,
             &mut graph_call,
             &mut native_call,
+            &mut native_lt_call,
         ] {
             let mut observed = vec![T::default(); R * C];
             call(&input.left, &input.right, &mut observed);
@@ -203,8 +222,10 @@ fn case<T: HeavyScalar, const R: usize, const K: usize, const C: usize>(
         for (label, call) in [
             ("source", &mut source_call as &mut HostCall<'_, T, R, K, C>),
             ("graph", &mut graph_call),
-            ("native", &mut native_call),
+            ("classic_cublas_reference", &mut native_call),
+            ("native_lt_same_policy", &mut native_lt_call),
         ] {
+            fusion_pcu_cuda::reset_cublaslt_api_census();
             super::allocations::census(
                 &format!(
                     "native_matmul/{}/{R}x{K}x{C}/{precision:?}/{label}",
@@ -212,12 +233,20 @@ fn case<T: HeavyScalar, const R: usize, const K: usize, const C: usize>(
                 ),
                 || call(left, right, &mut observed),
             );
+            let api = fusion_pcu_cuda::cublaslt_api_census();
+            eprintln!("warm Lt API census {label}: {api:?}");
+            assert_eq!(api.loads, 0);
+            assert_eq!(api.heuristics, 0);
+            assert_eq!(
+                api.matmuls,
+                usize::from(label != "classic_cublas_reference")
+            );
         }
     }
     #[cfg(not(feature = "allocation-census"))]
     {
         let fixtures = [0, 1].map(fixture::<T, R, K, C>);
-        let mut phases = [0; 3];
+        let mut phases = [0; 4];
         let mut group = criterion.benchmark_group(format!(
             "cuda_native_matmul_{}_{precision:?}_full_host/{R}x{K}x{C}",
             T::LABEL
@@ -237,9 +266,14 @@ fn case<T: HeavyScalar, const R: usize, const K: usize, const C: usize>(
                 measure(iterations, &mut phases[1], &fixtures, &mut graph_call)
             });
         });
-        group.bench_function("native_same_policy", |bench| {
+        group.bench_function("classic_cublas_reference", |bench| {
             bench.iter_custom(|iterations| {
                 measure(iterations, &mut phases[2], &fixtures, &mut native_call)
+            });
+        });
+        group.bench_function("native_lt_same_policy", |bench| {
+            bench.iter_custom(|iterations| {
+                measure(iterations, &mut phases[3], &fixtures, &mut native_lt_call)
             });
         });
         group.finish();
@@ -268,6 +302,7 @@ pub fn run(criterion: &mut Criterion) {
         case::<f64, 128, 256, 128>(criterion, &backend, &runtime, precision);
         case::<f64, 1024, 2048, 1024>(criterion, &backend, &runtime, precision);
     }
+    super::resident::run(criterion, &backend, &runtime);
     fusion_pcu::global::clear_thread_cache().unwrap();
     eprintln!(
         "diagnostic/whole_native_matmul/process_wall={:?}",

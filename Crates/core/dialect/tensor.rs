@@ -90,8 +90,6 @@ pub use execution::TensorExecution;
 mod reference;
 #[rustfmt::skip]
 use reference::{
-    as_f32_value,
-    binary,
     binary_value,
     execution_f32_value,
     matmul_value,
@@ -99,6 +97,7 @@ use reference::{
     mean_squared_error_value,
     relu_backward_value,
     relu_value,
+    sgd_value,
 };
 
 static NEXT_GRAPH_ID: AtomicU64 = AtomicU64::new(1);
@@ -225,7 +224,7 @@ pub enum TensorError {
         value: ValueId,
         /// Row-major output cell index.
         element_index: usize,
-        /// Increasing reduction index of the first failing operation.
+        /// Increasing reduction index of the first failing operation; zero for elementwise SGD.
         reduction_index: usize,
         step: TensorArithmeticStep,
         kind: PcuExecutionFaultKind,
@@ -403,6 +402,7 @@ pub enum OpDescriptor<'a> {
 pub enum TensorArithmeticStep {
     Multiply,
     Add,
+    Subtract,
 }
 
 /// Read-only metadata for one graph value, yielded in stable append order.
@@ -543,7 +543,10 @@ impl TensorOperationAssessor for TensorReferenceAssessor {
             };
         }
         if node.numerical_mode == Some(PcuNumericalMode::Strict)
-            && !matches!(node.op, OpDescriptor::MatMul { .. })
+            && !matches!(
+                node.op,
+                OpDescriptor::MatMul { .. } | OpDescriptor::SgdUpdate { .. }
+            )
         {
             return TensorOperationSupport::Unsupported {
                 reason: TensorUnsupportedReason::Operation,
@@ -610,7 +613,11 @@ impl TensorOperationAssessor for TensorCheckedReferenceAssessor {
             };
         }
         let unsupported_compound = node.numerical_mode.is_some_and(|mode| {
-            mode != PcuNumericalMode::Strict || !matches!(node.op, OpDescriptor::MatMul { .. })
+            mode != PcuNumericalMode::Strict
+                || !matches!(
+                    node.op,
+                    OpDescriptor::MatMul { .. } | OpDescriptor::SgdUpdate { .. }
+                )
         });
         if unsupported_compound || matches!(node.op, OpDescriptor::ReluBackward { .. }) {
             TensorOperationSupport::Unsupported {
@@ -3743,7 +3750,8 @@ impl Graph {
 
     /// Adds typed SGD with a finite F32 rate stored in the immutable graph descriptor.
     ///
-    /// The initial primitive supports F32. A dynamic learning rate needs a resource binding;
+    /// F32 and F64 are supported; the finite F32 rate widens exactly for F64 arithmetic.
+    /// A dynamic learning rate needs a resource binding;
     /// callers must not snapshot a changing rate into a reusable prepared graph.
     ///
     /// # Errors
@@ -3907,6 +3915,12 @@ impl Graph {
 
     /// Adds an elementwise SGD update, `weights - learning_rate * gradient`.
     ///
+    /// F32/F64 strict execution checks and rounds the product, then the subtraction. It does
+    /// not contract them into an FMA. Fault order is logical element, then multiply/subtract.
+    /// IEEE 754-derived rounding and underflow classification come from the scalar contract;
+    /// this exception granularity and first-fault order are PCU rules. The immutable F32 rate
+    /// widens exactly for F64. Boundary execution still requires separate backend admission.
+    ///
     /// # Errors
     ///
     /// Returns [`TensorError::UnknownValue`] for invalid operands,
@@ -3939,8 +3953,8 @@ impl Graph {
             return Err(TensorError::InvalidLearningRate);
         }
         let scalar_type = self.nodes[weights.index].scalar_type;
-        self.require_f32(weights)?;
-        self.require_f32(gradient)?;
+        self.require_float(weights)?;
+        self.require_float(gradient)?;
         Ok(self.push(
             Op::SgdUpdate(weights, gradient, learning_rate),
             weights_shape,
@@ -4321,7 +4335,8 @@ impl Graph {
 
     /// Executes only reference operations with implemented checked numerical contracts.
     ///
-    /// Strict F32/F64 `MatMul` checks separate multiply/add steps in increasing reduction order.
+    /// Strict F32/F64 `MatMul` checks separate multiply/add steps in increasing reduction order;
+    /// strict SGD checks a multiply then subtraction for each logical element.
     /// Boundary compounds and other raw reference operations have no checked certificate.
     ///
     /// # Errors
@@ -4340,7 +4355,10 @@ impl Graph {
             }
             if let Some(mode) = node.numerical_mode {
                 if mode != PcuNumericalMode::Strict
-                    || !matches!(node.op, OpDescriptor::MatMul { .. })
+                    || !matches!(
+                        node.op,
+                        OpDescriptor::MatMul { .. } | OpDescriptor::SgdUpdate { .. }
+                    )
                 {
                     return Err(TensorError::UnsupportedNumericalMode {
                         value: node.value,
@@ -4376,7 +4394,10 @@ impl Graph {
                 });
             }
             if node.numerical_mode == Some(PcuNumericalMode::Strict)
-                && !matches!(node.op, OpDescriptor::MatMul { .. })
+                && !matches!(
+                    node.op,
+                    OpDescriptor::MatMul { .. } | OpDescriptor::SgdUpdate { .. }
+                )
             {
                 return Err(TensorError::UnsupportedNumericalMode {
                     value: node.value,
@@ -4452,13 +4473,14 @@ impl Graph {
                     BinaryOp::Div,
                     node.float_underflow_policy,
                 )?,
-                Op::SgdUpdate(weights, gradient, learning_rate) => {
-                    let left = as_f32_value(&values[weights.index], id)?;
-                    let right = as_f32_value(&values[gradient.index], id)?;
-                    TensorValue::from_tensor(binary(left, right, |weight, grad| {
-                        weight - learning_rate * grad
-                    }))
-                }
+                Op::SgdUpdate(weights, gradient, learning_rate) => sgd_value(
+                    &values[weights.index],
+                    &values[gradient.index],
+                    *learning_rate,
+                    id,
+                    node.numerical_mode.unwrap_or_default(),
+                    node.float_underflow_policy.unwrap_or_default(),
+                )?,
                 Op::MatMul(a, b, transpose_left, transpose_right) => matmul_value(
                     &values[a.index],
                     &values[b.index],

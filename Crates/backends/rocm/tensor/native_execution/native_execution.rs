@@ -25,8 +25,8 @@ pub(super) fn batch_native_matmuls(nodes: &[NodeDescriptor<'_>], outputs: &[Valu
                         == fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
                     && node.numerical_options.reproducibility
                         == fusion_pcu::PcuReproducibility::Unspecified
-                    && node.float_underflow_policy
-                        != Some(fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult) =>
+                    && super::native_policy::assess_underflow(node.float_underflow_policy)
+                        .is_ok() =>
             {
                 has_matmul = true;
             }

@@ -23,7 +23,6 @@ use super::{
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuCompoundArithmeticPolicy,
-    PcuFloatUnderflowPolicy,
     PcuNumericalMode,
     PcuNumericalRequirement,
     PcuReproducibility,
@@ -61,10 +60,8 @@ pub(super) fn assess(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperation
             options: node.numerical_options,
         });
     }
-    if node.float_underflow_policy == Some(PcuFloatUnderflowPolicy::RejectSubnormalResult) {
-        return unsupported(TensorUnsupportedReason::UnderflowPolicy(
-            PcuFloatUnderflowPolicy::RejectSubnormalResult,
-        ));
+    if let Err(reason) = super::native_policy::assess_underflow(node.float_underflow_policy) {
+        return unsupported(reason);
     }
     if node.scalar_type != PcuScalarType::F32 {
         return unsupported(TensorUnsupportedReason::ElementType);

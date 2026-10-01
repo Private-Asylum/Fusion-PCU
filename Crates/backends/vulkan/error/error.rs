@@ -13,7 +13,10 @@ use ash::{
 };
 #[rustfmt::skip]
 use fusion_pcu::{
+    PcuBindingRef,
     PcuError,
+    PcuExecutionFault,
+    PcuTypedDispatchValidationError,
 };
 #[rustfmt::skip]
 use fusion_pcu_spirv::{
@@ -35,6 +38,17 @@ pub enum PcuVulkanError {
     },
     UnsupportedParameters,
     UnsupportedBindingProfile,
+    UnsupportedPreparedProfile,
+    InvalidArguments,
+    InvalidOfferShape,
+    InvalidOfferBinding(PcuBindingRef),
+    InvalidOfferValueFlow(PcuTypedDispatchValidationError),
+    Fault(PcuExecutionFault),
+    CompletionUnknown,
+    Quarantined,
+    DeviceLimitExceeded,
+    InvalidDiscoveryReference,
+    DiscoveryGenerationExhausted,
     Loader(ash::LoadingError),
     Vulkan {
         context: &'static str,
@@ -75,6 +89,33 @@ impl fmt::Display for PcuVulkanError {
             Self::UnsupportedBindingProfile => formatter.write_str(
                 "Vulkan prototype requires exactly set-zero bindings zero, one, and two",
             ),
+            Self::UnsupportedPreparedProfile => {
+                formatter.write_str("unsupported Vulkan prepared bit-map profile")
+            }
+            Self::InvalidArguments => formatter.write_str("invalid Vulkan prepared host arguments"),
+            Self::InvalidOfferShape => formatter.write_str("invalid Vulkan offer logical shape"),
+            Self::InvalidOfferBinding(binding) => {
+                write!(formatter, "invalid Vulkan offer binding: {binding:?}")
+            }
+            Self::InvalidOfferValueFlow(error) => {
+                write!(formatter, "invalid Vulkan offer value flow: {error:?}")
+            }
+            Self::Fault(fault) => write!(formatter, "Vulkan checked execution fault: {fault:?}"),
+            Self::CompletionUnknown => {
+                formatter.write_str("Vulkan completion unknown; native owners quarantined")
+            }
+            Self::Quarantined => {
+                formatter.write_str("Vulkan session is quarantined after unknown completion")
+            }
+            Self::DeviceLimitExceeded => {
+                formatter.write_str("Vulkan execution exceeds selected device limits")
+            }
+            Self::InvalidDiscoveryReference => {
+                formatter.write_str("invalid, stale or changed Vulkan device reference")
+            }
+            Self::DiscoveryGenerationExhausted => {
+                formatter.write_str("Vulkan discovery generation exhausted")
+            }
             Self::Loader(error) => write!(formatter, "Vulkan loader error: {error}"),
             Self::Vulkan { context, result } => write!(formatter, "{context}: {result:?}"),
             Self::NoPhysicalDevice => formatter.write_str("no Vulkan physical device found"),

@@ -65,6 +65,14 @@ pub fn tight_native<T: PcuScalar, const R: usize, const K: usize, const C: usize
     pcu::matmul(left, right)
 }
 
+#[pcu(flag(non_strict), flag(native_compound), flag(allow_gradual_underflow))]
+pub fn gradual_native<T: PcuScalar, const R: usize, const K: usize, const C: usize>(
+    left: &[[T; K]; R],
+    right: &[[T; C]; K],
+) -> Result<PcuTensor<T>, PcuExecutionError> {
+    pcu::matmul(left, right)
+}
+
 pub fn product<T: PcuScalar, const R: usize, const K: usize, const C: usize>(
     left: &[[T; K]; R],
     right: &[[T; C]; K],
@@ -75,4 +83,11 @@ pub fn product<T: PcuScalar, const R: usize, const K: usize, const C: usize>(
     } else {
         preserve(left, right)
     }
+}
+
+#[pcu]
+pub fn resident_identity<T: PcuScalar, const R: usize, const C: usize>(
+    input: &[[T; C]; R],
+) -> Result<PcuTensor<T>, PcuExecutionError> {
+    pcu::identity(input)
 }

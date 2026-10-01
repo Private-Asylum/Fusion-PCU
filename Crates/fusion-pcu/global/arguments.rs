@@ -87,7 +87,13 @@ pub enum PcuArgumentError {
 /// Opaque per-argument carrier passed from generated source signatures to the hosted dispatcher.
 #[doc(hidden)]
 #[cfg_attr(
-    not(any(feature = "rocm", feature = "cuda", feature = "metal")),
+    not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    )),
     allow(dead_code)
 )] // The disabled facade never inspects mixed arguments.
 pub struct PcuCallArgument<'a> {
@@ -97,7 +103,13 @@ pub struct PcuCallArgument<'a> {
 
 #[doc(hidden)]
 #[cfg_attr(
-    not(any(feature = "rocm", feature = "cuda", feature = "metal")),
+    not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    )),
     allow(dead_code)
 )] // Resident/host discrimination runs only with a provider.
 pub(super) enum PcuCallArgumentKind<'a> {
@@ -109,7 +121,13 @@ pub(super) enum PcuCallArgumentKind<'a> {
 }
 
 #[cfg_attr(
-    not(any(feature = "rocm", feature = "cuda", feature = "metal")),
+    not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    )),
     allow(dead_code)
 )] // Used by the provider-backed stack splitter.
 impl<'a> PcuCallArgument<'a> {
@@ -118,6 +136,7 @@ impl<'a> PcuCallArgument<'a> {
         (self.shape, self.kind)
     }
 
+    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
     pub(super) const fn kind(&self) -> &PcuCallArgumentKind<'a> {
         &self.kind
     }

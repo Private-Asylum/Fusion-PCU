@@ -13,7 +13,12 @@ pub(super) struct PolicySnapshot {
 }
 
 #[derive(Clone, Copy)]
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 pub(super) struct PolicyRoute {
     pub(super) generation: u64,
     pub(super) backend: super::PcuBackendChoice,
@@ -27,14 +32,33 @@ const fn backend_tag(backend: super::PcuBackendChoice) -> u64 {
         super::PcuBackendChoice::Cuda => 2,
         #[cfg(feature = "metal")]
         super::PcuBackendChoice::Metal => 3,
+        #[cfg(feature = "vulkan")]
+        super::PcuBackendChoice::Vulkan => 4,
+        #[cfg(feature = "cpu")]
+        super::PcuBackendChoice::Cpu => 5,
     }
 }
 
+// Reserve four route bits for compiled providers; the packed word remains one warm load.
+const ROUTE_TAG_BITS: u32 = 4;
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+const ROUTE_TAG_MASK: u64 = (1 << ROUTE_TAG_BITS) - 1;
+
 const fn encode_route(generation: u64, backend: super::PcuBackendChoice) -> u64 {
-    (generation << 2) | backend_tag(backend)
+    (generation << ROUTE_TAG_BITS) | backend_tag(backend)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 const fn decode_backend(tag: u64) -> super::PcuBackendChoice {
     match tag {
         1 => super::PcuBackendChoice::Rocm,
@@ -42,6 +66,10 @@ const fn decode_backend(tag: u64) -> super::PcuBackendChoice {
         2 => super::PcuBackendChoice::Cuda,
         #[cfg(feature = "metal")]
         3 => super::PcuBackendChoice::Metal,
+        #[cfg(feature = "vulkan")]
+        4 => super::PcuBackendChoice::Vulkan,
+        #[cfg(feature = "cpu")]
+        5 => super::PcuBackendChoice::Cpu,
         _ => super::PcuBackendChoice::Automatic,
     }
 }
@@ -63,10 +91,17 @@ static POLICY: RwLock<PolicySnapshot> = RwLock::new(PolicySnapshot {
             reproducibility: crate::PcuReproducibility::Unspecified,
         },
         score_device: super::default_device_score,
+        score_invocation: None,
     },
 });
 
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 pub(super) fn snapshot() -> Result<PolicySnapshot, PcuExecutionError> {
     POLICY
         .read()
@@ -76,15 +111,20 @@ pub(super) fn snapshot() -> Result<PolicySnapshot, PcuExecutionError> {
 
 #[cfg(any(feature = "rocm", all(feature = "cuda", feature = "tensor")))]
 pub(super) fn generation() -> u64 {
-    ROUTE.load(Ordering::Acquire) >> 2
+    ROUTE.load(Ordering::Acquire) >> ROUTE_TAG_BITS
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 pub(super) fn route() -> PolicyRoute {
     let packed = ROUTE.load(Ordering::Acquire);
     PolicyRoute {
-        generation: packed >> 2,
-        backend: decode_backend(packed & 0b11),
+        generation: packed >> ROUTE_TAG_BITS,
+        backend: decode_backend(packed & ROUTE_TAG_MASK),
     }
 }
 
@@ -95,7 +135,7 @@ pub(super) fn configure(policy: PcuExecutionPolicy) -> Result<(), PcuExecutionEr
     let generation = state
         .generation
         .checked_add(1)
-        .filter(|generation| *generation <= (u64::MAX >> 2))
+        .filter(|generation| *generation <= (u64::MAX >> ROUTE_TAG_BITS))
         .ok_or(PcuExecutionError::PolicyUnavailable)?;
     state.policy = policy;
     state.generation = generation;
@@ -122,7 +162,7 @@ mod tests {
         assert_eq!(selected.policy.numerical_mode, mode);
         assert!(selected.generation > initial.generation);
         assert_eq!(
-            super::ROUTE.load(core::sync::atomic::Ordering::Acquire) >> 2,
+            super::ROUTE.load(core::sync::atomic::Ordering::Acquire) >> super::ROUTE_TAG_BITS,
             selected.generation
         );
         let options = crate::PcuNumericalOptions {

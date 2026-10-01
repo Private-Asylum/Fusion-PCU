@@ -43,3 +43,9 @@ pub use global::{
 
 #[cfg(feature = "metal")]
 pub use fusion_pcu_metal as metal;
+
+#[cfg(feature = "vulkan")]
+pub use fusion_pcu_vulkan as vulkan;
+
+#[cfg(feature = "cpu")]
+pub use fusion_pcu_cpu as cpu;

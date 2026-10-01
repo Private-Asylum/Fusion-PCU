@@ -24,3 +24,9 @@ cargo test -p fusion-pcu-spirv --test checked_float_rejection
 
 The example and test are Cargo targets within their owning packages, with no
 separate example package or change to their numerical contracts.
+# Prepared headless checked arithmetic
+
+`cargo run -p fusion-pcu-vulkan --features hosted --example checked-neg` executes
+ordinary per-function annotated F32 Neg, verifies exact sign bits, and preserves
+the caller's unwritten tail. The prepared backend is explicit; runtime fallback
+is not performed. This slice is independent of the legacy windowed copy example.

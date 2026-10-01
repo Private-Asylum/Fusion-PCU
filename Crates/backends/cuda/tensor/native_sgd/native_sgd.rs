@@ -54,10 +54,10 @@ pub(super) fn assess(node: NodeDescriptor<'_>) -> Result<(), TensorUnsupportedRe
     {
         return Err(unsupported(PcuNumericalRequirement::CompoundArithmetic));
     }
-    if node.float_underflow_policy == Some(PcuFloatUnderflowPolicy::RejectSubnormalResult) {
-        return Err(TensorUnsupportedReason::UnderflowPolicy(
-            PcuFloatUnderflowPolicy::RejectSubnormalResult,
-        ));
+    if let Some(policy) = node.float_underflow_policy
+        && policy != PcuFloatUnderflowPolicy::IeeeAfterRounding
+    {
+        return Err(TensorUnsupportedReason::UnderflowPolicy(policy));
     }
     if node.scalar_type != PcuScalarType::F32 {
         return Err(TensorUnsupportedReason::ElementType);

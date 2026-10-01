@@ -16,6 +16,8 @@ mod integer;
 mod native_execution;
 #[path = "tensor/native_loss/native_loss.rs"]
 mod native_loss;
+#[path = "tensor/native_policy/native_policy.rs"]
+mod native_policy;
 #[path = "tensor/native_sgd/native_sgd.rs"]
 mod native_sgd;
 use native_sgd::SgdUpdateMode;
@@ -24,6 +26,9 @@ mod pointwise;
 #[path = "tensor/strict_matmul/strict_matmul.rs"]
 #[allow(clippy::redundant_pub_crate)] // Typed source factory must remain backend-internal.
 pub(crate) mod strict_matmul;
+#[path = "tensor/strict_sgd/strict_sgd.rs"]
+#[allow(clippy::redundant_pub_crate)] // Keep generated-source admission backend-private.
+pub(crate) mod strict_sgd;
 
 /// Lowers a validated strict `MatMul` to the exact HIP source used by the tensor executor.
 ///
@@ -46,6 +51,31 @@ pub fn lower_strict_matmul_to_hip_source(
             value,
             reason: TensorUnsupportedReason::Other(
                 "strict MatMul profile or shape is unsupported".into(),
+            ),
+        }
+    })?;
+    Ok(spec.source())
+}
+
+/// Generates the exact admitted strict F32/F64 SGD checker for a native comparison.
+///
+/// ABI: `(weights, gradient, output, u64 fault)`, with scalar-storage pointers and a fault
+/// word initialized to `u64::MAX`. Wait for terminal completion and inspect the fault before
+/// publishing output. Fault events encode `(element * 2 + step) << 3 | kind`, with multiply
+/// step zero and subtraction step one. The safe executor accepts only its private factory.
+///
+/// # Errors
+/// Rejects unproved provenance, shape, scalar, rate and numerical contracts before lowering.
+pub fn lower_strict_sgd_to_hip_source(
+    graph: &Graph,
+    value: ValueId,
+) -> Result<String, RocmTensorExecutionError> {
+    let node = graph.node(value)?;
+    let spec = strict_sgd::StrictSgdSpec::from_node(graph, node).ok_or_else(|| {
+        RocmTensorExecutionError::Unsupported {
+            value,
+            reason: TensorUnsupportedReason::Other(
+                "strict SGD profile or shape is unsupported".into(),
             ),
         }
     })?;
@@ -632,6 +662,7 @@ impl TensorPointwiseScalarType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TensorDispatchCacheKey {
     StrictMatMul(strict_matmul::StrictMatMulSpec),
+    StrictSgd(strict_sgd::StrictSgdSpec),
     Fixed(
         TensorDispatchKind,
         TensorPointwiseScalarType,
@@ -708,6 +739,7 @@ struct TensorDispatchCacheAdmission {
 #[derive(Clone, Debug)]
 enum TensorDispatchRequest<'graph> {
     StrictMatMul(strict_matmul::StrictMatMulSpec),
+    StrictSgd(strict_sgd::StrictSgdSpec),
     Fixed {
         kind: TensorDispatchKind,
         scalar_type: TensorPointwiseScalarType,
@@ -733,6 +765,7 @@ impl TensorDispatchRequest<'_> {
     fn key(&self) -> TensorDispatchCacheKey {
         match self {
             Self::StrictMatMul(spec) => TensorDispatchCacheKey::StrictMatMul(*spec),
+            Self::StrictSgd(spec) => TensorDispatchCacheKey::StrictSgd(*spec),
             Self::Fixed {
                 kind,
                 scalar_type,
@@ -1351,7 +1384,17 @@ impl fmt::Display for RocmTensorExecutionError {
     }
 }
 
-impl Error for RocmTensorExecutionError {}
+impl Error for RocmTensorExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Graph(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            Self::Backend(error) => Some(error),
+            Self::Completion(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<TensorError> for RocmTensorExecutionError {
     fn from(error: TensorError) -> Self {
@@ -1886,6 +1929,7 @@ impl<'session> RocmTensorAssessor<'session> {
                 TensorDispatchRequest::StrictMatMul(spec) => {
                     self.ensure_strict_matmul_cached(*spec)?
                 }
+                TensorDispatchRequest::StrictSgd(spec) => self.ensure_strict_sgd_cached(*spec)?,
                 TensorDispatchRequest::Fixed {
                     kind,
                     scalar_type,
@@ -2059,7 +2103,9 @@ impl<'session> RocmTensorAssessor<'session> {
             self.prepare_native_mse()?;
         }
         for node in &plan.nodes {
-            if matches!(node.op, OpDescriptor::SgdUpdate { .. }) {
+            if matches!(node.op, OpDescriptor::SgdUpdate { .. })
+                && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
+            {
                 self.prepare_native_sgd(
                     node.numerical_options.precision
                         == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
@@ -2089,6 +2135,7 @@ impl<'session> RocmTensorAssessor<'session> {
             suppressed_adds: plan.suppressed_adds,
             indexed_storage_constraints: plan.indexed_storage_constraints,
             matmul_operands: plan.matmul_operands,
+            strict_sgd: plan.strict_sgd,
             physical_layouts: plan.physical_layouts,
             rewrites: plan.lowering_plan.rewrites().to_vec(),
             input_values: plan.tensor_plan.input_values().to_vec(),
@@ -2142,7 +2189,9 @@ impl<'session> RocmTensorAssessor<'session> {
         }
         for &value in program.selected_nodes() {
             let node = program.graph().node(value)?;
-            if matches!(node.op, OpDescriptor::SgdUpdate { .. }) {
+            if matches!(node.op, OpDescriptor::SgdUpdate { .. })
+                && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
+            {
                 self.prepare_native_sgd(
                     node.numerical_options.precision
                         == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
@@ -4539,26 +4588,43 @@ impl<'session> RocmTensorAssessor<'session> {
                         output_bank,
                         fresh_outputs,
                     )?;
-                    self.execute_sgd_update(
-                        node.shape,
-                        resources[weights_index]
-                            .as_ref()
-                            .ok_or(RocmTensorExecutionError::MissingResource(weights))?,
-                        resources[gradient_index]
-                            .as_ref()
-                            .ok_or(RocmTensorExecutionError::MissingResource(gradient))?,
-                        SgdUpdateMode {
-                            learning_rate,
-                            contracted: node.numerical_options.precision
-                                == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
-                                || plan
-                                    .rewrites
-                                    .iter()
-                                    .any(|rewrite| rewrite.output == node.value),
-                        },
-                        &output,
-                        batch.as_deref_mut(),
-                    )?;
+                    if let Some(spec) = plan.strict_sgd[index] {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            tensor_flush_batch!(batch, timings, false)?;
+                        }
+                        self.execute_strict_sgd(
+                            spec,
+                            node.value,
+                            resources[weights_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(weights))?,
+                            resources[gradient_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(gradient))?,
+                            &output,
+                        )?;
+                    } else {
+                        self.execute_sgd_update(
+                            node.shape,
+                            resources[weights_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(weights))?,
+                            resources[gradient_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(gradient))?,
+                            SgdUpdateMode {
+                                learning_rate,
+                                contracted: node.numerical_options.precision
+                                    == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
+                                    || plan
+                                        .rewrites
+                                        .iter()
+                                        .any(|rewrite| rewrite.output == node.value),
+                            },
+                            &output,
+                            batch.as_deref_mut(),
+                        )?;
+                    }
                     resources[index] = Some(output);
                     release_after_read(&mut resources, &mut remaining_uses, weights_index)?;
                     release_after_read(&mut resources, &mut remaining_uses, gradient_index)?;
@@ -5353,6 +5419,7 @@ pub struct RocmPreparedGraphData {
     suppressed_adds: HashSet<ValueId>,
     indexed_storage_constraints: Vec<PreparedStorageConstraint>,
     matmul_operands: Vec<Option<PreparedMatMulOperands>>,
+    strict_sgd: Vec<Option<strict_sgd::StrictSgdSpec>>,
     physical_layouts: HashMap<ValueId, RocmPhysicalLayout>,
     rewrites: Vec<TensorSgdRewriteCandidate>,
     input_values: Vec<ValueId>,
@@ -6649,6 +6716,17 @@ fn collect_dispatch_requests<'graph>(
             continue;
         }
         let request = match node.op {
+            OpDescriptor::SgdUpdate { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                let index = prepared
+                    .index_of(node.value)
+                    .ok_or(RocmTensorExecutionError::InvalidPlan(node.value))?;
+                Some(TensorDispatchRequest::StrictSgd(
+                    prepared.strict_sgd[index]
+                        .ok_or(RocmTensorExecutionError::InvalidPlan(node.value))?,
+                ))
+            }
             OpDescriptor::MatMul { .. }
                 if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
             {
@@ -6878,6 +6956,7 @@ struct GraphExecutionPreflight<'a> {
     storage_constraints: Vec<TensorStorageConstraint>,
     indexed_storage_constraints: Vec<PreparedStorageConstraint>,
     matmul_operands: Vec<Option<PreparedMatMulOperands>>,
+    strict_sgd: Vec<Option<strict_sgd::StrictSgdSpec>>,
     physical_layouts: HashMap<ValueId, RocmPhysicalLayout>,
 }
 
@@ -6943,16 +7022,16 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     let nodes = lowering_plan.nodes().to_vec();
     for node in &nodes {
         let expected_route = match node.op {
+            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
             OpDescriptor::Input
             | OpDescriptor::Constant(_)
             | OpDescriptor::Uniform { .. }
             | OpDescriptor::ReluBackward { .. }
             | OpDescriptor::SgdUpdate { .. } => TensorExecutionRoute::Native,
-            OpDescriptor::MatMul { .. }
-                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
-            {
-                TensorExecutionRoute::Synthesized
-            }
             OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. } => {
                 TensorExecutionRoute::Library
             }
@@ -7051,6 +7130,10 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     let indexed_storage_constraints =
         prepare_storage_constraint_indices(storage_constraints, &index_by_value, outputs)?;
     let matmul_operands = prepare_matmul_operands(graph, &nodes, &index_by_value)?;
+    let strict_sgd = nodes
+        .iter()
+        .map(|node| strict_sgd::StrictSgdSpec::from_node(graph, *node))
+        .collect();
     Ok(GraphExecutionPreflight {
         tensor_plan: plan,
         lowering_plan,
@@ -7066,6 +7149,7 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
         storage_constraints: test_storage_constraints,
         indexed_storage_constraints,
         matmul_operands,
+        strict_sgd,
         physical_layouts,
     })
 }
@@ -7122,16 +7206,16 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
     }
     for node in &nodes {
         let expected_route = match node.op {
+            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
             OpDescriptor::Input
             | OpDescriptor::Constant(_)
             | OpDescriptor::Uniform { .. }
             | OpDescriptor::ReluBackward { .. }
             | OpDescriptor::SgdUpdate { .. } => TensorExecutionRoute::Native,
-            OpDescriptor::MatMul { .. }
-                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
-            {
-                TensorExecutionRoute::Synthesized
-            }
             OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. } => {
                 TensorExecutionRoute::Library
             }
@@ -7238,6 +7322,10 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
     let indexed_storage_constraints =
         prepare_storage_constraint_indices(storage_constraints, &index_by_value, outputs)?;
     let matmul_operands = prepare_matmul_operands(graph, &nodes, &index_by_value)?;
+    let strict_sgd = nodes
+        .iter()
+        .map(|node| strict_sgd::StrictSgdSpec::from_node(graph, *node))
+        .collect();
     Ok(RocmPreparedGraphData {
         scalar_type,
         requires_blas: nodes_require_blas(&nodes),
@@ -7256,6 +7344,7 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
         suppressed_adds,
         indexed_storage_constraints,
         matmul_operands,
+        strict_sgd,
         physical_layouts,
         rewrites: program.rewrites().to_vec(),
         input_values: program.input_values().to_vec(),
@@ -8303,14 +8392,8 @@ fn assess_float_matmul(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperati
     if node.numerical_options.compound_arithmetic
         == fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
     {
-        if node.float_underflow_policy
-            == Some(fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult)
-        {
-            return TensorOperationSupport::Unsupported {
-                reason: TensorUnsupportedReason::UnderflowPolicy(
-                    fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult,
-                ),
-            };
+        if let Err(reason) = native_policy::assess_underflow(node.float_underflow_policy) {
+            return TensorOperationSupport::Unsupported { reason };
         }
         if node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Boundary) {
             return TensorOperationSupport::Unsupported {
@@ -8360,7 +8443,14 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
         return native_loss::assess(graph, node);
     }
     if matches!(node.op, OpDescriptor::SgdUpdate { .. }) {
-        return native_sgd::assess(graph, node);
+        return if strict_sgd::StrictSgdSpec::from_node(graph, node).is_some() {
+            TensorOperationSupport::Supported {
+                route: TensorExecutionRoute::Synthesized,
+                workspace_bytes: Some(0),
+            }
+        } else {
+            native_sgd::assess(graph, node)
+        };
     }
     if matches!(node.op, OpDescriptor::ReluBackward { .. }) {
         return TensorOperationSupport::Unsupported {
@@ -9678,6 +9768,7 @@ mod tests {
             storage_constraints: _,
             indexed_storage_constraints,
             matmul_operands,
+            strict_sgd,
             physical_layouts,
         } = prepare_graph_outputs_plan_with_policies(
             graph,
@@ -9706,6 +9797,7 @@ mod tests {
             suppressed_adds,
             indexed_storage_constraints,
             matmul_operands,
+            strict_sgd,
             physical_layouts,
             rewrites: lowering_plan.rewrites().to_vec(),
             input_values: tensor_plan.input_values().to_vec(),
@@ -10877,7 +10969,7 @@ mod tests {
 
         let prepared = prepare_graph(&graph, output, &PureRocmAssessor).unwrap();
         assert_eq!(prepared.nodes.last().unwrap().value, output);
-        assert_eq!(prepared.nodes.last().unwrap().shape, &[]);
+        assert!(prepared.nodes.last().unwrap().shape.is_empty());
     }
 
     #[test]
@@ -11197,6 +11289,19 @@ mod tests {
                     "relu_backward" => graph.relu_backward(first, second).unwrap(),
                     _ => unreachable!(),
                 };
+                if operation == "sgd" && mode == fusion_pcu::PcuNumericalMode::Strict {
+                    assert!(matches!(
+                        assess_tensor_node(&graph, graph.node(output).unwrap()),
+                        TensorOperationSupport::Supported {
+                            route: TensorExecutionRoute::Synthesized,
+                            ..
+                        }
+                    ));
+                    assert!(
+                        prepare_graph_outputs_plan(&graph, &[output], &DenseOnlyAssessor).is_ok()
+                    );
+                    continue;
+                }
                 assert!(matches!(
                     assess_tensor_node(&graph, graph.node(output).unwrap()),
                     TensorOperationSupport::Unsupported { .. }

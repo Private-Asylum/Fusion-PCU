@@ -1,13 +1,13 @@
 [package]
 name = "fusion-pcu-vulkan"
-description = "Limited synchronous Vulkan SPIR-V prototype for Fusion PCU"
+description = "Explicit synchronous Vulkan SPIR-V compute execution for Fusion PCU"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 publish.workspace = true
@@ -31,9 +31,27 @@ workspace = true
 [dev-dependencies]
 # Test-only path dependencies stay out of the published dependency graph.
 fusion-pcu-macros = { path = "../../macros" }
+pcu-facade = { workspace = true, features = ["vulkan"] }
+criterion.workspace = true
 winit.workspace = true
 
 [[example]]
 name = "compute-copy"
 path = "examples/compute_copy/compute_copy.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "prepared_bit_map"
+path = "tests/prepared_bit_map/prepared_bit_map.rs"
+required-features = ["hosted"]
+
+[[example]]
+name = "checked-neg"
+path = "examples/checked_neg/checked_neg.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "checked_neg"
+path = "benches/checked_neg/checked_neg.rs"
+harness = false
 required-features = ["hosted"]

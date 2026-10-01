@@ -23,6 +23,7 @@ required. Check GPU activity before measurements.
 
 ```sh
 cargo bench -p fusion-pcu-cuda --bench strict_matmul --features tensor
+cargo bench -p fusion-pcu-cuda --bench strict_sgd --features tensor
 cargo bench -p fusion-pcu-cuda --bench checked_neg --features tensor
 cargo bench -p fusion-pcu-cuda --bench native_matmul --features tensor
 cargo bench -p fusion-pcu-cuda --bench native_mse --features tensor
@@ -31,6 +32,17 @@ cargo bench -p fusion-pcu-cuda --bench native_sgd --features tensor
 
 The native compound comparisons explicitly select backend-defined arithmetic;
 they do not weaken ordinary scalar checking or imply checked training support.
+Checked Strict F32/F64 SGD is available through ordinary `pcu::sgd_update` under
+`flag(strict)`: separate checked rate multiplication and subtraction, with the
+F32 rate widened exactly for F64. Default checked Boundary SGD remains guarded.
+See [strict SGD's guide](benches/strict_sgd/README.md) and its ordinary source example:
+
+```sh
+cargo run -p fusion-pcu-cuda --example strict_sgd --features tensor --release
+```
+
+See [native MatMul's guide](benches/native_matmul/README.md) for retained Lt
+plans, separate classic controls and matched full-host/resident boundaries.
 See [native SGD's guide](benches/native_sgd/README.md) for its rounding/FMA
 profiles, changing-input oracle, full timed boundary and diagnostic modes.
 
@@ -41,10 +53,14 @@ Criterion and `harness = false`.
 ## Tests
 
 Hardware tests remain explicitly ignored in ordinary host runs. Run authored
-SGD hardware tests serially on an idle CUDA machine:
+MatMul and SGD hardware tests serially on an idle CUDA machine:
 
 ```sh
+cargo test -p fusion-pcu-cuda --test native_matmul_source --features tensor,allocation-census \
+    -- --ignored --test-threads=1 --nocapture
 cargo test -p fusion-pcu-cuda --test native_sgd_source --features tensor \
+    -- --ignored --test-threads=1 --nocapture
+cargo test -p fusion-pcu-cuda --test strict_sgd_source --features tensor \
     -- --ignored --test-threads=1 --nocapture
 ```
 

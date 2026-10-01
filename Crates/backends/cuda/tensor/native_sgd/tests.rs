@@ -79,13 +79,16 @@ fn native_sgd_policy_and_finite_frozen_rate_are_admitted_cold() {
             })
         ));
         node.numerical_options = options(precision);
-        node.float_underflow_policy = Some(PcuFloatUnderflowPolicy::RejectSubnormalResult);
-        assert_eq!(
-            super::assess(node),
-            Err(TensorUnsupportedReason::UnderflowPolicy(
-                PcuFloatUnderflowPolicy::RejectSubnormalResult
-            ))
-        );
+        for policy in [
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        ] {
+            node.float_underflow_policy = Some(policy);
+            assert_eq!(
+                super::assess(node),
+                Err(TensorUnsupportedReason::UnderflowPolicy(policy))
+            );
+        }
         node.float_underflow_policy = None;
         node.scalar_type = PcuScalarType::F64;
         assert_eq!(

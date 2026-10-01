@@ -383,6 +383,44 @@ impl CudaOwnedDispatchBackend {
         })
     }
 
+    /// Internal verified strict tensor profile. It derives source, exact binding schema and
+    /// shape together; arbitrary user source cannot acquire a trusted checked dispatch.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_strict_sgd_dispatch(
+        &self,
+        profile: crate::tensor::strict_sgd::Profile,
+        stream: &crate::CudaStreamHandle,
+    ) -> Result<CudaPreparedDispatch, CudaOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(CudaOwnedDispatchError::Cuda(CudaError::DifferentRuntime));
+        }
+        let shape = fusion_pcu::PcuInvocationShape::invocations(
+            core::num::NonZeroU32::new(profile.count()).expect("profile verifies nonempty output"),
+        );
+        let requirements = profile.requirements();
+        let source = profile.source();
+        let grid_x = launch_grid(shape.invocation_count().get(), self.block_size)?;
+        let image = self.compile_tensor_source(&source)?;
+        let module = self.runtime.load_module(&image)?;
+        let function = module.function(c"fusion_kernel")?;
+        let binding_targets = requirements
+            .iter()
+            .map(|requirement| requirement.target)
+            .collect();
+        Ok(CudaPreparedDispatch {
+            runtime: self.runtime.clone(),
+            device: self.device,
+            binding_requirements: requirements,
+            shape,
+            grid_x,
+            block_size: self.block_size,
+            function,
+            stream: stream.clone(),
+            binding_targets,
+            checked_arithmetic: true,
+        })
+    }
+
     /// Private explicitly native MSE storage ABI. Tensor policy admission happens before this
     /// path; arbitrary unchecked scalar IR cannot use this trusted source preparation method.
     #[cfg(feature = "tensor")]

@@ -10,12 +10,14 @@ mod driver;
 #[path = "heavy/heavy.rs"]
 mod heavy;
 mod native;
+mod native_lt;
 #[path = "../strict_matmul/oracle.rs"]
 #[expect(
     dead_code,
     reason = "Shared nominal oracle's strict exceptional helpers are outside this native numerical contract."
 )]
 mod oracle;
+mod resident;
 #[path = "../strict_matmul/selection.rs"]
 mod selection;
 mod source;

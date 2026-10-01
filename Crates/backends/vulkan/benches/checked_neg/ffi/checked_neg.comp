@@ -1,0 +1,35 @@
+#version 450
+#ifdef F64
+#extension GL_ARB_gpu_shader_fp64 : require
+#define VALUE double
+#else
+#define VALUE uint
+#endif
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { VALUE input_values[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Output { VALUE output_values[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Status { uint status_values[]; };
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= EXTENT) return;
+#ifdef F64
+    uvec2 bits = unpackDouble2x32(input_values[id]);
+    uint exponent = bits.y & 0x7ff00000u;
+    uint fraction = (bits.y & 0x000fffffu) | bits.x;
+    bool invalid = exponent == 0x7ff00000u;
+    bits.y ^= 0x80000000u;
+    output_values[id] = packDouble2x32(bits);
+#else
+    uint bits = input_values[id];
+    uint exponent = bits & 0x7f800000u;
+    uint fraction = bits & 0x007fffffu;
+    bool invalid = exponent == 0x7f800000u;
+    output_values[id] = bits ^ 0x80000000u;
+#endif
+#ifdef REJECT_SUBNORMAL
+    uint valid_status = exponent == 0 && fraction != 0 ? 2u : 0u;
+#else
+    uint valid_status = 0u;
+#endif
+    status_values[id] = invalid ? 1u : valid_status;
+}

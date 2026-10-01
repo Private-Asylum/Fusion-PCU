@@ -12,10 +12,17 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+#[path = "bit_map/bit_map.rs"]
+mod bit_map;
+#[path = "error/error.rs"]
 pub mod error;
+#[path = "lower/lower.rs"]
 pub mod lower;
+#[path = "module/module.rs"]
 pub mod module;
+#[path = "sink/sink.rs"]
 pub mod sink;
+#[path = "types/types.rs"]
 pub mod types;
 
 pub use error::*;
@@ -23,3 +30,4 @@ pub use lower::*;
 pub use module::*;
 pub use sink::*;
 pub use types::*;
+pub use bit_map::*;

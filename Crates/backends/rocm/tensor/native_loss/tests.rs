@@ -1,6 +1,7 @@
 use super::*;
 #[rustfmt::skip]
 use fusion_pcu::{
+    PcuFloatUnderflowPolicy,
     PcuNumericalOptions,
     PcuPrecisionPolicy,
 };
@@ -75,17 +76,20 @@ fn loss_native_permission_cannot_be_forged_or_override_tight_underflow() {
     graph
         .set_value_numerical_options(loss, forged.numerical_options)
         .unwrap();
-    graph
-        .set_value_float_underflow_policy(loss, PcuFloatUnderflowPolicy::RejectSubnormalResult)
-        .unwrap();
-    assert_eq!(
-        assess(&graph, graph.node(loss).unwrap()),
-        TensorOperationSupport::Unsupported {
-            reason: TensorUnsupportedReason::UnderflowPolicy(
-                PcuFloatUnderflowPolicy::RejectSubnormalResult
-            ),
-        }
-    );
+    for policy in [
+        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+    ] {
+        graph
+            .set_value_float_underflow_policy(loss, policy)
+            .unwrap();
+        assert_eq!(
+            assess(&graph, graph.node(loss).unwrap()),
+            TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::UnderflowPolicy(policy),
+            }
+        );
+    }
 }
 
 #[test]

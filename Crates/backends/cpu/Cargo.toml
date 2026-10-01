@@ -16,8 +16,49 @@ publish.workspace = true
 crate-type = ["rlib"]
 path = "cpu.rs"
 
+[features]
+default = []
+std = []
+
 [dependencies]
 fusion-pcu-core.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+pcu-facade.workspace = true
+criterion.workspace = true
+
+[[test]]
+name = "prepared_neg"
+path = "tests/prepared_neg/prepared_neg.rs"
+
+[[test]]
+name = "checked_integer"
+path = "tests/checked_integer/checked_integer.rs"
+
+[[bench]]
+name = "checked_integer"
+path = "benches/checked_integer/checked_integer.rs"
+harness = false
+
+[[bench]]
+name = "checked_neg"
+path = "benches/checked_neg/checked_neg.rs"
+harness = false
+required-features = ["std"]
+
+[[test]]
+name = "host"
+path = "tests/host/host.rs"
+
+[[test]]
+name = "prepared_f64_neg"
+path = "tests/prepared_f64_neg/prepared_f64_neg.rs"
+
+[[bench]]
+name = "checked_f64_neg"
+path = "benches/checked_f64_neg/checked_f64_neg.rs"
+harness = false
+required-features = ["std"]

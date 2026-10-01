@@ -1,13 +1,79 @@
-//! Opt-in CPU execution oracle for the bounded scalar Dispatch and U32 Stream profiles.
+//! Opt-in CPU execution for bounded scalar Dispatch and U32 Stream profiles.
 //!
 //! The implementation is split by semantic concern: integer maps, floating-point maps,
 //! stream transforms, checked F32/F64 invocation maps, and explicit unchecked float oracles.
+//! Prepared host backends execute canonical checked integer Add/Sub/Mul with exact scalar
+//! semantics and checked F32/F64 Neg using an explicitly selected scalar/SIMD implementation.
+//! Default builds remain `no_std`; hosted runtime feature
+//! detection requires the optional `std` feature. No automatic CPU fallback is provided.
 
 #![no_std]
 
 extern crate fusion_pcu_core as fusion_pcu;
-#[cfg(test)]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
+
+#[cfg(feature = "std")]
+#[path = "discovery/discovery.rs"]
+mod discovery;
+#[cfg(feature = "std")]
+#[rustfmt::skip]
+pub use discovery::{
+    PCU_CPU_PROVIDER,
+    PcuCpuDiscovery,
+    PcuCpuDiscoveryError,
+};
+
+#[path = "host/host.rs"]
+mod host;
+#[rustfmt::skip]
+pub use host::{
+    PcuCpuHostArgumentError,
+    PcuCpuHostBackend,
+    PcuCpuHostError,
+    PcuCpuHostOfferError,
+    PcuCpuHostOffers,
+    PcuCpuPreparedHost,
+};
+
+#[path = "checked_integer/checked_integer.rs"]
+mod checked_integer;
+#[rustfmt::skip]
+pub use checked_integer::{
+    PCU_CPU_INTEGER_IMPLEMENTATION_REVISION,
+    PcuCheckedIntegerReference,
+    PcuCheckedIntegerReferenceError,
+    PcuCpuCheckedInteger,
+    PcuCpuCheckedIntegerError,
+    PcuCpuIntegerOfferError,
+    PcuCpuIntegerOffers,
+    PcuCpuPreparedInteger,
+};
+
+#[path = "offers/offers.rs"]
+mod offers;
+#[path = "prepared_neg/prepared_neg.rs"]
+mod prepared_neg;
+#[path = "processor/processor.rs"]
+mod processor;
+#[rustfmt::skip]
+pub use offers::{
+    PcuCpuNegOfferError,
+    PcuCpuNegOffers,
+};
+#[rustfmt::skip]
+pub use processor::{
+    PcuCpuFeatures,
+    PcuCpuImplementation,
+    PcuCpuImplementationUnavailable,
+    PcuCpuProcessor,
+};
+#[rustfmt::skip]
+pub use prepared_neg::{
+    PcuCpuCheckedNeg,
+    PcuCpuPreparedNeg,
+    PcuCpuPreparedNegError,
+};
 
 #[cfg(test)]
 #[rustfmt::skip]

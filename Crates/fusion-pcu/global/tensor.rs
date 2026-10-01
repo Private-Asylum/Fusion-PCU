@@ -22,6 +22,16 @@ use core::{
 use core::cell::RefCell;
 use alloc::rc::Rc;
 #[cfg(feature = "tensor")]
+#[path = "tensor/capture/capture.rs"]
+mod capture;
+#[cfg(feature = "tensor")]
+#[doc(hidden)]
+#[rustfmt::skip]
+pub use capture::{
+    __pcu_capture_tensor_program,
+    PcuCapturedTensorProgram,
+};
+#[cfg(feature = "tensor")]
 #[rustfmt::skip]
 use core::sync::atomic::{
     AtomicUsize,
@@ -1378,9 +1388,6 @@ mod execution {
     };
     #[rustfmt::skip]
     use crate::dialect::tensor::{
-        TensorArithmeticCapability,
-        TensorArithmeticRewritePolicy,
-        TensorPointwiseGroupingPolicy,
         ValueId,
     };
     #[rustfmt::skip]
@@ -1481,11 +1488,7 @@ mod execution {
         memory: Memory,
         host_inputs: Vec<Option<Resource>>,
     }
-    struct BuiltProgram {
-        program: Arc<crate::dialect::tensor::TensorOwnedSelectedProgram>,
-        input_ids: Vec<ValueId>,
-        input_indices: Vec<usize>,
-    }
+    use super::capture::PcuCapturedTensorProgram as BuiltProgram;
     #[derive(Default)]
     struct State {
         generation: u64,
@@ -1545,45 +1548,13 @@ mod execution {
             ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
             + 'static,
     {
-        let (mut capture, input_values) = PcuTensorGraphCapture::new_with_witnesses_and_policy::<
-            T,
-            N,
-        >(shapes, base_float_underflow_policy)?;
-        capture.numerical_mode.set(numerical_mode);
-        capture.numerical_options.set(numerical_options);
-        let captured_input_ids = input_values.map(|value| value.value.erase());
-        let output_value = build(&mut capture, input_values)?;
-        let (graph, output_id) = capture.finish(output_value)?;
-        let program = Arc::new(
-            graph
-                .into_selected_program(
-                    &[output_id],
-                    TensorArithmeticRewritePolicy::Disabled,
-                    TensorArithmeticCapability::Strict,
-                    TensorPointwiseGroupingPolicy::Disabled,
-                )
-                .map_err(crate::global::tensor_build_error)?,
-        );
-        let mut input_ids = Vec::with_capacity(program.input_values().len());
-        let mut input_indices = Vec::with_capacity(program.input_values().len());
-        for &selected_id in program.input_values() {
-            let Some(argument_index) = captured_input_ids
-                .iter()
-                .position(|captured_id| *captured_id == selected_id)
-            else {
-                return Err(PcuExecutionError::InvalidTensorSourcePlan);
-            };
-            input_ids.push(selected_id);
-            input_indices.push(argument_index);
-        }
-        if input_ids.is_empty() {
-            return Err(PcuExecutionError::InvalidTensorSourcePlan);
-        }
-        Ok(BuiltProgram {
-            program,
-            input_ids,
-            input_indices,
-        })
+        super::capture::build(
+            shapes,
+            base_float_underflow_policy,
+            numerical_mode,
+            numerical_options,
+            build,
+        )
     }
 
     fn prepare_entry<T: PcuScalar, const N: usize>(

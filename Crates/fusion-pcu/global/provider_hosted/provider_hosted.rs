@@ -5,8 +5,38 @@ use core::any::TypeId;
 use core::sync::atomic::Ordering;
 use std::cell::RefCell;
 use std::ffi::OsString;
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan"
+))]
 use std::rc::Rc;
+#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
 use smallvec::SmallVec;
+#[path = "affinity/affinity.rs"]
+mod affinity;
+#[path = "discovery/discovery.rs"]
+mod discovery;
+use affinity::ResidentAffinity;
+#[cfg(feature = "cpu")]
+#[rustfmt::skip]
+use fusion_pcu_cpu::{
+    PcuCpuDiscovery,
+    PcuCpuDiscoveryError,
+    PcuCpuHostBackend,
+    PcuCpuHostError,
+    PcuCpuHostArgumentError,
+    PcuCpuPreparedHost,
+};
+#[cfg(feature = "vulkan")]
+#[rustfmt::skip]
+use fusion_pcu_vulkan::{
+    PcuVulkanBackend,
+    PcuVulkanDiscovery,
+    PcuVulkanError,
+    PcuVulkanPreparedBitMap,
+};
 #[cfg(feature = "cuda")]
 #[rustfmt::skip]
 use fusion_pcu_cuda::{
@@ -57,10 +87,12 @@ use super::{
 };
 
 #[rustfmt::skip]
+#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
 use super::arguments::{
     PcuCallArgumentKind,
     ResidentWriteGuard,
 };
+#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
 use super::resident::DeviceArgument;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +103,10 @@ pub(super) enum Provider {
     Cuda,
     #[cfg(feature = "rocm")]
     Rocm,
+    #[cfg(feature = "vulkan")]
+    Vulkan,
+    #[cfg(feature = "cpu")]
+    Cpu,
 }
 
 #[derive(Clone)]
@@ -86,7 +122,12 @@ enum Session {
     Metal(Rc<MetalOwnedDispatchBackend>),
     #[cfg(feature = "cuda")]
     Cuda(Rc<CudaOwnedDispatchBackend>),
+    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
     Resident(Rc<super::resident::Session>),
+    #[cfg(feature = "vulkan")]
+    Vulkan(Rc<PcuVulkanBackend>),
+    #[cfg(feature = "cpu")]
+    Cpu(PcuCpuHostBackend),
     #[cfg(feature = "rocm")]
     Rocm(Rc<RocmOwnedDispatchBackend>),
 }
@@ -98,6 +139,10 @@ pub(super) enum Prepared {
     Cuda(CudaPreparedHostKernel),
     #[cfg(feature = "rocm")]
     Rocm(RocmPreparedHostKernel),
+    #[cfg(feature = "vulkan")]
+    Vulkan(PcuVulkanPreparedBitMap),
+    #[cfg(feature = "cpu")]
+    Cpu(PcuCpuPreparedHost),
 }
 
 impl Prepared {
@@ -109,6 +154,10 @@ impl Prepared {
             Self::Cuda(prepared) => prepared.call(args).map_err(map_cuda_error),
             #[cfg(feature = "rocm")]
             Self::Rocm(prepared) => prepared.call(args).map_err(map_rocm_error),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(prepared) => prepared.call(args).map_err(map_vulkan_error),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(prepared) => prepared.call(args).map_err(map_cpu_error),
         }
     }
     fn call_arguments<const N: usize>(
@@ -122,6 +171,10 @@ impl Prepared {
             Self::Cuda(prepared) => call_cuda_arguments(prepared, arguments),
             #[cfg(feature = "rocm")]
             Self::Rocm(prepared) => call_rocm_arguments(prepared, arguments),
+            #[cfg(feature = "vulkan")]
+            Self::Vulkan(prepared) => call_vulkan_arguments(prepared, arguments),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(prepared) => call_cpu_arguments(prepared, arguments),
         }
     }
 }
@@ -129,7 +182,7 @@ impl Prepared {
 pub(super) struct Preparation {
     policy: PcuExecutionPolicy,
     result: Option<(Session, Prepared)>,
-    affinity: Option<Rc<super::resident::Session>>,
+    affinity: Option<ResidentAffinity>,
 }
 
 impl Preparation {
@@ -147,6 +200,7 @@ impl Preparation {
         self.policy.range_policy
     }
 
+    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
     fn prepare_affinity(
         &mut self,
         kernel: &crate::PcuDispatchKernelIr<'_>,
@@ -154,7 +208,7 @@ impl Preparation {
         let Some(root) = &self.affinity else {
             return Ok(false);
         };
-        root.validate_policy(self.policy)?;
+        affinity::validate(root, self.policy)?;
         let prepared = root.prepare_host_kernel(kernel)?;
         self.result = Some((Session::Resident(Rc::clone(root)), prepared));
         Ok(true)
@@ -168,77 +222,28 @@ impl Preparation {
                 self.policy.numerical_options,
             ));
         }
+        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
         if self.prepare_affinity(kernel)? {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
-        let cuda_discovery = CudaDiscovery::new();
-        #[cfg(feature = "rocm")]
-        let rocm_discovery = RocmDiscovery::new();
-        #[cfg(feature = "metal")]
-        let metal_discovery = matches!(
-            self.policy.backend,
-            PcuBackendChoice::Automatic | PcuBackendChoice::Metal
-        )
-        .then(MetalDiscovery::discover);
-        let mut candidates = Vec::new();
-        let mut discovery_errors = Vec::new();
+        let providers = discovery::Discoveries::new(self.policy);
+        let (candidates, discovery_errors) = providers.candidates(self.policy, kernel);
+        let policy = self.policy;
+        self.prepare_candidates(kernel, candidates, discovery_errors, |candidate| {
+            providers.open(candidate, policy)
+        })
+    }
 
-        #[cfg(feature = "cuda")]
-        if matches!(
-            self.policy.backend,
-            PcuBackendChoice::Automatic | PcuBackendChoice::Cuda
-        ) && let Err(error) =
-            collect_cuda_candidates(&cuda_discovery, self.policy, &mut candidates)
-        {
-            discovery_errors.push(format!("CUDA discovery: {error}"));
-        }
-        #[cfg(feature = "rocm")]
-        if matches!(
-            self.policy.backend,
-            PcuBackendChoice::Automatic | PcuBackendChoice::Rocm
-        ) && let Err(error) =
-            collect_rocm_candidates(&rocm_discovery, self.policy, &mut candidates)
-        {
-            discovery_errors.push(format!("ROCm discovery: {error}"));
-        }
-        #[cfg(feature = "metal")]
-        match &metal_discovery {
-            Some(Ok(discovery)) => {
-                if let Err(error) =
-                    collect_metal_candidates(discovery, self.policy, &mut candidates)
-                {
-                    discovery_errors.push(format!("Metal discovery: {error}"));
-                }
-            }
-            Some(Err(error)) => discovery_errors.push(format!("Metal discovery: {error}")),
-            None => {}
-        }
-        rank_candidates(&mut candidates);
-
+    fn prepare_candidates(
+        &mut self,
+        kernel: &crate::PcuDispatchKernelIr<'_>,
+        candidates: Vec<Candidate>,
+        discovery_errors: Vec<String>,
+        mut open: impl FnMut(&Candidate) -> Result<Session, PcuExecutionError>,
+    ) -> Result<(), PcuExecutionError> {
         let mut rejected = Vec::new();
         for candidate in candidates {
-            let opened = match candidate.provider {
-                #[cfg(feature = "metal")]
-                Provider::Metal => open_metal(metal_discovery.as_ref(), candidate.device),
-                #[cfg(feature = "cuda")]
-                Provider::Cuda => CudaOwnedDispatchBackend::open(
-                    &cuda_discovery,
-                    candidate.device,
-                    self.policy.block_size,
-                )
-                .map(|backend| Session::Cuda(Rc::new(backend)))
-                .map_err(|error| format!("CUDA initialization: {error}")),
-                #[cfg(feature = "rocm")]
-                Provider::Rocm => RocmOwnedDispatchBackend::open(
-                    &rocm_discovery,
-                    candidate.device,
-                    self.policy.block_size,
-                )
-                .map(|backend| Session::Rocm(Rc::new(backend)))
-                .map_err(|error| format!("ROCm initialization: {error}")),
-            };
-            let session = match opened {
+            let session = match open(&candidate) {
                 Ok(session) => session,
                 Err(error) => {
                     rejected.push((candidate.device, error));
@@ -261,7 +266,7 @@ impl Preparation {
 struct Entry {
     specialization: TypeId,
     _session: Session,
-    affinity: Option<Rc<super::resident::Session>>,
+    affinity: Option<ResidentAffinity>,
     prepared: Prepared,
 }
 #[derive(Default)]
@@ -317,7 +322,7 @@ pub(super) fn call_host(
 fn with_entry<R>(
     site: &PcuHostCallSite,
     specialization: TypeId,
-    affinity: Option<&Rc<super::resident::Session>>,
+    affinity: Option<&ResidentAffinity>,
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
     execute: impl FnOnce(&mut Prepared) -> Result<R, PcuExecutionError>,
 ) -> Result<R, PcuExecutionError> {
@@ -332,7 +337,7 @@ fn with_entry<R>(
                 entry.specialization == specialization
                     && match (&entry.affinity, affinity) {
                         (None, None) => true,
-                        (Some(retained), Some(requested)) => Rc::ptr_eq(retained, requested),
+                        (Some(retained), Some(requested)) => affinity::same(retained, requested),
                         _ => false,
                     }
             };
@@ -353,7 +358,7 @@ fn with_entry<R>(
             let policy_snapshot = policy::snapshot()?;
             let policy = policy_snapshot.policy;
             if let Some(root) = affinity {
-                root.validate_policy(policy)?;
+                affinity::validate(root, policy)?;
             }
             if matches!(policy.backend, PcuBackendChoice::Rocm) && !cfg!(feature = "rocm") {
                 return Err(PcuExecutionError::NoBackendEnabled);
@@ -372,7 +377,7 @@ fn with_entry<R>(
                 shared: Some(Preparation::new(policy)),
             };
             if let Some(preparation) = context.shared.as_mut() {
-                preparation.affinity = affinity.map(Rc::clone);
+                preparation.affinity = affinity.cloned();
             }
             prepare(&mut context)?;
             let (session, prepared) = context
@@ -388,7 +393,7 @@ fn with_entry<R>(
                 state.entries[victim] = Entry {
                     specialization,
                     _session: session,
-                    affinity: affinity.map(Rc::clone),
+                    affinity: affinity.cloned(),
                     prepared,
                 };
                 victim
@@ -396,7 +401,7 @@ fn with_entry<R>(
                 state.entries.push(Entry {
                     specialization,
                     _session: session,
-                    affinity: affinity.map(Rc::clone),
+                    affinity: affinity.cloned(),
                     prepared,
                 });
                 state.entries.len() - 1
@@ -426,20 +431,7 @@ pub(super) fn call_arguments<const N: usize>(
     arguments: [super::arguments::PcuCallArgument<'_>; N],
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
 ) -> Result<(), PcuExecutionError> {
-    let mut affinity = None;
-    for argument in &arguments {
-        let session = match argument.kind() {
-            super::arguments::PcuCallArgumentKind::Host(_) => continue,
-            super::arguments::PcuCallArgumentKind::ResidentRead(resident) => resident.session,
-            super::arguments::PcuCallArgumentKind::ResidentWrite(resident) => resident.session,
-        };
-        if affinity.is_some_and(|root| !Rc::ptr_eq(root, session)) {
-            return Err(PcuExecutionError::Argument(
-                super::PcuArgumentError::SessionMismatch,
-            ));
-        }
-        affinity = Some(session);
-    }
+    let affinity = affinity::from_arguments(&arguments)?;
     with_entry(site, specialization, affinity, prepare, |prepared| {
         prepared.call_arguments(arguments)
     })
@@ -472,6 +464,10 @@ const fn provider_id(provider: Provider) -> u32 {
         Provider::Metal => 0x4d54_4c31,
         #[cfg(feature = "rocm")]
         Provider::Rocm => 0x524f_434d,
+        #[cfg(feature = "vulkan")]
+        Provider::Vulkan => 0x564b_4c31,
+        #[cfg(feature = "cpu")]
+        Provider::Cpu => 0x4350_5531,
     }
 }
 
@@ -500,6 +496,7 @@ const EMPTY_READY: PcuProviderReadiness<'static> = PcuProviderReadiness {
 pub(super) fn collect_cuda_candidates(
     discovery: &CudaDiscovery,
     policy: PcuExecutionPolicy,
+    kernel: Option<&crate::PcuDispatchKernelIr<'_>>,
     out: &mut Vec<Candidate>,
 ) -> Result<(), fusion_pcu_cuda::CudaError> {
     let mut providers = [PcuProviderDescriptor {
@@ -537,11 +534,14 @@ pub(super) fn collect_cuda_candidates(
         }
         let memory = discovery
             .device_info(descriptor.reference)
-            .map_or(0, |info| info.total_memory);
+            .ok()
+            .map(|info| info.total_memory);
         out.push(Candidate {
             provider: Provider::Cuda,
             device: descriptor.reference,
-            score: (policy.score_device)(&descriptor, memory),
+            score: super::selection::score_candidate(policy, descriptor, memory, kernel, || {
+                discovery.device_facts(descriptor.reference)
+            })?,
         });
     }
     Ok(())
@@ -551,6 +551,7 @@ pub(super) fn collect_cuda_candidates(
 pub(super) fn collect_rocm_candidates(
     discovery: &RocmDiscovery,
     policy: PcuExecutionPolicy,
+    kernel: Option<&crate::PcuDispatchKernelIr<'_>>,
     out: &mut Vec<Candidate>,
 ) -> Result<(), fusion_pcu_rocm::HipError> {
     let mut providers = [PcuProviderDescriptor {
@@ -588,11 +589,14 @@ pub(super) fn collect_rocm_candidates(
         }
         let memory = discovery
             .device_info(descriptor.reference)
-            .map_or(0, |info| info.total_memory);
+            .ok()
+            .map(|info| info.total_memory);
         out.push(Candidate {
             provider: Provider::Rocm,
             device: descriptor.reference,
-            score: (policy.score_device)(&descriptor, memory),
+            score: super::selection::score_candidate(policy, descriptor, memory, kernel, || {
+                discovery.device_facts(descriptor.reference)
+            })?,
         });
     }
     Ok(())
@@ -602,15 +606,17 @@ pub(super) fn collect_rocm_candidates(
 fn open_metal(
     discovery: Option<&Result<MetalDiscovery, fusion_pcu_metal::MetalError>>,
     device: PcuObjectRef,
-) -> Result<Session, String> {
+) -> Result<Session, PcuExecutionError> {
     let discovery = discovery
-        .ok_or_else(|| "Metal excluded by explicit policy".to_string())?
+        .ok_or(PcuExecutionError::NoBackendEnabled)?
         .as_ref()
-        .map_err(ToString::to_string)?;
+        .map_err(|error| PcuExecutionError::BackendFailure(error.to_string()))?;
     discovery
         .open_owned_device(device)
         .map(|backend| Session::Metal(Rc::new(backend)))
-        .map_err(|error| format!("Metal initialization: {error}"))
+        .map_err(|error| {
+            PcuExecutionError::BackendFailure(format!("Metal initialization: {error}"))
+        })
 }
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
@@ -703,6 +709,7 @@ fn map_metal_error(error: fusion_pcu_metal::MetalHostKernelError) -> PcuExecutio
 pub(super) fn collect_metal_candidates(
     discovery: &MetalDiscovery,
     policy: PcuExecutionPolicy,
+    kernel: Option<&crate::PcuDispatchKernelIr<'_>>,
     out: &mut Vec<Candidate>,
 ) -> Result<(), fusion_pcu_metal::MetalError> {
     let mut providers = [PcuProviderDescriptor {
@@ -738,11 +745,13 @@ pub(super) fn collect_metal_candidates(
         {
             continue;
         }
-        // Metal exposes max single allocation, not physical capacity; unknown memory scores zero.
+        // Metal exposes max single allocation, not physical capacity; report unknown capacity.
         out.push(Candidate {
             provider: Provider::Metal,
             device: descriptor.reference,
-            score: (policy.score_device)(&descriptor, 0),
+            score: super::selection::score_candidate(policy, descriptor, None, kernel, || {
+                discovery.device_facts(descriptor.reference)
+            })?,
         });
     }
     Ok(())
@@ -901,41 +910,262 @@ fn call_rocm_arguments<'a, const N: usize>(
 fn prepare_session(
     session: &Session,
     kernel: &crate::PcuDispatchKernelIr<'_>,
-) -> Result<Prepared, String> {
+) -> Result<Prepared, PcuExecutionError> {
     match session {
         #[cfg(feature = "metal")]
         Session::Metal(backend) => backend
             .prepare_host_kernel(kernel)
             .map(Prepared::Metal)
-            .map_err(|error| format!("Metal preparation: {error:?}")),
-        Session::Resident(root) => root
+            .map_err(|error| {
+                PcuExecutionError::BackendFailure(format!("Metal preparation: {error:?}"))
+            }),
+        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        Session::Resident(root) => root.prepare_host_kernel(kernel),
+        #[cfg(feature = "cpu")]
+        Session::Cpu(backend) => backend
             .prepare_host_kernel(kernel)
-            .map_err(|error| error.to_string()),
+            .map(Prepared::Cpu)
+            .map_err(map_cpu_error),
+        #[cfg(feature = "vulkan")]
+        Session::Vulkan(backend) => backend
+            .prepare_host_kernel(kernel)
+            .map(Prepared::Vulkan)
+            .map_err(map_vulkan_error),
         #[cfg(feature = "cuda")]
         Session::Cuda(backend) => backend
             .prepare_host_kernel(kernel)
             .map(Prepared::Cuda)
-            .map_err(|error| format!("CUDA preparation: {error}")),
+            .map_err(|error| {
+                PcuExecutionError::BackendFailure(format!("CUDA preparation: {error}"))
+            }),
         #[cfg(feature = "rocm")]
         Session::Rocm(backend) => backend
             .prepare_host_kernel(kernel)
             .map(Prepared::Rocm)
-            .map_err(|error| format!("ROCm preparation: {error}")),
+            .map_err(|error| {
+                PcuExecutionError::BackendFailure(format!("ROCm preparation: {error}"))
+            }),
     }
 }
 
 fn rejected_candidates(
-    rejected: Vec<(PcuObjectRef, String)>,
+    rejected: Vec<(PcuObjectRef, PcuExecutionError)>,
     discovery: Vec<String>,
 ) -> PcuExecutionError {
     if rejected.is_empty() && discovery.is_empty() {
         return PcuExecutionError::NoBackendEnabled;
     }
     PcuExecutionError::NoCompatibleInvocationDevice {
-        rejected: rejected
-            .into_iter()
-            .map(|(device, error)| (device, PcuExecutionError::BackendFailure(error)))
-            .collect(),
+        rejected,
         discovery,
     }
+}
+
+#[cfg(feature = "vulkan")]
+fn map_vulkan_error(error: PcuVulkanError) -> PcuExecutionError {
+    match error {
+        PcuVulkanError::Fault(fault) => PcuExecutionError::ArithmeticFault(fault),
+        other => PcuExecutionError::VulkanExecution(other),
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn open_vulkan(
+    discovery: Option<&Result<PcuVulkanDiscovery, PcuVulkanError>>,
+    device: PcuObjectRef,
+) -> Result<Session, PcuExecutionError> {
+    let discovery = discovery.ok_or(PcuExecutionError::NoBackendEnabled)?;
+    discovery.as_ref().map_or_else(
+        |_| Err(PcuExecutionError::NoBackendEnabled),
+        |discovery| {
+            PcuVulkanBackend::open(discovery, device)
+                .map(|backend| Session::Vulkan(Rc::new(backend)))
+                .map_err(map_vulkan_error)
+        },
+    )
+}
+
+#[cfg(feature = "vulkan")]
+fn collect_vulkan_candidates(
+    discovery: &PcuVulkanDiscovery,
+    policy: PcuExecutionPolicy,
+    kernel: &crate::PcuDispatchKernelIr<'_>,
+    out: &mut Vec<Candidate>,
+) -> Result<(), PcuVulkanError> {
+    let mut providers = [PcuProviderDescriptor {
+        id: PcuProviderId(0),
+        generation: 0,
+        backend: "",
+        readiness: EMPTY_READY,
+    }];
+    discovery.providers(&mut providers)?;
+    let mut targets = [PcuTargetDescriptor {
+        reference: EMPTY_REF,
+        name: "",
+        readiness: EMPTY_READY,
+    }];
+    discovery.targets(providers[0].id, providers[0].generation, &mut targets)?;
+    let count = discovery.devices(targets[0].reference, &mut [])?;
+    let blank = PcuDeviceDescriptor {
+        reference: EMPTY_REF,
+        target: EMPTY_REF,
+        name: "",
+        class: PcuDeviceClass::Other,
+        vendor: None,
+        architecture: None,
+        generation: None,
+        location: None,
+    };
+    let mut devices = vec![blank; count];
+    discovery.devices(targets[0].reference, &mut devices)?;
+    for descriptor in devices {
+        if policy
+            .device
+            .is_some_and(|id| id != descriptor.reference.id)
+        {
+            continue;
+        }
+        // Vulkan memory heaps are not yet exposed as neutral physical capacity. Keep it unknown.
+        let score =
+            super::selection::score_candidate(policy, descriptor, None, Some(kernel), || {
+                discovery.device_facts(descriptor.reference)
+            })?;
+        out.push(Candidate {
+            provider: Provider::Vulkan,
+            device: descriptor.reference,
+            score,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn call_vulkan_arguments<const N: usize>(
+    prepared: &mut PcuVulkanPreparedBitMap,
+    arguments: [super::arguments::PcuCallArgument<'_>; N],
+) -> Result<(), PcuExecutionError> {
+    // This profile admits exactly two host bindings. A fixed stack array adds no warm heap work.
+    // Other providers' resident arguments are never silently read back or reinterpreted.
+    if N != 2 {
+        return Err(PcuExecutionError::VulkanExecution(
+            PcuVulkanError::InvalidArguments,
+        ));
+    }
+    let mut source = arguments.into_iter();
+    let mut host = || match source
+        .next()
+        .ok_or(PcuExecutionError::VulkanExecution(
+            PcuVulkanError::InvalidArguments,
+        ))?
+        .into_parts()
+        .1
+    {
+        super::arguments::PcuCallArgumentKind::Host(argument) => Ok(argument),
+        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        _ => Err(PcuExecutionError::Argument(
+            super::PcuArgumentError::SessionMismatch,
+        )),
+    };
+    prepared
+        .call(&mut [host()?, host()?])
+        .map_err(map_vulkan_error)
+}
+
+#[cfg(feature = "cpu")]
+fn map_cpu_error(error: PcuCpuHostError) -> PcuExecutionError {
+    error.fault().map_or(
+        PcuExecutionError::CpuExecution(error),
+        PcuExecutionError::ArithmeticFault,
+    )
+}
+
+#[cfg(feature = "cpu")]
+fn collect_cpu_candidates(
+    discovery: &PcuCpuDiscovery,
+    policy: PcuExecutionPolicy,
+    kernel: &crate::PcuDispatchKernelIr<'_>,
+    out: &mut Vec<Candidate>,
+) -> Result<(), PcuCpuDiscoveryError> {
+    let mut providers = [PcuProviderDescriptor {
+        id: PcuProviderId(0),
+        generation: 0,
+        backend: "",
+        readiness: EMPTY_READY,
+    }];
+    discovery.providers(&mut providers)?;
+    let mut targets = [PcuTargetDescriptor {
+        reference: EMPTY_REF,
+        name: "",
+        readiness: EMPTY_READY,
+    }];
+    discovery.targets(providers[0].id, providers[0].generation, &mut targets)?;
+    let mut devices = [PcuDeviceDescriptor {
+        reference: EMPTY_REF,
+        target: EMPTY_REF,
+        name: "",
+        class: PcuDeviceClass::Other,
+        vendor: None,
+        architecture: None,
+        generation: None,
+        location: None,
+    }];
+    discovery.devices(targets[0].reference, &mut devices)?;
+    let descriptor = devices[0];
+    if policy.device.is_none_or(|id| id == descriptor.reference.id) {
+        let score =
+            super::selection::score_candidate(policy, descriptor, None, Some(kernel), || {
+                discovery.device_facts(descriptor.reference)
+            })?;
+        out.push(Candidate {
+            provider: Provider::Cpu,
+            device: descriptor.reference,
+            score,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cpu")]
+fn call_cpu_arguments<const N: usize>(
+    prepared: &mut PcuCpuPreparedHost,
+    arguments: [super::arguments::PcuCallArgument<'_>; N],
+) -> Result<(), PcuExecutionError> {
+    let expected = if matches!(prepared, PcuCpuPreparedHost::Neg(_)) {
+        2
+    } else {
+        3
+    };
+    if N != expected {
+        return Err(PcuExecutionError::CpuExecution(PcuCpuHostError::Arguments(
+            PcuCpuHostArgumentError::Count {
+                expected,
+                actual: N,
+            },
+        )));
+    }
+    let mut source = arguments.into_iter();
+    let mut host = || match source
+        .next()
+        .ok_or(PcuExecutionError::CpuExecution(PcuCpuHostError::Arguments(
+            PcuCpuHostArgumentError::Count {
+                expected,
+                actual: N,
+            },
+        )))?
+        .into_parts()
+        .1
+    {
+        super::arguments::PcuCallArgumentKind::Host(argument) => Ok(argument),
+        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        _ => Err(PcuExecutionError::Argument(
+            super::PcuArgumentError::SessionMismatch,
+        )),
+    };
+    // Profile counts are frozen at preparation. Arguments stay on the stack at warm submission.
+    if expected == 2 {
+        prepared.call(&mut [host()?, host()?])
+    } else {
+        prepared.call(&mut [host()?, host()?, host()?])
+    }
+    .map_err(map_cpu_error)
 }

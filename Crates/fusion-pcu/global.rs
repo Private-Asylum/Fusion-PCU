@@ -7,13 +7,24 @@ use core::any::TypeId;
 use core::fmt;
 #[cfg(feature = "std")]
 mod policy;
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 use core::sync::atomic::AtomicUsize;
 
 #[cfg(feature = "rocm")]
 #[path = "global/hosted.rs"]
 mod hosted;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 #[path = "global/provider_hosted/provider_hosted.rs"]
 mod provider_hosted;
 
@@ -26,8 +37,22 @@ mod session;
 // Sealed source carriers preserve ordinary borrows across automatic host/device staging.
 // The public logical owner hides backend resources and retains initialized device results.
 mod arguments;
+#[path = "global/selection/selection.rs"]
+mod selection;
+#[rustfmt::skip]
+pub use selection::{
+    PcuInvocationCandidate,
+    PcuInvocationScorer,
+};
 
 mod tensor;
+#[cfg(feature = "tensor")]
+#[doc(hidden)]
+#[rustfmt::skip]
+pub use tensor::{
+    __pcu_capture_tensor_program,
+    PcuCapturedTensorProgram,
+};
 pub use arguments::PcuTensor;
 #[doc(hidden)]
 #[rustfmt::skip]
@@ -74,6 +99,12 @@ pub enum PcuBackendChoice {
     /// Require Metal; disabled or incompatible devices never substitute another provider.
     #[cfg(feature = "metal")]
     Metal,
+    /// Require Vulkan compute; resident imports require a separate proved interop route.
+    #[cfg(feature = "vulkan")]
+    Vulkan,
+    /// Require the explicitly compiled CPU host provider; CPU is never silently compiled in.
+    #[cfg(feature = "cpu")]
+    Cpu,
 }
 
 /// Runtime preferences for later calls; an already executing call retains its selected state.
@@ -84,7 +115,8 @@ pub struct PcuExecutionPolicy {
     pub device: Option<u32>,
     /// Maximum cached specializations per host thread.
     pub cache_capacity: usize,
-    /// Backend launch block size, checked by device preparation.
+    /// ROCm/CUDA launch block size, checked by device preparation.
+    /// Fixed implementation profiles (currently Vulkan Copy/Neg) own their workgroup width.
     pub block_size: u32,
     /// Default for checked F32/F64 tensor arithmetic in unannotated owned source functions.
     /// Explicit function flags override this value without changing other helpers.
@@ -100,6 +132,10 @@ pub struct PcuExecutionPolicy {
     pub numerical_options: crate::PcuNumericalOptions,
     /// Cold candidate scoring after explicit device filtering; higher scores rank first.
     pub score_device: fn(&crate::PcuDeviceDescriptor<'_>, u64) -> i128,
+    /// Optional cold invocation ranking with actual IR and directly reported physical facts.
+    /// Overrides `score_device` for invocation preparation; tensor roots retain device scoring.
+    /// Cached warm calls and resident-affinity calls do not rank or query facts.
+    pub score_invocation: Option<PcuInvocationScorer>,
 }
 
 impl Default for PcuExecutionPolicy {
@@ -114,6 +150,7 @@ impl Default for PcuExecutionPolicy {
             numerical_mode: crate::PcuNumericalMode::Boundary,
             numerical_options: crate::PcuNumericalOptions::default(),
             score_device: default_device_score,
+            score_invocation: None,
         }
     }
 }
@@ -131,12 +168,23 @@ pub enum PcuExecutionError {
     ArithmeticFault(crate::PcuExecutionFault),
     NoBackendEnabled,
     /// Cold source admission failures retain each selected physical provider reference.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    ))]
     NoCompatibleInvocationDevice {
         rejected: alloc::vec::Vec<(crate::PcuObjectRef, Self)>,
         discovery: alloc::vec::Vec<alloc::string::String>,
     },
     BackendFailure(alloc::string::String),
+    #[cfg(feature = "vulkan")]
+    VulkanExecution(fusion_pcu_vulkan::PcuVulkanError),
+    #[cfg(feature = "cpu")]
+    CpuExecution(fusion_pcu_cpu::PcuCpuHostError),
+    #[cfg(feature = "cpu")]
+    CpuDiscovery(fusion_pcu_cpu::PcuCpuDiscoveryError),
     ReentrantCall,
     ThreadUnavailable,
     InvalidPolicy,
@@ -192,22 +240,28 @@ pub enum PcuExecutionError {
 }
 
 impl fmt::Display for PcuExecutionError {
+    #[allow(clippy::too_many_lines)] // Keep one exhaustive diagnostic arm per structured failure.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ArithmeticFault(fault) => write!(
-                f,
-                "PCU {}arithmetic fault {:?} at logical invocation {}",
-                if fault.recovered { "recovered " } else { "" },
-                fault.kind,
-                fault.invocation_id
-            ),
+            Self::ArithmeticFault(fault) => format_arithmetic_fault(f, *fault),
             Self::NoBackendEnabled => f.write_str("no executable backend is enabled"),
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))]
             Self::NoCompatibleInvocationDevice {
                 rejected,
                 discovery,
             } => format_invocation_rejections(f, rejected, discovery),
             Self::BackendFailure(error) => f.write_str(error),
+            #[cfg(feature = "cpu")]
+            Self::CpuExecution(error) => write!(f, "PCU CPU execution failed: {error:?}"),
+            #[cfg(feature = "cpu")]
+            Self::CpuDiscovery(error) => write!(f, "PCU CPU discovery failed: {error:?}"),
+            #[cfg(feature = "vulkan")]
+            Self::VulkanExecution(error) => write!(f, "PCU Vulkan execution failed: {error}"),
             Self::ReentrantCall => {
                 f.write_str("the thread's PCU execution environment is already in use")
             }
@@ -340,6 +394,10 @@ impl core::error::Error for PcuExecutionError {
             Self::TensorExecution(error) => return Some(error),
             _ => {}
         }
+        #[cfg(feature = "vulkan")]
+        if let Self::VulkanExecution(error) = self {
+            return Some(error);
+        }
         None
     }
 }
@@ -385,7 +443,12 @@ impl From<fusion_pcu_rocm::RocmTensorExecutionError> for PcuExecutionError {
 pub struct PcuHostCallSite {
     #[cfg(any(feature = "rocm", all(feature = "cuda", feature = "tensor")))]
     slot: AtomicUsize,
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    ))]
     provider_slot: AtomicUsize,
 }
 impl PcuHostCallSite {
@@ -394,7 +457,12 @@ impl PcuHostCallSite {
         Self {
             #[cfg(any(feature = "rocm", all(feature = "cuda", feature = "tensor")))]
             slot: AtomicUsize::new(usize::MAX),
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))]
             provider_slot: AtomicUsize::new(usize::MAX),
         }
     }
@@ -410,7 +478,12 @@ impl Default for PcuHostCallSite {
 pub struct PcuHostPreparation {
     #[cfg(feature = "rocm")]
     inner: Option<hosted::Preparation>,
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    ))]
     shared: Option<provider_hosted::Preparation>,
 }
 impl PcuHostPreparation {
@@ -419,7 +492,12 @@ impl PcuHostPreparation {
     pub const fn float_underflow_policy(&self) -> crate::PcuFloatUnderflowPolicy {
         #[cfg(feature = "rocm")]
         {
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))]
             if let Some(shared) = &self.shared {
                 return shared.float_underflow_policy();
             }
@@ -429,7 +507,15 @@ impl PcuHostPreparation {
                 crate::PcuFloatUnderflowPolicy::IeeeAfterRounding
             }
         }
-        #[cfg(all(not(feature = "rocm"), any(feature = "cuda", feature = "metal")))]
+        #[cfg(all(
+            not(feature = "rocm"),
+            any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            )
+        ))]
         {
             if let Some(shared) = &self.shared {
                 shared.float_underflow_policy()
@@ -437,7 +523,15 @@ impl PcuHostPreparation {
                 crate::PcuFloatUnderflowPolicy::IeeeAfterRounding
             }
         }
-        #[cfg(all(not(feature = "rocm"), not(any(feature = "cuda", feature = "metal"))))]
+        #[cfg(all(
+            not(feature = "rocm"),
+            not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))
+        ))]
         {
             crate::PcuFloatUnderflowPolicy::IeeeAfterRounding
         }
@@ -448,7 +542,12 @@ impl PcuHostPreparation {
     pub const fn range_policy(&self) -> crate::PcuRangePolicy {
         #[cfg(feature = "rocm")]
         {
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))]
             if let Some(shared) = &self.shared {
                 return shared.range_policy();
             }
@@ -458,7 +557,15 @@ impl PcuHostPreparation {
                 crate::PcuRangePolicy::Reject
             }
         }
-        #[cfg(all(not(feature = "rocm"), any(feature = "cuda", feature = "metal")))]
+        #[cfg(all(
+            not(feature = "rocm"),
+            any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            )
+        ))]
         {
             if let Some(shared) = &self.shared {
                 shared.range_policy()
@@ -466,7 +573,15 @@ impl PcuHostPreparation {
                 crate::PcuRangePolicy::Reject
             }
         }
-        #[cfg(all(not(feature = "rocm"), not(any(feature = "cuda", feature = "metal"))))]
+        #[cfg(all(
+            not(feature = "rocm"),
+            not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))
+        ))]
         {
             crate::PcuRangePolicy::Reject
         }
@@ -483,7 +598,12 @@ impl PcuHostPreparation {
     ) -> Result<(), PcuExecutionError> {
         #[cfg(feature = "rocm")]
         {
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))]
             if let Some(shared) = &mut self.shared {
                 return shared.prepare(kernel);
             }
@@ -492,14 +612,30 @@ impl PcuHostPreparation {
                 .ok_or(PcuExecutionError::NoBackendEnabled)?
                 .prepare(kernel)
         }
-        #[cfg(all(not(feature = "rocm"), any(feature = "cuda", feature = "metal")))]
+        #[cfg(all(
+            not(feature = "rocm"),
+            any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            )
+        ))]
         {
             self.shared
                 .as_mut()
                 .ok_or(PcuExecutionError::NoBackendEnabled)?
                 .prepare(kernel)
         }
-        #[cfg(all(not(feature = "rocm"), not(any(feature = "cuda", feature = "metal"))))]
+        #[cfg(all(
+            not(feature = "rocm"),
+            not(any(
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan",
+                feature = "cpu"
+            ))
+        ))]
         {
             let _ = kernel;
             Err(PcuExecutionError::NoBackendEnabled)
@@ -544,7 +680,12 @@ pub fn use_defaults() -> Result<(), PcuExecutionError> {
 /// Rejects clearing during a nested active call.
 #[allow(clippy::missing_const_for_fn)] // Hosted implementations perform runtime IO/state mutation.
 pub fn clear_thread_cache() -> Result<(), PcuExecutionError> {
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    ))]
     provider_hosted::clear_thread_cache()?;
     #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
@@ -601,15 +742,34 @@ pub fn call_arguments<const N: usize>(
     arguments: [PcuCallArgument<'_>; N],
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
 ) -> Result<(), PcuExecutionError> {
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    ))]
     {
         provider_hosted::call_arguments(site, specialization, arguments, prepare)
     }
-    #[cfg(all(feature = "rocm", not(any(feature = "cuda", feature = "metal"))))]
+    #[cfg(all(
+        feature = "rocm",
+        not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "vulkan",
+            feature = "cpu"
+        ))
+    ))]
     {
         hosted::call_arguments(site, specialization, arguments, prepare)
     }
-    #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
+    #[cfg(not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    )))]
     {
         let _ = (site, specialization, arguments, prepare);
         Err(PcuExecutionError::NoBackendEnabled)
@@ -627,7 +787,12 @@ pub fn call_host(
     arguments: &mut [crate::PcuHostArgument<'_>],
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
 ) -> Result<(), PcuExecutionError> {
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    ))]
     {
         let route = policy::route();
         #[cfg(feature = "rocm")]
@@ -639,11 +804,25 @@ pub fn call_host(
         }
         provider_hosted::call_host(site, specialization, arguments, prepare)
     }
-    #[cfg(all(feature = "rocm", not(any(feature = "cuda", feature = "metal"))))]
+    #[cfg(all(
+        feature = "rocm",
+        not(any(
+            feature = "cuda",
+            feature = "metal",
+            feature = "vulkan",
+            feature = "cpu"
+        ))
+    ))]
     {
         hosted::call_host(site, specialization, arguments, prepare)
     }
-    #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
+    #[cfg(not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu"
+    )))]
     {
         let _ = (site, specialization, arguments, prepare);
         Err(PcuExecutionError::NoBackendEnabled)
@@ -666,7 +845,12 @@ fn format_resident_rejections(
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 fn format_invocation_rejections(
     f: &mut fmt::Formatter<'_>,
     rejected: &[(crate::PcuObjectRef, PcuExecutionError)],
@@ -684,6 +868,19 @@ fn format_invocation_rejections(
         write!(f, "; {error}")?;
     }
     Ok(())
+}
+
+fn format_arithmetic_fault(
+    f: &mut fmt::Formatter<'_>,
+    fault: crate::PcuExecutionFault,
+) -> fmt::Result {
+    write!(
+        f,
+        "PCU {}arithmetic fault {:?} at logical invocation {}",
+        if fault.recovered { "recovered " } else { "" },
+        fault.kind,
+        fault.invocation_id
+    )
 }
 
 #[cfg(test)]

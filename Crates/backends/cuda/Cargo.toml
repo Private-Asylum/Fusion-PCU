@@ -87,3 +87,24 @@ required-features = ["allocation-census"]
 name = "native_sgd_source"
 path = "tests/native_sgd_source/native_sgd_source.rs"
 required-features = ["tensor"]
+
+[[test]]
+name = "native_matmul_source"
+path = "tests/native_matmul_source/native_matmul_source.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "strict_sgd_source"
+path = "tests/strict_sgd_source/strict_sgd_source.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "strict_sgd"
+path = "benches/strict_sgd/strict_sgd.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "strict_sgd"
+path = "examples/strict_sgd/strict_sgd.rs"
+required-features = ["tensor"]

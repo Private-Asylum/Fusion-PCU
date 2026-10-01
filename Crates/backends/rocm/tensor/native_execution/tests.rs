@@ -89,13 +89,18 @@ fn checked_strict_portable_tight_and_device_status_boundaries_do_not_batch() {
             &[second]
         ));
         graph.set_value_numerical_options(first, options).unwrap();
-        graph
-            .set_value_float_underflow_policy(first, PcuFloatUnderflowPolicy::RejectSubnormalResult)
-            .unwrap();
-        assert!(!batch_native_matmuls(
-            &graph.nodes().collect::<Vec<_>>(),
-            &[second]
-        ));
+        for policy in [
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        ] {
+            graph
+                .set_value_float_underflow_policy(first, policy)
+                .unwrap();
+            assert!(!batch_native_matmuls(
+                &graph.nodes().collect::<Vec<_>>(),
+                &[second]
+            ));
+        }
         graph
             .set_value_float_underflow_policy(first, PcuFloatUnderflowPolicy::IeeeAfterRounding)
             .unwrap();

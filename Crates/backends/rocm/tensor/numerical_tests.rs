@@ -119,7 +119,7 @@ fn forged_native_permission_cannot_relax_graph_contract() {
 }
 
 #[test]
-fn native_matmul_rejects_unproved_tight_underflow() {
+fn native_matmul_rejects_unproved_subnormal_contracts() {
     let (mut graph, result) = matmul_graph(
         PcuScalarType::F64,
         PcuNumericalMode::Boundary,
@@ -128,17 +128,20 @@ fn native_matmul_rejects_unproved_tight_underflow() {
             ..PcuNumericalOptions::default()
         },
     );
-    graph
-        .set_value_float_underflow_policy(result, PcuFloatUnderflowPolicy::RejectSubnormalResult)
-        .unwrap();
-    assert_eq!(
-        assess_tensor_node(&graph, graph.node(result).unwrap()),
-        TensorOperationSupport::Unsupported {
-            reason: TensorUnsupportedReason::UnderflowPolicy(
-                PcuFloatUnderflowPolicy::RejectSubnormalResult
-            ),
-        }
-    );
+    for policy in [
+        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+    ] {
+        graph
+            .set_value_float_underflow_policy(result, policy)
+            .unwrap();
+        assert_eq!(
+            assess_tensor_node(&graph, graph.node(result).unwrap()),
+            TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::UnderflowPolicy(policy),
+            }
+        );
+    }
 }
 
 #[test]
