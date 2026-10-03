@@ -44,7 +44,7 @@ fn explicit_metal_never_substitutes_cpu_and_portable_policy_rejects_cold() {
     let mut output = [91.0_f32; 5];
     assert!(matches!(
         negate(&[1.0, 2.0, 3.0], &mut output),
-        Err(PcuExecutionError::NoCompatibleInvocationDevice { .. })
+        Err(PcuExecutionError::NoCompatibleDevice { .. })
     ));
     assert_eq!(output.map(f32::to_bits), [91.0_f32; 5].map(f32::to_bits));
     configure(PcuExecutionPolicy {
@@ -66,6 +66,7 @@ fn explicit_metal_never_substitutes_cpu_and_portable_policy_rejects_cold() {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "Requires actual Metal facade source, mixed resident and policy execution."]
+#[allow(clippy::too_many_lines)] // Resident publication distinguishes preflight, discarded fault output and fresh-owner retry.
 fn native_global_source_mixed_resident_fault_publication_and_policy() {
     #[rustfmt::skip]
     use fusion_pcu::{
@@ -126,21 +127,44 @@ fn native_global_source_mixed_resident_fault_publication_and_policy() {
             91.0_f32.to_bits()
         ]
     );
+    // Preflight failure never submits output writes and preserves the previous logical value.
+    assert!(negate(&[1.0], &mut resident).is_err());
+    let before = resident_result.map(f32::to_bits);
+    resident.read_into(&mut resident_result).unwrap();
+    assert_eq!(resident_result.map(f32::to_bits), before);
     assert!(
         matches!(negate(&[1.0, f32::INFINITY, f32::NAN], &mut resident), Err(PcuExecutionError::ArithmeticFault(fault)) if fault.invocation_id == 1)
     );
+    assert!(matches!(
+        resident.read_into(&mut resident_result),
+        Err(PcuExecutionError::Argument(
+            fusion_pcu::PcuArgumentError::ResidentValueDiscarded
+        ))
+    ));
+    assert_eq!(resident_result.map(f32::to_bits), before);
+    assert!(matches!(
+        negate(&resident, &mut host_output),
+        Err(PcuExecutionError::Argument(
+            fusion_pcu::PcuArgumentError::ResidentValueDiscarded
+        ))
+    ));
+    assert!(matches!(
+        negate(&[1.0, 2.0, 3.0], &mut resident),
+        Err(PcuExecutionError::Argument(
+            fusion_pcu::PcuArgumentError::ResidentValueDiscarded
+        ))
+    ));
+    let backend = open_backend();
+    let buffer = backend
+        .upload_buffer(PcuMemoryPoolId(12), &[91.0_f32; 5])
+        .unwrap();
+    let mut resident = PcuTensor::from_device_buffer(backend, buffer, &[5]).unwrap();
+    negate(&[1.0, 2.0, 3.0], &mut resident).unwrap();
     resident.read_into(&mut resident_result).unwrap();
     assert_eq!(
         resident_result.map(f32::to_bits),
-        [
-            (-1.0_f32).to_bits(),
-            0,
-            0,
-            91.0_f32.to_bits(),
-            91.0_f32.to_bits()
-        ]
+        [-1.0_f32, -2.0, -3.0, 91.0, 91.0].map(f32::to_bits)
     );
-    negate(&[1.0, 2.0, 3.0], &mut resident).unwrap();
     // A different explicit device never substitutes the retained resident affinity.
     configure(PcuExecutionPolicy {
         backend: PcuBackendChoice::Metal,
@@ -163,6 +187,7 @@ fn native_global_source_mixed_resident_fault_publication_and_policy() {
     let forged = PcuDeviceBuffer::new(buffer.into_resource(), 4);
     assert!(PcuTensor::<f32>::from_device_buffer(backend, forged, &[4]).is_err());
     assert_native_cold_rejections();
+    assert_native_f64();
     configure(PcuExecutionPolicy::default()).unwrap();
 }
 
@@ -191,7 +216,7 @@ fn assert_native_cold_rejections() {
     .unwrap();
     assert!(matches!(
         negate(&[1.0, 2.0, 3.0], &mut output),
-        Err(PcuExecutionError::NoCompatibleInvocationDevice { .. })
+        Err(PcuExecutionError::NoCompatibleDevice { .. })
     ));
     assert_eq!(output.map(f32::to_bits), [91.0_f32; 5].map(f32::to_bits));
     configure(PcuExecutionPolicy {
@@ -199,12 +224,6 @@ fn assert_native_cold_rejections() {
         ..PcuExecutionPolicy::default()
     })
     .unwrap();
-    let mut wide = [91.0_f64; 5];
-    assert!(matches!(
-        negate_f64(&[1.0, 2.0, 3.0], &mut wide),
-        Err(PcuExecutionError::NoCompatibleInvocationDevice { .. })
-    ));
-    assert_eq!(wide.map(f64::to_bits), [91.0_f64; 5].map(f64::to_bits));
     let backend = open_backend();
     let buffer = backend
         .upload_buffer(fusion_pcu::PcuMemoryPoolId(12), &[1.0_f32; 3])
@@ -216,6 +235,29 @@ fn assert_native_cold_rejections() {
         .upload_buffer(fusion_pcu::PcuMemoryPoolId(12), &[1.0_f32; 3])
         .unwrap();
     assert!(fusion_pcu::PcuTensor::<f32>::from_device_buffer(backend, buffer, &[2]).is_err());
+}
+
+#[cfg(target_os = "macos")]
+fn assert_native_f64() {
+    let mut output = [91.0_f64; 5];
+    negate_f64(&[0.0, -0.0, f64::from_bits(1)], &mut output).unwrap();
+    let expected = [
+        0x8000_0000_0000_0000_u64,
+        0,
+        0x8000_0000_0000_0001,
+        91.0_f64.to_bits(),
+        91.0_f64.to_bits(),
+    ];
+    assert_eq!(output.map(f64::to_bits), expected);
+    assert!(
+        matches!(negate_f64(&[1.0, f64::INFINITY, f64::NAN], &mut output), Err(PcuExecutionError::ArithmeticFault(fault)) if fault.invocation_id == 1 && fault.kind == PcuExecutionFaultKind::InvalidFloatingOperand)
+    );
+    assert_eq!(output.map(f64::to_bits), expected);
+    negate_f64(&[1.0, -2.0, 3.0], &mut output).unwrap();
+    assert_eq!(
+        output.map(f64::to_bits),
+        [-1.0_f64, 2.0, -3.0, 91.0, 91.0].map(f64::to_bits)
+    );
 }
 
 #[cfg(target_os = "macos")]

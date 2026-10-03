@@ -63,6 +63,118 @@ use crate::{
 const PROVIDER: PcuProviderId = PcuProviderId(0x4355_4441);
 const TARGET_ID: u32 = 0;
 
+// Cold typed arithmetic offers are shared by discovery and executor descriptors.
+const fn scalar_alu_support() -> fusion_pcu::PcuDispatchScalarAluSupport {
+    fusion_pcu::PcuDispatchScalarAluSupport::empty()
+        .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
+        .with(
+            fusion_pcu::PcuScalarType::F16,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::BF16,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::F8E4M3FN,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::F8E5M2,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps())
+        .with(
+            fusion_pcu::PcuScalarType::I128,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::U128,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::I256,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::U256,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::I512,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::U512,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+}
+
+// Storage transport is independent of arithmetic offers: all 22 sealed byte carriers.
+const fn scalar_storage_caps() -> PcuValueTypeCaps {
+    PcuValueTypeCaps::FLOAT32
+        .union(PcuValueTypeCaps::FLOAT16)
+        .union(PcuValueTypeCaps::BFLOAT16)
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F8E4M3FN,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F8E5M2,
+        ))
+        .union(PcuValueTypeCaps::FLOAT64)
+        .union(PcuValueTypeCaps::INT8)
+        .union(PcuValueTypeCaps::UINT8)
+        .union(PcuValueTypeCaps::UINT16)
+        .union(PcuValueTypeCaps::UINT32)
+        .union(PcuValueTypeCaps::INT32)
+        .union(PcuValueTypeCaps::INT16)
+        .union(PcuValueTypeCaps::UINT64)
+        .union(PcuValueTypeCaps::INT64)
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::I128,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::U128,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::I256,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::U256,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::I512,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::U512,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F128,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F256,
+        ))
+        .union(PcuValueTypeCaps::SCALAR_VALUES)
+}
+
 const fn f32_alu_caps() -> PcuDispatchOpCaps {
     PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
         .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
@@ -526,19 +638,7 @@ impl CudaDiscovery {
                 PcuPrimitiveCaps::empty(),
             ),
         };
-        let types = PcuValueTypeCaps::FLOAT32
-            .union(PcuValueTypeCaps::FLOAT16)
-            .union(PcuValueTypeCaps::BFLOAT16)
-            .union(PcuValueTypeCaps::FLOAT64)
-            .union(PcuValueTypeCaps::INT8)
-            .union(PcuValueTypeCaps::UINT8)
-            .union(PcuValueTypeCaps::UINT16)
-            .union(PcuValueTypeCaps::UINT32)
-            .union(PcuValueTypeCaps::INT32)
-            .union(PcuValueTypeCaps::INT16)
-            .union(PcuValueTypeCaps::UINT64)
-            .union(PcuValueTypeCaps::INT64)
-            .union(PcuValueTypeCaps::SCALAR_VALUES);
+        let types = scalar_storage_caps();
         support.value_type_support = PcuFeatureSupport::new(types, PcuValueTypeCaps::empty());
         let instructions = PcuDispatchOpCaps::VALUE_CONSTANT
             .union(PcuDispatchOpCaps::VALUE_CAST)
@@ -559,17 +659,7 @@ impl CudaDiscovery {
             flags: PcuDispatchPolicyCaps::SERIAL.union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION),
             instructions: PcuFeatureSupport::new(instructions, PcuDispatchOpCaps::empty()),
             scalar_alu: PcuFeatureSupport::new(
-                fusion_pcu::PcuDispatchScalarAluSupport::empty()
-                    .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
-                    .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
+                scalar_alu_support(),
                 fusion_pcu::PcuDispatchScalarAluSupport::empty(),
             ),
             features: PcuFeatureSupport::new(features, PcuDispatchFeatureCaps::empty()),
@@ -634,19 +724,7 @@ const CUDA_EXECUTOR: PcuExecutorDescriptor = PcuExecutorDescriptor {
         primitives: PcuPrimitiveCaps::DISPATCH,
         dispatch_policy: PcuDispatchPolicyCaps::SERIAL
             .union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION),
-        value_types: PcuValueTypeCaps::FLOAT32
-            .union(PcuValueTypeCaps::FLOAT16)
-            .union(PcuValueTypeCaps::BFLOAT16)
-            .union(PcuValueTypeCaps::FLOAT64)
-            .union(PcuValueTypeCaps::INT8)
-            .union(PcuValueTypeCaps::UINT8)
-            .union(PcuValueTypeCaps::UINT16)
-            .union(PcuValueTypeCaps::UINT32)
-            .union(PcuValueTypeCaps::INT32)
-            .union(PcuValueTypeCaps::INT16)
-            .union(PcuValueTypeCaps::UINT64)
-            .union(PcuValueTypeCaps::INT64)
-            .union(PcuValueTypeCaps::SCALAR_VALUES),
+        value_types: scalar_storage_caps(),
         dispatch_instructions: PcuDispatchOpCaps::VALUE_CONSTANT
             .union(PcuDispatchOpCaps::VALUE_CAST)
             .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
@@ -659,17 +737,7 @@ const CUDA_EXECUTOR: PcuExecutorDescriptor = PcuExecutorDescriptor {
             .union(PcuDispatchOpCaps::BINDING_LOAD)
             .union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
             .union(PcuDispatchOpCaps::BINDING_STORE),
-        dispatch_scalar_alu: fusion_pcu::PcuDispatchScalarAluSupport::empty()
-            .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
+        dispatch_scalar_alu: scalar_alu_support(),
         dispatch_features: PcuDispatchFeatureCaps::MUTABLE_RESOURCES
             .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES)
             .union(PcuDispatchFeatureCaps::RANGE_CLAMP),
@@ -844,6 +912,7 @@ mod tests {
             },
         )];
         let kernel = fusion_pcu::PcuDispatchKernelIr {
+            numerical_requirements: fusion_pcu::PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: fusion_pcu::PcuKernelId(1),
             entry: fusion_pcu::PcuDispatchEntryPoint {
                 name: "f32-max-capability",
@@ -883,24 +952,43 @@ mod tests {
     }
 
     #[test]
-    fn discovery_advertises_half_types_for_transport_without_alu_claims() {
+    fn discovery_advertises_named_low_formats_for_transport_and_checked_binary_only() {
         let support = sample().support(true);
         let half_types = PcuValueTypeCaps::FLOAT16
             .union(PcuValueTypeCaps::BFLOAT16)
+            .union(PcuValueTypeCaps::for_scalar(
+                fusion_pcu::PcuScalarType::F8E4M3FN,
+            ))
+            .union(PcuValueTypeCaps::for_scalar(
+                fusion_pcu::PcuScalarType::F8E5M2,
+            ))
             .union(PcuValueTypeCaps::SCALAR_VALUES);
         assert!(support.value_type_support.direct.contains(half_types));
         assert!(CUDA_EXECUTOR.support.value_types.contains(half_types));
         for scalar in [
             fusion_pcu::PcuScalarType::F16,
             fusion_pcu::PcuScalarType::BF16,
+            fusion_pcu::PcuScalarType::F8E4M3FN,
+            fusion_pcu::PcuScalarType::F8E5M2,
         ] {
+            assert_eq!(
+                support
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar),
+                PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                    .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+            );
             assert_eq!(
                 CUDA_EXECUTOR
                     .support
                     .dispatch_scalar_alu
                     .for_scalar(scalar)
                     .bits(),
-                0
+                PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                    .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+                    .bits()
             );
         }
     }
@@ -1398,6 +1486,7 @@ mod tests {
     fn assessment_rejects_stale_device_before_lowering_or_compiling() {
         let discovery = sample();
         let kernel = fusion_pcu::PcuDispatchKernelIr {
+            numerical_requirements: fusion_pcu::PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: fusion_pcu::PcuKernelId(1),
             entry: fusion_pcu::PcuDispatchEntryPoint {
                 name: "empty",

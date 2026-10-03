@@ -28,16 +28,18 @@ work through SPIR-V/Vulkan, WebGPU, and other APIs is still ahead. If you've
 read this far, I hope this project interests you and thank you for checking it
 out!
 
-To be clear, this project is experimental. ROCm and CUDA execute hosted
-invocation kernels and owned tensor compositions, including checked arithmetic
-and opt-in strict F32/F64 MatMul and SGD. CPU, Metal and Vulkan execute narrower
-checked map profiles; SPIR-V supplies shader lowering for Vulkan. MLX is a
-separate Apple-silicon tensor runtime with a bounded, explicitly permitted F32
-MatMul path; it is not yet a global facade provider. The remaining backend
-crates are scaffolds. Default checked boundary MatMul, MSE, SGD, ReLU backward
-and owned tensor clamp remain unsupported until their numerical contracts are
-implemented. Explicit native permissions admit additional vendor operations. The
-example below targets the current checkout; published versions may lag.
+This project is experimental. ROCm and CUDA execute hosted invocation kernels
+and owned tensor compositions, including checked arithmetic, opt-in strict
+F32/F64 MatMul, MSE, SGD and bounded reverse-mode training. CPU and Vulkan also
+execute bounded strict training graphs; SPIR-V supplies Vulkan's shader
+lowering. Metal supports checked maps and owned pointwise compositions. MLX is
+an Apple-silicon runtime with checked scalar arithmetic, six-format owned binary
+compositions, resident values and an explicitly permitted native F32 MatMul
+path through the global facade. The remaining backend crates are scaffolds.
+Default checked boundary MatMul, MSE and SGD, and owned tensor clamp, remain
+unsupported until their numerical and ownership contracts are implemented.
+Explicit native permissions admit additional vendor operations. The example
+below targets the current checkout; published versions may lag.
 
 ## Use it today
 

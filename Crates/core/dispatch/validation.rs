@@ -244,6 +244,7 @@ mod tests {
             }),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "mismatch",

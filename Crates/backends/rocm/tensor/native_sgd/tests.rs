@@ -163,8 +163,9 @@ fn dense_extent_and_scalar_width_are_admitted_cold() {
         .unwrap();
     assert_eq!(
         assess(&f64_graph, f64_graph.node(output).unwrap()),
-        TensorOperationSupport::Unsupported {
-            reason: TensorUnsupportedReason::ElementType
+        TensorOperationSupport::Supported {
+            route: TensorExecutionRoute::Native,
+            workspace_bytes: Some(0)
         }
     );
     let (graph, output) = graph(&[17], PcuScalarType::F32, 0.5);
@@ -261,6 +262,15 @@ fn reject_before_kernel_preparation(assessor: &RocmTensorAssessor<'_>) {
         unreachable!()
     };
     let unsupported = rejected.relu_backward(weights, gradient).unwrap();
+    rejected
+        .set_value_numerical_options(
+            unsupported,
+            fusion_pcu::PcuNumericalOptions {
+                reproducibility: fusion_pcu::PcuReproducibility::PortableV1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert!(
         assessor
             .prepare_graph_outputs(&rejected, &[update, unsupported])
@@ -280,8 +290,22 @@ fn reject_before_kernel_preparation(assessor: &RocmTensorAssessor<'_>) {
             )
             .is_err()
     );
-    assert!(assessor.state().native_sgd.preserved.borrow().is_none());
-    assert!(assessor.state().native_sgd.contracted.borrow().is_none());
+    assert!(
+        assessor
+            .state()
+            .native_sgd
+            .preserved
+            .iter()
+            .all(|cache| cache.borrow().is_none())
+    );
+    assert!(
+        assessor
+            .state()
+            .native_sgd
+            .contracted
+            .iter()
+            .all(|cache| cache.borrow().is_none())
+    );
 }
 
 #[test]
@@ -360,5 +384,30 @@ fn native_sgd_rounding_rates_exception_permission_and_retry() {
             0
         };
         assert!(witness.iter().all(|value| value.to_bits() == expected));
+    }
+}
+
+#[test]
+fn native_f64_width_and_precision_are_separate_cold_kernel_identities() {
+    for precision in [
+        PcuPrecisionPolicy::Preserve,
+        PcuPrecisionPolicy::BackendOptimized,
+    ] {
+        let mut graph = Graph::default();
+        graph.set_numerical_options(options(precision));
+        let weights = graph.input([17], PcuScalarType::F64).unwrap();
+        let gradient = graph.input([17], PcuScalarType::F64).unwrap();
+        let output = graph.sgd_update(weights, gradient, -0.0_f32).unwrap();
+        let source = super::lower_native_sgd_to_hip_source(&graph, output).unwrap();
+        assert!(source.contains("const double *weights"));
+        assert!(source.contains("double learning_rate"));
+        assert_eq!(
+            source.contains("__builtin_fma"),
+            precision == PcuPrecisionPolicy::BackendOptimized
+        );
+        graph
+            .set_value_numerical_mode(output, PcuNumericalMode::Strict)
+            .unwrap();
+        assert!(super::lower_native_sgd_to_hip_source(&graph, output).is_err());
     }
 }

@@ -39,7 +39,16 @@ set_property(TARGET mlxc PROPERTY SOURCES "${upstream_sources}")
 target_sources(mlxc PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/cpp/reporting/reporting.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/cpp/manifest/manifest.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/cpp/replay/replay.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/replay/replay.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/checked_unary/checked_unary.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/encoded_prefix/encoded_prefix.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/f32_view/f32_view.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/carrier/carrier.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/transport/transport.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/composed/composed.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/checked_binary/checked_binary.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/checked_integer/checked_integer.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/cpp/checked_div_rem/checked_div_rem.cpp")
 target_include_directories(mlxc PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/c/include"
     "${CMAKE_CURRENT_LIST_DIR}/cpp")

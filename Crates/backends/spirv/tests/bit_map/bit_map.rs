@@ -117,6 +117,14 @@ fn with_typed_kernel<R>(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     run(&PcuDispatchKernelIr {
+        numerical_requirements: fusion_pcu_core::PcuImplementationRequirements {
+            range_policy: range,
+            float_underflow: match operation {
+                PcuSpirvBitOperation::Copy => PcuFloatUnderflowPolicy::default(),
+                PcuSpirvBitOperation::CheckedNeg(policy) => policy,
+            },
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: PcuKernelId(1),
         entry: PcuDispatchEntryPoint {
             name: "bits",

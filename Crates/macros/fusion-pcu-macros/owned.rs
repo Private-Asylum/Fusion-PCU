@@ -34,7 +34,7 @@ pub fn declares_owned_tensor_return(output: &ReturnType) -> bool {
     let ReturnType::Type(_, ty) = output else {
         return false;
     };
-    let Type::Path(result) = ty.as_ref() else {
+    let Type::Path(result) = super::transparent_type(ty) else {
         return false;
     };
     let Some(segment) = result.path.segments.last() else {
@@ -46,8 +46,9 @@ pub fn declares_owned_tensor_return(output: &ReturnType) -> bool {
     let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
         return false;
     };
-    matches!(arguments.args.first(), Some(syn::GenericArgument::Type(Type::Path(owner)))
-        if owner.path.segments.last().is_some_and(|segment| segment.ident == "PcuTensor"))
+    matches!(arguments.args.first(), Some(syn::GenericArgument::Type(ty))
+        if matches!(super::transparent_type(ty), Type::Path(owner)
+            if owner.path.segments.last().is_some_and(|segment| segment.ident == "PcuTensor")))
 }
 
 /// Expand a homogeneous scalar composition over slices, fixed arrays, or fixed matrices.
@@ -89,10 +90,14 @@ pub fn expand_owned_return_with_policies(
             .generics
             .type_params()
             .any(|parameter| parameter.ident == scalar);
-        if scalar != "f32" && scalar != "f64" && !generic_scalar {
+        let checked_float = matches!(
+            scalar.to_string().as_str(),
+            "f32" | "f64" | "PcuF16Bits" | "PcuBf16Bits" | "PcuF8E4M3FnBits" | "PcuF8E5M2Bits"
+        );
+        if !checked_float && !generic_scalar {
             return Err(Error::new_spanned(
                 &function.sig.output,
-                "float underflow flags require an f32/f64 owned tensor helper; generic scalar helpers are checked at capture time",
+                "float underflow flags require a checked float owned tensor helper; generic scalar helpers are checked at capture time",
             ));
         }
     }
@@ -680,7 +685,7 @@ fn validate_owned_signature(function: &ItemFn) -> Result<Vec<syn::ConstParam>, E
         })
         .collect::<Vec<_>>();
     for parameter in &const_params {
-        if !matches!(&parameter.ty, Type::Path(path) if path.path.is_ident("usize"))
+        if !matches!(super::transparent_type(&parameter.ty), Type::Path(path) if path.path.is_ident("usize"))
             || parameter.default.is_some()
         {
             return Err(Error::new_spanned(
@@ -696,13 +701,8 @@ fn validate_owned_signature(function: &ItemFn) -> Result<Vec<syn::ConstParam>, E
         [parameter] => {
             scalar.as_ref() == Some(&parameter.ident)
                 && parameter.default.is_none()
-                && (parameter.bounds.iter().all(|bound| matches!(bound,
-                    syn::TypeParamBound::Trait(bound)
-                        if bound.path.segments.last().is_some_and(|segment| segment.ident == "PcuScalar")))
-                    || parameter.bounds.is_empty())
-                && (parameter.bounds.iter().any(|bound| matches!(bound,
-                    syn::TypeParamBound::Trait(bound)
-                        if bound.path.segments.last().is_some_and(|segment| segment.ident == "PcuScalar")))
+                && (parameter.bounds.iter().all(scalar_bound) || parameter.bounds.is_empty())
+                && (parameter.bounds.iter().any(scalar_bound)
                     || where_clause_has_scalar_bound(&function.sig.generics, &parameter.ident))
         }
         _ => false,
@@ -716,6 +716,18 @@ fn validate_owned_signature(function: &ItemFn) -> Result<Vec<syn::ConstParam>, E
     Ok(const_params)
 }
 
+// These declared arithmetic traits inherit PcuScalar. Accepting that ordinary
+// Rust bound does not imply an operation or provider supports every member type.
+fn scalar_bound(bound: &syn::TypeParamBound) -> bool {
+    matches!(bound, syn::TypeParamBound::Trait(bound)
+    if bound.path.segments.last().is_some_and(|segment| matches!(
+        segment.ident.to_string().as_str(),
+        "PcuScalar" | "PcuCheckedFloat" | "PcuClampedFloat"
+            | "PcuCheckedInteger" | "PcuCheckedIntegerDivision"
+            | "PcuClampedInteger" | "PcuWrappingInteger"
+    )))
+}
+
 fn valid_scalar_where_clause(generics: &syn::Generics) -> bool {
     let Some(clause) = &generics.where_clause else {
         return true;
@@ -727,10 +739,8 @@ fn valid_scalar_where_clause(generics: &syn::Generics) -> bool {
         let syn::WherePredicate::Type(predicate) = predicate else {
             return false;
         };
-        matches!(&predicate.bounded_ty, Type::Path(path) if path.path.is_ident(&parameter.ident))
-            && predicate.bounds.iter().all(|bound| matches!(bound,
-                syn::TypeParamBound::Trait(bound)
-                    if bound.path.segments.last().is_some_and(|segment| segment.ident == "PcuScalar")))
+        matches!(super::transparent_type(&predicate.bounded_ty), Type::Path(path) if path.path.is_ident(&parameter.ident))
+            && predicate.bounds.iter().all(scalar_bound)
     })
 }
 
@@ -739,10 +749,8 @@ fn where_clause_has_scalar_bound(generics: &syn::Generics, ident: &syn::Ident) -
         clause.predicates.iter().any(|predicate| {
             matches!(predicate,
                 syn::WherePredicate::Type(predicate)
-                    if matches!(&predicate.bounded_ty, Type::Path(path) if path.path.is_ident(ident))
-                        && predicate.bounds.iter().any(|bound| matches!(bound,
-                            syn::TypeParamBound::Trait(bound)
-                                if bound.path.segments.last().is_some_and(|segment| segment.ident == "PcuScalar"))))
+                    if matches!(super::transparent_type(&predicate.bounded_ty), Type::Path(path) if path.path.is_ident(ident))
+                        && predicate.bounds.iter().any(scalar_bound))
         })
     })
 }
@@ -812,7 +820,7 @@ fn validate_owned_parameters(
 }
 
 fn is_consumed_resident_type(ty: &Type, scalar: &syn::Ident) -> bool {
-    let Type::Path(path) = ty else {
+    let Type::Path(path) = super::transparent_type(ty) else {
         return false;
     };
     if path.qself.is_some() || path.path.leading_colon.is_some() {
@@ -832,7 +840,7 @@ fn is_consumed_resident_type(ty: &Type, scalar: &syn::Ident) -> bool {
 }
 
 fn is_borrowed_resident_type(ty: &Type, scalar: &syn::Ident) -> bool {
-    let Type::Reference(reference) = ty else {
+    let Type::Reference(reference) = super::transparent_type(ty) else {
         return false;
     };
     reference.mutability.is_none()
@@ -878,19 +886,19 @@ fn parse_source_shape(
     const_names: &[syn::Ident],
     scalar: &syn::Ident,
 ) -> Option<SourceShape> {
-    let Type::Reference(reference) = ty else {
+    let Type::Reference(reference) = super::transparent_type(ty) else {
         return None;
     };
     if reference.mutability.is_some() || reference.lifetime.is_some() {
         return None;
     }
-    match reference.elem.as_ref() {
+    match super::transparent_type(&reference.elem) {
         Type::Slice(slice) if is_scalar_type(&slice.elem, scalar) => Some(SourceShape::Slice),
         Type::Array(array) if is_scalar_type(&array.elem, scalar) => Some(SourceShape::FixedArray(
             valid_const_expr(&array.len, const_names)?,
         )),
         Type::Array(outer) => {
-            let Type::Array(inner) = outer.elem.as_ref() else {
+            let Type::Array(inner) = super::transparent_type(&outer.elem) else {
                 return None;
             };
             if !is_scalar_type(&inner.elem, scalar) {
@@ -906,7 +914,7 @@ fn parse_source_shape(
 }
 
 fn is_scalar_type(ty: &Type, scalar: &syn::Ident) -> bool {
-    matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident(scalar))
+    matches!(super::transparent_type(ty), Type::Path(path) if path.qself.is_none() && path.path.is_ident(scalar))
 }
 
 fn valid_const_expr(expression: &Expr, const_names: &[syn::Ident]) -> Option<Expr> {
@@ -947,6 +955,8 @@ enum Operation {
     Div,
     Matmul,
     MeanSquaredError,
+    Gradient,
+    ReluBackward,
     SgdUpdate(Expr),
     Helper(Path),
 }
@@ -1376,7 +1386,9 @@ impl LoweringState<'_> {
             | Operation::Mul
             | Operation::Div
             | Operation::Matmul
-            | Operation::MeanSquaredError => Some(2),
+            | Operation::MeanSquaredError
+            | Operation::Gradient
+            | Operation::ReluBackward => Some(2),
             Operation::SgdUpdate(_) => Some(3),
             Operation::Helper(_) => None,
         };
@@ -1392,6 +1404,7 @@ impl LoweringState<'_> {
         Ok(self.emit(operation, &values))
     }
 
+    #[allow(clippy::cognitive_complexity)] // Preserve the exhaustive operation/ownership lowering table in one cold pass.
     fn emit(&mut self, operation: Operation, sources: &[Value]) -> Value {
         let reserved = self.generated.iter().collect::<Vec<_>>();
         let temporary = fresh_ident("__pcu_graph_value", &self.inputs[0], &reserved);
@@ -1404,12 +1417,14 @@ impl LoweringState<'_> {
         let call = match operation {
             Operation::Identity => quote! { #capture.identity(#(#values),*)? },
             Operation::Relu => quote! { #capture.relu(#(#values),*)? },
+            Operation::ReluBackward => quote! { #capture.relu_backward(#(#values),*)? },
             Operation::Add => quote! { #capture.add(#(#values),*)? },
             Operation::Sub => quote! { #capture.sub(#(#values),*)? },
             Operation::Mul => quote! { #capture.mul(#(#values),*)? },
             Operation::Div => quote! { #capture.div(#(#values),*)? },
             Operation::Matmul => quote! { #capture.matmul(#(#values),*)? },
             Operation::MeanSquaredError => quote! { #capture.mean_squared_error(#(#values),*)? },
+            Operation::Gradient => quote! { #capture.gradient(#(#values),*)? },
             Operation::SgdUpdate(learning_rate) => {
                 quote! { #capture.sgd_update(#(#values),*, #learning_rate)? }
             }
@@ -1449,6 +1464,7 @@ fn operation_for_path(
         }
         return match path.segments[1].ident.to_string().as_str() {
             "relu" => Ok(Operation::Relu),
+            "relu_backward" => Ok(Operation::ReluBackward),
             "identity" => Ok(Operation::Identity),
             "add" => Ok(Operation::Add),
             "sub" => Ok(Operation::Sub),
@@ -1456,6 +1472,7 @@ fn operation_for_path(
             "div" => Ok(Operation::Div),
             "matmul" => Ok(Operation::Matmul),
             "mean_squared_error" => Ok(Operation::MeanSquaredError),
+            "gradient" => Ok(Operation::Gradient),
             _ => Err(composition_body_error(span)),
         };
     }
@@ -1502,10 +1519,11 @@ fn valid_helper_arguments(
                 }
                 // Rust parses a bare identifier in turbofish position as a type argument,
                 // even when it resolves to a const parameter in the generated companion.
-                syn::GenericArgument::Type(Type::Path(path)) => path
-                    .path
-                    .get_ident()
-                    .is_some_and(|ident| const_args.contains(ident) || type_args.contains(ident)),
+                syn::GenericArgument::Type(ty) => {
+                    matches!(super::transparent_type(ty), Type::Path(path)
+                        if path.qself.is_none() && path.path.get_ident()
+                            .is_some_and(|ident| const_args.contains(ident) || type_args.contains(ident)))
+                }
                 _ => false,
             }
         }),
@@ -1648,7 +1666,7 @@ fn value_tokens(
 fn composition_body_error(span: &impl quote::ToTokens) -> Error {
     Error::new_spanned(
         span,
-        "owned tensor body accepts immutable let bindings of pcu::relu|identity|add|sub|mul|div|matmul|mean_squared_error|sgd_update, binary `+`|`-`|`*`|`/`, or another #[pcu] helper, and a final value/Ok(value)",
+        "owned tensor body accepts immutable let bindings of pcu::relu|identity|add|sub|mul|div|matmul|mean_squared_error|gradient|sgd_update, binary `+`|`-`|`*`|`/`, or another #[pcu] helper, and a final value/Ok(value)",
     )
 }
 
@@ -1664,7 +1682,7 @@ fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
     let ReturnType::Type(_, ty) = output else {
         return None;
     };
-    let Type::Path(result) = ty.as_ref() else {
+    let Type::Path(result) = super::transparent_type(ty) else {
         return None;
     };
     let result_segment = result.path.segments.last()?;
@@ -1677,7 +1695,10 @@ fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
     if result_args.args.len() != 2 {
         return None;
     }
-    let Some(syn::GenericArgument::Type(Type::Path(tensor))) = result_args.args.first() else {
+    let Some(syn::GenericArgument::Type(tensor_ty)) = result_args.args.first() else {
+        return None;
+    };
+    let Type::Path(tensor) = super::transparent_type(tensor_ty) else {
         return None;
     };
     let tensor_segment = tensor.path.segments.last()?;
@@ -1690,12 +1711,17 @@ fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
     if tensor_args.args.len() != 1 {
         return None;
     }
-    let Some(syn::GenericArgument::Type(Type::Path(scalar))) = tensor_args.args.first() else {
+    let Some(syn::GenericArgument::Type(scalar_ty)) = tensor_args.args.first() else {
+        return None;
+    };
+    let Type::Path(scalar) = super::transparent_type(scalar_ty) else {
         return None;
     };
     if scalar.qself.is_some()
         || scalar.path.segments.len() != 1
-        || !matches!(result_args.args.last(), Some(syn::GenericArgument::Type(Type::Path(error))) if error.path.segments.last().is_some_and(|segment| segment.ident == "PcuExecutionError"))
+        || !matches!(result_args.args.last(), Some(syn::GenericArgument::Type(ty))
+            if matches!(super::transparent_type(ty), Type::Path(error)
+                if error.path.segments.last().is_some_and(|segment| segment.ident == "PcuExecutionError")))
     {
         return None;
     }
@@ -1706,10 +1732,87 @@ fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn low_float_owned_helpers_keep_explicit_underflow_policy() {
+        for scalar in [
+            "PcuF16Bits",
+            "PcuBf16Bits",
+            "PcuF8E4M3FnBits",
+            "PcuF8E5M2Bits",
+        ] {
+            let scalar = syn::Ident::new(scalar, proc_macro2::Span::call_site());
+            let source: ItemFn = syn::parse_quote! {
+                fn transform(input: &[#scalar]) -> Result<PcuTensor<#scalar>, PcuExecutionError> {
+                    pcu::relu(input)
+                }
+            };
+            for flag in [
+                super::super::PcuOwnedFlag::IeeeUnderflow,
+                super::super::PcuOwnedFlag::AllowGradualUnderflow,
+                super::super::PcuOwnedFlag::RejectSubnormalResult,
+            ] {
+                let tokens = expand_owned_return_with_flag(
+                    &source,
+                    &syn::parse_quote!(::pcu_alias),
+                    Some(flag),
+                )
+                .unwrap();
+                assert!(
+                    tokens
+                        .to_string()
+                        .contains("require_float_underflow_policy")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_owned_types_preserve_shape_and_owner_contracts() {
+        let source: ItemFn = syn::parse_quote! {
+            fn transform<const R: usize, const C: usize>(
+                input: &([[((f32)); C]; R]),
+                retained: &(PcuTensor<(f32)>),
+                consumed: (PcuTensor<(f32)>),
+            ) -> (Result<(PcuTensor<(f32)>), (PcuExecutionError)>) {
+                let intermediate = pcu::add(input, retained)?;
+                pcu::add(&intermediate, consumed)
+            }
+        };
+        assert!(declares_owned_tensor_return(&source.sig.output));
+        assert!(expand(&source).contains("add"));
+
+        // Transparent grouping must not turn an associated type into a scalar.
+        let invalid: ReturnType = syn::parse_quote!(
+            -> Result<PcuTensor<(<T as Trait>::Scalar)>, PcuExecutionError>
+        );
+        assert!(owned_return_scalar(&invalid).is_none());
+    }
+
     fn expand(source: &ItemFn) -> String {
         expand_owned_return(source, &syn::parse_quote!(::pcu_alias))
             .expect("owned tensor composition should expand")
             .to_string()
+    }
+
+    #[test]
+    fn owned_gradient_captures_actual_loss_and_target_and_checks_arity() {
+        let source: ItemFn = syn::parse_quote! {
+            fn derivative(prediction: &[f64], target: &[f64])
+                -> Result<PcuTensor<f64>, PcuExecutionError>
+            {
+                let loss = pcu::mean_squared_error(prediction, target);
+                pcu::gradient(&loss, prediction)
+            }
+        };
+        let expanded = expand(&source);
+        assert!(expanded.contains("mean_squared_error"));
+        assert!(expanded.contains(". gradient ("));
+        for arguments in ["prediction", "prediction, target, prediction"] {
+            let invalid: ItemFn = syn::parse_str(&format!(
+                "fn derivative(prediction: &[f64], target: &[f64]) -> Result<PcuTensor<f64>, PcuExecutionError> {{ pcu::gradient({arguments}) }}"
+            )).unwrap();
+            assert!(expand_owned_return(&invalid, &syn::parse_quote!(::pcu_alias)).is_err());
+        }
     }
 
     #[test]
@@ -2474,6 +2577,45 @@ mod tests {
             ) -> Result<PcuTensor<f32>, PcuExecutionError> { Ok(a0) }
         };
         assert!(expand_owned_return(&source, &syn::parse_quote!(::pcu_alias)).is_err());
+    }
+
+    #[test]
+    fn owned_scalar_bounds_accept_declared_inherited_contracts() {
+        for bound in [
+            "PcuScalar",
+            "PcuCheckedFloat",
+            "PcuClampedFloat",
+            "PcuCheckedInteger",
+            "PcuCheckedIntegerDivision",
+            "PcuClampedInteger",
+            "PcuWrappingInteger",
+            "PcuScalar + PcuCheckedFloat",
+        ] {
+            for signature in [
+                format!(
+                    "fn kernel<T: {bound}>(input: &[T]) -> Result<PcuTensor<T>, PcuExecutionError>"
+                ),
+                format!(
+                    "fn kernel<T>(input: &[T]) -> Result<PcuTensor<T>, PcuExecutionError> where T: fusion_pcu::{bound}"
+                ),
+            ] {
+                let source: ItemFn =
+                    syn::parse_str(&format!("{signature} {{ pcu::identity(input) }}")).unwrap();
+                expand_owned_return(&source, &syn::parse_quote!(::pcu_alias)).unwrap_or_else(
+                    |error| panic!("valid inherited scalar bound {bound}: {error}"),
+                );
+            }
+        }
+        for bound in [
+            "Copy",
+            "PcuCheckedFloatConversion",
+            "PcuScalar + SomeUnrelatedTrait",
+        ] {
+            let source: ItemFn = syn::parse_str(&format!(
+                "fn kernel<T: {bound}>(input: &[T]) -> Result<PcuTensor<T>, PcuExecutionError> {{ pcu::identity(input) }}"
+            )).unwrap();
+            assert!(expand_owned_return(&source, &syn::parse_quote!(::pcu_alias)).is_err());
+        }
     }
 
     #[test]

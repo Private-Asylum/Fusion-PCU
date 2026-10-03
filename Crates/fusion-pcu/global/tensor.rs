@@ -24,6 +24,8 @@ use alloc::rc::Rc;
 #[cfg(feature = "tensor")]
 #[path = "tensor/capture/capture.rs"]
 mod capture;
+#[path = "tensor/gradient/gradient.rs"]
+mod gradient;
 #[cfg(feature = "tensor")]
 #[doc(hidden)]
 #[rustfmt::skip]
@@ -104,6 +106,8 @@ pub struct PcuTensorGraphCapture {
     capture_id: usize,
     #[cfg(feature = "tensor")]
     active_markers: Rc<RefCell<Vec<TypeId>>>,
+    #[cfg(feature = "tensor")]
+    gradient_sets: Vec<(ValueId, Vec<Option<ValueId>>)>,
     base_float_underflow_policy: crate::PcuFloatUnderflowPolicy,
     float_underflow_policy: Rc<Cell<crate::PcuFloatUnderflowPolicy>>,
     numerical_mode: Rc<Cell<crate::PcuNumericalMode>>,
@@ -245,7 +249,7 @@ impl PcuTensorGraphCapture {
                 current.checked_add(1)
             })
             .map_err(|_| PcuExecutionError::InvalidTensorSourcePlan)?;
-        let mut graph = Graph::default();
+        let mut graph = Graph::try_new().map_err(super::tensor_build_error)?;
         let mut values = Vec::with_capacity(N);
         for shape in shapes {
             let value = match shape {
@@ -273,6 +277,7 @@ impl PcuTensorGraphCapture {
                 graph,
                 capture_id,
                 active_markers: Rc::new(RefCell::new(Vec::new())),
+                gradient_sets: Vec::new(),
                 base_float_underflow_policy,
                 float_underflow_policy: Rc::new(Cell::new(base_float_underflow_policy)),
                 numerical_mode: Rc::new(Cell::new(crate::PcuNumericalMode::Boundary)),
@@ -376,6 +381,11 @@ impl PcuTensorGraphCapture {
     }
 
     /// Captures an identity edge without adding a graph operation.
+    ///
+    /// This retains the original logical value and its producer's numerical contract.
+    /// A helper's strictness or reproducibility scope applies to arithmetic it captures;
+    /// an identity edge cannot retroactively make an already computed value strict or
+    /// portable. Bit-preserving storage transport remains a provider responsibility.
     #[doc(hidden)]
     pub fn identity<T: PcuScalar>(
         &mut self,
@@ -407,6 +417,9 @@ impl PcuTensorGraphCapture {
                 .relu_typed(value.value)
                 .map_err(super::tensor_build_error)?;
             self.graph
+                .set_value_float_underflow_policy(value.erase(), self.float_underflow_policy.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
                 .set_value_numerical_options(value.erase(), self.numerical_options.get())
                 .map_err(super::tensor_build_error)?;
             Ok(PcuTensorGraphValue {
@@ -422,7 +435,48 @@ impl PcuTensorGraphCapture {
         }
     }
 
-    /// Rejects an explicitly requested floating underflow policy for non-float captures.
+    /// Captures checked derivative selection; both operands remain semantic consumers.
+    #[doc(hidden)]
+    pub fn relu_backward<T: PcuScalar>(
+        &mut self,
+        input: PcuTensorGraphValue<T>,
+        upstream: PcuTensorGraphValue<T>,
+    ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError> {
+        #[cfg(feature = "tensor")]
+        {
+            self.validate_value(input)?;
+            self.validate_value(upstream)?;
+            let value = self
+                .graph
+                .relu_backward(input.value.erase(), upstream.value.erase())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_mode(value, self.numerical_mode.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_float_underflow_policy(value, self.float_underflow_policy.get())
+                .map_err(super::tensor_build_error)?;
+            self.graph
+                .set_value_numerical_options(value, self.numerical_options.get())
+                .map_err(super::tensor_build_error)?;
+            Ok(PcuTensorGraphValue {
+                value: self
+                    .graph
+                    .typed_view(value)
+                    .map_err(super::tensor_build_error)?,
+                capture_id: self.capture_id,
+                marker: PhantomData,
+            })
+        }
+        #[cfg(not(feature = "tensor"))]
+        {
+            let _ = (input, upstream);
+            Err(PcuExecutionError::TensorExecutionUnavailable)
+        }
+    }
+
+    /// Requires a checked float representation for an explicitly requested underflow policy.
+    /// Wide floating bit carriers do not acquire arithmetic semantics through this gate.
     #[doc(hidden)]
     pub fn require_float_underflow_policy<T: PcuScalar>(
         &self,
@@ -433,7 +487,12 @@ impl PcuTensorGraphCapture {
             self.validate_value(value)?;
             if !matches!(
                 T::TYPE,
-                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
+                crate::PcuScalarType::F16
+                    | crate::PcuScalarType::BF16
+                    | crate::PcuScalarType::F8E4M3FN
+                    | crate::PcuScalarType::F8E5M2
+                    | crate::PcuScalarType::F32
+                    | crate::PcuScalarType::F64
             ) {
                 return Err(super::tensor_build_error(
                     crate::dialect::tensor::TensorError::UnsupportedScalarType {
@@ -463,10 +522,7 @@ impl PcuTensorGraphCapture {
             self.validate_value(lhs)?;
             self.validate_value(rhs)?;
             let policy = self.float_underflow_policy.get();
-            let value = if matches!(
-                T::TYPE,
-                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
-            ) {
+            let value = if checked_float_scalar(T::TYPE) {
                 self.graph
                     .add_typed_with_underflow_policy(lhs.value, rhs.value, policy)
             } else {
@@ -501,10 +557,7 @@ impl PcuTensorGraphCapture {
             self.validate_value(lhs)?;
             self.validate_value(rhs)?;
             let policy = self.float_underflow_policy.get();
-            let value = if matches!(
-                T::TYPE,
-                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
-            ) {
+            let value = if checked_float_scalar(T::TYPE) {
                 self.graph
                     .sub_typed_with_underflow_policy(lhs.value, rhs.value, policy)
             } else {
@@ -539,10 +592,7 @@ impl PcuTensorGraphCapture {
             self.validate_value(lhs)?;
             self.validate_value(rhs)?;
             let policy = self.float_underflow_policy.get();
-            let value = if matches!(
-                T::TYPE,
-                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
-            ) {
+            let value = if checked_float_scalar(T::TYPE) {
                 self.graph
                     .mul_typed_with_underflow_policy(lhs.value, rhs.value, policy)
             } else {
@@ -580,10 +630,7 @@ impl PcuTensorGraphCapture {
         {
             self.validate_value(lhs)?;
             self.validate_value(rhs)?;
-            if !matches!(
-                T::TYPE,
-                crate::PcuScalarType::F32 | crate::PcuScalarType::F64
-            ) {
+            if !checked_float_scalar(T::TYPE) {
                 return Err(super::tensor_build_error(
                     crate::dialect::tensor::TensorError::UnsupportedScalarType {
                         value: lhs.value.erase(),
@@ -654,7 +701,7 @@ impl PcuTensorGraphCapture {
 
     /// Captures one compound mean-squared-error primitive with caller/helper numerical policy.
     ///
-    /// The current primitive supports F32 and returns a rank-zero value. Default checked and
+    /// The current primitive supports F32/F64 and returns a rank-zero value. Default checked and
     /// strict admission remain separate from an explicitly permitted native implementation.
     ///
     /// # Errors
@@ -890,14 +937,28 @@ impl<'a, T: PcuScalar> PcuTensorInput<'a, T> {
             shape: PcuTensorShapeWitness::Static(shape),
         }
     }
-    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     const fn resident(owner: &'a PcuTensor<T>, shape: PcuSourceShape) -> Self {
         Self {
             kind: TensorInputKind::Resident(owner),
             shape: PcuTensorShapeWitness::Static(shape),
         }
     }
-    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     fn resident_dynamic(owner: &'a PcuTensor<T>) -> Self {
         Self {
             kind: TensorInputKind::Resident(owner),
@@ -1022,52 +1083,129 @@ impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatri
     }
 }
 
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> sealed::TensorSource<T, SliceShape> for PcuTensor<T> {}
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> PcuTensorSource<T, SliceShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
-        let length = self.device_tensor().len();
+        let length = self.len();
         let shape = PcuSourceShape::Slice { length };
         Ok(PcuTensorInput::resident(self, shape))
     }
 }
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar> sealed::TensorSource<T, SliceShape> for PcuTensor<T> {}
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar> PcuTensorSource<T, SliceShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Err(PcuArgumentError::ProviderUnavailable)
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const N: usize> sealed::TensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {}
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const N: usize> PcuTensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         let shape = PcuSourceShape::FixedArray { length: N };
         Ok(PcuTensorInput::resident(self, shape))
     }
 }
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar, const N: usize> sealed::TensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {}
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar, const N: usize> PcuTensorSource<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Err(PcuArgumentError::ProviderUnavailable)
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const R: usize, const C: usize> sealed::TensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
 }
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar, const R: usize, const C: usize> sealed::TensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
 }
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -1076,23 +1214,58 @@ impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatri
     }
 }
 
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> sealed::TensorSource<T, DynamicResidentShape> for PcuTensor<T> {}
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> PcuTensorSource<T, DynamicResidentShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Ok(PcuTensorInput::resident_dynamic(self))
     }
 }
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar> sealed::TensorSource<T, DynamicResidentShape> for PcuTensor<T> {}
-#[cfg(not(any(feature = "rocm", feature = "cuda")))]
+#[cfg(not(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+)))]
 impl<T: PcuScalar> PcuTensorSource<T, DynamicResidentShape> for PcuTensor<T> {
     fn as_tensor_source(&self) -> Result<PcuTensorInput<'_, T>, PcuArgumentError> {
         Err(PcuArgumentError::ProviderUnavailable)
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuTensorSource<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -1125,28 +1298,54 @@ impl<T: PcuScalar> PcuTensor<T> {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Provider configurations borrow dynamic shape metadata.
     pub fn shape(&self) -> &[usize] {
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-        {
-            self.device_tensor().shape()
+        match &self.backing {
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            super::arguments::TensorBacking::Device { tensor, .. } => tensor.shape(),
+            #[cfg(feature = "mlx")]
+            super::arguments::TensorBacking::Mlx { shape, .. } => shape,
+            #[cfg(feature = "mlx")]
+            super::arguments::TensorBacking::MlxEncoded { shape, .. } => shape,
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            super::arguments::TensorBacking::Cpu { shape, .. } => shape,
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            super::arguments::TensorBacking::Vulkan { shape, .. } => shape,
+            #[cfg(not(any(
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor"),
+                all(feature = "vulkan", feature = "tensor")
+            )))]
+            super::arguments::TensorBacking::Unavailable(_) => &[],
         }
-        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
-        {
-            &[]
-        } // No safe constructor exists when no execution provider is compiled.
     }
 
     /// Logical scalar element count; no device transfer occurs.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // Provider metadata comes through its typed storage view.
+    #[allow(clippy::missing_const_for_fn)] // Metadata is borrowed from the active backing.
     pub fn len(&self) -> usize {
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-        {
-            self.device_tensor().len()
+        match &self.backing {
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            super::arguments::TensorBacking::Device { tensor, .. } => tensor.len(),
+            #[cfg(feature = "mlx")]
+            super::arguments::TensorBacking::Mlx { shape, .. } => shape.iter().product(),
+            #[cfg(feature = "mlx")]
+            super::arguments::TensorBacking::MlxEncoded { array, .. } => array.element_count(),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            super::arguments::TensorBacking::Cpu { values, .. } => values.len(),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            super::arguments::TensorBacking::Vulkan { buffer, .. } => buffer.len(),
+            #[cfg(not(any(
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor"),
+                all(feature = "vulkan", feature = "tensor")
+            )))]
+            super::arguments::TensorBacking::Unavailable(_) => 0,
         }
-        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
-        {
-            0
-        } // The disabled-provider owner is not constructible by consumers.
     }
 
     /// Whether the logical tensor contains no scalar elements.
@@ -1156,7 +1355,8 @@ impl<T: PcuScalar> PcuTensor<T> {
     }
     /// Copies this initialized logical tensor into caller-owned RAM without consuming its owner.
     ///
-    /// The destination must contain exactly the tensor's flattened element count. Device storage
+    /// The destination must contain at least the tensor's flattened element count; its tail
+    /// is preserved. Device storage
     /// stays owned by this value until ordinary Drop or consumption; readback does not free it.
     ///
     /// # Errors
@@ -1164,15 +1364,45 @@ impl<T: PcuScalar> PcuTensor<T> {
     /// or backend transfer failure. No implicit CPU computation or backend migration occurs.
     #[allow(clippy::missing_const_for_fn)] // Executable configurations perform validated device IO.
     pub fn read_into(&self, destination: &mut [T]) -> Result<(), PcuExecutionError> {
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-        {
-            self.validate_initialized().map_err(super::argument_error)?;
-            self.session().download(self.device_tensor(), destination)
+        self.validate_initialized().map_err(super::argument_error)?;
+        if destination.len() < self.len() {
+            return Err(PcuExecutionError::InvalidTensorSourcePlan);
         }
-        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
-        {
-            let _ = destination;
-            Err(PcuExecutionError::NoBackendEnabled)
+        let destination = &mut destination[..self.len()];
+        match &self.backing {
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            super::arguments::TensorBacking::Device {
+                tensor, session, ..
+            } => session.download(tensor, destination),
+            #[cfg(feature = "mlx")]
+            super::arguments::TensorBacking::Mlx { array, .. } => array
+                .read_into_typed(destination)
+                .map_err(PcuExecutionError::MlxExecution),
+            #[cfg(feature = "mlx")]
+            super::arguments::TensorBacking::MlxEncoded { array, .. } => array
+                .read_into(destination)
+                .map_err(PcuExecutionError::MlxExecution),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            super::arguments::TensorBacking::Cpu { values, .. } => {
+                destination.copy_from_slice(values);
+                Ok(())
+            }
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            super::arguments::TensorBacking::Vulkan { buffer, .. } => buffer
+                .read_into(destination)
+                .map_err(PcuExecutionError::VulkanExecution),
+            #[cfg(not(any(
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor"),
+                all(feature = "vulkan", feature = "tensor")
+            )))]
+            super::arguments::TensorBacking::Unavailable(_) => {
+                let _ = destination;
+                Err(PcuExecutionError::NoBackendEnabled)
+            }
         }
     }
 }
@@ -1200,6 +1430,18 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
+    #[cfg(all(
+        feature = "tensor",
+        any(
+            feature = "mlx",
+            feature = "cpu",
+            feature = "vulkan",
+            feature = "metal"
+        )
+    ))]
+    if opaque::selected(&inputs) {
+        return opaque::call(site, specialization, &inputs, build);
+    }
     #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call(site, specialization, &inputs, build)
@@ -1240,6 +1482,21 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
+    #[cfg(all(
+        feature = "tensor",
+        any(
+            feature = "mlx",
+            feature = "cpu",
+            feature = "vulkan",
+            feature = "metal"
+        )
+    ))]
+    {
+        let borrowed = [PcuTensorInput::resident_dynamic(&input)];
+        if opaque::selected(&borrowed) {
+            return opaque::call(site, specialization, &borrowed, build);
+        }
+    }
     #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_consumed(site, specialization, input, build)
@@ -1281,6 +1538,29 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
+    #[cfg(all(
+        feature = "tensor",
+        any(
+            feature = "mlx",
+            feature = "cpu",
+            feature = "vulkan",
+            feature = "metal"
+        )
+    ))]
+    {
+        if donor_index > 1 {
+            return Err(PcuExecutionError::InvalidTensorSourcePlan);
+        }
+        let donor_source = PcuTensorInput::resident_dynamic(&donor);
+        let borrowed = if donor_index == 0 {
+            [donor_source, other]
+        } else {
+            [other, donor_source]
+        };
+        if opaque::selected(&borrowed) {
+            return opaque::call(site, specialization, &borrowed, build);
+        }
+    }
     #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_consumed_pair(site, specialization, donor, other, donor_index, build)
@@ -1320,6 +1600,22 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
+    #[cfg(all(
+        feature = "tensor",
+        any(
+            feature = "mlx",
+            feature = "cpu",
+            feature = "vulkan",
+            feature = "metal"
+        )
+    ))]
+    {
+        let borrowed =
+            core::array::from_fn(|index| PcuTensorInput::resident_dynamic(&inputs[index]));
+        if opaque::selected(&borrowed) {
+            return opaque::call::<T, N, F>(site, specialization, &borrowed, build);
+        }
+    }
     #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_consumed_owners::<T, N, F>(site, specialization, inputs, build)
@@ -1351,6 +1647,24 @@ where
         ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
         + 'static,
 {
+    #[cfg(all(
+        feature = "tensor",
+        any(
+            feature = "mlx",
+            feature = "cpu",
+            feature = "vulkan",
+            feature = "metal"
+        )
+    ))]
+    {
+        let borrowed = core::array::from_fn(|index| match &inputs[index] {
+            PcuTensorCallInput::Borrowed(input) => *input,
+            PcuTensorCallInput::Consumed(owner) => PcuTensorInput::resident_dynamic(owner),
+        });
+        if opaque::selected(&borrowed) {
+            return opaque::call::<T, N, F>(site, specialization, &borrowed, build);
+        }
+    }
     #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
     {
         execution::call_mixed_consumed::<T, N, F>(site, specialization, inputs, build)
@@ -1405,16 +1719,6 @@ mod execution {
         sync::atomic::Ordering,
     };
     use crate::global::resident::Session;
-
-    fn tensor_element_count(shape: PcuSourceShape) -> Result<usize, PcuExecutionError> {
-        match shape {
-            PcuSourceShape::Scalar => Ok(1),
-            PcuSourceShape::Slice { length } | PcuSourceShape::FixedArray { length } => Ok(length),
-            PcuSourceShape::FixedMatrix { rows, columns } => rows
-                .checked_mul(columns)
-                .ok_or(PcuExecutionError::InvalidTensorSourcePlan),
-        }
-    }
 
     // Only called when a host staging tensor is first allocated on a cold call.
     fn tensor_dimensions(shape: PcuSourceShape) -> Vec<usize> {
@@ -1622,39 +1926,38 @@ mod execution {
             return Err(PcuExecutionError::EmptyTensorInput);
         }
         let shapes = core::array::from_fn(|index| inputs[index].shape);
-        for (index, shape) in shapes.iter().copied().enumerate() {
-            let elements = match shape {
-                PcuTensorShapeWitness::Static(shape) => tensor_element_count(shape)?,
-                PcuTensorShapeWitness::Dynamic(dimensions) => dimensions
-                    .iter()
-                    .try_fold(1_usize, |elements, dimension| {
-                        elements.checked_mul(*dimension)
-                    })
-                    .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?,
-            };
-            if elements == 0 {
-                return Err(PcuExecutionError::EmptyTensorInput);
-            }
-            if let TensorInputKind::Host(values) = &inputs[index].kind
-                && values.len() != elements
-            {
-                return Err(PcuExecutionError::Argument(
-                    PcuArgumentError::SourceShapeMismatch {
-                        expected: match shape {
-                            PcuTensorShapeWitness::Static(shape) => shape,
-                            PcuTensorShapeWitness::Dynamic(_) => {
-                                return Err(PcuExecutionError::InvalidTensorSourcePlan);
-                            }
-                        },
-                        actual: PcuSourceShape::Slice {
-                            length: values.len(),
-                        },
-                    },
-                ));
-            }
-        }
-
         Ok(shapes)
+    }
+
+    // Admission and warm preflight use the frozen selected input projection.
+    // Shape keys remain conservative: shape-only capture obligations are not
+    // permission to erase observable constraints from cache specialization.
+    fn preflight_input_shape<T: PcuScalar>(
+        input: &PcuTensorInput<'_, T>,
+    ) -> Result<(), PcuExecutionError> {
+        let shape = input.shape;
+        let elements = super::capture::element_count(shape)?;
+        if elements == 0 {
+            return Err(PcuExecutionError::EmptyTensorInput);
+        }
+        if let TensorInputKind::Host(values) = &input.kind
+            && values.len() != elements
+        {
+            return Err(PcuExecutionError::Argument(
+                PcuArgumentError::SourceShapeMismatch {
+                    expected: match shape {
+                        PcuTensorShapeWitness::Static(shape) => shape,
+                        PcuTensorShapeWitness::Dynamic(_) => {
+                            return Err(PcuExecutionError::InvalidTensorSourcePlan);
+                        }
+                    },
+                    actual: PcuSourceShape::Slice {
+                        length: values.len(),
+                    },
+                },
+            ));
+        }
+        Ok(())
     }
 
     fn preflight_selected_inputs<'a, T: PcuScalar, const N: usize>(
@@ -1666,8 +1969,9 @@ mod execution {
             let input = inputs
                 .get(index)
                 .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?;
+            preflight_input_shape(input)?;
             if let TensorInputKind::Resident(owner) = &input.kind {
-                let owner_session = owner.session();
+                let owner_session = owner.session().map_err(PcuExecutionError::Argument)?;
                 if affinity.is_some_and(|existing| !Rc::ptr_eq(existing, owner_session)) {
                     return Err(PcuExecutionError::Argument(
                         PcuArgumentError::SessionMismatch,
@@ -1683,6 +1987,7 @@ mod execution {
                 }
                 owner
                     .device_tensor()
+                    .map_err(PcuExecutionError::Argument)?
                     .validate_access_available()
                     .map_err(|_| {
                         PcuExecutionError::Argument(PcuArgumentError::ResidentCompletionUncertain)
@@ -1720,9 +2025,10 @@ mod execution {
                     T::TYPE,
                     entry.pool,
                 ),
-                TensorInputKind::Resident(owner) => {
-                    assessor.borrow_device_input_ref(owner.device_tensor(), entry.pool)
-                }
+                TensorInputKind::Resident(owner) => assessor.borrow_device_input_ref(
+                    owner.device_tensor().map_err(PcuExecutionError::Argument)?,
+                    entry.pool,
+                ),
             }?;
             sources[index] = Some(source);
         }
@@ -1824,7 +2130,7 @@ mod execution {
                     build,
                 )?
             };
-            let (tensor, retained_session) = input.into_device_parts();
+            let (tensor, retained_session) = input.into_device_parts()?;
             let entry = &mut state.entries[slot];
             if !Rc::ptr_eq(&retained_session, &entry.session) {
                 return Err(PcuExecutionError::Argument(
@@ -1879,7 +2185,7 @@ mod execution {
                 ConsumedPairResolution::Selected(selected) => selected,
             };
 
-            let (tensor, retained_session) = donor.into_device_parts();
+            let (tensor, retained_session) = donor.into_device_parts()?;
             let entry = &mut state.entries[selected.slot];
             if !Rc::ptr_eq(&retained_session, &entry.session) {
                 return Err(PcuExecutionError::Argument(
@@ -1898,9 +2204,10 @@ mod execution {
                         T::TYPE,
                         entry.pool,
                     ),
-                    TensorInputKind::Resident(owner) => {
-                        assessor.borrow_device_input_ref(owner.device_tensor(), entry.pool)
-                    }
+                    TensorInputKind::Resident(owner) => assessor.borrow_device_input_ref(
+                        owner.device_tensor().map_err(PcuExecutionError::Argument)?,
+                        entry.pool,
+                    ),
                 }?;
                 assessor.execute_owned_program_consuming_binary_input(
                     &entry.prepared,
@@ -2272,7 +2579,7 @@ mod execution {
         let [selected_owner, _] = owner_inputs;
         let (tensor, retained_session) = selected_owner
             .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?
-            .into_device_parts();
+            .into_device_parts()?;
         if !Rc::ptr_eq(&retained_session, session) {
             return Err(PcuExecutionError::Argument(
                 PcuArgumentError::SessionMismatch,
@@ -2302,8 +2609,8 @@ mod execution {
         let [Some(lhs), Some(rhs)] = owner_inputs else {
             return Err(PcuExecutionError::InvalidTensorSourcePlan);
         };
-        let (tensor0, retained_session) = lhs.into_device_parts();
-        let (tensor1, other_session) = rhs.into_device_parts();
+        let (tensor0, retained_session) = lhs.into_device_parts()?;
+        let (tensor1, other_session) = rhs.into_device_parts()?;
         if !Rc::ptr_eq(&retained_session, &other_session) || !Rc::ptr_eq(&retained_session, session)
         {
             return Err(PcuExecutionError::Argument(
@@ -2361,7 +2668,7 @@ mod execution {
             second_owner
         }
         .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?;
-        let (tensor, retained_session) = owner.into_device_parts();
+        let (tensor, retained_session) = owner.into_device_parts()?;
         if !Rc::ptr_eq(&retained_session, session) {
             return Err(PcuExecutionError::Argument(
                 PcuArgumentError::SessionMismatch,
@@ -2387,9 +2694,10 @@ mod execution {
                 T::TYPE,
                 pool,
             ),
-            TensorInputKind::Resident(owner) => {
-                assessor.borrow_device_input_ref(owner.device_tensor(), pool)
-            }
+            TensorInputKind::Resident(owner) => assessor.borrow_device_input_ref(
+                owner.device_tensor().map_err(PcuExecutionError::Argument)?,
+                pool,
+            ),
         }?;
         let output = assessor.execute_owned_program_consuming_binary_input(
             prepared,
@@ -2599,6 +2907,9 @@ mod execution {
     mod cache_tests {
         use super::with_state;
 
+        #[path = "shape/shape.rs"]
+        mod shape;
+
         #[test]
         fn scalar_neutral_cache_state_keeps_generation() {
             with_state(|state| {
@@ -2635,6 +2946,21 @@ mod execution {
             .unwrap();
         }
     }
+}
+
+// The six executable checked encodings share one policy capture path. This is
+// source admission, not a backend capability promise or wide-float arithmetic.
+#[cfg(feature = "tensor")]
+const fn checked_float_scalar(scalar: crate::PcuScalarType) -> bool {
+    matches!(
+        scalar,
+        crate::PcuScalarType::F16
+            | crate::PcuScalarType::BF16
+            | crate::PcuScalarType::F8E4M3FN
+            | crate::PcuScalarType::F8E5M2
+            | crate::PcuScalarType::F32
+            | crate::PcuScalarType::F64
+    )
 }
 
 #[cfg(all(test, feature = "tensor"))]
@@ -2936,6 +3262,21 @@ mod capture_tests {
     }
 
     #[test]
+    fn owned_underflow_policy_admits_all_six_checked_float_formats() {
+        fn verify<T: crate::PcuCheckedFloat>() {
+            let shape = PcuSourceShape::Slice { length: 2 };
+            let (capture, [value]) = PcuTensorGraphCapture::new::<T, 1>([shape]).unwrap();
+            capture.require_float_underflow_policy(value).unwrap();
+        }
+        verify::<crate::PcuF16Bits>();
+        verify::<crate::PcuBf16Bits>();
+        verify::<crate::PcuF8E4M3FnBits>();
+        verify::<crate::PcuF8E5M2Bits>();
+        verify::<f32>();
+        verify::<f64>();
+    }
+
+    #[test]
     fn cross_capture_validation_rejects_foreign_f64_tokens() {
         let shape = PcuSourceShape::FixedMatrix {
             rows: 2,
@@ -3071,4 +3412,29 @@ mod capture_tests {
 #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
 pub(super) fn clear_cache() -> Result<(), PcuExecutionError> {
     execution::clear_cache()
+}
+
+#[cfg(all(
+    feature = "tensor",
+    any(
+        feature = "mlx",
+        feature = "cpu",
+        feature = "vulkan",
+        feature = "metal"
+    )
+))]
+#[path = "tensor/opaque/opaque.rs"]
+mod opaque;
+
+#[cfg(all(
+    feature = "tensor",
+    any(
+        feature = "mlx",
+        feature = "cpu",
+        feature = "vulkan",
+        feature = "metal"
+    )
+))]
+pub(super) fn clear_opaque_cache() -> Result<(), PcuExecutionError> {
+    opaque::clear()
 }

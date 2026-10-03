@@ -47,10 +47,35 @@ const SHADER_ENTRY_POINT: &CStr = c"main";
 
 #[path = "prepared/prepared.rs"]
 mod prepared;
-pub use prepared::VulkanPreparedBitMap;
+#[rustfmt::skip]
+pub use prepared::{VulkanMixedInput, VulkanMixedOutput, VulkanWriteState};
+#[rustfmt::skip]
+pub use prepared::{VulkanPreparedScalarTransport,
+    VulkanPreparedBitMap,
+    VulkanPreparedBinary,
+    VulkanPreparedInteger,
+    VulkanPreparedDivRem,
+    VulkanPreparedUnary,
+    VulkanPreparedConversion,
+    VulkanPreparedComposed,
+    VulkanPreparedOrderedTransport,
+    PcuVulkanComposedMemoryRealizations,
+};
 #[path = "discovery/discovery.rs"]
 mod discovery;
 pub use discovery::VulkanNativeDevice;
+#[path = "owned/owned.rs"]
+mod owned;
+#[rustfmt::skip]
+pub use owned::{
+    VulkanOwnedBuffer,
+    VulkanPreparedOwnedCopy,
+};
+#[cfg(feature = "tensor")]
+#[path = "tensor/tensor.rs"]
+mod tensor;
+#[cfg(feature = "tensor")]
+pub use tensor::{VulkanPreparedTensorMap, TensorStatusPolicy};
 
 /// Vulkan PCU prototype.
 pub struct VulkanDevice {
@@ -210,6 +235,218 @@ impl VulkanDevice {
         validate_device_geometry(
             &self.limits,
             [profile.extent.div_ceil(profile.local_size[0]), 1, 1],
+            profile.local_size,
+            bytes,
+        )
+    }
+
+    pub fn validate_ordered_transport_geometry(
+        &self,
+        profile: &fusion_pcu_spirv::PcuSpirvOrderedTransportProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        validate_map_descriptor_count(&self.limits, 5)?;
+        let bytes = usize::try_from(profile.dispatch_extent())
+            .ok()
+            .and_then(|words| words.checked_mul(4))
+            .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [profile.dispatch_extent().div_ceil(64), 1, 1],
+            [64, 1, 1],
+            bytes,
+        )
+    }
+
+    pub fn validate_composed_geometry(
+        &self,
+        profile: &fusion_pcu_spirv::PcuSpirvComposedFloatProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        validate_map_descriptor_count(&self.limits, 5)?;
+        // The 8-byte ordered status is at least as large as every scalar resource.
+        let bytes = usize::try_from(profile.extent())
+            .ok()
+            .and_then(|extent| extent.checked_mul(8))
+            .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [profile.dispatch_extent().div_ceil(64), 1, 1],
+            [64, 1, 1],
+            bytes,
+        )
+    }
+
+    pub fn validate_scalar_transport_geometry(
+        &self,
+        profile: fusion_pcu_spirv::PcuSpirvScalarTransportProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        if profile.local_id().is_none() {
+            return Err(PcuVulkanError::UnsupportedPreparedProfile);
+        }
+        validate_map_descriptor_count(&self.limits, 2)?;
+        let bytes = usize::try_from(
+            profile
+                .logical_bytes()
+                .ok_or(PcuVulkanError::BufferTooLarge)?,
+        )
+        .ok()
+        .and_then(|n| n.checked_add(3))
+        .map(|n| n & !3)
+        .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [
+                profile
+                    .dispatch_extent()
+                    .ok_or(PcuVulkanError::BufferTooLarge)?
+                    .div_ceil(profile.local_size[0]),
+                1,
+                1,
+            ],
+            profile.local_size,
+            bytes,
+        )
+    }
+
+    pub fn validate_unary_geometry(
+        &self,
+        profile: fusion_pcu_spirv::PcuSpirvCheckedUnaryProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        if profile.local_id().is_none() {
+            return Err(PcuVulkanError::UnsupportedPreparedProfile);
+        }
+        validate_map_descriptor_count(&self.limits, 3)?;
+        let bytes = usize::try_from(profile.extent)
+            .ok()
+            .and_then(|n| n.checked_mul(profile.element_bytes().max(4)))
+            .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [
+                profile.dispatch_extent().div_ceil(profile.local_size[0]),
+                1,
+                1,
+            ],
+            profile.local_size,
+            bytes,
+        )
+    }
+
+    pub fn validate_conversion_geometry(
+        &self,
+        profile: fusion_pcu_spirv::PcuSpirvCheckedConversionProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        validate_map_descriptor_count(&self.limits, 3)?;
+        let bytes = usize::try_from(profile.extent)
+            .ok()
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [profile.extent.div_ceil(profile.local_size[0]), 1, 1],
+            profile.local_size,
+            bytes,
+        )
+    }
+
+    pub fn validate_integer_geometry(
+        &self,
+        profile: fusion_pcu_spirv::PcuSpirvCheckedIntegerProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        if profile.local_id().is_none() || profile.logical_bytes().is_none() {
+            return Err(PcuVulkanError::UnsupportedPreparedProfile);
+        }
+        validate_map_descriptor_count(&self.limits, 4)?;
+        let bytes = usize::try_from(profile.extent)
+            .ok()
+            .and_then(|n| n.checked_mul(profile.element_bytes().max(4)))
+            .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [
+                profile.dispatch_extent().div_ceil(profile.local_size[0]),
+                1,
+                1,
+            ],
+            profile.local_size,
+            bytes,
+        )
+    }
+
+    pub fn validate_div_rem_geometry(
+        &self,
+        profile: fusion_pcu_spirv::PcuSpirvCheckedDivRemProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        if profile.local_id().is_none() || profile.logical_bytes().is_none() {
+            return Err(PcuVulkanError::UnsupportedPreparedProfile);
+        }
+        validate_map_descriptor_count(&self.limits, 5)?;
+        let bytes = usize::try_from(profile.extent)
+            .ok()
+            .and_then(|n| n.checked_mul(profile.element_bytes().max(4)))
+            .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [
+                profile.dispatch_extent().div_ceil(profile.local_size[0]),
+                1,
+                1,
+            ],
+            profile.local_size,
+            bytes,
+        )
+    }
+
+    pub fn validate_binary_geometry(
+        &self,
+        profile: fusion_pcu_spirv::PcuSpirvCheckedBinaryProfile,
+    ) -> Result<(), PcuVulkanError> {
+        if self.poisoned.get() {
+            return Err(PcuVulkanError::Quarantined);
+        }
+        if !matches!(
+            profile.scalar,
+            fusion_pcu::PcuScalarType::F32
+                | fusion_pcu::PcuScalarType::F64
+                | fusion_pcu::PcuScalarType::F16
+                | fusion_pcu::PcuScalarType::BF16
+                | fusion_pcu::PcuScalarType::F8E4M3FN
+                | fusion_pcu::PcuScalarType::F8E5M2
+        ) {
+            return Err(PcuVulkanError::UnsupportedPreparedProfile);
+        }
+        validate_map_descriptor_count(&self.limits, 4)?;
+        let bytes = usize::try_from(profile.extent)
+            .ok()
+            .and_then(|extent| extent.checked_mul(profile.element_bytes().max(4)))
+            .ok_or(PcuVulkanError::BufferTooLarge)?;
+        validate_device_geometry(
+            &self.limits,
+            [
+                profile.dispatch_extent().div_ceil(profile.local_size[0]),
+                1,
+                1,
+            ],
             profile.local_size,
             bytes,
         )
@@ -799,11 +1036,15 @@ fn create_shader_module<'a>(
 fn create_descriptor_set_layout(
     device: &ash::Device,
 ) -> Result<VulkanDescriptorSetLayout<'_>, PcuVulkanError> {
-    let bindings = [
-        storage_buffer_layout_binding(0),
-        storage_buffer_layout_binding(1),
-        storage_buffer_layout_binding(2),
-    ];
+    create_map_descriptor_set_layout::<3>(device)
+}
+
+fn create_map_descriptor_set_layout<const N: usize>(
+    device: &ash::Device,
+) -> Result<VulkanDescriptorSetLayout<'_>, PcuVulkanError> {
+    let bindings: [_; N] = core::array::from_fn(|index| {
+        storage_buffer_layout_binding(u32::try_from(index).expect("bounded map descriptors"))
+    });
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     let handle = vk_try("create Vulkan descriptor set layout", unsafe {
         // SAFETY: The create info references only stack-local binding descriptors for the duration of the call.
@@ -876,9 +1117,15 @@ fn create_compute_pipeline<'a>(
 fn create_descriptor_pool(
     device: &ash::Device,
 ) -> Result<VulkanDescriptorPool<'_>, PcuVulkanError> {
+    create_map_descriptor_pool::<3>(device)
+}
+
+fn create_map_descriptor_pool<const N: usize>(
+    device: &ash::Device,
+) -> Result<VulkanDescriptorPool<'_>, PcuVulkanError> {
     let pool_sizes = [vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(3)];
+        .descriptor_count(u32::try_from(N).expect("bounded map descriptors"))];
     let create_info = vk::DescriptorPoolCreateInfo::default()
         .max_sets(1)
         .pool_sizes(&pool_sizes);
@@ -1085,6 +1332,7 @@ fn validate_device_geometry(
     local: [u32; 3],
     bytes: usize,
 ) -> Result<(), PcuVulkanError> {
+    validate_map_descriptor_count(limits, 3)?;
     let local_count = local.into_iter().try_fold(1_u32, u32::checked_mul);
     if local_count
         .is_none_or(|count| count == 0 || count > limits.max_compute_work_group_invocations)
@@ -1097,12 +1345,23 @@ fn validate_device_geometry(
             .zip(limits.max_compute_work_group_count)
             .any(|(count, limit)| *count == 0 || *count > limit)
         || bytes > limits.max_storage_buffer_range as usize
-        || limits.max_per_stage_descriptor_storage_buffers < 3
-        || limits.max_descriptor_set_storage_buffers < 3
     {
         return Err(PcuVulkanError::DeviceLimitExceeded);
     }
     Ok(())
+}
+
+const fn validate_map_descriptor_count(
+    limits: &vk::PhysicalDeviceLimits,
+    count: u32,
+) -> Result<(), PcuVulkanError> {
+    if limits.max_per_stage_descriptor_storage_buffers < count
+        || limits.max_descriptor_set_storage_buffers < count
+    {
+        Err(PcuVulkanError::DeviceLimitExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 fn find_compute_queue_family(
@@ -1251,10 +1510,26 @@ impl<'a> VulkanBuffer<'a> {
         device: &'a ash::Device,
         byte_len: usize,
     ) -> Result<Self, PcuVulkanError> {
+        Self::new_buffer(
+            instance,
+            physical_device,
+            device,
+            byte_len,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )
+    }
+
+    fn new_buffer(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &'a ash::Device,
+        byte_len: usize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<Self, PcuVulkanError> {
         let size = byte_len_to_device_size(byte_len)?;
         let create_info = vk::BufferCreateInfo::default()
             .size(size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = vk_try("create Vulkan storage buffer", unsafe {
             // SAFETY: The create info contains no borrowed extension data.
@@ -1429,13 +1704,14 @@ fn find_memory_type(
 mod tests {
     #[rustfmt::skip]
     use super::{
-        fixed_descriptor_geometry,
-        validate_device_geometry,
-        vk,
-        PcuVulkanError,
-        PcuVulkanDescriptorHeapBudget,
-        PcuVulkanDescriptorIndexingCaps,
-    };
+    fixed_descriptor_geometry,
+    validate_device_geometry,
+    validate_map_descriptor_count,
+    vk,
+    PcuVulkanError,
+    PcuVulkanDescriptorHeapBudget,
+    PcuVulkanDescriptorIndexingCaps,
+};
 
     #[test]
     fn native_limits_reject_workgroup_dispatch_range_and_descriptor_excesses() {
@@ -1449,6 +1725,13 @@ mod tests {
             ..vk::PhysicalDeviceLimits::default()
         };
         assert!(validate_device_geometry(&limits, [4, 1, 1], [64, 1, 1], 1024).is_ok());
+        assert!(validate_map_descriptor_count(&limits, 4).is_err());
+        let four_descriptors = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_storage_buffers: 4,
+            max_descriptor_set_storage_buffers: 4,
+            ..limits
+        };
+        assert!(validate_map_descriptor_count(&four_descriptors, 4).is_ok());
         for (groups, local, bytes) in [
             ([5, 1, 1], [64, 1, 1], 1024),
             ([4, 1, 1], [65, 1, 1], 1024),

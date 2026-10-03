@@ -1,0 +1,5 @@
+error: generic checked floating expressions support indexed resources, unary negation, pcu::relu, and + - * /; typed literals, casts, and helper calls require a concrete float profile
+ --> tests/ui/generic_checked_float_literal.rs:7:30
+  |
+7 |     output[id] = input[id] * 0.5;
+  |                              ^^^

@@ -268,6 +268,7 @@ pub trait PcuDispatchPreparationBackend: PcuBaseContract {
     }
 }
 
+#[allow(clippy::large_types_passed_by_value)] // Cold assessment retains a snapshot; never a warm execution call.
 const fn assess_floor(
     descriptor: PcuExecutorDescriptor,
     request: PcuDispatchPreparationRequest<'_>,

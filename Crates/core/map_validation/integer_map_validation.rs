@@ -14,6 +14,7 @@ use crate::{
     PcuDispatchKernelIr,
     PcuDispatchOp,
     PcuDispatchValueId,
+    PcuRangePolicy,
     PcuValueType,
     PcuValueTypeCaps,
 };
@@ -22,6 +23,8 @@ use crate::{
 pub enum IntegerMapValidationError {
     UnsupportedInterface,
     UnsupportedRequirements,
+    /// The instruction and kernel header disagree about range recovery.
+    RangePolicyMismatch,
     InvalidBinding(PcuBindingRef),
     DuplicateBinding(PcuBindingRef),
     UnsupportedOperation(usize),
@@ -31,15 +34,40 @@ pub enum IntegerMapValidationError {
 }
 
 mod checked_binary;
-pub use checked_binary::validate_integer_checked_binary_kernel;
+#[path = "integer_map_validation/checked_div_rem/operand_schema/operand_schema.rs"]
+mod checked_div_rem_operands;
+#[rustfmt::skip]
+pub use checked_div_rem_operands::{
+    assess_checked_integer_div_rem_operands,
+    CheckedIntegerDivRemOperandSchema,
+};
+#[rustfmt::skip]
+pub use checked_binary::{
+    assess_checked_integer_binary_operands,
+    validate_integer_checked_binary_kernel,
+    CheckedIntegerBinaryOperandSchema,
+};
 
 /// Shared structural admission for checked exact-width quotient/remainder maps.
+///
+/// # Errors
+///
+/// Returns the first structural violation when the kernel's resource schema,
+/// required capabilities, indexing, or quotient/remainder operations do not
+/// match this bounded map profile. This validates the IR contract; it does not
+/// establish that a backend implements the requested integer width.
+/// Only Reject is specified here: zero and signed MIN/-1 have no defined
+/// clamped quotient/remainder recovery. A Clamp header must not silently execute
+/// the checked instruction under a different publication contract.
 #[allow(clippy::too_many_lines)]
 pub fn validate_integer_checked_div_rem_kernel(
     kernel: &PcuDispatchKernelIr<'_>,
     value_type: PcuValueType,
     scalar_caps: PcuValueTypeCaps,
 ) -> Result<(), IntegerMapValidationError> {
+    if !super::typed_dispatch::is_supported_checked_integer(value_type) {
+        return Err(IntegerMapValidationError::UnsupportedInterface);
+    }
     if !kernel.ports.is_empty() || !kernel.parameters.is_empty() || kernel.bindings.len() != 4 {
         return Err(IntegerMapValidationError::UnsupportedInterface);
     }
@@ -48,6 +76,7 @@ pub fn validate_integer_checked_div_rem_kernel(
         PcuDispatchFeatureCaps::MUTABLE_RESOURCES | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES;
     if kernel.required_type_support().bits() & !allowed_types.bits() != 0
         || kernel.required_feature_support().bits() & !allowed_features.bits() != 0
+        || kernel.numerical_requirements.range_policy != PcuRangePolicy::Reject
     {
         return Err(IntegerMapValidationError::UnsupportedRequirements);
     }

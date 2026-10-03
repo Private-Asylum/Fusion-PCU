@@ -23,10 +23,11 @@ use crate::{
     PcuScalar,
 };
 
-/// Policy for recovering from checked floating result-range faults.
+/// Policy for recovering from checked integer or floating result-range faults.
 ///
 /// This is independent of [`crate::PcuFloatUnderflowPolicy`]: it controls recovery for either
-/// overflow or underflow while the underflow policy only classifies tiny inexact results.
+/// overflow or underflow. Integer recovery saturates to the nearest representable endpoint;
+/// the floating underflow policy independently classifies tiny results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PcuRangePolicy {
     /// Report a range fault and reject the operation result.
@@ -36,7 +37,7 @@ pub enum PcuRangePolicy {
     Clamp,
 }
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
     impl Sealed for u8 {}
     impl Sealed for u16 {}
@@ -46,6 +47,8 @@ mod sealed {
     impl Sealed for i16 {}
     impl Sealed for i32 {}
     impl Sealed for i64 {}
+    impl Sealed for u128 {}
+    impl Sealed for i128 {}
 }
 
 /// A range fault and its defined recovery value.
@@ -188,8 +191,8 @@ macro_rules! signed_integer {
     )+};
 }
 
-unsigned_integer!(u8, u16, u32, u64);
-signed_integer!(i8, i16, i32, i64);
+unsigned_integer!(u8, u16, u32, u64, u128);
+signed_integer!(i8, i16, i32, i64, i128);
 
 #[cfg(test)]
 mod tests;

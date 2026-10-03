@@ -78,7 +78,7 @@ pub enum RocblasError {
 /// Host-side phase durations for one explicitly profiled SGEMM call.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RocblasSgemmHostTiming {
-    /// Validation, leases, device selection, and symbol lookup.
+    /// Validation, leases, device selection, and retained function-pointer access.
     pub preflight: std::time::Duration,
     /// Time spent in the `rocblas_sgemm` C function.
     pub rocblas_call: std::time::Duration,
@@ -193,6 +193,8 @@ struct RocblasHandleOwner {
     runtime: HipRuntime,
     library: Arc<Library>,
     handle: RocblasHandle,
+    vectors: crate::ffi::VectorFunctions,
+    functions: crate::ffi::BlasHandleFunctions,
     poisoned: Cell<bool>,
     dgemm: OnceCell<Result<Dgemm, RocblasError>>,
 }
@@ -433,6 +435,17 @@ impl Rocblas {
         self.dgemm_function().map(|_| ())
     }
 
+    // Error-only quarantine owns the exact queue as well as the vendor handle, library and
+    // runtime/context. Allocation leases retain data separately. A later cache/session drop
+    // cannot destroy the bound stream or code roots while completion remains unknown.
+    fn retain_unknown_completion(&self) {
+        self.owner.poisoned.set(true);
+        std::mem::forget(Rc::clone(&self.owner));
+        if let Some(stream) = &self.bound_stream {
+            std::mem::forget(stream.clone());
+        }
+    }
+
     /// Whether this handle may safely admit another operation after prior completion results.
     #[must_use]
     pub fn is_usable(&self) -> bool {
@@ -499,42 +512,22 @@ impl Rocblas {
                         detail: e.to_string(),
                     }
                 })?;
-            // An opened handle is only useful to the tensor adapter when the required operation
-            // is present. Validate the symbol during setup so assessment cannot claim Library
-            // support and defer a missing-symbol failure until execution.
-            unsafe { crate::ffi::require_rocblas_sgemm(&library) }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sgemm",
-                    detail: e.to_string(),
-                }
-            })?;
-            for (symbol, result) in [
-                (
-                    "rocblas_sdot",
-                    unsafe { crate::ffi::require_rocblas_sdot(&library) }.map(|_| ()),
-                ),
-                (
-                    "rocblas_sasum",
-                    unsafe { crate::ffi::require_rocblas_sasum(&library) }.map(|_| ()),
-                ),
-                (
-                    "rocblas_sscal",
-                    unsafe { crate::ffi::require_rocblas_sscal(&library) }.map(|_| ()),
-                ),
-                (
-                    "rocblas_get_pointer_mode",
-                    unsafe { crate::ffi::require_rocblas_get_pointer_mode(&library) }.map(|_| ()),
-                ),
-                (
-                    "rocblas_set_pointer_mode",
-                    unsafe { crate::ffi::require_rocblas_set_pointer_mode(&library) }.map(|_| ()),
-                ),
-            ] {
-                result.map_err(|e| RocblasError::MissingSymbol {
+            // SAFETY: retain the required ABI table before handle creation; missing entries
+            // fail cold and the owner keeps this library live through every later invocation.
+            let functions = unsafe { crate::ffi::retain_blas_handle_functions(&library) }.map_err(
+                |(symbol, error)| RocblasError::MissingSymbol {
                     symbol,
-                    detail: e.to_string(),
-                })?;
-            }
+                    detail: error.to_string(),
+                },
+            )?;
+            // SAFETY: typed SDK declarations are paired with exact symbol names. The
+            // handle owner stores this immutable table beside its retained library owner.
+            let vectors = unsafe { crate::ffi::retain_blas_vector_functions(&library) }.map_err(
+                |(symbol, error)| RocblasError::MissingSymbol {
+                    symbol,
+                    detail: error.to_string(),
+                },
+            )?;
             let status =
                 unsafe { crate::ffi::invoke_rocblas_create_handle(&create, &raw mut handle) };
             if status != ROCBLAS_SUCCESS {
@@ -548,6 +541,8 @@ impl Rocblas {
                     runtime: runtime.clone(),
                     library,
                     handle,
+                    vectors,
+                    functions,
                     poisoned: Cell::new(false),
                     dgemm: OnceCell::new(),
                 }),
@@ -580,12 +575,8 @@ impl Rocblas {
         self.owner
             .runtime
             .hip_set_device(self.owner.runtime.0.device)?;
-        // SAFETY: rocblas_set_stream has the documented C ABI in rocblas-auxiliary.h.
-        let set_stream = unsafe { crate::ffi::require_rocblas_set_stream(&self.owner.library) }
-            .map_err(|error| RocblasError::MissingSymbol {
-                symbol: "rocblas_set_stream",
-                detail: error.to_string(),
-            })?;
+        // The cold handle table and retained library outlive this stream binding.
+        let set_stream = self.owner.functions.set_stream;
         let status = unsafe {
             crate::ffi::invoke_rocblas_set_stream(&set_stream, self.owner.handle, stream.inner.raw)
         };
@@ -676,15 +667,7 @@ impl Rocblas {
         self.owner
             .runtime
             .hip_set_device(self.owner.runtime.0.device)?;
-        // SAFETY: signature matches rocblas_sgemm; runtime, dimensions, stream, and allocations
-        // have been checked before loading or invoking the C ABI.
-        let sgemm =
-            unsafe { crate::ffi::require_rocblas_sgemm(&self.owner.library) }.map_err(|error| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sgemm",
-                    detail: error.to_string(),
-                }
-            })?;
+        let sgemm = self.owner.functions.sgemm;
 
         reserve_async_operation(&self.in_flight)?;
         let owner = Rc::new(RocblasAsyncOperationOwner {
@@ -1044,7 +1027,7 @@ impl Rocblas {
         };
         let sync = unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.owner.runtime) };
         if let Err(error) = sync {
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(a_lease);
             std::mem::forget(b_lease);
             std::mem::forget(c_lease);
@@ -1086,55 +1069,48 @@ impl Rocblas {
         timing: &mut T,
     ) -> Result<(), RocblasError> {
         let preflight_mark = timing.begin(SgemmPhase::Preflight);
-        let preflight =
-            (|| {
-                self.ensure_idle()?;
-                let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
-                let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
-                matrix_bytes("A", a_rows, a_cols, lda, a.len())?;
-                matrix_bytes("B", b_rows, b_cols, ldb, b.len())?;
-                matrix_bytes("C", m, n, ldc, c.len())?;
-                self.owner
-                    .runtime
-                    .ensure_same_runtime(&a.allocation.runtime)
-                    .map_err(|_| RocblasError::DifferentRuntime)?;
-                self.owner
-                    .runtime
-                    .ensure_same_runtime(&b.allocation.runtime)
-                    .map_err(|_| RocblasError::DifferentRuntime)?;
-                self.owner
-                    .runtime
-                    .ensure_same_runtime(&c.allocation.runtime)
-                    .map_err(|_| RocblasError::DifferentRuntime)?;
-                if Rc::ptr_eq(&a.allocation, &b.allocation)
-                    || Rc::ptr_eq(&a.allocation, &c.allocation)
-                    || Rc::ptr_eq(&b.allocation, &c.allocation)
-                {
-                    return Err(RocblasError::AliasedBuffers);
-                }
-                let a_lease = a.acquire_access().map_err(|_| RocblasError::Busy)?;
-                let b_lease = b.acquire_access().map_err(|_| RocblasError::Busy)?;
-                let c_lease = c.acquire_access().map_err(|_| RocblasError::Busy)?;
-                let (m, n, k, lda, ldb, ldc) = (
-                    c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
-                    c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
-                );
-                self.owner
-                    .runtime
-                    .hip_set_device(self.owner.runtime.0.device)?;
-                // SAFETY: signature follows rocblas_sgemm in rocblas.h; buffers are validated allocations
-                // from this runtime/device and the scalar pointers remain live through the call.
-                let sgemm = unsafe { crate::ffi::require_rocblas_sgemm(&self.owner.library) }
-                    .map_err(|e| RocblasError::MissingSymbol {
-                        symbol: "rocblas_sgemm",
-                        detail: e.to_string(),
-                    })?;
-                Ok((a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, *sgemm))
-            })();
+        let preflight = (|| {
+            self.ensure_idle()?;
+            let (a_rows, a_cols) = if transpose_a { (k, m) } else { (m, k) };
+            let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
+            matrix_bytes("A", a_rows, a_cols, lda, a.len())?;
+            matrix_bytes("B", b_rows, b_cols, ldb, b.len())?;
+            matrix_bytes("C", m, n, ldc, c.len())?;
+            self.owner
+                .runtime
+                .ensure_same_runtime(&a.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            self.owner
+                .runtime
+                .ensure_same_runtime(&b.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            self.owner
+                .runtime
+                .ensure_same_runtime(&c.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+            if Rc::ptr_eq(&a.allocation, &b.allocation)
+                || Rc::ptr_eq(&a.allocation, &c.allocation)
+                || Rc::ptr_eq(&b.allocation, &c.allocation)
+            {
+                return Err(RocblasError::AliasedBuffers);
+            }
+            let a_lease = a.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let b_lease = b.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let c_lease = c.acquire_access().map_err(|_| RocblasError::Busy)?;
+            let (m, n, k, lda, ldb, ldc) = (
+                c_int::try_from(m).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(k).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(lda).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(ldb).map_err(|_| RocblasError::DimensionOverflow)?,
+                c_int::try_from(ldc).map_err(|_| RocblasError::DimensionOverflow)?,
+            );
+            self.owner
+                .runtime
+                .hip_set_device(self.owner.runtime.0.device)?;
+            let sgemm = self.owner.functions.sgemm;
+            Ok((a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, sgemm))
+        })();
         timing.finish(SgemmPhase::Preflight, preflight_mark);
         let (a_lease, b_lease, c_lease, m, n, k, lda, ldb, ldc, sgemm) = preflight?;
         let call_mark = timing.begin(SgemmPhase::RocblasCall);
@@ -1176,7 +1152,7 @@ impl Rocblas {
         if let Err(error) = sync {
             // Completion is now unknown. Retain every allocation and the library/handle forever;
             // freeing any of them could race device work that HIP failed to confirm had stopped.
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(a_lease);
             std::mem::forget(b_lease);
             std::mem::forget(c_lease);
@@ -1270,32 +1246,12 @@ impl Rocblas {
         self.owner
             .runtime
             .hip_set_device(self.owner.runtime.0.device)?;
-        // SAFETY: symbols match rocBLAS public declarations; live validated device allocations
-        // remain leased until synchronization confirms completion.
-        let get_mode = unsafe { crate::ffi::require_rocblas_get_pointer_mode(&self.owner.library) }
-            .map_err(|e| RocblasError::MissingSymbol {
-                symbol: "rocblas_get_pointer_mode",
-                detail: e.to_string(),
-            })?;
-        let set_mode = unsafe { crate::ffi::require_rocblas_set_pointer_mode(&self.owner.library) }
-            .map_err(|e| RocblasError::MissingSymbol {
-                symbol: "rocblas_set_pointer_mode",
-                detail: e.to_string(),
-            })?;
-        let sdot =
-            unsafe { crate::ffi::require_rocblas_sdot(&self.owner.library) }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sdot",
-                    detail: e.to_string(),
-                }
-            })?;
-        let sscal =
-            unsafe { crate::ffi::require_rocblas_sscal(&self.owner.library) }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sscal",
-                    detail: e.to_string(),
-                }
-            })?;
+        // All typed entries were validated cold; the handle/library and allocation leases
+        // remain retained through synchronization or quarantine.
+        let get_mode = self.owner.vectors.get_pointer_mode;
+        let set_mode = self.owner.vectors.set_pointer_mode;
+        let sdot = self.owner.functions.sdot;
+        let sscal = self.owner.vectors.sscal;
         let mut prior_mode = ROCBLAS_POINTER_MODE_HOST;
         let get_status = unsafe {
             crate::ffi::invoke_rocblas_get_pointer_mode(
@@ -1367,7 +1323,7 @@ impl Rocblas {
         };
         let sync = unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.owner.runtime) };
         if let Err(error) = sync {
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(x_lease);
             std::mem::forget(y_lease);
             std::mem::forget(result_lease);
@@ -1458,30 +1414,11 @@ impl Rocblas {
             .hip_set_device(self.owner.runtime.0.device)?;
         // SAFETY: symbols match rocBLAS public declarations; leased allocations remain alive
         // until synchronization confirms the operation has completed.
-        let get_mode = unsafe { crate::ffi::require_rocblas_get_pointer_mode(&self.owner.library) }
-            .map_err(|e| RocblasError::MissingSymbol {
-                symbol: "rocblas_get_pointer_mode",
-                detail: e.to_string(),
-            })?;
-        let set_mode = unsafe { crate::ffi::require_rocblas_set_pointer_mode(&self.owner.library) }
-            .map_err(|e| RocblasError::MissingSymbol {
-                symbol: "rocblas_set_pointer_mode",
-                detail: e.to_string(),
-            })?;
-        let sasum =
-            unsafe { crate::ffi::require_rocblas_sasum(&self.owner.library) }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sasum",
-                    detail: e.to_string(),
-                }
-            })?;
-        let sscal =
-            unsafe { crate::ffi::require_rocblas_sscal(&self.owner.library) }.map_err(|e| {
-                RocblasError::MissingSymbol {
-                    symbol: "rocblas_sscal",
-                    detail: e.to_string(),
-                }
-            })?;
+        // No warm symbol lookup: cold handle admission owns all four exact entrypoints.
+        let get_mode = self.owner.vectors.get_pointer_mode;
+        let set_mode = self.owner.vectors.set_pointer_mode;
+        let sasum = self.owner.vectors.sasum;
+        let sscal = self.owner.vectors.sscal;
         let mut prior_mode = ROCBLAS_POINTER_MODE_HOST;
         let get_status = unsafe {
             crate::ffi::invoke_rocblas_get_pointer_mode(
@@ -1549,7 +1486,7 @@ impl Rocblas {
         };
         let sync = unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.owner.runtime) };
         if let Err(error) = sync {
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(x_lease);
             std::mem::forget(result_lease);
             return Err(error.into());
@@ -1575,6 +1512,165 @@ impl Rocblas {
         }
         Ok(())
     }
+
+    /// Reduce F64 magnitudes into a device scalar, then scale in F64.
+    ///
+    /// Typed double ASUM/SCAL preserve F64 storage and arithmetic. Reduction order and
+    /// special-value propagation remain native library behavior, independently of strict
+    /// checking or portable reproducibility. The selected handle configuration is retained.
+    ///
+    /// # Errors
+    /// Rejects invalid extents, strides, aliases, conflicting access and different runtimes.
+    /// Library errors restore pointer mode after terminal completion; uncertain completion
+    /// quarantines leases and poisons the handle exactly as [`Self::sasum_scaled`].
+    #[allow(clippy::too_many_lines)]
+    pub fn dasum_scaled(
+        &self,
+        n: usize,
+        x: &DeviceBuffer,
+        incx: usize,
+        scale: f64,
+        result: &DeviceBuffer,
+    ) -> Result<(), RocblasError> {
+        self.ensure_idle()?;
+        if n == 0 || incx == 0 {
+            return Err(RocblasError::InvalidVector(
+                "length and strides must be positive",
+            ));
+        }
+        let x_required = vector_bytes_for_size(n, incx, size_of::<f64>())?;
+        if x_required > x.len() {
+            return Err(RocblasError::BufferTooSmall {
+                matrix: "x",
+                allocation: x.len(),
+                required: x_required,
+            });
+        }
+        if result.len() < size_of::<f64>() {
+            return Err(RocblasError::BufferTooSmall {
+                matrix: "result",
+                allocation: result.len(),
+                required: size_of::<f64>(),
+            });
+        }
+        for buffer in [x, result] {
+            self.owner
+                .runtime
+                .ensure_same_runtime(&buffer.allocation.runtime)
+                .map_err(|_| RocblasError::DifferentRuntime)?;
+        }
+        if Rc::ptr_eq(&x.allocation, &result.allocation) {
+            return Err(RocblasError::AliasedBuffers);
+        }
+        let x_lease = x.acquire_access().map_err(|_| RocblasError::Busy)?;
+        let result_lease = result.acquire_access().map_err(|_| RocblasError::Busy)?;
+        let (n, incx) = (
+            c_int::try_from(n).map_err(|_| RocblasError::DimensionOverflow)?,
+            c_int::try_from(incx).map_err(|_| RocblasError::DimensionOverflow)?,
+        );
+        self.owner
+            .runtime
+            .hip_set_device(self.owner.runtime.0.device)?;
+        // SAFETY: symbols match rocBLAS public declarations; leased allocations remain alive
+        // until synchronization confirms the operation has completed.
+        // No warm symbol lookup: cold handle admission owns all four exact entrypoints.
+        let get_mode = self.owner.vectors.get_pointer_mode;
+        let set_mode = self.owner.vectors.set_pointer_mode;
+        let dasum = self.owner.vectors.dasum;
+        let dscal = self.owner.vectors.dscal;
+        let mut prior_mode = ROCBLAS_POINTER_MODE_HOST;
+        let get_status = unsafe {
+            crate::ffi::invoke_rocblas_get_pointer_mode(
+                &get_mode,
+                self.owner.handle,
+                &raw mut prior_mode,
+            )
+        };
+        if get_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_get_pointer_mode",
+                code: get_status,
+            });
+        }
+        let set_status = unsafe {
+            crate::ffi::invoke_rocblas_set_pointer_mode(
+                &set_mode,
+                self.owner.handle,
+                ROCBLAS_POINTER_MODE_DEVICE,
+            )
+        };
+        if set_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_set_pointer_mode",
+                code: set_status,
+            });
+        }
+        let reduction_status = unsafe {
+            crate::ffi::invoke_rocblas_dasum(
+                &dasum,
+                self.owner.handle,
+                n,
+                x.allocation.pointer.cast(),
+                incx,
+                result.allocation.pointer.cast(),
+            )
+        };
+        let scale_status = if reduction_status == ROCBLAS_SUCCESS {
+            let host_status = unsafe {
+                crate::ffi::invoke_rocblas_set_pointer_mode(
+                    &set_mode,
+                    self.owner.handle,
+                    ROCBLAS_POINTER_MODE_HOST,
+                )
+            };
+            if host_status == ROCBLAS_SUCCESS {
+                unsafe {
+                    crate::ffi::invoke_rocblas_dscal(
+                        &dscal,
+                        self.owner.handle,
+                        1,
+                        std::ptr::from_ref(&scale),
+                        result.allocation.pointer.cast(),
+                        1,
+                    )
+                }
+            } else {
+                host_status
+            }
+        } else {
+            ROCBLAS_SUCCESS
+        };
+        let restore_status = unsafe {
+            crate::ffi::invoke_rocblas_set_pointer_mode(&set_mode, self.owner.handle, prior_mode)
+        };
+        let sync = unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.owner.runtime) };
+        if let Err(error) = sync {
+            self.retain_unknown_completion();
+            std::mem::forget(x_lease);
+            std::mem::forget(result_lease);
+            return Err(error.into());
+        }
+        if restore_status != ROCBLAS_SUCCESS {
+            self.owner.poisoned.set(true);
+            return Err(RocblasError::Status {
+                operation: "rocblas_set_pointer_mode(restore)",
+                code: restore_status,
+            });
+        }
+        if reduction_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_dasum",
+                code: reduction_status,
+            });
+        }
+        if scale_status != ROCBLAS_SUCCESS {
+            return Err(RocblasError::Status {
+                operation: "rocblas_dscal",
+                code: scale_status,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RocblasHandleOwner {
@@ -1588,9 +1684,9 @@ impl Drop for RocblasHandleOwner {
             return;
         }
         // SAFETY: handle came from rocblas_create_handle and library is retained until this drop.
-        if let Ok(destroy) = unsafe { crate::ffi::require_rocblas_destroy_handle(&self.library) } {
-            let _ = unsafe { crate::ffi::invoke_rocblas_destroy_handle(&destroy, self.handle) };
-        }
+        let _ = unsafe {
+            crate::ffi::invoke_rocblas_destroy_handle(&self.functions.destroy, self.handle)
+        };
     }
 }
 
@@ -1657,6 +1753,14 @@ fn matrix_bytes_f64(
 }
 
 fn vector_bytes(n: usize, stride: usize) -> Result<usize, RocblasError> {
+    vector_bytes_for_size(n, stride, size_of::<f32>())
+}
+
+fn vector_bytes_for_size(
+    n: usize,
+    stride: usize,
+    element_size: usize,
+) -> Result<usize, RocblasError> {
     if n == 0 || stride == 0 {
         return Err(RocblasError::InvalidVector(
             "length and strides must be positive",
@@ -1667,13 +1771,21 @@ fn vector_bytes(n: usize, stride: usize) -> Result<usize, RocblasError> {
         .and_then(|v| v.checked_add(1))
         .ok_or(RocblasError::DimensionOverflow)?;
     elements
-        .checked_mul(size_of::<f32>())
+        .checked_mul(element_size)
         .ok_or(RocblasError::DimensionOverflow)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_vector_extents_include_stride_and_detect_overflow() {
+        assert_eq!(vector_bytes_for_size(1, 8, size_of::<f64>()).unwrap(), 8);
+        assert_eq!(vector_bytes_for_size(4, 2, size_of::<f64>()).unwrap(), 56);
+        assert!(vector_bytes_for_size(0, 1, size_of::<f64>()).is_err());
+        assert!(vector_bytes_for_size(usize::MAX / 8 + 1, 1, size_of::<f64>()).is_err());
+    }
 
     #[test]
     fn matrix_extent_checks_leading_dimension_and_overflow() {
@@ -1817,6 +1929,113 @@ mod tests {
         drop(rocblas);
         completion.wait().expect("wait for DGEMM completion");
         verify(&read_output(&batch_c), 1.5, -0.25);
+    }
+
+    #[test]
+    #[cfg(feature = "allocation-census")]
+    #[ignore = "requires authorized ROCm device and native BLAS library"]
+    fn retained_sgemm_dot_stream_and_destroy_have_no_warm_symbol_resolution() {
+        let runtime = HipRuntime::new(0).unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let mut blas = Rocblas::new(&runtime).unwrap();
+        let mut left = runtime.allocate(16).unwrap();
+        let mut right = runtime.allocate(16).unwrap();
+        let output = runtime.allocate(16).unwrap();
+        let dot = runtime.allocate(4).unwrap();
+        let encode = |values: [f32; 4]| {
+            values
+                .into_iter()
+                .flat_map(f32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        };
+        right.copy_from(&encode([1.0, 0.0, 0.0, 1.0])).unwrap();
+        crate::reset_rocm_api_census();
+        blas.bind_stream(&stream).unwrap();
+        for iteration in 0..8 {
+            let values = if iteration % 2 == 0 {
+                [1.0, 2.0, 3.0, 4.0]
+            } else {
+                [5.0, 6.0, 7.0, 8.0]
+            };
+            let bytes = encode(values);
+            left.copy_from(&bytes).unwrap();
+            blas.sgemm(
+                false, false, 2, 2, 2, 1.0, &left, 2, &right, 2, 0.0, &output, 2,
+            )
+            .unwrap();
+            let mut actual = [0; 16];
+            output.copy_to(&mut actual).unwrap();
+            assert_eq!(actual.as_slice(), bytes);
+            blas.sdot_scaled(4, &left, 1, &right, 1, 0.5, &dot).unwrap();
+            let mut actual_dot = [0; 4];
+            dot.copy_to(&mut actual_dot).unwrap();
+            assert_eq!(
+                f32::from_ne_bytes(actual_dot).to_bits(),
+                if iteration % 2 == 0 {
+                    2.5_f32.to_bits()
+                } else {
+                    6.5_f32.to_bits()
+                }
+            );
+        }
+        drop(blas);
+        let api = crate::rocm_api_census();
+        assert_eq!(api.symbol_resolutions, 0);
+        assert_eq!(api.module_loads, 0);
+    }
+
+    #[test]
+    #[ignore = "requires native BLAS/device; deterministic error-only owner-retention witness"]
+    fn synchronous_unknown_completion_retains_exact_handle_stream_roots() {
+        for bound in [false, true] {
+            let runtime = HipRuntime::new(0).unwrap();
+            let stream = runtime.create_stream().unwrap();
+            let mut blas = Rocblas::new(&runtime).unwrap();
+            if bound {
+                blas.bind_stream(&stream).unwrap();
+            }
+            let mut left = runtime.allocate(4).unwrap();
+            let mut right = runtime.allocate(4).unwrap();
+            let output = runtime.allocate(4).unwrap();
+            left.copy_from(&2.0_f32.to_ne_bytes()).unwrap();
+            right.copy_from(&3.0_f32.to_ne_bytes()).unwrap();
+            let owner_count = Rc::strong_count(&blas.owner);
+            let stream_count = Rc::strong_count(&stream.inner);
+            blas.sgemm(
+                false, false, 1, 1, 1, 1.0, &left, 1, &right, 1, 0.0, &output, 1,
+            )
+            .unwrap();
+            let mut actual = [0; 4];
+            output.copy_to(&mut actual).unwrap();
+            assert_eq!(f32::from_ne_bytes(actual).to_bits(), 6.0_f32.to_bits());
+            assert_eq!(Rc::strong_count(&blas.owner), owner_count);
+            assert_eq!(Rc::strong_count(&stream.inner), stream_count);
+            let owner = Rc::downgrade(&blas.owner);
+            let library = Arc::downgrade(&blas.owner.library);
+            let context = Arc::downgrade(&runtime.0);
+            let queue = Rc::downgrade(&stream.inner);
+            // Real SGEMM has already completed. Exercise the actual private unknown-result
+            // retention helper deterministically; this is not an injected driver-loss test.
+            blas.retain_unknown_completion();
+            assert!(!blas.is_usable());
+            assert!(matches!(
+                blas.sgemm(
+                    false, false, 1, 1, 1, 1.0, &left, 1, &right, 1, 0.0, &output, 1
+                ),
+                Err(RocblasError::CompletionUnknown)
+            ));
+            drop(blas);
+            drop(left);
+            drop(right);
+            drop(output);
+            drop(stream);
+            drop(runtime);
+            assert!(owner.upgrade().is_some());
+            assert!(library.upgrade().is_some());
+            assert!(context.upgrade().is_some());
+            // NULL has no separate Rust stream owner; an unrelated created stream must drop.
+            assert_eq!(queue.upgrade().is_some(), bound);
+        }
     }
 
     #[test]

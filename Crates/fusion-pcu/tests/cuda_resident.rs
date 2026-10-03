@@ -162,7 +162,11 @@ fn ordinary_cuda_source_ownership_and_fault_contracts() {
 
     let matrix = [[1.0_f32, 2.0], [3.0, 4.0]];
     let rejected = checked_matmul(&matrix, &matrix).unwrap_err();
-    let PcuExecutionError::NoCompatibleResidentDevice(rejections) = rejected else {
+    let PcuExecutionError::NoCompatibleDevice {
+        rejected: rejections,
+        ..
+    } = rejected
+    else {
         panic!("checked compound rejection retains cold candidate metadata: {rejected}");
     };
     assert!(rejections.iter().any(|(_, error)| matches!(

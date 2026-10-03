@@ -27,7 +27,7 @@ use pcu_facade::{
 use fusion_pcu_vulkan::{
     PcuVulkanBackend,
     PcuVulkanError,
-    PcuVulkanPreparedBitMap,
+    PcuVulkanPreparedHost,
 };
 
 pub fn prepare_graph(
@@ -36,7 +36,7 @@ pub fn prepare_graph(
     underflow: PcuFloatUnderflowPolicy,
     range: PcuRangePolicy,
     grid: bool,
-) -> Result<PcuVulkanPreparedBitMap, PcuVulkanError> {
+) -> Result<PcuVulkanPreparedHost, PcuVulkanError> {
     with_graph(extent, underflow, range, grid, |kernel| {
         backend.prepare_host_kernel(kernel)
     })
@@ -117,6 +117,11 @@ pub fn with_typed_graph<R>(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     run(&PcuDispatchKernelIr {
+        numerical_requirements: pcu_facade::PcuImplementationRequirements {
+            range_policy: range,
+            float_underflow: underflow,
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: PcuKernelId(90),
         entry: PcuDispatchEntryPoint {
             name: "checked_neg",

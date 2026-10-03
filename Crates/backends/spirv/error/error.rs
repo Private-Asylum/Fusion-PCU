@@ -16,6 +16,7 @@ use super::types::{
 /// Failure returned while lowering PCU IR into SPIR-V words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuSpirvError {
+    UnsupportedNumericalRequirements,
     UnsupportedInstruction(PcuDispatchOpCaps),
     UnsupportedValueType(PcuValueType),
     UnsupportedCapability(PcuSpirvCapability),
@@ -29,6 +30,9 @@ pub enum PcuSpirvError {
 impl fmt::Display for PcuSpirvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Self::UnsupportedNumericalRequirements => {
+                f.write_str("unproved SPIR-V numerical requirements")
+            }
             Self::UnsupportedInstruction(flags) => {
                 write!(
                     f,

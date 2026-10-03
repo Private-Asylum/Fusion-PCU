@@ -74,6 +74,7 @@ fn packed(error: &TensorError) -> u64 {
 pub fn run<T: Scalar + TensorElement>(
     backend: &Rc<RocmOwnedDispatchBackend>,
     runtime: &HipRuntime,
+    options: fusion_pcu::PcuNumericalOptions,
 ) -> Result<(), Box<dyn Error>> {
     let one = T::from_units(1, 1);
     let zero = T::default();
@@ -124,6 +125,7 @@ pub fn run<T: Scalar + TensorElement>(
     ] {
         let mut graph = Graph::default();
         graph.set_numerical_mode(PcuNumericalMode::Strict);
+        graph.set_numerical_options(options);
         let w = graph.input([2], T::TYPE)?;
         let g = graph.input([2], T::TYPE)?;
         let output = graph.sgd_update(w, g, 0.5)?;
@@ -211,7 +213,7 @@ pub fn run<T: Scalar + TensorElement>(
         Native::read(&native_output, &mut actual)?;
         oracle::verify(&expected, &actual);
         eprintln!(
-            "correctness/{}/{label}: source+graph+native complete output/fault coordinates and terminal retry passed",
+            "correctness/{}/{label}: requested={options:?} source+graph+native complete output/fault coordinates and terminal retry passed",
             T::LABEL
         );
     }

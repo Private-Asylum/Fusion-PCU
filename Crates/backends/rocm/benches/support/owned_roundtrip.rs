@@ -134,6 +134,7 @@ impl Roundtrip {
         let upload_stream = backend.create_stream()?;
         let readback_stream = backend.create_stream()?;
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(0xD1_0054),
             entry: PcuDispatchEntryPoint {
                 name: "owned_roundtrip_copy",

@@ -151,6 +151,7 @@ pub fn prepare(
             index: PcuDispatchIndex::BindingElementZero,
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            range_policy: fusion_pcu::PcuRangePolicy::Reject,
             value_type: scalar_type,
             op: operation,
             result: RESULT,
@@ -177,6 +178,7 @@ pub fn prepare(
         &body[..]
     };
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu_core::PcuKernelId(91),
         entry: PcuDispatchEntryPoint {
             name: "checked_integer_map",

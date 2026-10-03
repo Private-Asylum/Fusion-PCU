@@ -119,6 +119,10 @@ fn with_request(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuImplementationRequirements {
+            float_underflow: underflow,
+            ..PcuImplementationRequirements::default()
+        },
         id: PcuKernelId(0),
         entry: PcuDispatchEntryPoint {
             name: "neg_offer",
@@ -155,6 +159,14 @@ fn cold_offer_preserves_exact_requirements_and_has_no_invented_cost() {
             with_request(grid, underflow, |request| {
                 for mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
                     request.requirements.numerical_mode = mode;
+                    let kernel = PcuDispatchKernelIr {
+                        numerical_requirements: request.requirements,
+                        ..*request.operation
+                    };
+                    let request = &mut PcuImplementationRequest {
+                        operation: &kernel,
+                        ..*request
+                    };
                     let mut output = [None; 2];
                     assert_eq!(
                         provider().implementation_offers(request, &mut output),
@@ -198,6 +210,14 @@ fn cold_offer_rejects_stale_targets_and_mismatched_operation_policy() {
             );
             request.executor = PcuExecutorId(0);
             request.requirements.float_underflow = PcuFloatUnderflowPolicy::RejectSubnormalResult;
+            let kernel = PcuDispatchKernelIr {
+                numerical_requirements: request.requirements,
+                ..*request.operation
+            };
+            let request = &mut PcuImplementationRequest {
+                operation: &kernel,
+                ..*request
+            };
             assert_eq!(
                 provider().implementation_offers(request, &mut output),
                 Err(PcuCpuNegOfferError::UnderflowMismatch)

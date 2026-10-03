@@ -63,6 +63,7 @@ fn f32_coefficient_scalar_broadcast_maps_over_vector() {
         PcuDispatchOp::Control(fusion_pcu_core::PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(1),
         entry: PcuDispatchEntryPoint {
             name: "coefficient_map",
@@ -163,6 +164,7 @@ fn f64_seed_scalar_broadcast_maps_over_vector() {
         PcuDispatchOp::Control(fusion_pcu_core::PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(2),
         entry: PcuDispatchEntryPoint {
             name: "seed_map",
@@ -275,6 +277,7 @@ fn f64_min_max_keep_double_precision_nan_and_signed_zero_semantics() {
             PcuDispatchOp::Control(fusion_pcu_core::PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(3),
             entry: PcuDispatchEntryPoint {
                 name: "f64_min_max",
@@ -387,6 +390,7 @@ fn f64_add_relu_oracle_preserves_bits_beyond_f32_integer_precision() {
         PcuDispatchOp::Control(fusion_pcu_core::PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(4),
         entry: PcuDispatchEntryPoint {
             name: "f64_add_relu",

@@ -45,6 +45,7 @@ type NegExecution = fn(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuCpuPreparedNegError {
     UnsupportedProfile,
+    HeaderUnderflowMismatch,
     InvalidKernel(CheckedFloatMapValidationError),
     InvalidValueFlow(PcuTypedDispatchValidationError),
     InvalidGridExtent,
@@ -193,7 +194,11 @@ impl PcuHostKernelBackend for PcuCpuCheckedNeg {
         else {
             return Err(PcuCpuPreparedNegError::UnsupportedProfile);
         };
-        if *value_type != PcuValueType::Scalar(scalar)
+        if kernel.numerical_requirements.float_underflow != *underflow_policy {
+            return Err(PcuCpuPreparedNegError::HeaderUnderflowMismatch);
+        }
+        if kernel.numerical_requirements.range_policy != PcuRangePolicy::Reject
+            || *value_type != PcuValueType::Scalar(scalar)
             || loaded != value
             || negated != stored
             || load_index != &index
@@ -275,6 +280,15 @@ impl PcuPreparedHostKernel for PcuCpuPreparedNeg {
 fn validate_neg_profile(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<PcuScalarType, PcuCpuPreparedNegError> {
+    // Exact scalar arithmetic does not certify the complete PortableV1 contract.
+    if kernel
+        .numerical_requirements
+        .numerical_options
+        .reproducibility
+        == fusion_pcu::PcuReproducibility::PortableV1
+    {
+        return Err(PcuCpuPreparedNegError::UnsupportedProfile);
+    }
     if kernel.entry.logical_shape.contains(&0) {
         return Err(PcuCpuPreparedNegError::InvalidKernel(
             CheckedFloatMapValidationError::InvalidLogicalShape,

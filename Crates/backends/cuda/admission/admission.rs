@@ -11,7 +11,16 @@ use fusion_pcu::{
 
 /// Legacy value ALU opcodes have no explicit permission to suppress numerical faults.
 pub fn checked_numeric_contract(kernel: &PcuDispatchKernelIr<'_>) -> bool {
-    checked_ops(kernel.ops)
+    (kernel
+        .numerical_requirements
+        .numerical_options
+        .reproducibility
+        != fusion_pcu::PcuReproducibility::PortableV1
+        || fusion_pcu::describe_portable_v1_map(kernel).is_ok()
+        || fusion_pcu::describe_portable_v1_integer_map(kernel).is_ok()
+        || fusion_pcu::describe_portable_v1_integer_div_rem_map(kernel).is_ok()
+        || fusion_pcu::describe_portable_v1_unary_map(kernel).is_ok())
+        && checked_ops(kernel.ops)
 }
 
 fn checked_ops(ops: &[PcuDispatchOp<'_>]) -> bool {
@@ -20,7 +29,12 @@ fn checked_ops(ops: &[PcuDispatchOp<'_>]) -> bool {
         PcuDispatchOp::Data(PcuDispatchDataOp::Convert { conversion, .. }) => !matches!(
             conversion.source_type(),
             PcuValueType::Scalar(
-                PcuScalarType::F16 | PcuScalarType::BF16 | PcuScalarType::F32 | PcuScalarType::F64
+                PcuScalarType::F16
+                    | PcuScalarType::BF16
+                    | PcuScalarType::F8E4M3FN
+                    | PcuScalarType::F8E5M2
+                    | PcuScalarType::F32
+                    | PcuScalarType::F64
             )
         ),
         PcuDispatchOp::GridStrideLoop { body, .. } => checked_ops(body),

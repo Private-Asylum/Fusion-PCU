@@ -13,6 +13,8 @@ use fusion_pcu::{
     PcuBindingType,
     PcuExecutionFault,
     PcuFloatUnderflowPolicy,
+    PcuImplementationRequirements,
+    PcuRangePolicy,
     PcuInvocationShape,
     PcuNumericalMode,
     PcuOwnedBindingRequirement,
@@ -41,9 +43,24 @@ pub(crate) struct StrictMatMulSpec {
     transpose_right: bool,
     scalar_type: PcuScalarType,
     underflow: PcuFloatUnderflowPolicy,
+    numerical_requirements: PcuImplementationRequirements,
 }
 
 impl StrictMatMulSpec {
+    // Private factory admission establishes positive dimensions and packed event bounds.
+    pub(crate) fn fault_domain(self) -> fusion_pcu::dialect::tensor::TensorStrictFaultDomain {
+        fusion_pcu::dialect::tensor::TensorStrictFaultDomain::matmul(
+            self.scalar_type,
+            u64::from(self.rows) * u64::from(self.columns),
+            u64::from(self.inner),
+            self.underflow,
+        )
+        .expect("verified checked compound dimensions and format")
+    }
+    pub(crate) fn fault_extent(self) -> u64 {
+        self.fault_domain().event_extent()
+    }
+
     pub(super) fn from_node(graph: &Graph, node: NodeDescriptor<'_>) -> Option<Self> {
         let OpDescriptor::MatMul {
             left,
@@ -55,8 +72,6 @@ impl StrictMatMulSpec {
             return None;
         };
         if node.numerical_mode != Some(PcuNumericalMode::Strict)
-            || node.numerical_options.compound_arithmetic
-                != fusion_pcu::PcuCompoundArithmeticPolicy::Checked
             || node.numerical_options.reproducibility != fusion_pcu::PcuReproducibility::Unspecified
         {
             return None;
@@ -99,6 +114,14 @@ impl StrictMatMulSpec {
             transpose_left,
             transpose_right,
             scalar_type: node.scalar_type,
+            // Permissions may use this stronger ordered checker; retain the requested tuple.
+            numerical_requirements: PcuImplementationRequirements {
+                numerical_mode: PcuNumericalMode::Strict,
+                numerical_options: node.numerical_options,
+                float_underflow: node.float_underflow_policy.unwrap_or_default(),
+                // Tensor nodes currently represent only Reject range.
+                range_policy: PcuRangePolicy::Reject,
+            },
             underflow: node.float_underflow_policy?,
         };
         if !matches!(spec.scalar_type, PcuScalarType::F32 | PcuScalarType::F64)

@@ -2,7 +2,7 @@
 
 use crate::PcuScalar;
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
     impl Sealed for u8 {}
     impl Sealed for u16 {}
@@ -12,10 +12,12 @@ mod sealed {
     impl Sealed for i16 {}
     impl Sealed for i32 {}
     impl Sealed for i64 {}
+    impl Sealed for u128 {}
+    impl Sealed for i128 {}
 }
 
 /// A `PcuScalar` whose integer wrapping add, subtract, and multiply are part of its generic PCU
-/// contract. Implementations are sealed to the eight built-in integer scalar types.
+/// contract. Implementations are sealed to native and limb-based PCU integer carriers.
 pub trait PcuWrappingInteger: PcuScalar + sealed::Sealed + Sized {
     /// Adds two values modulo the scalar's bit width.
     #[must_use]
@@ -40,4 +42,4 @@ macro_rules! impl_wrapping_integer {
     };
 }
 
-impl_wrapping_integer!(u8, u16, u32, u64, i8, i16, i32, i64);
+impl_wrapping_integer!(u8, u16, u32, u64, i8, i16, i32, i64, u128, i128);

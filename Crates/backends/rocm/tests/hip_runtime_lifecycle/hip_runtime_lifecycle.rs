@@ -48,3 +48,37 @@ fn hip_runtime_remains_usable_after_short_lived_threads_exit() {
     );
     assert_eq!(third, first, "HIP discovery survives repeated thread exits");
 }
+
+#[cfg(feature = "allocation-census")]
+#[test]
+#[ignore = "requires authorized ROCm hardware; correctness/census only"]
+fn retained_runtime_entries_select_device_on_another_thread_without_resolving() {
+    let runtime = HipRuntime::new(0).unwrap();
+    std::thread::spawn(move || {
+        fusion_pcu_rocm::reset_rocm_api_census();
+        assert!(runtime.device_count().unwrap() > 0);
+        assert!(runtime.memory_info().unwrap().total_bytes > 0);
+        let info = runtime.device_info().unwrap();
+        assert!(!info.name.is_empty());
+        let mut buffer = runtime.allocate(16).unwrap();
+        buffer.copy_from(&[3_u8; 16]).unwrap();
+        let mut output = [0_u8; 16];
+        buffer.copy_to(&mut output).unwrap();
+        assert_eq!(output, [3_u8; 16]);
+        let stream = runtime.create_stream().unwrap();
+        stream.synchronize().unwrap();
+        drop(stream);
+        drop(buffer);
+        let api = fusion_pcu_rocm::rocm_api_census();
+        assert_eq!(api.symbol_resolutions, 0);
+        assert_eq!(api.allocations, 1);
+        assert_eq!(api.frees, 1);
+        assert_eq!(api.host_to_device_copies, 1);
+        assert_eq!(api.device_to_host_copies, 1);
+        assert_eq!(api.device_selections * 2, api.runtime_calls);
+        assert!(api.device_selections >= 10);
+        eprintln!("retained cross-thread HIP: {api:?}");
+    })
+    .join()
+    .unwrap();
+}

@@ -385,6 +385,7 @@ fn run_case(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(width.id()),
         entry: PcuDispatchEntryPoint {
             name: "widen",

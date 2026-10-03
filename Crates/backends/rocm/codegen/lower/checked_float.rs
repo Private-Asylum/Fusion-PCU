@@ -76,6 +76,9 @@ pub(super) fn emit_helpers(source: &mut String, kernel: &fusion_pcu::PcuDispatch
             }
         }
     }
+    if low_precision::uses(kernel) {
+        source.push_str(low_precision::HELPERS);
+    }
     let mut has_f32 = false;
     let mut has_f64 = false;
     let mut has_narrow = false;
@@ -127,6 +130,19 @@ pub(super) fn emit_checked_float_unary(
     result: PcuDispatchValueId,
     value: PcuDispatchValueId,
 ) -> Result<(), RocmLowerError> {
+    if low_precision::format(value_type).is_some() {
+        return low_precision::emit_unary(
+            source,
+            indent,
+            logical_index,
+            op,
+            policy,
+            range_policy,
+            value_type,
+            result,
+            value,
+        );
+    }
     let policy_tag = match policy {
         PcuFloatUnderflowPolicy::IeeeAfterRounding => 0u32,
         PcuFloatUnderflowPolicy::RejectSubnormalResult => 1,
@@ -186,6 +202,20 @@ pub(super) fn emit_checked_float_binary(
     lhs: PcuDispatchValueId,
     rhs: PcuDispatchValueId,
 ) -> Result<(), RocmLowerError> {
+    if low_precision::format(value_type).is_some() {
+        return low_precision::emit(
+            source,
+            indent,
+            logical_index,
+            op,
+            policy,
+            range_policy,
+            value_type,
+            result,
+            lhs,
+            rhs,
+        );
+    }
     let op_tag = match op {
         PcuDispatchFloatBinaryOp::Add => 0u32,
         PcuDispatchFloatBinaryOp::Sub => 1,
@@ -608,3 +638,6 @@ __device__ __forceinline__ FusionF32ToF64Result fusion_checked_f32_to_f64(unsign
     return {sign64 | (static_cast<unsigned long long>(exponent64) << 52u) | fraction64, 0u};
 }
 ";
+
+#[path = "checked_float/low_precision/low_precision.rs"]
+mod low_precision;

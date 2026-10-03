@@ -3,4 +3,5 @@
 #include "pcu_mlx/error.h"
 #include "pcu_mlx/manifest.h"
 #include "pcu_mlx/replay.h"
+#include "pcu_mlx/checked_unary.h"
 #endif

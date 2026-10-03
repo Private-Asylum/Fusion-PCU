@@ -19,6 +19,104 @@ path = "cpu.rs"
 [features]
 default = []
 std = []
+tensor = ["fusion-pcu-core/tensor"]
+source-tensor = ["std", "tensor", "pcu-facade/cpu", "pcu-facade/tensor"]
+source-div-rem = ["std", "pcu-facade/cpu"]
+source-low-precision = ["std", "pcu-facade/cpu"]
+source-unary = ["std", "pcu-facade/cpu"]
+source-wide = ["std", "pcu-facade/cpu"]
+source-portable = ["std", "pcu-facade/cpu"]
+source-clamp = ["std", "pcu-facade/cpu"]
+source-composed = ["std", "pcu-facade/cpu"]
+source-transport = ["std", "pcu-facade/cpu"]
+
+[[test]]
+name = "ordered_transport"
+path = "tests/ordered_transport/ordered_transport.rs"
+required-features = ["source-transport"]
+
+[[bench]]
+name = "ordered_transport"
+path = "benches/ordered_transport/ordered_transport.rs"
+harness = false
+required-features = ["source-transport"]
+
+[[test]]
+name = "composed_float_maps"
+path = "tests/composed_float_maps/composed_float_maps.rs"
+required-features = ["source-composed"]
+
+[[bench]]
+name = "composed_float_maps"
+path = "benches/composed_float_maps/composed_float_maps.rs"
+harness = false
+required-features = ["source-composed"]
+
+[[example]]
+name = "composed_float_maps"
+path = "examples/composed_float_maps/composed_float_maps.rs"
+required-features = ["source-composed"]
+
+[[test]]
+name = "clamped_binary"
+path = "tests/clamped_binary/clamped_binary.rs"
+
+[[test]]
+name = "low_precision"
+path = "tests/low_precision/low_precision.rs"
+
+[[bench]]
+name = "low_precision"
+path = "benches/low_precision/low_precision.rs"
+harness = false
+required-features = ["source-low-precision"]
+
+[[example]]
+name = "low_precision"
+path = "examples/low_precision/low_precision.rs"
+required-features = ["source-low-precision"]
+
+[[test]]
+name = "source_float"
+path = "tests/source_float/source_float.rs"
+required-features = ["source-div-rem"]
+
+[[test]]
+name = "checked_div_rem"
+path = "tests/checked_div_rem/checked_div_rem.rs"
+required-features = ["source-div-rem"]
+
+[[bench]]
+name = "checked_div_rem"
+path = "benches/checked_div_rem/checked_div_rem.rs"
+harness = false
+required-features = ["source-div-rem"]
+
+[[example]]
+name = "checked_div_rem"
+path = "examples/checked_div_rem/checked_div_rem.rs"
+required-features = ["source-div-rem"]
+
+[[test]]
+name = "prepared_tensor"
+path = "tests/prepared_tensor/prepared_tensor.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "source_tensor"
+path = "tests/source_tensor/source_tensor.rs"
+required-features = ["source-tensor"]
+
+[[bench]]
+name = "checked_tensor"
+path = "benches/checked_tensor/checked_tensor.rs"
+harness = false
+required-features = ["source-tensor"]
+
+[[example]]
+name = "training"
+path = "examples/training/training.rs"
+required-features = ["source-tensor"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
@@ -62,3 +160,359 @@ name = "checked_f64_neg"
 path = "benches/checked_f64_neg/checked_f64_neg.rs"
 harness = false
 required-features = ["std"]
+
+[[test]]
+name = "prepared_binary"
+path = "tests/prepared_binary/prepared_binary.rs"
+
+[[bench]]
+name = "checked_binary"
+path = "benches/checked_binary/checked_binary.rs"
+harness = false
+
+[[example]]
+name = "checked_binary"
+path = "examples/checked_binary/checked_binary.rs"
+
+[[test]]
+name = "prepared_identity"
+path = "tests/prepared_identity/prepared_identity.rs"
+
+[[bench]]
+name = "identity"
+path = "benches/identity/identity.rs"
+harness = false
+
+[[test]]
+name = "prepared_conversion"
+path = "tests/prepared_conversion/prepared_conversion.rs"
+
+[[bench]]
+name = "checked_conversion"
+path = "benches/checked_conversion/checked_conversion.rs"
+harness = false
+
+[[bench]]
+name = "clamped_binary"
+path = "benches/clamped_binary/clamped_binary.rs"
+harness = false
+required-features = ["source-clamp"]
+
+[[example]]
+name = "clamped_binary"
+path = "examples/clamped_binary/clamped_binary.rs"
+required-features = ["source-clamp"]
+
+[[test]]
+name = "portable_binary"
+path = "tests/portable_binary/portable_binary.rs"
+required-features = ["source-portable"]
+
+[[bench]]
+name = "portable_binary"
+path = "benches/portable_binary/portable_binary.rs"
+harness = false
+required-features = ["source-portable"]
+
+[[example]]
+name = "portable_binary"
+path = "examples/portable_binary/portable_binary.rs"
+required-features = ["source-portable"]
+
+[[test]]
+name = "wide_integer"
+path = "tests/wide_integer/wide_integer.rs"
+required-features = ["source-wide"]
+
+[[bench]]
+name = "wide_integer"
+path = "benches/wide_integer/wide_integer.rs"
+harness = false
+required-features = ["source-wide"]
+
+[[example]]
+name = "wide_integer"
+path = "examples/wide_integer/wide_integer.rs"
+required-features = ["source-wide"]
+
+[[test]]
+name = "low_unary"
+path = "tests/low_unary/low_unary.rs"
+
+[[bench]]
+name="low_unary"
+path="benches/low_unary/low_unary.rs"
+harness=false
+required-features=["source-unary"]
+
+[[example]]
+name="low_unary"
+path="examples/low_unary/low_unary.rs"
+required-features=["source-unary"]
+
+[[test]]
+name="native_unary"
+path="tests/native_unary/native_unary.rs"
+required-features=["source-unary"]
+
+[[bench]]
+name="native_unary"
+path="benches/native_unary/native_unary.rs"
+harness=false
+required-features=["source-unary"]
+
+[[example]]
+name="native_unary"
+path="examples/native_unary/native_unary.rs"
+required-features=["source-unary"]
+
+[[test]]
+name = "clamped_integer"
+path = "tests/clamped_integer/clamped_integer.rs"
+
+[[bench]]
+name = "clamped_integer"
+path = "benches/clamped_integer/clamped_integer.rs"
+harness = false
+
+[[example]]
+name = "clamped-integer"
+path = "examples/clamped_integer/clamped_integer.rs"
+
+[[test]]
+name = "scalar_broadcast"
+path = "tests/scalar_broadcast/scalar_broadcast.rs"
+
+[[bench]]
+name="scalar_broadcast"
+path="benches/scalar_broadcast/scalar_broadcast.rs"
+harness=false
+
+[[example]]
+name="scalar_broadcast"
+path="examples/scalar_broadcast/scalar_broadcast.rs"
+
+[[test]]
+name="integer_tensor"
+path="tests/integer_tensor/integer_tensor.rs"
+required-features=["source-tensor"]
+
+[[bench]]
+name="integer_tensor"
+path="benches/integer_tensor/integer_tensor.rs"
+harness=false
+required-features=["source-tensor"]
+
+[[example]]
+name="integer-tensor"
+path="examples/integer_tensor/integer_tensor.rs"
+required-features=["source-tensor"]
+
+[[test]]
+name="low_tensor"
+path="tests/low_tensor/low_tensor.rs"
+required-features=["source-tensor"]
+
+[[bench]]
+name="low_tensor"
+path="benches/low_tensor/low_tensor.rs"
+harness=false
+required-features=["source-tensor"]
+
+[[example]]
+name="low-tensor"
+path="examples/low_tensor/low_tensor.rs"
+required-features=["source-tensor"]
+
+[[test]]
+name="scalar_tensor"
+path="tests/scalar_tensor/scalar_tensor.rs"
+required-features=["source-tensor"]
+
+[[bench]]
+name="scalar_tensor"
+path="benches/scalar_tensor/scalar_tensor.rs"
+harness=false
+required-features=["source-tensor"]
+
+[[example]]
+name="scalar-tensor"
+path="examples/scalar_tensor/scalar_tensor.rs"
+required-features=["source-tensor"]
+
+[[test]]
+name="low_tensor_backward"
+path="tests/low_tensor_backward/low_tensor_backward.rs"
+required-features=["source-tensor"]
+
+[[bench]]
+name="low_tensor_backward"
+path="benches/low_tensor_backward/low_tensor_backward.rs"
+harness=false
+required-features=["source-tensor"]
+
+[[example]]
+name="low-tensor-backward"
+path="examples/low_tensor_backward/low_tensor_backward.rs"
+required-features=["source-tensor"]
+
+[[test]]
+name="clamped_conversion"
+path="tests/clamped_conversion/clamped_conversion.rs"
+required-features=["source-clamp"]
+
+[[bench]]
+name="clamped_conversion"
+path="benches/clamped_conversion/clamped_conversion.rs"
+harness=false
+required-features=["source-clamp"]
+
+[[example]]
+name="clamped-conversion"
+path="examples/clamped_conversion/clamped_conversion.rs"
+required-features=["source-clamp"]
+
+[[test]]
+name="operand_schema"
+path="tests/operand_schema/operand_schema.rs"
+required-features=["source-low-precision"]
+
+[[bench]]
+name="operand_schema"
+path="benches/operand_schema/operand_schema.rs"
+harness=false
+required-features=["source-low-precision"]
+
+[[example]]
+name="operand-schema"
+path="examples/operand_schema/operand_schema.rs"
+required-features=["source-low-precision"]
+
+[[bench]]
+name="compound_permissions"
+path="benches/compound_permissions/compound_permissions.rs"
+harness=false
+required-features=["source-tensor"]
+
+[[example]]
+name = "compound-permissions"
+path = "examples/compound_permissions/compound_permissions.rs"
+required-features = ["source-tensor"]
+
+[[bench]]
+name="integer_simd"
+path="benches/integer_simd/integer_simd.rs"
+harness=false
+required-features=["source-clamp"]
+
+[[test]]
+name="integer_simd"
+path="tests/integer_simd/integer_simd.rs"
+required-features=["source-clamp"]
+
+[[example]]
+name="integer-simd"
+path="examples/integer_simd/integer_simd.rs"
+required-features=["source-clamp"]
+
+[[test]]
+name="flush_environment"
+path="tests/flush_environment/flush_environment.rs"
+required-features=["source-tensor"]
+
+[[test]]
+name="cold_constants"
+path="tests/cold_constants/cold_constants.rs"
+required-features=["source-tensor"]
+
+[[bench]]
+name = "integer_operands"
+path = "benches/integer_operands/integer_operands.rs"
+harness = false
+required-features = ["source-wide"]
+
+[[test]]
+name = "integer_operands"
+path = "tests/integer_operands/integer_operands.rs"
+required-features = ["source-wide"]
+
+[[example]]
+name = "integer_operands"
+path = "examples/integer_operands/integer_operands.rs"
+required-features = ["source-wide"]
+
+[[test]]
+name="portable_integer"
+path="tests/portable_integer/portable_integer.rs"
+required-features=["source-wide"]
+
+[[test]]
+name="wide_div_rem"
+path="tests/wide_div_rem/wide_div_rem.rs"
+required-features=["source-div-rem"]
+
+[[bench]]
+name="wide_div_rem"
+path="benches/wide_div_rem/wide_div_rem.rs"
+harness=false
+required-features=["source-div-rem"]
+
+[[example]]
+name="wide-div-rem"
+path="examples/wide_div_rem/wide_div_rem.rs"
+required-features=["source-div-rem"]
+
+[[test]]
+name = "div_rem_roles"
+path = "tests/div_rem_roles/div_rem_roles.rs"
+required-features = ["std"]
+
+[[bench]]
+name = "div_rem_roles"
+path = "benches/div_rem_roles/div_rem_roles.rs"
+harness = false
+required-features = ["std"]
+
+[[example]]
+name = "div-rem-roles"
+path = "examples/div_rem_roles/div_rem_roles.rs"
+required-features = ["std"]
+
+[[test]]
+name="portable_div_rem"
+path="tests/portable_div_rem/portable_div_rem.rs"
+
+[[bench]]
+name="portable_div_rem"
+path="benches/portable_div_rem/portable_div_rem.rs"
+harness=false
+
+[[example]]
+name="portable-div-rem"
+path="examples/portable_div_rem/portable_div_rem.rs"
+
+[[test]]
+name = "portable_unary"
+path = "tests/portable_unary/portable_unary.rs"
+
+[[bench]]
+name = "portable_unary"
+path = "benches/portable_unary/portable_unary.rs"
+harness = false
+required-features = ["source-portable"]
+
+[[example]]
+name = "portable-unary"
+path = "examples/portable_unary/portable_unary.rs"
+required-features = ["source-portable"]
+
+[[test]]
+name = "unary_roles"
+path = "tests/unary_roles/unary_roles.rs"
+required-features = ["source-unary"]
+
+[[bench]]
+name = "unary_roles"
+path = "benches/unary_roles/unary_roles.rs"
+harness = false
+required-features = ["source-unary"]

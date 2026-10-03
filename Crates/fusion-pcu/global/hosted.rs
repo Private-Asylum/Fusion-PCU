@@ -108,23 +108,20 @@ pub(super) struct Preparation {
 }
 
 impl Preparation {
-    pub(super) const fn float_underflow_policy(&self) -> crate::PcuFloatUnderflowPolicy {
-        self.policy.float_underflow
-    }
-
-    pub(super) const fn range_policy(&self) -> crate::PcuRangePolicy {
-        self.policy.range_policy
+    pub(super) const fn numerical_requirements(&self) -> crate::PcuImplementationRequirements {
+        crate::PcuImplementationRequirements {
+            numerical_mode: self.policy.numerical_mode,
+            numerical_options: self.policy.numerical_options,
+            float_underflow: self.policy.float_underflow,
+            range_policy: self.policy.range_policy,
+        }
     }
 
     pub(super) fn prepare(
         &mut self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<(), PcuExecutionError> {
-        if self.policy.numerical_options.reproducibility != crate::PcuReproducibility::Unspecified {
-            return Err(PcuExecutionError::UnsupportedNumericalOptions(
-                self.policy.numerical_options,
-            ));
-        }
+        super::numerical::validate_invocation_contract(kernel)?;
         let (session, prepared) = prepare_in_arena(
             &mut self.arena,
             self.policy,
@@ -194,17 +191,20 @@ fn prepare_in_arena<R>(
                     session
                 }
                 Err(error) => {
-                    rejected.push((device.id, PcuExecutionError::BackendInitialization(error)));
+                    rejected.push((device, PcuExecutionError::BackendInitialization(error)));
                     continue;
                 }
             }
         };
         match prepare(&session) {
             Ok(prepared) => return Ok((session, prepared)),
-            Err(error) => rejected.push((device.id, error)),
+            Err(error) => rejected.push((device, error)),
         }
     }
-    Err(PcuExecutionError::NoCompatibleDevice(rejected))
+    Err(PcuExecutionError::NoCompatibleDevice {
+        rejected,
+        discovery: Vec::new(),
+    })
 }
 
 /// Cold typed graph preparation shares the same selection and retained roots as Dispatch.
@@ -273,7 +273,8 @@ pub(super) fn call_host(
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 )))]
 pub(super) fn call_arguments<'a, const N: usize>(
     site: &PcuHostCallSite,
@@ -283,6 +284,7 @@ pub(super) fn call_arguments<'a, const N: usize>(
 ) -> Result<(), PcuExecutionError> {
     #[rustfmt::skip]
     use super::arguments::{
+        finish_resident_writes,
         PcuCallArgumentKind,
         ResidentWriteGuard,
     };
@@ -325,17 +327,17 @@ pub(super) fn call_arguments<'a, const N: usize>(
         for guard in guards.iter_mut().flatten() {
             guard.mark_may_have_written();
         }
-        let result = entry.prepared.call_mixed(&mut bindings);
-        if result.is_ok() {
-            for guard in guards.iter_mut().flatten() {
-                guard.mark_complete();
-            }
-        } else if !entry.prepared.last_call_completion_uncertain() {
-            for guard in guards.iter_mut().flatten() {
-                guard.mark_known_partial();
-            }
-        }
-        result.map_err(PcuExecutionError::from)
+        let result = entry
+            .prepared
+            .call_mixed(&mut bindings)
+            .map_err(PcuExecutionError::from);
+        finish_resident_writes(
+            &mut guards,
+            entry.prepared.last_call_may_have_written(),
+            entry.prepared.last_call_completion_uncertain(),
+            &result,
+        );
+        result
     })
 }
 
@@ -386,7 +388,8 @@ fn with_entry<R>(
                         feature = "cuda",
                         feature = "metal",
                         feature = "vulkan",
-                        feature = "cpu"
+                        feature = "cpu",
+                        feature = "mlx"
                     ))]
                     shared: None,
                     inner: Some(Preparation {
@@ -562,6 +565,10 @@ mod tests {
             arena: SessionArena::default(),
         };
         let kernel = crate::PcuDispatchKernelIr {
+            numerical_requirements: crate::PcuImplementationRequirements {
+                numerical_options: options,
+                ..crate::PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+            },
             id: crate::PcuKernelId(1),
             entry: crate::PcuDispatchEntryPoint {
                 name: "portable_probe",

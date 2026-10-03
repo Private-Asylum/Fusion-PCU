@@ -37,6 +37,7 @@ use crate::VALUE_SLOTS;
 /// Failure to execute the typed wrapping `u8` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuU8MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuU8MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -59,6 +60,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<u8> for PcuU8MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, u8>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuU8MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<u8, ()>(submission, bindings)
             .map_err(|_| PcuU8MapReferenceError::InvalidSubmission)?;
         if validate_u8_checked_div_rem_kernel(submission.kernel).is_ok() {
@@ -196,6 +206,7 @@ fn run_checked_u8_div_rem(
 /// Failure to execute the typed wrapping `u16` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuU16MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuU16MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -218,6 +229,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<u16> for PcuU16MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, u16>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuU16MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<u16, ()>(submission, bindings)
             .map_err(|_| PcuU16MapReferenceError::InvalidSubmission)?;
         if validate_u16_checked_div_rem_kernel(submission.kernel).is_ok() {
@@ -356,6 +376,7 @@ fn run_checked_u16_div_rem(
 /// Failure to execute the typed wrapping `u32` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuU32MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuU32MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -378,6 +399,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<u32> for PcuU32MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, u32>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuU32MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<u32, ()>(submission, bindings)
             .map_err(|_| PcuU32MapReferenceError::InvalidSubmission)?;
         if validate_u32_checked_div_rem_kernel(submission.kernel).is_ok() {
@@ -518,6 +548,7 @@ fn run_checked_u32_div_rem(
 /// Failure to execute the typed wrapping `u64` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuU64MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuU64MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -540,6 +571,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<u64> for PcuU64MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, u64>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuU64MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<u64, ()>(submission, bindings)
             .map_err(|_| PcuU64MapReferenceError::InvalidSubmission)?;
         if validate_u64_checked_div_rem_kernel(submission.kernel).is_ok() {
@@ -698,6 +738,7 @@ fn read_u64_binding(
 /// Failure to execute the typed wrapping `i64` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuI64MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuI64MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -720,6 +761,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<i64> for PcuI64MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, i64>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuI64MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<i64, ()>(submission, bindings)
             .map_err(|_| PcuI64MapReferenceError::InvalidSubmission)?;
         if validate_i64_checked_div_rem_kernel(submission.kernel).is_ok() {
@@ -805,6 +855,7 @@ unsafe impl PcuSynchronousHostDispatchBackend<i64> for PcuI64MapReference {
 /// Failure to execute the typed wrapping `i32` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuI32MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuI32MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -827,6 +878,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<i32> for PcuI32MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, i32>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuI32MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<i32, ()>(submission, bindings)
             .map_err(|_| PcuI32MapReferenceError::InvalidSubmission)?;
         if validate_i32_checked_div_rem_kernel(submission.kernel).is_ok() {
@@ -1055,6 +1115,7 @@ fn read_i64_binding(
 /// Failure to execute the typed wrapping `i8` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuI8MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuI8MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -1077,6 +1138,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<i8> for PcuI8MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, i8>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuI8MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<i8, ()>(submission, bindings)
             .map_err(|_| PcuI8MapReferenceError::InvalidSubmission)?;
         if validate_i8_checked_div_rem_kernel(submission.kernel).is_ok() {
@@ -1232,6 +1302,7 @@ fn read_i8_binding(
 /// Failure to execute the typed wrapping `i16` map reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuI16MapReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(fusion_pcu::PcuI16MapValidationError),
     MissingBinding(PcuBindingRef),
@@ -1254,6 +1325,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<i16> for PcuI16MapReference {
         bindings: &mut [PcuHostScalarBinding<'_, i16>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuI16MapReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<i16, ()>(submission, bindings)
             .map_err(|_| PcuI16MapReferenceError::InvalidSubmission)?;
         if validate_i16_checked_div_rem_kernel(submission.kernel).is_ok() {

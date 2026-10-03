@@ -132,6 +132,7 @@ fn kernel(
         },
     );
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(501),
         entry: PcuDispatchEntryPoint {
             name: "checked_cpu",
@@ -486,6 +487,7 @@ fn mixed_typed_ssa_widen_arithmetic_narrow_grid_and_clamp() {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let program = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(502),
             entry: PcuDispatchEntryPoint {
                 name: "mixed",
@@ -745,6 +747,7 @@ fn mixed_narrowing_rounds_ties_and_default_tininess_without_stale_ssa() {
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let program = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(504),
         entry: PcuDispatchEntryPoint {
             name: "narrow",

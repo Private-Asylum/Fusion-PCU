@@ -173,6 +173,7 @@ fn benchmark_owned_execution_dependency_chain(
     input.copy_from(&input_bytes)?;
 
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0042),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_bench_dependency_copy",
@@ -336,6 +337,7 @@ fn run_owned_execution_sgemm_event_fixture(
     rhs.copy_from(&rhs_bytes)?;
 
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0051),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_sgemm_copy",
@@ -595,6 +597,7 @@ fn run_host_upload_graph_fixture(backend: &RocmOwnedDispatchBackend) -> Result<(
     let upload_stream = backend.create_stream()?;
 
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0052),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_upload_copy",
@@ -688,6 +691,7 @@ fn run_device_readback_graph_fixture(
     let upload_stream = backend.create_stream()?;
     let readback_stream = backend.create_stream()?;
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0054),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_readback_copy",
@@ -1217,6 +1221,7 @@ fn run_case<const N: usize>(
 
     let (bindings, kernel_ops) = build_ops::<N>(grid_stride);
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0001),
         entry: PcuDispatchEntryPoint {
             name: "checked_i32_div_rem",
@@ -1424,6 +1429,7 @@ fn run_owned_execution_gate_preflight(
 
     let (bindings, ops) = build_ops::<N>(false);
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0030),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_checked_div_rem_preflight",
@@ -1463,6 +1469,7 @@ fn verify_owned_execution_event_chain(
     input.copy_from(&input_bytes)?;
 
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0041),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_event_chain_copy",
@@ -1598,6 +1605,7 @@ fn verify_owned_execution_two_slot(
     second_device_input.copy_from(&second_bytes)?;
 
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0040),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_two_slot_copy",
@@ -1749,6 +1757,7 @@ fn verify_owned_execution_fault_gate(
 ) -> Result<(), Box<dyn Error>> {
     const N: usize = 65;
     let copy_kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0020),
         entry: PcuDispatchEntryPoint {
             name: "owned_execution_gated_copy",
@@ -2004,6 +2013,7 @@ fn verify_unchecked_predecessor_batch(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0010),
         entry: PcuDispatchEntryPoint {
             name: "batch_predecessor_copy",

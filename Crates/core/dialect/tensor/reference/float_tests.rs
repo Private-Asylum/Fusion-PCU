@@ -86,3 +86,89 @@ fn selected_plan_retains_discarded_float_checked_effects() {
     let plan = graph.execution_plan_for_outputs(&[lhs.erase()]).unwrap();
     assert!(plan.nodes().any(|node| node.value == discarded.erase()));
 }
+
+#[test]
+fn relu_backward_checks_inactive_operands_preserves_bits_and_applies_selected_policy() {
+    let mut graph = Graph::default();
+    let input = graph.input_typed::<f64>([4]).unwrap();
+    let upstream = graph.input_typed::<f64>([4]).unwrap();
+    let output = graph
+        .relu_backward(input.erase(), upstream.erase())
+        .unwrap();
+    let make = |values: Vec<f64>| TensorValue::F64(Tensor::new([4], values).unwrap());
+    let mut inputs = [
+        (input.erase(), make(vec![-1.0, -0.0, 1.0, 1.0])),
+        (
+            upstream.erase(),
+            make(vec![1.0, 1.0, -0.0, f64::from_bits(1)]),
+        ),
+    ];
+    let execution = graph.evaluate_checked(&inputs).unwrap();
+    let actual = execution.value_typed::<f64>(output).unwrap().data();
+    assert_eq!(
+        actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        vec![0, 0, 1 << 63, 1]
+    );
+    graph
+        .set_value_float_underflow_policy(output, PcuFloatUnderflowPolicy::RejectSubnormalResult)
+        .unwrap();
+    assert!(matches!(
+        graph.evaluate_checked(&inputs),
+        Err(TensorError::ArithmeticFault {
+            element_index: 3,
+            kind: PcuExecutionFaultKind::ArithmeticUnderflow,
+            ..
+        })
+    ));
+    inputs[1].1 = make(vec![f64::NAN, 1.0, -0.0, 1.0]);
+    assert!(matches!(
+        graph.evaluate_checked(&inputs),
+        Err(TensorError::ArithmeticFault {
+            element_index: 0,
+            kind: PcuExecutionFaultKind::InvalidFloatingOperand,
+            ..
+        })
+    ));
+    let selected = graph.execution_plan_for_outputs(&[input.erase()]).unwrap();
+    assert!(selected.nodes().any(|node| node.value == output));
+}
+
+#[test]
+fn relu_captures_underflow_and_keeps_discarded_faults_live() {
+    let mut graph = Graph::default();
+    let input = graph.input_typed::<f64>([1]).unwrap();
+    let output = graph.relu_typed(input).unwrap();
+    graph
+        .set_value_float_underflow_policy(
+            output.erase(),
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        )
+        .unwrap();
+    let plan = graph.execution_plan_for_outputs(&[input.erase()]).unwrap();
+    assert!(plan.node_order().contains(&output.erase()));
+    let inputs = [(
+        input.erase(),
+        TensorValue::F64(Tensor::new([1], vec![f64::from_bits(1)]).unwrap()),
+    )];
+    assert!(
+        matches!(graph.evaluate_checked(&inputs), Err(TensorError::ArithmeticFault {
+        value, element_index: 0, kind: PcuExecutionFaultKind::ArithmeticUnderflow,
+    }) if value == output.erase())
+    );
+    graph
+        .set_value_float_underflow_policy(
+            output.erase(),
+            PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        )
+        .unwrap();
+    assert_eq!(
+        graph
+            .evaluate_checked(&inputs)
+            .unwrap()
+            .value_typed::<f64>(output.erase())
+            .unwrap()
+            .data()[0]
+            .to_bits(),
+        1
+    );
+}

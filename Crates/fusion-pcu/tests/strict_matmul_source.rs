@@ -91,13 +91,8 @@ fn assert_boundary_rejection(error: &PcuExecutionError) {
         _ => false,
     };
     let rejected = match error {
-        #[cfg(feature = "rocm")]
-        PcuExecutionError::NoCompatibleDevice(rejections) => {
-            rejections.iter().any(|(_, error)| unsupported(error))
-        }
-        #[cfg(feature = "cuda")]
-        PcuExecutionError::NoCompatibleResidentDevice(rejections) => {
-            rejections.iter().any(|(_, error)| unsupported(error))
+        PcuExecutionError::NoCompatibleDevice { rejected, .. } => {
+            rejected.iter().any(|(_, error)| unsupported(error))
         }
         _ => false,
     };

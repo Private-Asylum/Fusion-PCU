@@ -206,6 +206,7 @@ fn prepare<T: TestInteger>(
             index: PcuDispatchIndex::BindingElementZero,
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            range_policy: fusion_pcu::PcuRangePolicy::Reject,
             value_type: scalar_type,
             op: operation,
             result: RESULT,
@@ -232,6 +233,7 @@ fn prepare<T: TestInteger>(
         &body[..]
     };
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(91),
         entry: PcuDispatchEntryPoint {
             name: "checked_integer_map",

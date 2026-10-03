@@ -1,0 +1,82 @@
+#version 450
+// Exact 128/256/512-bit joint quotient/remainder with U32 limbs. No Int64/native division.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint ELEMENT_BYTES=16u;
+layout(constant_id=1) const uint SIGNED=0u;
+layout(constant_id=2) const uint EXTENT=1u;
+layout(constant_id=3) const uint OPERAND_A=0u;
+layout(constant_id=4) const uint OPERAND_B=1u;
+layout(constant_id=5) const uint OPERAND_A_ZERO=0u;
+layout(constant_id=6) const uint OPERAND_B_ZERO=0u;
+layout(set=0,binding=0,std430) readonly buffer A{uint words[];}source_a;
+layout(set=0,binding=1,std430) readonly buffer B{uint words[];}source_b;
+layout(set=0,binding=2,std430) writeonly buffer Q{uint words[];}quotient_data;
+layout(set=0,binding=3,std430) writeonly buffer R{uint words[];}remainder_data;
+layout(set=0,binding=4,std430) writeonly buffer Status{uint codes[];}status_data;
+uint width(){return ELEMENT_BYTES/4u;}
+void negate(in uint value[16],out uint result[16]){
+    uint carry=1u;
+    for(uint i=0u;i<16u;i++)result[i]=0u;
+    for(uint i=0u;i<width();i++){
+        uint next=(~value[i])+carry;
+        carry=uint(carry!=0u&&next==0u);
+        result[i]=next;
+    }
+}
+bool at_least(in uint left[16],in uint right[16]){
+    for(uint count=width();count>0u;count--){uint i=count-1u;
+        if(left[i]!=right[i])return left[i]>right[i];}
+    return true;
+}
+void subtract(inout uint left[16],in uint right[16]){
+    uint borrow=0u;
+    for(uint i=0u;i<width();i++){
+        uint subtrahend=right[i]+borrow;
+        // U32 wrap is intentional, with its carry included in next borrow.
+        uint next=uint(subtrahend<right[i]||left[i]<subtrahend);
+        left[i]-=subtrahend;borrow=next;
+    }
+}
+uint evaluate(uint lane,out uint quotient[16],out uint remainder[16]){
+    uint left[16],right[16];uint n=width();uint nonzero=0u;
+    for(uint i=0u;i<16u;i++){left[i]=0u;right[i]=0u;quotient[i]=0u;remainder[i]=0u;}
+    for(uint i=0u;i<n;i++){
+        uint left_index=(OPERAND_A_ZERO!=0u?0u:lane)*n+i;
+        uint right_index=(OPERAND_B_ZERO!=0u?0u:lane)*n+i;
+        left[i]=OPERAND_A==0u?source_a.words[left_index]:source_b.words[left_index];
+        right[i]=OPERAND_B==0u?source_a.words[right_index]:source_b.words[right_index];
+        nonzero|=right[i];
+    }
+    if(nonzero==0u)return 4u;
+    bool left_negative=SIGNED!=0u&&(left[n-1u]&0x80000000u)!=0u;
+    bool right_negative=SIGNED!=0u&&(right[n-1u]&0x80000000u)!=0u;
+    bool minimum=left[n-1u]==0x80000000u;
+    bool minus_one=right[n-1u]==0xffffffffu;
+    for(uint i=0u;i+1u<n;i++){minimum=minimum&&left[i]==0u;minus_one=minus_one&&right[i]==0xffffffffu;}
+    if(SIGNED!=0u&&minimum&&minus_one)return 5u;
+    uint numerator[16],denominator[16];
+    for(uint i=0u;i<16u;i++){numerator[i]=left[i];denominator[i]=right[i];}
+    if(left_negative)negate(left,numerator);
+    if(right_negative)negate(right,denominator);
+    // Cold admission permits n=4/8/16 only. Bit indices0..511 yield limb0..15,
+    // shift0..31. Before every step R<D. The explicit carry retains bit32*n;
+    // after subtraction R<D again, so discarding that carry loses no result bits.
+    for(uint remaining=ELEMENT_BYTES*8u;remaining>0u;remaining--){
+        uint bit=remaining-1u;uint carry=remainder[n-1u]>>31u;
+        for(uint count=n;count>1u;count--){uint i=count-1u;remainder[i]=(remainder[i]<<1u)|(remainder[i-1u]>>31u);}
+        remainder[0]=(remainder[0]<<1u)|((numerator[bit/32u]>>(bit%32u))&1u);
+        if(carry!=0u||at_least(remainder,denominator)){
+            subtract(remainder,denominator);quotient[bit/32u]|=1u<<(bit%32u);
+        }
+    }
+    uint magnitude[16];
+    if(left_negative!=right_negative){for(uint i=0u;i<16u;i++)magnitude[i]=quotient[i];negate(magnitude,quotient);}
+    if(left_negative){for(uint i=0u;i<16u;i++)magnitude[i]=remainder[i];negate(magnitude,remainder);}
+    return 0u;
+}
+void main(){uint lane=gl_GlobalInvocationID.x;if(lane>=EXTENT)return;
+    uint q[16],r[16];status_data.codes[lane]=evaluate(lane,q,r);
+    // Each invocation owns complete disjoint native-width words for both private outputs.
+    for(uint limb=0u;limb<width();limb++){uint index=lane*width()+limb;
+        quotient_data.words[index]=q[limb];remainder_data.words[index]=r[limb];}
+}

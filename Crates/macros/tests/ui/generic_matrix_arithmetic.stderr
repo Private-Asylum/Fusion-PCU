@@ -1,4 +1,4 @@
-error: generic `T: PcuScalar` kernels currently support only an indexed identity copy
+error: generic `T: PcuScalar` kernels support indexed identity copy or read-only scalar broadcast
   --> tests/ui/generic_matrix_arithmetic.rs:13:30
    |
 13 |     output[id / C][id % C] = input[id / C][id % C] + input[id / C][id % C];

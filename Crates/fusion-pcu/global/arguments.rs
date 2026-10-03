@@ -17,6 +17,16 @@ use super::resident::{
     DeviceTensor,
     Session,
 };
+#[cfg(any(
+    feature = "mlx",
+    not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    ))
+))]
 use core::marker::PhantomData;
 
 /// Semantic source shape, retaining rank and source role instead of only a flattened element
@@ -80,8 +90,13 @@ pub enum PcuArgumentError {
     },
     SessionMismatch,
     ResidentCompletionUncertain,
+    /// A completed unsuccessful operation discarded this logical resident value.
+    /// Its backing remains owned until drop, but it cannot be read or borrowed again.
+    ResidentValueDiscarded,
     /// A logical resident tensor is unavailable when the facade has no device provider.
     ProviderUnavailable,
+    /// This owner has no supported generic device-buffer invocation view.
+    UnsupportedResidentBorrow,
 }
 
 /// Opaque per-argument carrier passed from generated source signatures to the hosted dispatcher.
@@ -114,10 +129,20 @@ pub struct PcuCallArgument<'a> {
 )] // Resident/host discrimination runs only with a provider.
 pub(super) enum PcuCallArgumentKind<'a> {
     Host(PcuHostArgument<'a>),
+    #[cfg(all(feature = "vulkan", feature = "tensor"))]
+    VulkanRead(PcuVulkanReadArgument<'a>),
+    #[cfg(all(feature = "vulkan", feature = "tensor"))]
+    VulkanWrite(PcuVulkanWriteArgument<'a>),
+    #[cfg(all(feature = "cpu", feature = "tensor"))]
+    CpuOwner(PcuHostArgument<'a>),
     #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
     ResidentRead(PcuResidentReadArgument<'a>),
     #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
     ResidentWrite(PcuResidentWriteArgument<'a>),
+    #[cfg(feature = "mlx")]
+    MlxRead(PcuMlxReadArgument<'a>),
+    #[cfg(feature = "mlx")]
+    MlxWrite(PcuMlxWriteArgument<'a>),
 }
 
 #[cfg_attr(
@@ -136,13 +161,50 @@ impl<'a> PcuCallArgument<'a> {
         (self.shape, self.kind)
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     pub(super) const fn kind(&self) -> &PcuCallArgumentKind<'a> {
         &self.kind
     }
 }
 
 impl<'a> PcuCallArgument<'a> {
+    /// Metadata for an unread source declaration, established by validated lowering.
+    ///
+    /// No consumer storage is inspected or borrowed. The empty typed declaration
+    /// retains access/type validation but contributes no residency affinity, upload,
+    /// owner lease or device allocation. Providers must still assess the actual IR;
+    /// this is not an initialized device buffer or permission to skip a real load.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn unused_read<T: PcuScalar>(target: PcuBindingRef) -> Self {
+        Self::host(
+            PcuHostArgument::read::<T>(target, &[]),
+            PcuSourceShape::Slice { length: 0 },
+        )
+    }
+
+    /// Metadata for a mutable declaration with no reads or writes in validated lowering.
+    ///
+    /// The generated function still takes an exclusive Rust borrow. This empty
+    /// read/write declaration preserves access and type checks, but never borrows
+    /// consumer backing, inspects its session or contributes residency affinity.
+    /// Providers must reject any actual IR access that this empty view cannot cover.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn unused_read_write<T: PcuScalar>(target: PcuBindingRef) -> Self {
+        Self::host(
+            PcuHostArgument::read_write::<T>(target, &mut []),
+            PcuSourceShape::Slice { length: 0 },
+        )
+    }
+
     const fn host(argument: PcuHostArgument<'a>, shape: PcuSourceShape) -> Self {
         Self {
             shape,
@@ -534,11 +596,17 @@ macro_rules! shared_matrix_storage {
 shared_matrix_storage!(alloc::rc::Rc);
 shared_matrix_storage!(alloc::sync::Arc);
 
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    all(feature = "vulkan", feature = "tensor")
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResidentValidity {
+pub(super) enum ResidentValidity {
     Ready,
     Uncertain,
+    Discarded,
 }
 
 /// A logical tensor whose backing may be retained by an execution provider.
@@ -548,6 +616,9 @@ enum ResidentValidity {
 /// Borrowing retains the logical value; moving transfers it. A move permits a provider to
 /// consider storage reuse, but does not establish physical backing exclusivity by itself.
 /// Ordinary `Drop` releases this owner's claim; readback does not consume it.
+/// Current live backings retain thread-local `Rc` metadata or provider sessions. This owner is
+/// neither `Send` nor `Sync`, including with CPU-only execution; cross-thread transfer is not
+/// currently guaranteed.
 ///
 /// A live borrow prevents transferring the owner, including while that borrow is used by a
 /// later device operation:
@@ -563,13 +634,61 @@ enum ResidentValidity {
 /// }
 /// ```
 pub struct PcuTensor<T: PcuScalar> {
+    pub(super) backing: TensorBacking<T>,
+}
+
+pub(super) enum TensorBacking<T: PcuScalar> {
+    #[cfg(all(feature = "vulkan", feature = "tensor"))]
+    Vulkan {
+        buffer: fusion_pcu_vulkan::PcuVulkanOwnedBuffer<T>,
+        shape: std::rc::Rc<[usize]>,
+        root: std::rc::Rc<fusion_pcu_vulkan::PcuVulkanBackend>,
+        validity: ResidentValidity,
+    },
     #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-    tensor: DeviceTensor<T>,
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-    session: std::rc::Rc<Session>,
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-    validity: ResidentValidity,
-    marker: PhantomData<fn() -> T>,
+    #[cfg_attr(not(any(feature = "metal", feature = "tensor")), allow(dead_code))]
+    // These provider-only builds have no initialized owner constructor.
+    Device {
+        tensor: DeviceTensor<T>,
+        session: std::rc::Rc<Session>,
+        validity: ResidentValidity,
+    },
+    #[cfg(feature = "mlx")]
+    Mlx {
+        array: fusion_pcu_mlx::MlxArray,
+        shape: [usize; 2],
+        root: std::rc::Rc<MlxSourceRoot>,
+        marker: PhantomData<fn() -> T>,
+    },
+    #[cfg(feature = "mlx")]
+    MlxEncoded {
+        array: fusion_pcu_mlx::MlxEncodedArray,
+        shape: std::rc::Rc<[usize]>,
+        root: std::rc::Rc<MlxSourceRoot>,
+        marker: PhantomData<fn() -> T>,
+    },
+    #[cfg(all(feature = "cpu", feature = "tensor"))]
+    Cpu {
+        values: Vec<T>,
+        shape: std::rc::Rc<[usize]>,
+    },
+    #[cfg(not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    )))]
+    #[allow(dead_code)]
+    // Provider-off builds retain the public owner API without a constructor.
+    Unavailable(PhantomData<fn() -> T>),
+}
+
+#[cfg(feature = "mlx")]
+pub(super) struct MlxSourceRoot {
+    pub(super) discovery: fusion_pcu_mlx::MlxDiscovery,
+    pub(super) session: fusion_pcu_mlx::MlxSession,
 }
 
 impl<T: PcuScalar> PcuTensor<T> {
@@ -598,97 +717,303 @@ impl<T: PcuScalar> PcuTensor<T> {
         feature = "metal",
         all(any(feature = "rocm", feature = "cuda"), feature = "tensor")
     ))]
-    pub(super) fn from_successful_output(
+    pub(super) const fn from_successful_output(
         tensor: DeviceTensor<T>,
         session: std::rc::Rc<Session>,
     ) -> Self {
         Self {
-            tensor,
-            session,
-            validity: ResidentValidity::Ready,
-            marker: PhantomData,
+            backing: TensorBacking::Device {
+                tensor,
+                session,
+                validity: ResidentValidity::Ready,
+            },
         }
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-    pub(super) const fn device_tensor(&self) -> &DeviceTensor<T> {
-        &self.tensor
+    #[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
+    #[cfg_attr(
+        not(any(
+            feature = "mlx",
+            all(feature = "cpu", feature = "tensor"),
+            all(feature = "vulkan", feature = "tensor")
+        )),
+        allow(clippy::unnecessary_wraps)
+    )] // The common checked accessor rejects opaque backings when compiled.
+    pub(super) const fn device_tensor(&self) -> Result<&DeviceTensor<T>, PcuArgumentError> {
+        match &self.backing {
+            TensorBacking::Device { tensor, .. } => Ok(tensor),
+            #[cfg(any(
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor"),
+                all(feature = "vulkan", feature = "tensor")
+            ))]
+            _ => Err(PcuArgumentError::UnsupportedResidentBorrow),
+        }
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-    pub(super) const fn session(&self) -> &std::rc::Rc<Session> {
-        &self.session
+    #[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
+    #[cfg_attr(
+        not(any(
+            feature = "mlx",
+            all(feature = "cpu", feature = "tensor"),
+            all(feature = "vulkan", feature = "tensor")
+        )),
+        allow(clippy::unnecessary_wraps)
+    )] // The common checked accessor rejects opaque backings when compiled.
+    pub(super) const fn session(&self) -> Result<&std::rc::Rc<Session>, PcuArgumentError> {
+        match &self.backing {
+            TensorBacking::Device { session, .. } => Ok(session),
+            #[cfg(any(
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor"),
+                all(feature = "vulkan", feature = "tensor")
+            ))]
+            _ => Err(PcuArgumentError::UnsupportedResidentBorrow),
+        }
     }
 
     #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
-    pub(super) fn into_device_parts(self) -> (DeviceTensor<T>, std::rc::Rc<Session>) {
-        (self.tensor, self.session)
-    }
-
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-    pub(super) const fn validate_initialized(&self) -> Result<(), PcuArgumentError> {
-        match self.validity {
-            ResidentValidity::Ready => Ok(()),
-            ResidentValidity::Uncertain => Err(PcuArgumentError::ResidentCompletionUncertain),
+    #[cfg_attr(
+        not(any(
+            feature = "mlx",
+            all(feature = "cpu", feature = "tensor"),
+            all(feature = "vulkan", feature = "tensor")
+        )),
+        allow(clippy::unnecessary_wraps)
+    )] // Opaque/host tensor variants must retain the fallible consuming boundary.
+    pub(super) fn into_device_parts(
+        self,
+    ) -> Result<(DeviceTensor<T>, std::rc::Rc<Session>), super::PcuExecutionError> {
+        match self.backing {
+            TensorBacking::Device {
+                tensor, session, ..
+            } => Ok((tensor, session)),
+            #[cfg(any(
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor"),
+                all(feature = "vulkan", feature = "tensor")
+            ))]
+            _ => Err(super::PcuExecutionError::Argument(
+                PcuArgumentError::UnsupportedResidentBorrow,
+            )),
         }
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+    #[allow(clippy::missing_const_for_fn)] // MLX checks live native access state.
+    #[cfg_attr(
+        all(
+            feature = "cpu",
+            feature = "tensor",
+            not(any(feature = "rocm", feature = "cuda", feature = "metal", feature = "mlx"))
+        ),
+        allow(clippy::unnecessary_wraps)
+    )] // Shared API also validates live device and opaque completion.
+    pub(super) fn validate_initialized(&self) -> Result<(), PcuArgumentError> {
+        match &self.backing {
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            TensorBacking::Device { validity, .. } => match validity {
+                ResidentValidity::Ready => Ok(()),
+                ResidentValidity::Uncertain => Err(PcuArgumentError::ResidentCompletionUncertain),
+                ResidentValidity::Discarded => Err(PcuArgumentError::ResidentValueDiscarded),
+            },
+            #[cfg(feature = "mlx")]
+            TensorBacking::Mlx { array, .. } => array
+                .validate_access_available()
+                .map_err(|_| PcuArgumentError::ResidentCompletionUncertain),
+            #[cfg(feature = "mlx")]
+            TensorBacking::MlxEncoded { array, .. } => array
+                .validate_access_available()
+                .map_err(|_| PcuArgumentError::ResidentCompletionUncertain),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            TensorBacking::Cpu { .. } => Ok(()),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            TensorBacking::Vulkan {
+                buffer, validity, ..
+            } => {
+                match validity {
+                    ResidentValidity::Uncertain => {
+                        return Err(PcuArgumentError::ResidentCompletionUncertain);
+                    }
+                    ResidentValidity::Discarded => {
+                        return Err(PcuArgumentError::ResidentValueDiscarded);
+                    }
+                    ResidentValidity::Ready => {}
+                }
+                buffer
+                    .validate_access_available()
+                    .map_err(|_| PcuArgumentError::ResidentCompletionUncertain)
+            }
+            #[cfg(not(any(
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor"),
+                all(feature = "vulkan", feature = "tensor")
+            )))]
+            TensorBacking::Unavailable(_) => Err(PcuArgumentError::ProviderUnavailable),
+        }
+    }
+
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     pub(super) fn validate_read(
         &self,
         expected_shape: PcuSourceShape,
     ) -> Result<(), PcuArgumentError> {
-        if !expected_shape.accepts_resident_shape(self.tensor.shape()) {
+        if !expected_shape.accepts_resident_shape(self.shape()) {
             return Err(PcuArgumentError::ResidentShapeMismatch {
                 expected: expected_shape,
             });
         }
         self.validate_initialized()?;
-        self.tensor.validate_access_available()
+        match &self.backing {
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            TensorBacking::Device { tensor, .. } => tensor.validate_access_available(),
+            #[cfg(feature = "mlx")]
+            TensorBacking::Mlx { .. } | TensorBacking::MlxEncoded { .. } => Ok(()),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            TensorBacking::Vulkan { .. } => Ok(()),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            TensorBacking::Cpu { .. } => Ok(()),
+        }
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     fn read_argument(
         &self,
         target: PcuBindingRef,
         expected_shape: PcuSourceShape,
     ) -> Result<PcuCallArgument<'_>, PcuArgumentError> {
         self.validate_read(expected_shape)?;
-        Ok(PcuResidentReadArgument {
-            argument: self.tensor.read_argument(target),
-            shape: expected_shape,
-            session: &self.session,
+        match &self.backing {
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            TensorBacking::Device {
+                tensor, session, ..
+            } => Ok(PcuResidentReadArgument {
+                argument: tensor.read_argument(target),
+                shape: expected_shape,
+                session,
+            }
+            .into_call_argument()),
+            #[cfg(feature = "mlx")]
+            TensorBacking::MlxEncoded { array, root, .. } => Ok(PcuCallArgument {
+                shape: expected_shape,
+                kind: PcuCallArgumentKind::MlxRead(PcuMlxReadArgument {
+                    array,
+                    root,
+                    target,
+                }),
+            }),
+            #[cfg(feature = "mlx")]
+            TensorBacking::Mlx { .. } => Err(PcuArgumentError::UnsupportedResidentBorrow),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            TensorBacking::Vulkan { buffer, root, .. } => Ok(PcuCallArgument {
+                shape: expected_shape,
+                kind: PcuCallArgumentKind::VulkanRead(PcuVulkanReadArgument {
+                    argument: buffer.read_argument(target),
+                    root,
+                }),
+            }),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            TensorBacking::Cpu { values, .. } => Ok(PcuCallArgument {
+                shape: expected_shape,
+                kind: PcuCallArgumentKind::CpuOwner(PcuHostArgument::read(target, values)),
+            }),
         }
-        .into_call_argument())
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        all(feature = "cpu", feature = "tensor"),
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     fn write_argument(
         &mut self,
         target: PcuBindingRef,
         expected_shape: PcuSourceShape,
     ) -> Result<PcuCallArgument<'_>, PcuArgumentError> {
         self.validate_read(expected_shape)?;
-        let Self {
-            tensor,
-            session,
-            validity,
-            ..
-        } = self;
-        let guard = ResidentWriteGuard::new(validity);
-        Ok(PcuResidentWriteArgument {
-            argument: tensor.read_write_argument(target),
-            shape: expected_shape,
-            session,
-            guard,
+        match &mut self.backing {
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            TensorBacking::Device {
+                tensor,
+                session,
+                validity,
+            } => Ok(PcuResidentWriteArgument {
+                argument: tensor.read_write_argument(target),
+                shape: expected_shape,
+                session,
+                guard: ResidentWriteGuard::new(validity),
+            }
+            .into_call_argument()),
+            #[cfg(feature = "mlx")]
+            TensorBacking::MlxEncoded { array, root, .. } => Ok(PcuCallArgument {
+                shape: expected_shape,
+                kind: PcuCallArgumentKind::MlxWrite(PcuMlxWriteArgument {
+                    array,
+                    root,
+                    target,
+                }),
+            }),
+            #[cfg(feature = "mlx")]
+            TensorBacking::Mlx { .. } => Err(PcuArgumentError::UnsupportedResidentBorrow),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            TensorBacking::Vulkan {
+                buffer,
+                root,
+                validity,
+                ..
+            } => Ok(PcuCallArgument {
+                shape: expected_shape,
+                kind: PcuCallArgumentKind::VulkanWrite(PcuVulkanWriteArgument {
+                    argument: buffer.write_argument(target),
+                    root,
+                    guard: ResidentWriteGuard::new(validity),
+                }),
+            }),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            TensorBacking::Cpu { values, .. } => Ok(PcuCallArgument {
+                shape: expected_shape,
+                kind: PcuCallArgumentKind::CpuOwner(PcuHostArgument::read_write(target, values)),
+            }),
         }
-        .into_call_argument())
     }
 }
 
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, Shape> sealed::Sealed<T, Shape> for PcuTensor<T> {}
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> PcuReadStorage<T, ScalarShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &self,
@@ -697,17 +1022,31 @@ impl<T: PcuScalar> PcuReadStorage<T, ScalarShape> for PcuTensor<T> {
         self.read_argument(target, PcuSourceShape::Scalar)
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> PcuReadStorage<T, SliceShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &self,
         target: PcuBindingRef,
     ) -> Result<PcuCallArgument<'_>, PcuArgumentError> {
-        let length = self.tensor.len();
+        let length = self.len();
         self.read_argument(target, PcuSourceShape::Slice { length })
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const N: usize> PcuReadStorage<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &self,
@@ -716,7 +1055,14 @@ impl<T: PcuScalar, const N: usize> PcuReadStorage<T, FixedArrayShape<N>> for Pcu
         self.read_argument(target, PcuSourceShape::FixedArray { length: N })
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuReadStorage<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -733,7 +1079,14 @@ impl<T: PcuScalar, const R: usize, const C: usize> PcuReadStorage<T, FixedMatrix
         )
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> PcuWriteStorage<T, ScalarShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &mut self,
@@ -742,17 +1095,31 @@ impl<T: PcuScalar> PcuWriteStorage<T, ScalarShape> for PcuTensor<T> {
         self.write_argument(target, PcuSourceShape::Scalar)
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar> PcuWriteStorage<T, SliceShape> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &mut self,
         target: PcuBindingRef,
     ) -> Result<PcuCallArgument<'_>, PcuArgumentError> {
-        let length = self.tensor.len();
+        let length = self.len();
         self.write_argument(target, PcuSourceShape::Slice { length })
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const N: usize> PcuWriteStorage<T, FixedArrayShape<N>> for PcuTensor<T> {
     fn as_pcu_call_argument(
         &mut self,
@@ -761,7 +1128,14 @@ impl<T: PcuScalar, const N: usize> PcuWriteStorage<T, FixedArrayShape<N>> for Pc
         self.write_argument(target, PcuSourceShape::FixedArray { length: N })
     }
 }
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    all(feature = "cpu", feature = "tensor"),
+    all(feature = "vulkan", feature = "tensor")
+))]
 impl<T: PcuScalar, const R: usize, const C: usize> PcuWriteStorage<T, FixedMatrixShape<R, C>>
     for PcuTensor<T>
 {
@@ -784,6 +1158,20 @@ pub(super) struct PcuResidentReadArgument<'a> {
     pub(super) argument: DeviceArgument<'a>,
     pub(super) shape: PcuSourceShape,
     pub(super) session: &'a std::rc::Rc<Session>,
+}
+
+#[cfg(feature = "mlx")]
+pub(super) struct PcuMlxReadArgument<'a> {
+    pub(super) array: &'a fusion_pcu_mlx::MlxEncodedArray,
+    pub(super) root: &'a std::rc::Rc<MlxSourceRoot>,
+    pub(super) target: PcuBindingRef,
+}
+
+#[cfg(feature = "mlx")]
+pub(super) struct PcuMlxWriteArgument<'a> {
+    pub(super) array: &'a mut fusion_pcu_mlx::MlxEncodedArray,
+    pub(super) root: &'a std::rc::Rc<MlxSourceRoot>,
+    pub(super) target: PcuBindingRef,
 }
 
 #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
@@ -814,65 +1202,20 @@ impl<'a> PcuResidentWriteArgument<'a> {
     }
 }
 
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResidentWriteDisposition {
-    NotSubmitted,
-    MayHaveWritten,
-    KnownPartial,
-    Complete,
-}
-
-/// Tracks whether a mutable resident value remains readable across failure. The caller marks
-/// possible submission only after preflight; Drop restores the prior state for prelaunch errors,
-/// preserves initialized storage after a quiescent partial error, and blocks uncertain completion.
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-pub(super) struct ResidentWriteGuard<'a> {
-    validity: &'a mut ResidentValidity,
-    prior: ResidentValidity,
-    disposition: ResidentWriteDisposition,
-}
-
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-impl<'a> ResidentWriteGuard<'a> {
-    const fn new(validity: &'a mut ResidentValidity) -> Self {
-        let prior = *validity;
-        Self {
-            validity,
-            prior,
-            disposition: ResidentWriteDisposition::NotSubmitted,
-        }
-    }
-
-    pub(super) const fn mark_may_have_written(&mut self) {
-        self.disposition = ResidentWriteDisposition::MayHaveWritten;
-    }
-
-    pub(super) const fn mark_known_partial(&mut self) {
-        self.disposition = ResidentWriteDisposition::KnownPartial;
-    }
-
-    pub(super) const fn mark_complete(&mut self) {
-        self.disposition = ResidentWriteDisposition::Complete;
-    }
-}
-
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
-impl Drop for ResidentWriteGuard<'_> {
-    fn drop(&mut self) {
-        *self.validity = match self.disposition {
-            ResidentWriteDisposition::NotSubmitted => self.prior,
-            ResidentWriteDisposition::MayHaveWritten => ResidentValidity::Uncertain,
-            ResidentWriteDisposition::KnownPartial => match self.prior {
-                // A quiescent operation error may leave a changed prefix, but every element of a
-                // previously initialized scalar buffer still has a valid Rust representation.
-                ResidentValidity::Ready => ResidentValidity::Ready,
-                ResidentValidity::Uncertain => ResidentValidity::Uncertain,
-            },
-            ResidentWriteDisposition::Complete => ResidentValidity::Ready,
-        };
-    }
-}
+#[cfg(any(
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    all(feature = "vulkan", feature = "tensor")
+))]
+#[path = "arguments/resident_write/resident_write.rs"]
+mod resident_write;
+#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal", all(feature = "vulkan", feature = "tensor")))]
+#[rustfmt::skip]
+pub(super) use resident_write::{
+    ResidentWriteGuard,
+    finish_resident_writes,
+};
 
 /// Sealed static ownership adapter for advanced device-buffer interoperation.
 ///
@@ -903,9 +1246,110 @@ impl<T: PcuScalar> PcuResidentBufferOwner<T> for fusion_pcu_metal::MetalOwnedDis
     }
 }
 
+#[cfg(all(feature = "vulkan", feature = "tensor"))]
+pub(super) struct PcuVulkanReadArgument<'a> {
+    pub(super) argument: fusion_pcu_vulkan::PcuVulkanArgument<'a>,
+    pub(super) root: &'a std::rc::Rc<fusion_pcu_vulkan::PcuVulkanBackend>,
+}
+#[cfg(all(feature = "vulkan", feature = "tensor"))]
+pub(super) struct PcuVulkanWriteArgument<'a> {
+    pub(super) argument: fusion_pcu_vulkan::PcuVulkanArgument<'a>,
+    pub(super) root: &'a std::rc::Rc<fusion_pcu_vulkan::PcuVulkanBackend>,
+    pub(super) guard: ResidentWriteGuard<'a>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_declarations_retain_type_access_but_no_storage_or_affinity() {
+        let target = PcuBindingRef::new(4, 17);
+        let argument = PcuCallArgument::unused_read::<crate::PcuU512>(target);
+        assert_eq!(argument.shape, PcuSourceShape::Slice { length: 0 });
+        #[cfg_attr(
+            not(any(
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor")
+            )),
+            allow(irrefutable_let_patterns)
+        )]
+        // A disabled facade has only the host variant; resident builds test this discrimination.
+        let PcuCallArgumentKind::Host(metadata) = argument.into_parts().1 else {
+            panic!("unread declaration must not carry a resident lease")
+        };
+        assert_eq!(metadata.target(), target);
+        assert_eq!(metadata.scalar(), crate::PcuScalarType::U512);
+        assert_eq!(metadata.access(), crate::PcuBindingAccess::ReadOnly);
+        assert!(metadata.bytes().is_empty());
+    }
+
+    #[test]
+    fn untouched_mutable_declarations_retain_read_write_metadata() {
+        let target = PcuBindingRef::new(4, 17);
+        let argument = PcuCallArgument::unused_read_write::<crate::PcuU512>(target);
+        assert_eq!(argument.shape, PcuSourceShape::Slice { length: 0 });
+        #[cfg_attr(
+            not(any(
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "mlx",
+                all(feature = "cpu", feature = "tensor")
+            )),
+            allow(irrefutable_let_patterns)
+        )]
+        // Disabled providers leave only the host variant; no resident lease is manufactured.
+        let PcuCallArgumentKind::Host(metadata) = argument.into_parts().1 else {
+            panic!("untouched declaration must not carry a resident lease")
+        };
+        assert_eq!(metadata.target(), target);
+        assert_eq!(metadata.scalar(), crate::PcuScalarType::U512);
+        assert_eq!(metadata.access(), crate::PcuBindingAccess::ReadWrite);
+        assert!(metadata.bytes().is_empty());
+    }
+
+    #[cfg(not(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        feature = "cpu",
+        feature = "vulkan"
+    )))]
+    mod untouched_owner {
+        use super::*;
+
+        struct UnavailableOwner;
+        impl sealed::Sealed<f32, SliceShape> for UnavailableOwner {}
+        impl PcuWriteStorage<f32, SliceShape> for UnavailableOwner {
+            fn as_pcu_call_argument(
+                &mut self,
+                _: PcuBindingRef,
+            ) -> Result<PcuCallArgument<'_>, PcuArgumentError> {
+                panic!("unused owner storage must never be inspected")
+            }
+        }
+
+        #[crate::pcu(invocations = 1, crate_path = crate)]
+        fn copy(input: &[f32], ghost: &mut [f32], output: &mut [f32]) {
+            let id = pcu::context::global_invocation_id();
+            output[id] = input[id];
+        }
+
+        #[test]
+        fn ordinary_source_refuses_without_probing_unused_owner() {
+            let input = [1.0_f32];
+            let mut output = [7.0_f32];
+            // No provider is enabled. The relevant failure is selection, not this
+            // unrelated owner's unavailable storage or a hidden CPU fallback.
+            assert!(copy(&input, &mut UnavailableOwner, &mut output).is_err());
+            assert_eq!(output.map(f32::to_bits), [7.0_f32.to_bits()]);
+        }
+    }
 
     #[test]
     fn source_shapes_preserve_rank_and_parameter_role() {
@@ -935,11 +1379,25 @@ mod tests {
         )
         .expect("host scalar conversion succeeds");
         assert_eq!(argument.shape, PcuSourceShape::Scalar);
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        #[cfg(any(
+            feature = "rocm",
+            feature = "cuda",
+            feature = "metal",
+            feature = "mlx",
+            all(feature = "cpu", feature = "tensor"),
+            all(feature = "vulkan", feature = "tensor")
+        ))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind else {
             panic!("host scalar conversion remains host-backed");
         };
-        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
+        #[cfg(not(any(
+            feature = "rocm",
+            feature = "cuda",
+            feature = "metal",
+            feature = "mlx",
+            all(feature = "cpu", feature = "tensor"),
+            all(feature = "vulkan", feature = "tensor")
+        )))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind;
         assert_eq!(host_argument.access(), crate::PcuBindingAccess::ReadOnly);
 
@@ -956,19 +1414,38 @@ mod tests {
                 columns: 3
             }
         );
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        #[cfg(any(
+            feature = "rocm",
+            feature = "cuda",
+            feature = "metal",
+            feature = "mlx",
+            all(feature = "cpu", feature = "tensor"),
+            all(feature = "vulkan", feature = "tensor")
+        ))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind else {
             panic!("host matrix conversion remains host-backed");
         };
-        #[cfg(not(any(feature = "rocm", feature = "cuda", feature = "metal")))]
+        #[cfg(not(any(
+            feature = "rocm",
+            feature = "cuda",
+            feature = "metal",
+            feature = "mlx",
+            all(feature = "cpu", feature = "tensor"),
+            all(feature = "vulkan", feature = "tensor")
+        )))]
         let PcuCallArgumentKind::Host(host_argument) = argument.kind;
         assert_eq!(host_argument.access(), crate::PcuBindingAccess::ReadWrite);
         assert_eq!(host_argument.bytes().len(), 6 * core::mem::size_of::<u32>());
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     #[test]
-    fn resident_write_guard_preserves_initialized_values_but_blocks_uncertain_completion() {
+    fn resident_write_guard_distinguishes_prelaunch_discard_and_uncertain_completion() {
         let mut validity = ResidentValidity::Ready;
         {
             let _guard = ResidentWriteGuard::new(&mut validity);
@@ -976,9 +1453,20 @@ mod tests {
         assert_eq!(validity, ResidentValidity::Ready);
         {
             let mut guard = ResidentWriteGuard::new(&mut validity);
-            guard.mark_known_partial();
+            guard.mark_may_have_written();
+            guard.mark_not_submitted();
         }
         assert_eq!(validity, ResidentValidity::Ready);
+        {
+            let mut guard = ResidentWriteGuard::new(&mut validity);
+            guard.mark_may_have_written();
+            guard.mark_discarded();
+        }
+        assert_eq!(validity, ResidentValidity::Discarded);
+        {
+            let _guard = ResidentWriteGuard::new(&mut validity);
+        }
+        assert_eq!(validity, ResidentValidity::Discarded);
         {
             let mut guard = ResidentWriteGuard::new(&mut validity);
             guard.mark_may_have_written();
@@ -989,5 +1477,82 @@ mod tests {
             guard.mark_complete();
         }
         assert_eq!(validity, ResidentValidity::Ready);
+    }
+
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        all(feature = "vulkan", feature = "tensor")
+    ))]
+    #[test]
+    fn resident_outcome_classification_applies_to_every_mutable_result() {
+        use super::super::PcuExecutionError;
+        let fatal = || {
+            PcuExecutionError::ArithmeticFault(crate::PcuExecutionFault {
+                kind: crate::PcuExecutionFaultKind::DivideByZero,
+                invocation_id: 5,
+                recovered: false,
+            })
+        };
+        let recovered = PcuExecutionError::ArithmeticFault(crate::PcuExecutionFault {
+            kind: crate::PcuExecutionFaultKind::ArithmeticOverflow,
+            invocation_id: 5,
+            recovered: true,
+        });
+        let cases = [
+            (
+                false,
+                false,
+                Err(PcuExecutionError::Argument(
+                    PcuArgumentError::SessionMismatch,
+                )),
+                None,
+            ),
+            (false, false, Err(fatal()), None),
+            (true, false, Ok(()), Some(ResidentValidity::Ready)),
+            (true, false, Err(recovered), Some(ResidentValidity::Ready)),
+            (true, false, Err(fatal()), Some(ResidentValidity::Discarded)),
+            (
+                true,
+                false,
+                Err(PcuExecutionError::Argument(
+                    PcuArgumentError::SessionMismatch,
+                )),
+                Some(ResidentValidity::Discarded),
+            ),
+            (true, true, Ok(()), Some(ResidentValidity::Uncertain)),
+            (false, true, Err(fatal()), Some(ResidentValidity::Uncertain)),
+        ];
+        for prior in [
+            ResidentValidity::Ready,
+            ResidentValidity::Uncertain,
+            ResidentValidity::Discarded,
+        ] {
+            for (may_write, uncertain, result, expected) in &cases {
+                let (mut first, mut second) = (prior, prior);
+                {
+                    let mut guards = [
+                        Some(ResidentWriteGuard::new(&mut first)),
+                        None,
+                        Some(ResidentWriteGuard::new(&mut second)),
+                    ];
+                    if !uncertain {
+                        for guard in guards.iter_mut().flatten() {
+                            guard.mark_may_have_written();
+                        }
+                    }
+                    finish_resident_writes(&mut guards, *may_write, *uncertain, result);
+                }
+                assert_eq!(first, expected.unwrap_or(prior));
+                assert_eq!(second, expected.unwrap_or(prior));
+            }
+            let mut value = prior;
+            {
+                let _unsubmitted = ResidentWriteGuard::new(&mut value);
+                // A later argument conversion/preparation rejection drops this borrow.
+            }
+            assert_eq!(value, prior);
+        }
     }
 }

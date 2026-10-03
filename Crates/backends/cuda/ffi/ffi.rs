@@ -37,7 +37,10 @@ pub mod cublas;
 pub mod cublaslt;
 pub mod driver;
 pub mod nvrtc;
+#[path = "retained/retained.rs"]
+mod retained;
 pub mod runtime;
+pub use retained::RetainedApi;
 #[cfg(feature = "allocation-census")]
 pub use census::{CudaApiCensus, cuda_api_census, reset_cuda_api_census};
 
@@ -61,7 +64,17 @@ use crate::{
 pub unsafe fn invoke_cudaFree(runtime: &CudaRuntime, arg0: *mut c_void) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaFree", None);
-    runtime.call("cudaFree", |f: runtime::RuntimeFree| unsafe { f(arg0) })
+    runtime.call(
+        "cudaFree",
+        runtime
+            .0
+            .api
+            .cuda_free
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::RuntimeFree| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cuDeviceGet` ABI using the retained selected runtime.
@@ -76,9 +89,17 @@ pub unsafe fn invoke_cuDeviceGet(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cuDeviceGet", None);
-    runtime.driver_call("cuDeviceGet", |f: driver::DriverGetDevice| unsafe {
-        f(arg0, arg1)
-    })
+    runtime.driver_call(
+        "cuDeviceGet",
+        runtime
+            .0
+            .api
+            .cu_device_get
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: driver::DriverGetDevice| unsafe { f(arg0, arg1) },
+    )
 }
 
 /// Invoke the declared `cudaGetDeviceCount` ABI using the retained selected runtime.
@@ -92,9 +113,17 @@ pub unsafe fn invoke_cudaGetDeviceCount(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaGetDeviceCount", None);
-    runtime.call("cudaGetDeviceCount", |f: runtime::GetDeviceCount| unsafe {
-        f(arg0)
-    })
+    runtime.call(
+        "cudaGetDeviceCount",
+        runtime
+            .0
+            .api
+            .cuda_get_device_count
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::GetDeviceCount| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cuDeviceTotalMem_v2` ABI using the retained selected runtime.
@@ -111,6 +140,13 @@ pub unsafe fn invoke_cuDeviceTotalMem_v2(
     census::call("cuDeviceTotalMem_v2", None);
     runtime.driver_call(
         "cuDeviceTotalMem_v2",
+        runtime
+            .0
+            .api
+            .cu_device_total_mem_v2
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: driver::DriverDeviceTotalMem| unsafe { f(arg0, arg1) },
     )
 }
@@ -127,9 +163,17 @@ pub unsafe fn invoke_cudaMemGetInfo(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaMemGetInfo", None);
-    runtime.call("cudaMemGetInfo", |f: runtime::MemGetInfo| unsafe {
-        f(arg0, arg1)
-    })
+    runtime.call(
+        "cudaMemGetInfo",
+        runtime
+            .0
+            .api
+            .cuda_mem_get_info
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::MemGetInfo| unsafe { f(arg0, arg1) },
+    )
 }
 
 /// Invoke the declared `cudaMalloc` ABI using the retained selected runtime.
@@ -144,7 +188,17 @@ pub unsafe fn invoke_cudaMalloc(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaMalloc", None);
-    runtime.call("cudaMalloc", |f: runtime::Malloc| unsafe { f(arg0, arg1) })
+    runtime.call(
+        "cudaMalloc",
+        runtime
+            .0
+            .api
+            .cuda_malloc
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::Malloc| unsafe { f(arg0, arg1) },
+    )
 }
 
 /// Invoke the declared `cuModuleLoadData` ABI using the retained selected runtime.
@@ -161,6 +215,13 @@ pub unsafe fn invoke_cuModuleLoadData(
     census::call("cuModuleLoadData", None);
     runtime.driver_call(
         "cuModuleLoadData",
+        runtime
+            .0
+            .api
+            .cu_module_load_data
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: driver::DriverModuleLoadData| unsafe { f(arg0, arg1) },
     )
 }
@@ -176,9 +237,17 @@ pub unsafe fn invoke_cudaStreamCreate(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaStreamCreate", None);
-    runtime.call("cudaStreamCreate", |f: runtime::StreamCreate| unsafe {
-        f(arg0)
-    })
+    runtime.call(
+        "cudaStreamCreate",
+        runtime
+            .0
+            .api
+            .cuda_stream_create
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::StreamCreate| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cudaEventCreateWithFlags` ABI using the retained selected runtime.
@@ -195,6 +264,13 @@ pub unsafe fn invoke_cudaEventCreateWithFlags(
     census::call("cudaEventCreateWithFlags", None);
     runtime.call(
         "cudaEventCreateWithFlags",
+        runtime
+            .0
+            .api
+            .cuda_event_create_with_flags
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::EventCreate| unsafe { f(arg0, arg1) },
     )
 }
@@ -214,6 +290,13 @@ pub unsafe fn invoke_cudaEventElapsedTime(
     census::call("cudaEventElapsedTime", None);
     runtime.call(
         "cudaEventElapsedTime",
+        runtime
+            .0
+            .api
+            .cuda_event_elapsed_time
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::EventElapsedTime| unsafe { f(arg0, arg1, arg2) },
     )
 }
@@ -231,9 +314,17 @@ pub unsafe fn invoke_cuDeviceGetName(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cuDeviceGetName", None);
-    runtime.driver_call("cuDeviceGetName", |f: driver::DriverDeviceGetName| unsafe {
-        f(arg0, arg1, arg2)
-    })
+    runtime.driver_call(
+        "cuDeviceGetName",
+        runtime
+            .0
+            .api
+            .cu_device_get_name
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: driver::DriverDeviceGetName| unsafe { f(arg0, arg1, arg2) },
+    )
 }
 
 /// Invoke the declared `cudaSetDevice` ABI using the retained selected runtime.
@@ -242,7 +333,19 @@ pub fn invoke_cudaSetDevice(
     runtime: &CudaRuntime,
     arg0: runtime::CudaDevice,
 ) -> Result<(), CudaError> {
-    runtime.call("cudaSetDevice", |f: runtime::SetDevice| unsafe { f(arg0) })
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaSetDevice", None);
+    runtime.call(
+        "cudaSetDevice",
+        runtime
+            .0
+            .api
+            .cuda_set_device
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::SetDevice| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cudaMemcpy` ABI using the retained selected runtime.
@@ -259,18 +362,40 @@ pub unsafe fn invoke_cudaMemcpy(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaMemcpy", Some(arg3));
-    runtime.call("cudaMemcpy", |f: runtime::Memcpy| unsafe {
-        f(arg0, arg1, arg2, arg3)
-    })
+    runtime.call(
+        "cudaMemcpy",
+        runtime
+            .0
+            .api
+            .cuda_memcpy
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::Memcpy| unsafe { f(arg0, arg1, arg2, arg3) },
+    )
 }
 
 /// Invoke the declared `cudaDeviceSynchronize` ABI using the retained selected runtime.
 #[allow(non_snake_case)] // Preserve SDK operation names at the private FFI boundary.
 pub fn invoke_cudaDeviceSynchronize(runtime: &CudaRuntime) -> Result<(), CudaError> {
-    runtime.call(
+    #[cfg(feature = "allocation-census")]
+    census::call("cudaDeviceSynchronize", None);
+    #[cfg(feature = "allocation-census")]
+    let started = std::time::Instant::now();
+    let result = runtime.call(
         "cudaDeviceSynchronize",
+        runtime
+            .0
+            .api
+            .cuda_device_synchronize
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::DeviceSynchronize| unsafe { f() },
-    )
+    );
+    #[cfg(feature = "allocation-census")]
+    census::completion_time(started.elapsed());
+    result
 }
 
 /// Invoke the declared `cudaStreamDestroy` ABI using the retained selected runtime.
@@ -284,9 +409,17 @@ pub unsafe fn invoke_cudaStreamDestroy(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaStreamDestroy", None);
-    runtime.call("cudaStreamDestroy", |f: runtime::StreamDestroy| unsafe {
-        f(arg0)
-    })
+    runtime.call(
+        "cudaStreamDestroy",
+        runtime
+            .0
+            .api
+            .cuda_stream_destroy
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::StreamDestroy| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cudaStreamSynchronize` ABI using the retained selected runtime.
@@ -300,10 +433,22 @@ pub unsafe fn invoke_cudaStreamSynchronize(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaStreamSynchronize", None);
-    runtime.call(
+    #[cfg(feature = "allocation-census")]
+    let started = std::time::Instant::now();
+    let result = runtime.call(
         "cudaStreamSynchronize",
+        runtime
+            .0
+            .api
+            .cuda_stream_synchronize
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::StreamSynchronize| unsafe { f(arg0) },
-    )
+    );
+    #[cfg(feature = "allocation-census")]
+    census::completion_time(started.elapsed());
+    result
 }
 
 /// Invoke the declared `cudaEventRecord` ABI using the retained selected runtime.
@@ -318,9 +463,17 @@ pub unsafe fn invoke_cudaEventRecord(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaEventRecord", None);
-    runtime.call("cudaEventRecord", |f: runtime::EventRecord| unsafe {
-        f(arg0, arg1)
-    })
+    runtime.call(
+        "cudaEventRecord",
+        runtime
+            .0
+            .api
+            .cuda_event_record
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::EventRecord| unsafe { f(arg0, arg1) },
+    )
 }
 
 /// Invoke the declared `cudaEventDestroy` ABI using the retained selected runtime.
@@ -334,9 +487,17 @@ pub unsafe fn invoke_cudaEventDestroy(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaEventDestroy", None);
-    runtime.call("cudaEventDestroy", |f: runtime::EventDestroy| unsafe {
-        f(arg0)
-    })
+    runtime.call(
+        "cudaEventDestroy",
+        runtime
+            .0
+            .api
+            .cuda_event_destroy
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::EventDestroy| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cudaEventSynchronize` ABI using the retained selected runtime.
@@ -352,6 +513,13 @@ pub unsafe fn invoke_cudaEventSynchronize(
     census::call("cudaEventSynchronize", None);
     runtime.call(
         "cudaEventSynchronize",
+        runtime
+            .0
+            .api
+            .cuda_event_synchronize
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::EventSynchronize| unsafe { f(arg0) },
     )
 }
@@ -367,9 +535,17 @@ pub unsafe fn invoke_cuModuleUnload(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cuModuleUnload", None);
-    runtime.driver_call("cuModuleUnload", |f: driver::DriverModuleUnload| unsafe {
-        f(arg0)
-    })
+    runtime.driver_call(
+        "cuModuleUnload",
+        runtime
+            .0
+            .api
+            .cu_module_unload
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: driver::DriverModuleUnload| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cuModuleGetFunction` ABI using the retained selected runtime.
@@ -387,6 +563,13 @@ pub unsafe fn invoke_cuModuleGetFunction(
     census::call("cuModuleGetFunction", None);
     runtime.driver_call(
         "cuModuleGetFunction",
+        runtime
+            .0
+            .api
+            .cu_module_get_function
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: driver::DriverModuleGetFunction| unsafe { f(arg0, arg1, arg2) },
     )
 }
@@ -406,9 +589,17 @@ pub unsafe fn invoke_cudaMemcpyAsync(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaMemcpyAsync", Some(arg3));
-    runtime.call("cudaMemcpyAsync", |f: runtime::MemcpyAsync| unsafe {
-        f(arg0, arg1, arg2, arg3, arg4)
-    })
+    runtime.call(
+        "cudaMemcpyAsync",
+        runtime
+            .0
+            .api
+            .cuda_memcpy_async
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::MemcpyAsync| unsafe { f(arg0, arg1, arg2, arg3, arg4) },
+    )
 }
 
 /// Invoke the declared `cudaStreamWaitEvent` ABI using the retained selected runtime.
@@ -426,6 +617,13 @@ pub unsafe fn invoke_cudaStreamWaitEvent(
     census::call("cudaStreamWaitEvent", None);
     runtime.call(
         "cudaStreamWaitEvent",
+        runtime
+            .0
+            .api
+            .cuda_stream_wait_event
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::StreamWaitEvent| unsafe { f(arg0, arg1, arg2) },
     )
 }
@@ -454,6 +652,13 @@ pub unsafe fn invoke_cuLaunchKernel(
     census::call("cuLaunchKernel", None);
     runtime.driver_call(
         "cuLaunchKernel",
+        runtime
+            .0
+            .api
+            .cu_launch_kernel
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: driver::DriverModuleLaunchKernel| unsafe {
             f(
                 kernel,
@@ -487,6 +692,13 @@ pub unsafe fn invoke_cudaStreamCreateWithPriority(
     census::call("cudaStreamCreateWithPriority", None);
     runtime.call(
         "cudaStreamCreateWithPriority",
+        runtime
+            .0
+            .api
+            .cuda_stream_create_with_priority
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::StreamCreateWithPriority| unsafe { f(arg0, arg1, arg2) },
     )
 }
@@ -505,6 +717,13 @@ pub unsafe fn invoke_cudaDeviceGetStreamPriorityRange(
     census::call("cudaDeviceGetStreamPriorityRange", None);
     runtime.call(
         "cudaDeviceGetStreamPriorityRange",
+        runtime
+            .0
+            .api
+            .cuda_device_get_stream_priority_range
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::DeviceGetStreamPriorityRange| unsafe { f(arg0, arg1) },
     )
 }
@@ -521,9 +740,17 @@ pub unsafe fn invoke_cudaStreamGetFlags(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaStreamGetFlags", None);
-    runtime.call("cudaStreamGetFlags", |f: runtime::StreamGetFlags| unsafe {
-        f(arg0, arg1)
-    })
+    runtime.call(
+        "cudaStreamGetFlags",
+        runtime
+            .0
+            .api
+            .cuda_stream_get_flags
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::StreamGetFlags| unsafe { f(arg0, arg1) },
+    )
 }
 
 /// Invoke the declared `cudaStreamGetPriority` ABI using the retained selected runtime.
@@ -540,6 +767,13 @@ pub unsafe fn invoke_cudaStreamGetPriority(
     census::call("cudaStreamGetPriority", None);
     runtime.call(
         "cudaStreamGetPriority",
+        runtime
+            .0
+            .api
+            .cuda_stream_get_priority
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::StreamGetPriority| unsafe { f(arg0, arg1) },
     )
 }
@@ -555,9 +789,17 @@ pub unsafe fn invoke_cudaStreamQuery(
 ) -> Result<crate::control::CudaReadiness, CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaStreamQuery", None);
-    runtime.query_readiness("cudaStreamQuery", |f: runtime::StreamQuery| unsafe {
-        f(arg0)
-    })
+    runtime.query_readiness(
+        "cudaStreamQuery",
+        runtime
+            .0
+            .api
+            .cuda_stream_query
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::StreamQuery| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cudaEventQuery` ABI using the retained selected runtime.
@@ -571,9 +813,17 @@ pub unsafe fn invoke_cudaEventQuery(
 ) -> Result<crate::control::CudaReadiness, CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaEventQuery", None);
-    runtime.query_readiness("cudaEventQuery", |f: runtime::EventQuery| unsafe {
-        f(arg0)
-    })
+    runtime.query_readiness(
+        "cudaEventQuery",
+        runtime
+            .0
+            .api
+            .cuda_event_query
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::EventQuery| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cuDeviceGetUuid_v2` ABI using the retained selected runtime.
@@ -590,6 +840,13 @@ pub unsafe fn invoke_cuDeviceGetUuid_v2(
     census::call("cuDeviceGetUuid_v2", None);
     runtime.driver_call(
         "cuDeviceGetUuid_v2",
+        runtime
+            .0
+            .api
+            .cu_device_get_uuid_v2
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: driver::DriverDeviceGetUuid| unsafe { f(arg0, arg1) },
     )
 }
@@ -609,6 +866,13 @@ pub unsafe fn invoke_cuDeviceGetAttribute(
     census::call("cuDeviceGetAttribute", None);
     runtime.driver_call(
         "cuDeviceGetAttribute",
+        runtime
+            .0
+            .api
+            .cu_device_get_attribute
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: driver::DriverDeviceGetAttribute| unsafe { f(arg0, arg1, arg2) },
     )
 }
@@ -624,7 +888,17 @@ pub unsafe fn invoke_cudaFreeHost(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaFreeHost", None);
-    runtime.call("cudaFreeHost", |f: runtime::FreeHost| unsafe { f(arg0) })
+    runtime.call(
+        "cudaFreeHost",
+        runtime
+            .0
+            .api
+            .cuda_free_host
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::FreeHost| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cudaMallocHost` ABI using the retained selected runtime.
@@ -639,9 +913,17 @@ pub unsafe fn invoke_cudaMallocHost(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaMallocHost", None);
-    runtime.call("cudaMallocHost", |f: runtime::MallocHost| unsafe {
-        f(arg0, arg1)
-    })
+    runtime.call(
+        "cudaMallocHost",
+        runtime
+            .0
+            .api
+            .cuda_malloc_host
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::MallocHost| unsafe { f(arg0, arg1) },
+    )
 }
 
 /// Invoke the declared `cudaStreamBeginCapture` ABI using the retained selected runtime.
@@ -658,6 +940,13 @@ pub unsafe fn invoke_cudaStreamBeginCapture(
     census::call("cudaStreamBeginCapture", None);
     runtime.call(
         "cudaStreamBeginCapture",
+        runtime
+            .0
+            .api
+            .cuda_stream_begin_capture
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::StreamBeginCapture| unsafe { f(arg0, arg1) },
     )
 }
@@ -676,6 +965,13 @@ pub unsafe fn invoke_cudaStreamEndCapture(
     census::call("cudaStreamEndCapture", None);
     runtime.call(
         "cudaStreamEndCapture",
+        runtime
+            .0
+            .api
+            .cuda_stream_end_capture
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::StreamEndCapture| unsafe { f(arg0, arg1) },
     )
 }
@@ -695,6 +991,13 @@ pub unsafe fn invoke_cudaGraphInstantiateWithFlags(
     census::call("cudaGraphInstantiateWithFlags", None);
     runtime.call(
         "cudaGraphInstantiateWithFlags",
+        runtime
+            .0
+            .api
+            .cuda_graph_instantiate_with_flags
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::GraphInstantiateWithFlags| unsafe { f(arg0, arg1, arg2) },
     )
 }
@@ -710,9 +1013,17 @@ pub unsafe fn invoke_cudaGraphDestroy(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaGraphDestroy", None);
-    runtime.call("cudaGraphDestroy", |f: runtime::GraphDestroy| unsafe {
-        f(arg0)
-    })
+    runtime.call(
+        "cudaGraphDestroy",
+        runtime
+            .0
+            .api
+            .cuda_graph_destroy
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::GraphDestroy| unsafe { f(arg0) },
+    )
 }
 
 /// Invoke the declared `cudaGraphLaunch` ABI using the retained selected runtime.
@@ -727,9 +1038,17 @@ pub unsafe fn invoke_cudaGraphLaunch(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaGraphLaunch", None);
-    runtime.call("cudaGraphLaunch", |f: runtime::GraphLaunch| unsafe {
-        f(arg0, arg1)
-    })
+    runtime.call(
+        "cudaGraphLaunch",
+        runtime
+            .0
+            .api
+            .cuda_graph_launch
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::GraphLaunch| unsafe { f(arg0, arg1) },
+    )
 }
 
 /// Invoke the declared `cudaMemsetAsync` ABI using the retained selected runtime.
@@ -746,9 +1065,17 @@ pub unsafe fn invoke_cudaMemsetAsync(
 ) -> Result<(), CudaError> {
     #[cfg(feature = "allocation-census")]
     census::call("cudaMemsetAsync", None);
-    runtime.call("cudaMemsetAsync", |f: runtime::MemsetAsync| unsafe {
-        f(arg0, arg1, arg2, arg3)
-    })
+    runtime.call(
+        "cudaMemsetAsync",
+        runtime
+            .0
+            .api
+            .cuda_memset_async
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
+        |f: runtime::MemsetAsync| unsafe { f(arg0, arg1, arg2, arg3) },
+    )
 }
 
 /// Invoke the declared `cudaGraphExecDestroy` ABI using the retained selected runtime.
@@ -764,6 +1091,13 @@ pub unsafe fn invoke_cudaGraphExecDestroy(
     census::call("cudaGraphExecDestroy", None);
     runtime.call(
         "cudaGraphExecDestroy",
+        runtime
+            .0
+            .api
+            .cuda_graph_exec_destroy
+            .as_ref()
+            .copied()
+            .map_err(Clone::clone)?,
         |f: runtime::GraphExecDestroy| unsafe { f(arg0) },
     )
 }
@@ -772,22 +1106,11 @@ impl CudaRuntime {
     fn driver_call<T: Copy>(
         &self,
         symbol: &'static str,
+        function: T,
         invoke: impl FnOnce(T) -> CudaResult,
     ) -> Result<(), CudaError> {
         self.cuda_set_device(self.0.ordinal)?;
-        let symbol_bytes = driver_symbol(symbol).ok_or_else(|| CudaError::MissingSymbol {
-            symbol,
-            detail: "symbol is not declared in the CUDA driver ABI table".into(),
-        })?;
-        // SAFETY: this symbol is resolved from retained libcuda and T matches its C ABI.
-        let function =
-            unsafe { crate::ffi::symbol::<T>(&self.0.driver, symbol_bytes) }.map_err(|error| {
-                CudaError::MissingSymbol {
-                    symbol,
-                    detail: error.to_string(),
-                }
-            })?;
-        let status = invoke(*function);
+        let status = invoke(function);
         if status == CUDA_SUCCESS {
             Ok(())
         } else {
@@ -796,21 +1119,20 @@ impl CudaRuntime {
     }
     fn driver_error(&self, operation: &'static str, code: CudaResult) -> CudaError {
         let mut message = ptr::null();
-        let detail = unsafe {
-            crate::ffi::symbol::<DriverGetErrorString>(
-                &self.0.driver,
-                driver_symbol("cuGetErrorString").unwrap_or(&[]),
-            )
-        }
-        .ok()
-        .filter(|f| unsafe { f(code, &raw mut message) } == CUDA_SUCCESS)
-        .and_then(|_| {
-            (!message.is_null()).then(|| {
-                unsafe { CStr::from_ptr(message) }
-                    .to_string_lossy()
-                    .into_owned()
-            })
-        });
+        let detail = self
+            .0
+            .api
+            .cu_get_error_string
+            .as_ref()
+            .ok()
+            .filter(|f| unsafe { f(code, &raw mut message) } == CUDA_SUCCESS)
+            .and_then(|_| {
+                (!message.is_null()).then(|| {
+                    unsafe { CStr::from_ptr(message) }
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            });
         CudaError::Runtime {
             operation,
             code,
@@ -820,39 +1142,27 @@ impl CudaRuntime {
     fn call<T: Copy>(
         &self,
         symbol: &'static str,
+        function: T,
         invoke: impl FnOnce(T) -> CudaResult,
     ) -> Result<(), CudaError> {
         if symbol != "cudaSetDevice" {
             // CUDA's current device is thread-local, so select this runtime's device before each
             // operation. This keeps cloned handles valid when used from another host thread.
-            let setter = unsafe {
-                crate::ffi::symbol::<SetDevice>(
-                    &self.0.library,
-                    runtime_symbol("cudaSetDevice").unwrap_or(&[]),
-                )
-            }
-            .map_err(|error| CudaError::MissingSymbol {
-                symbol: "cudaSetDevice",
-                detail: error.to_string(),
-            })?;
+            let setter = self
+                .0
+                .api
+                .cuda_set_device
+                .as_ref()
+                .copied()
+                .map_err(Clone::clone)?;
+            #[cfg(feature = "allocation-census")]
+            census::call("cudaSetDevice", None);
             let status = unsafe { setter(self.0.ordinal) };
             if status != CUDA_SUCCESS {
                 return Err(self.error("cudaSetDevice", status));
             }
         }
-        let symbol_bytes = runtime_symbol(symbol).ok_or_else(|| CudaError::MissingSymbol {
-            symbol,
-            detail: "symbol is not declared in the CUDA runtime ABI table".into(),
-        })?;
-        // SAFETY: `symbol` is selected from the runtime ABI table and T matches its C ABI.
-        let function =
-            unsafe { crate::ffi::symbol::<T>(&self.0.library, symbol_bytes) }.map_err(|error| {
-                CudaError::MissingSymbol {
-                    symbol,
-                    detail: error.to_string(),
-                }
-            })?;
-        let status = invoke(*function);
+        let status = invoke(function);
         if status == CUDA_SUCCESS {
             Ok(())
         } else {
@@ -862,16 +1172,15 @@ impl CudaRuntime {
     #[allow(clippy::redundant_pub_crate)] // Keep the inherent method private to this backend crate.
     pub(super) fn error(&self, operation: &'static str, code: CudaResult) -> CudaError {
         // Error-string lookup is optional; preserve numeric status even if the symbol is absent.
-        let detail = unsafe {
-            crate::ffi::symbol::<GetErrorString>(
-                &self.0.library,
-                runtime_symbol("cudaGetErrorString").unwrap_or(&[]),
-            )
-        }
-        .ok()
-        .map(|f| unsafe { f(code) })
-        .filter(|p| !p.is_null())
-        .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
+        let detail = self
+            .0
+            .api
+            .cuda_get_error_string
+            .as_ref()
+            .ok()
+            .map(|f| unsafe { f(code) })
+            .filter(|p| !p.is_null())
+            .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
         CudaError::Runtime {
             operation,
             code,
@@ -881,21 +1190,11 @@ impl CudaRuntime {
     fn query_readiness<T: Copy>(
         &self,
         operation: &'static str,
+        function: T,
         invoke: impl FnOnce(T) -> CudaResult,
     ) -> Result<CudaReadiness, CudaError> {
         self.cuda_set_device(self.0.ordinal)?;
-        let bytes = runtime_symbol(operation).ok_or_else(|| CudaError::MissingSymbol {
-            symbol: operation,
-            detail: "readiness symbol is not declared in the CUDA runtime ABI table".into(),
-        })?;
-        // SAFETY: each private caller supplies the declared ABI type and retains this runtime.
-        let function = unsafe { symbol::<T>(&self.0.library, bytes) }.map_err(|error| {
-            CudaError::MissingSymbol {
-                symbol: operation,
-                detail: error.to_string(),
-            }
-        })?;
-        let status = invoke(*function);
+        let status = invoke(function);
         classify_readiness(status).ok_or_else(|| self.error(operation, status))
     }
 }
@@ -1058,7 +1357,6 @@ use crate::ffi::{
         CudaResult,
         CudaStream,
         GetErrorString,
-        SetDevice,
     },
 };
 
@@ -1498,6 +1796,29 @@ pub fn resolve_cublas_set_pointer_mode_v2(
     unsafe { symbol::<cublas::SetPointerMode>(library, cublas::SYM_CUBLAS_SET_POINTER_MODE_V2) }
 }
 
+/// Resolve the exact cold handle-stream observation ABI.
+pub fn resolve_cublas_get_stream_v2(
+    library: &Library,
+) -> Result<Symbol<'_, cublas::GetStream>, libloading::Error> {
+    // SAFETY: fixed SDK name/type pairing; caller retains this library owner.
+    unsafe { symbol::<cublas::GetStream>(library, cublas::SYM_CUBLAS_GET_STREAM_V2) }
+}
+/// Observe a private handle's stream while retaining its library.
+///
+/// # Safety
+/// The handle must be live on the selected device and stream must address writable host storage.
+#[allow(non_snake_case)] // Exact private SDK boundary.
+pub unsafe fn call_cublas_GetStream(
+    function: cublas::GetStream,
+    handle: cublas::CublasHandle,
+    stream: *mut *mut c_void,
+) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
+    // SAFETY: caller supplies the live handle, exact output and retained provider.
+    unsafe { function(handle, stream) }
+}
+
 /// Resolve the fixed `cublasSetStream_v2` entrypoint from its retained SDK library.
 pub fn resolve_cublas_set_stream_v2(
     library: &Library,
@@ -1544,6 +1865,8 @@ pub unsafe fn call_cublas_CreateHandle(
     function: cublas::CreateHandle,
     arg0: *mut cublas::CublasHandle,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(arg0) }
 }
 
@@ -1560,6 +1883,8 @@ pub unsafe fn call_cublas_SetStream(
     arg0: cublas::CublasHandle,
     arg1: *mut c_void,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(arg0, arg1) }
 }
 
@@ -1589,6 +1914,8 @@ pub unsafe fn call_cublas_Sgemm(
     output: *mut f32,
     output_stride: c_int,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe {
         function(
             handle,
@@ -1622,6 +1949,8 @@ pub unsafe fn call_cublas_GetPointerMode(
     arg0: cublas::CublasHandle,
     arg1: *mut c_int,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(arg0, arg1) }
 }
 
@@ -1638,6 +1967,8 @@ pub unsafe fn call_cublas_SetPointerMode(
     arg0: cublas::CublasHandle,
     arg1: c_int,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(arg0, arg1) }
 }
 
@@ -1660,6 +1991,8 @@ pub unsafe fn call_cublas_Sdot(
     arg5: c_int,
     arg6: *mut f32,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(arg0, arg1, arg2, arg3, arg4, arg5, arg6) }
 }
 
@@ -1679,6 +2012,8 @@ pub unsafe fn call_cublas_Sscal(
     arg3: *mut f32,
     arg4: c_int,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(arg0, arg1, arg2, arg3, arg4) }
 }
 
@@ -1698,6 +2033,8 @@ pub unsafe fn call_cublas_Sasum(
     arg3: c_int,
     arg4: *mut f32,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(arg0, arg1, arg2, arg3, arg4) }
 }
 
@@ -1727,6 +2064,8 @@ pub unsafe fn call_cublas_Dgemm(
     output: *mut f64,
     output_stride: c_int,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe {
         function(
             handle,
@@ -1998,6 +2337,8 @@ pub unsafe fn call_cublas_DestroyHandle(
     function: cublas::DestroyHandle,
     handle: cublas::CublasHandle,
 ) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
     unsafe { function(handle) }
 }
 /// Open an SDK library whose symbol/resource lifetime is retained by the caller.
@@ -2075,3 +2416,75 @@ fn driver_symbol(name: &str) -> Option<&'static [u8]> {
         _ => return None,
     })
 }
+
+/// Resolve the fixed `cublasDasum_v2` entrypoint from its retained SDK library.
+pub fn resolve_cublas_dasum_v2(
+    library: &Library,
+) -> Result<Symbol<'_, cublas::Dasum>, libloading::Error> {
+    unsafe { symbol::<cublas::Dasum>(library, cublas::SYM_CUBLAS_DASUM_V2) }
+}
+
+/// Resolve the fixed `cublasDscal_v2` entrypoint from its retained SDK library.
+pub fn resolve_cublas_dscal_v2(
+    library: &Library,
+) -> Result<Symbol<'_, cublas::Dscal>, libloading::Error> {
+    unsafe { symbol::<cublas::Dscal>(library, cublas::SYM_CUBLAS_DSCAL_V2) }
+}
+
+/// Call the declared SDK entrypoint.
+///
+/// # Safety
+/// `function` must be the declared SDK entry point, with its originating library retained.
+/// Handles must be live in the selected context. Scalar/result pointers must address their
+/// declared host types. Device buffers must cover the dimensions and strides passed here;
+/// all buffer owners must survive queued completion on the handle's stream.
+#[allow(non_snake_case)] // ABI type identity at the private boundary.
+pub unsafe fn call_cublas_Dscal(
+    function: cublas::Dscal,
+    arg0: cublas::CublasHandle,
+    arg1: c_int,
+    arg2: *const f64,
+    arg3: *mut f64,
+    arg4: c_int,
+) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
+    unsafe { function(arg0, arg1, arg2, arg3, arg4) }
+}
+
+/// Call the declared SDK entrypoint.
+///
+/// # Safety
+/// `function` must be the declared SDK entry point, with its originating library retained.
+/// Handles must be live in the selected context. Scalar/result pointers must address their
+/// declared host types. Device buffers must cover the dimensions and strides passed here;
+/// all buffer owners must survive queued completion on the handle's stream.
+#[allow(non_snake_case)] // ABI type identity at the private boundary.
+pub unsafe fn call_cublas_Dasum(
+    function: cublas::Dasum,
+    arg0: cublas::CublasHandle,
+    arg1: c_int,
+    arg2: *const f64,
+    arg3: c_int,
+    arg4: *mut f64,
+) -> cublas::CublasStatus {
+    #[cfg(feature = "allocation-census")]
+    census::blas();
+    unsafe { function(arg0, arg1, arg2, arg3, arg4) }
+}
+
+#[path = "blas_vector/blas_vector.rs"]
+mod blas_vector;
+#[rustfmt::skip]
+pub use blas_vector::{
+    VectorFunctions,
+    retain as retain_blas_vector_functions,
+};
+
+#[path = "blas_handle/blas_handle.rs"]
+mod blas_handle;
+#[rustfmt::skip]
+pub use blas_handle::{
+    BlasHandleFunctions,
+    retain as retain_blas_handle_functions,
+};

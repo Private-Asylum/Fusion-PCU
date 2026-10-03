@@ -31,6 +31,9 @@ fn dispatch_macro_ui() {
     tests.compile_fail("tests/ui/generic_identity_arithmetic.rs");
     tests.compile_fail("tests/ui/generic_grid_identity_arithmetic.rs");
     tests.compile_fail("tests/ui/generic_identity_unsupported_bound.rs");
+    tests.compile_fail("tests/ui/generic_checked_float_literal.rs");
+    tests.compile_fail("tests/ui/generic_checked_float_helper.rs");
+    tests.compile_fail("tests/ui/generic_checked_integer_expressions.rs");
     tests.compile_fail("tests/ui/matrix_noncanonical_index.rs");
     tests.compile_fail("tests/ui/matrix_mismatched_shape.rs");
     tests.compile_fail("tests/ui/matrix_invocation_count_mismatch.rs");

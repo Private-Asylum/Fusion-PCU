@@ -6,6 +6,10 @@ use fusion_pcu::{
     PcuExecutionFault,
     PcuExecutionFaultKind,
 };
+#[path = "composition/composition.rs"]
+pub mod composition;
+#[path = "helper_integer/helper_integer.rs"]
+pub mod helper_integer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     Schema,

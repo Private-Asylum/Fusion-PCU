@@ -239,6 +239,7 @@ mod tests {
             rhs: PcuDispatchValueId(2),
         })];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(12),
             entry: PcuDispatchEntryPoint {
                 name: "u32-add-capability",

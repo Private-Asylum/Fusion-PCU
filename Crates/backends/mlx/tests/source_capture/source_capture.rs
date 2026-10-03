@@ -227,3 +227,71 @@ fn captured_singleton_and_rectangular_shape_borders() {
     check_shaped_source::<7, 13, 5>(&session);
     check_shaped_source::<3, 7, 9>(&session);
 }
+
+#[test]
+#[ignore = "requires pinned MLX C GPU and external activity guard"]
+fn opaque_prepared_source_stages_ram_and_rejects_foreign_before_publication() {
+    #[rustfmt::skip]
+    use fusion_pcu_mlx::{
+        MlxError,
+        MlxProgramInput,
+    };
+    let runtime = MlxRuntime::load_default().unwrap();
+    let session = runtime.open_gpu(0).unwrap();
+    let other = runtime.open_gpu(0).unwrap();
+    let capture = captured();
+    let prepared = session
+        .prepare_program(std::sync::Arc::clone(capture.program()))
+        .unwrap();
+    let [left_id, right_id] = prepared.matmul().plan().inputs();
+    let left = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let right = [7.0_f32, 8.0, 9.0, 10.0, 11.0, 12.0];
+    let resident = session.upload_f32([3, 2], &right).unwrap();
+    let foreign = other.upload_f32([3, 2], &right).unwrap();
+    let mut host = [-73.0_f32; 5];
+    assert!(matches!(
+        prepared.execute_mixed(&[
+            (left_id, MlxProgramInput::Host(&left)),
+            (right_id, MlxProgramInput::Resident(&foreign))
+        ]),
+        Err(MlxError::ForeignSession)
+    ));
+    assert!(matches!(
+        prepared.execute_host_into(&[(left_id, &left[..5]), (right_id, &right)], &mut host),
+        Err(MlxError::InvalidExtent)
+    ));
+    assert_eq!(host.map(f32::to_bits), [-73.0_f32; 5].map(f32::to_bits));
+    assert!(matches!(
+        prepared.execute_host_into(&[(left_id, &left[..]), (left_id, &right[..])], &mut host),
+        Err(MlxError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        prepared.execute_host_into(
+            &[(left_id, &[1_u32; 6]), (right_id, &[1_u32; 6])],
+            &mut [0_u32; 4]
+        ),
+        Err(MlxError::UnsupportedScalar(_))
+    ));
+    prepared
+        .execute_host_into(&[(right_id, &right[..]), (left_id, &left[..])], &mut host)
+        .unwrap();
+    assert_eq!(
+        host.map(f32::to_bits),
+        [58.0_f32, 64.0, 139.0, 154.0, -73.0].map(f32::to_bits)
+    );
+    let output = prepared
+        .execute_mixed(&[
+            (right_id, MlxProgramInput::Resident(&resident)),
+            (left_id, MlxProgramInput::Host(&left)),
+        ])
+        .unwrap();
+    assert_eq!(prepared.matmul().compilation_trace_count(), 1);
+    drop((
+        prepared, capture, session, other, runtime, resident, foreign,
+    ));
+    output.read_into_f32(&mut host).unwrap();
+    assert_eq!(
+        host.map(f32::to_bits),
+        [58.0_f32, 64.0, 139.0, 154.0, -73.0].map(f32::to_bits)
+    );
+}

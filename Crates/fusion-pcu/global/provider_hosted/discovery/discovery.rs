@@ -12,6 +12,14 @@ use super::{
     PcuExecutionError,
     PcuExecutionPolicy,
 };
+#[cfg(feature = "mlx")]
+#[rustfmt::skip]
+use super::{
+    MlxDiscovery,
+    MlxError,
+    collect_mlx_candidates,
+    open_mlx,
+};
 #[cfg(feature = "cuda")]
 #[rustfmt::skip]
 use super::{
@@ -51,12 +59,14 @@ use super::{
 };
 
 pub(super) struct Discoveries {
+    #[cfg(feature = "mlx")]
+    mlx: Option<Result<MlxDiscovery, MlxError>>,
     #[cfg(feature = "cpu")]
     cpu: Option<Result<PcuCpuDiscovery, PcuCpuDiscoveryError>>,
     #[cfg(feature = "cuda")]
-    cuda: CudaDiscovery,
+    cuda: Option<CudaDiscovery>,
     #[cfg(feature = "rocm")]
-    rocm: RocmDiscovery,
+    rocm: Option<RocmDiscovery>,
     #[cfg(feature = "metal")]
     metal: Option<Result<MetalDiscovery, fusion_pcu_metal::MetalError>>,
     #[cfg(feature = "vulkan")]
@@ -65,9 +75,20 @@ pub(super) struct Discoveries {
 
 impl Discoveries {
     pub(super) fn new(policy: PcuExecutionPolicy) -> Self {
-        #[cfg(not(any(feature = "metal", feature = "vulkan", feature = "cpu")))]
+        #[cfg(not(any(
+            feature = "metal",
+            feature = "vulkan",
+            feature = "cpu",
+            feature = "mlx"
+        )))]
         let _ = policy;
         Self {
+            #[cfg(feature = "mlx")]
+            mlx: matches!(
+                policy.backend,
+                PcuBackendChoice::Automatic | PcuBackendChoice::Mlx
+            )
+            .then(MlxDiscovery::discover_default),
             #[cfg(feature = "cpu")]
             cpu: matches!(
                 policy.backend,
@@ -75,9 +96,17 @@ impl Discoveries {
             )
             .then(PcuCpuDiscovery::discover),
             #[cfg(feature = "cuda")]
-            cuda: CudaDiscovery::new(),
+            cuda: matches!(
+                policy.backend,
+                PcuBackendChoice::Automatic | PcuBackendChoice::Cuda
+            )
+            .then(CudaDiscovery::new),
             #[cfg(feature = "rocm")]
-            rocm: RocmDiscovery::new(),
+            rocm: matches!(
+                policy.backend,
+                PcuBackendChoice::Automatic | PcuBackendChoice::Rocm
+            )
+            .then(RocmDiscovery::new),
             #[cfg(feature = "metal")]
             metal: matches!(
                 policy.backend,
@@ -101,21 +130,30 @@ impl Discoveries {
         let mut candidates = Vec::new();
         let mut discovery_errors = Vec::new();
 
+        #[cfg(feature = "mlx")]
+        match &self.mlx {
+            Some(Ok(discovery)) => {
+                if let Err(error) =
+                    collect_mlx_candidates(discovery, policy, kernel, &mut candidates)
+                {
+                    discovery_errors.push(format!("MLX discovery: {error}"));
+                }
+            }
+            Some(Err(error)) => discovery_errors.push(format!("MLX discovery: {error}")),
+            None => {}
+        }
+
         #[cfg(feature = "cuda")]
-        if matches!(
-            policy.backend,
-            PcuBackendChoice::Automatic | PcuBackendChoice::Cuda
-        ) && let Err(error) =
-            collect_cuda_candidates(&self.cuda, policy, Some(kernel), &mut candidates)
+        if let Some(discovery) = &self.cuda
+            && let Err(error) =
+                collect_cuda_candidates(discovery, policy, Some(kernel), &mut candidates)
         {
             discovery_errors.push(format!("CUDA discovery: {error}"));
         }
         #[cfg(feature = "rocm")]
-        if matches!(
-            policy.backend,
-            PcuBackendChoice::Automatic | PcuBackendChoice::Rocm
-        ) && let Err(error) =
-            collect_rocm_candidates(&self.rocm, policy, Some(kernel), &mut candidates)
+        if let Some(discovery) = &self.rocm
+            && let Err(error) =
+                collect_rocm_candidates(discovery, policy, Some(kernel), &mut candidates)
         {
             discovery_errors.push(format!("ROCm discovery: {error}"));
         }
@@ -168,6 +206,8 @@ impl Discoveries {
         #[cfg(not(any(feature = "rocm", feature = "cuda")))]
         let _ = policy;
         match candidate.provider {
+            #[cfg(feature = "mlx")]
+            Provider::Mlx => open_mlx(self.mlx.as_ref(), candidate.device),
             #[cfg(feature = "cpu")]
             Provider::Cpu => self
                 .cpu
@@ -187,7 +227,11 @@ impl Discoveries {
             Provider::Metal => open_metal(self.metal.as_ref(), candidate.device),
             #[cfg(feature = "cuda")]
             Provider::Cuda => {
-                CudaOwnedDispatchBackend::open(&self.cuda, candidate.device, policy.block_size)
+                let discovery = self
+                    .cuda
+                    .as_ref()
+                    .ok_or(PcuExecutionError::NoBackendEnabled)?;
+                CudaOwnedDispatchBackend::open(discovery, candidate.device, policy.block_size)
                     .map(|backend| Session::Cuda(Rc::new(backend)))
                     .map_err(|error| {
                         PcuExecutionError::BackendFailure(format!("CUDA initialization: {error}"))
@@ -195,7 +239,11 @@ impl Discoveries {
             }
             #[cfg(feature = "rocm")]
             Provider::Rocm => {
-                RocmOwnedDispatchBackend::open(&self.rocm, candidate.device, policy.block_size)
+                let discovery = self
+                    .rocm
+                    .as_ref()
+                    .ok_or(PcuExecutionError::NoBackendEnabled)?;
+                RocmOwnedDispatchBackend::open(discovery, candidate.device, policy.block_size)
                     .map(|backend| Session::Rocm(Rc::new(backend)))
                     .map_err(|error| {
                         PcuExecutionError::BackendFailure(format!("ROCm initialization: {error}"))

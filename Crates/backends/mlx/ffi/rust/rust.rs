@@ -11,6 +11,14 @@ pub use c_api::{
     Api,
     Array,
     Session,
+    CheckedUnary,
+    CheckedBinary,
+    CheckedInteger,
+    CheckedDivRem,
+    EncodedArray,
+    CarrierCopy,
+    Transport,
+    Composed,
 };
 #[cfg(feature = "tensor")]
 pub use c_api::PreparedMatmul;
@@ -49,3 +57,43 @@ const fn require_apple_silicon() -> Result<(), MlxError> {
         Err(MlxError::UnsupportedPlatform)
     }
 }
+
+#[cfg(feature = "view-census")]
+#[rustfmt::skip]
+pub use c_api::{
+    MlxViewCallCensus,
+    view_call_census,
+    reset_view_call_census,
+};
+
+#[cfg(feature = "division-census")]
+#[rustfmt::skip]
+pub use c_api::{
+    MlxDivRemCallCensus,
+    div_rem_call_census,
+    reset_div_rem_call_census,
+};
+
+#[cfg(feature = "carrier-census")]
+#[rustfmt::skip]
+pub use c_api::{
+    MlxCarrierCallCensus,
+    carrier_call_census,
+    reset_carrier_call_census,
+};
+
+#[cfg(feature = "binary-census")]
+#[rustfmt::skip]
+pub use c_api::{
+    MlxBinaryCallCensus,
+    binary_call_census,
+    reset_binary_call_census,
+};
+
+#[cfg(feature = "integer-census")]
+#[rustfmt::skip]
+pub use c_api::{
+    MlxIntegerCallCensus,
+    integer_call_census,
+    reset_integer_call_census,
+};

@@ -8,7 +8,7 @@ use fusion_pcu::{
 };
 
 #[test]
-fn caps_admit_only_checked_u32_and_f32_alu_floors() {
+fn caps_admit_checked_integer_and_exact_float_alu_floors() {
     let support = caps::support();
     assert!(
         support
@@ -23,10 +23,48 @@ fn caps_admit_only_checked_u32_and_f32_alu_floors() {
             .contains(PcuValueTypeCaps::FLOAT32)
     );
     assert!(
-        !support
+        support
+            .value_type_support
+            .direct
+            .contains(PcuValueTypeCaps::INT32)
+    );
+    assert!(
+        support
+            .dispatch_support
+            .scalar_alu
+            .direct
+            .for_scalar(PcuScalarType::I32)
+            .contains(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+    );
+    assert!(
+        support
+            .dispatch_support
+            .scalar_alu
+            .direct
+            .for_scalar(PcuScalarType::I128)
+            .contains(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+    );
+    assert!(
+        support
             .value_type_support
             .direct
             .contains(PcuValueTypeCaps::FLOAT64)
+    );
+    assert!(
+        support
+            .dispatch_support
+            .scalar_alu
+            .direct
+            .for_scalar(PcuScalarType::F64)
+            .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
+    );
+    assert!(
+        support
+            .dispatch_support
+            .scalar_alu
+            .direct
+            .for_scalar(PcuScalarType::F64)
+            .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
     );
     assert!(
         !support
@@ -44,13 +82,66 @@ fn caps_admit_only_checked_u32_and_f32_alu_floors() {
             .contains(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
     );
     assert!(
-        !support
+        support
             .dispatch_support
             .scalar_alu
             .direct
             .for_scalar(PcuScalarType::F32)
             .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
     );
+}
+
+#[test]
+fn low_float_caps_admit_proved_binary_and_unary_without_raw_alu() {
+    let support = caps::support();
+    for scalar in [
+        PcuScalarType::F16,
+        PcuScalarType::BF16,
+        PcuScalarType::F8E4M3FN,
+        PcuScalarType::F8E5M2,
+    ] {
+        assert!(
+            support
+                .value_type_support
+                .direct
+                .contains(PcuValueTypeCaps::for_scalar(scalar))
+        );
+        let operations = support
+            .dispatch_support
+            .scalar_alu
+            .direct
+            .for_scalar(scalar);
+        assert!(operations.contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY));
+        assert!(operations.contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY));
+        assert!(!operations.contains(PcuDispatchOpCaps::ALU_MUL));
+    }
+    for scalar in PcuScalarType::ALL {
+        assert_eq!(
+            support
+                .value_type_support
+                .direct
+                .contains(PcuValueTypeCaps::for_scalar(scalar)),
+            scalar.bit_width() >= 8
+        );
+        if matches!(scalar, PcuScalarType::F128 | PcuScalarType::F256) {
+            assert!(
+                !support
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar)
+                    .contains(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
+            );
+            assert!(
+                !support
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar)
+                    .contains(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -129,6 +220,124 @@ mod native {
                     .unwrap()
             })
             .collect()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One native fixture compares exact-byte publication across normal/Portable, direct/grid and actual SSA operand roles."
+    )]
+    fn low_owned<T: fusion_pcu::PcuCheckedFloat>(value: impl Fn(f32) -> T) {
+        #[rustfmt::skip]
+        use fusion_pcu::{
+            PcuHostArgument,
+            PcuDispatchFloatBinaryOp,
+        };
+        use crate::admission::binary::tests::Variant;
+        for (portable, grid, variant) in [false, true].into_iter().flat_map(|portable| {
+            [false, true].into_iter().flat_map(move |grid| {
+                [
+                    Variant::Plain,
+                    Variant::Swap,
+                    Variant::Repeat,
+                    Variant::PortableBroadcast,
+                ]
+                .into_iter()
+                .filter(move |variant| portable || !matches!(variant, Variant::PortableBroadcast))
+                .map(move |variant| (portable, grid, variant))
+            })
+        }) {
+            crate::admission::binary::tests::fixture::<T>(
+                grid,
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                variant,
+                |kernel| {
+                    let mut kernel = *kernel;
+                    if portable {
+                        kernel.numerical_requirements.float_underflow =
+                            PcuFloatUnderflowPolicy::IeeeAfterRounding;
+                        kernel
+                            .numerical_requirements
+                            .numerical_options
+                            .reproducibility = fusion_pcu::PcuReproducibility::PortableV1;
+                    }
+                    let backend = open_backend();
+                    let mut provider = backend.memory_provider(PcuMemoryPoolId(9));
+                    let mut allocate = |data: &[T]| {
+                        let bytes = PcuHostArgument::read(PcuBindingRef::new(0, 0), data);
+                        let mut resource = provider
+                            .allocate(PcuMemoryAllocationRequest {
+                                pool: PcuMemoryPoolId(9),
+                                size_bytes: bytes.bytes().len() as u64,
+                                alignment_bytes: 4,
+                                access: PcuMemoryAccess::ReadWrite,
+                                host_access: PcuMemoryHostAccess::TransferOnly,
+                                require_device_local: false,
+                            })
+                            .unwrap();
+                        provider
+                            .transfer_to(&mut resource, 0, bytes.bytes())
+                            .unwrap();
+                        resource
+                    };
+                    let left = allocate(&[value(1.0), value(2.0), value(3.0)]);
+                    let right = allocate(&[value(2.0), value(4.0), value(6.0)]);
+                    let output = allocate(&[value(91.0); 5]);
+                    let shape =
+                        PcuInvocationShape::invocations(core::num::NonZeroU32::new(3).unwrap());
+                    let prepared = backend
+                        .prepare_dispatch_owned(
+                            PcuDispatchSubmission {
+                                kernel: &kernel,
+                                shape,
+                            },
+                            PcuInvocationParameters::empty(),
+                        )
+                        .unwrap_or_else(|error| panic!("owned portable={portable} grid={grid} variant={variant:?}: {error:?}"));
+                    let mut completion = prepared
+                        .submit_owned(bind(&backend, &kernel, [&left, &right, &output]))
+                        .unwrap();
+                    assert_eq!(completion.wait().unwrap(), PcuCompletionOutcome::Succeeded);
+                    let expected = match variant {
+                        Variant::Swap => [value(2.0); 3],
+                        Variant::Repeat => [value(1.0); 3],
+                        Variant::PortableBroadcast => [
+                            value(0.5),
+                            value(0.25),
+                            value(1.0).pcu_checked_div(value(6.0)).unwrap(),
+                        ],
+                        _ => [value(0.5); 3],
+                    };
+                    let expected = [
+                        expected[0],
+                        expected[1],
+                        expected[2],
+                        value(91.0),
+                        value(91.0),
+                    ];
+                    let expected = PcuHostArgument::read(PcuBindingRef::new(0, 0), &expected);
+                    let mut bytes = vec![0; expected.bytes().len()];
+                    provider.transfer_from(&output, 0, &mut bytes).unwrap();
+                    assert_eq!(bytes, expected.bytes());
+                },
+            );
+        }
+    }
+    #[test]
+    #[ignore = "Requires actual Metal advanced owned publication for exact odd low payloads."]
+    fn low_formats_owned_dispatch_exact_byte_publication_and_tails() {
+        low_owned::<fusion_pcu::PcuF16Bits>(|value| {
+            fusion_pcu::PcuF16Bits::pcu_checked_from_f32(value).unwrap()
+        });
+        low_owned::<fusion_pcu::PcuBf16Bits>(|value| {
+            fusion_pcu::PcuBf16Bits::pcu_checked_from_f32(value).unwrap()
+        });
+        low_owned::<fusion_pcu::PcuF8E4M3FnBits>(|value| {
+            fusion_pcu::PcuF8E4M3FnBits::pcu_checked_from_f32(value).unwrap()
+        });
+        low_owned::<fusion_pcu::PcuF8E5M2Bits>(|value| {
+            fusion_pcu::PcuF8E5M2Bits::pcu_checked_from_f32(value).unwrap()
+        });
     }
 
     fn integer_fixture(
@@ -333,6 +542,11 @@ mod native {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         visit(&PcuDispatchKernelIr {
+            numerical_requirements: fusion_pcu::PcuImplementationRequirements {
+                float_underflow: underflow_policy,
+                range_policy,
+                ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+            },
             id: PcuKernelId(14),
             entry: PcuDispatchEntryPoint {
                 name: "owned-checked-f32",
@@ -351,9 +565,10 @@ mod native {
     #[ignore = "Requires actual Metal owned F32 bit-map execution."]
     #[allow(
         clippy::too_many_lines,
-        reason = "One allocation set proves exact bits, first fault, output preservation, retry and policy rejection across profiles."
+        clippy::cognitive_complexity,
+        reason = "One allocation set proves bits, first fault, transactional rollback, retry and recovered Clamp across profiles."
     )]
-    fn owned_f32_direct_grid_exact_bits_fault_retry_and_range_rejection() {
+    fn owned_f32_direct_grid_exact_bits_fault_retry_and_recovered_clamp() {
         for operation in [PcuDispatchFloatUnaryOp::Neg, PcuDispatchFloatUnaryOp::Relu] {
             for grid in [false, true] {
                 let backend = open_backend();
@@ -375,16 +590,6 @@ mod native {
                             PcuDispatchSubmission { kernel, shape },
                             PcuInvocationParameters::empty(),
                         );
-                        if range != PcuRangePolicy::Reject {
-                            assert!(matches!(
-                                prepared,
-                                Err(PcuOwnedDispatchError::Admission(_)
-                                    | PcuOwnedDispatchError::Backend(
-                                        MetalOwnedDispatchError::Metal(MetalError::Unsupported)
-                                    ))
-                            ));
-                            return;
-                        }
                         let prepared = prepared.unwrap();
                         let bindings = kernel
                             .bindings
@@ -449,12 +654,30 @@ mod native {
                 };
                 assert_eq!(after, retry);
                 let (outcome, after) = run(
-                    PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                    PcuFloatUnderflowPolicy::RejectSubnormalResult,
                     PcuRangePolicy::Clamp,
-                    [0, 0, 0, 99],
+                    [0, 1, 0x3f80_0000, 99],
                 );
-                assert_eq!(outcome, None);
-                assert_eq!(after, retry);
+                assert!(
+                    matches!(outcome,Some(PcuCompletionOutcome::Fault(fault)) if fault.recovered
+                    && fault.invocation_id==1 && fault.kind==PcuExecutionFaultKind::ArithmeticUnderflow)
+                );
+                let recovered = if operation == PcuDispatchFloatUnaryOp::Neg {
+                    [0x8000_0000, 0x8000_0001, 0xbf80_0000, 91, 91]
+                } else {
+                    [0, 1, 0x3f80_0000, 91, 91]
+                };
+                assert_eq!(after, recovered);
+                let (outcome, after) = run(
+                    PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                    PcuRangePolicy::Clamp,
+                    [0, 1, 0x7f80_0000, 99],
+                );
+                assert!(
+                    matches!(outcome,Some(PcuCompletionOutcome::Fault(fault)) if !fault.recovered
+                    && fault.invocation_id==2 && fault.kind==PcuExecutionFaultKind::InvalidFloatingOperand)
+                );
+                assert_eq!(after, recovered);
             }
         }
     }
@@ -540,5 +763,104 @@ mod native {
                 });
             }
         }
+    }
+
+    #[test]
+    #[ignore = "Requires actual Metal staging, resident writes and checked fault completion."]
+    fn mixed_call_write_fact_resets_before_validation_and_tracks_terminal_fault() {
+        #[rustfmt::skip]
+        use fusion_pcu::{
+            PcuDeviceBuffer,
+            PcuDeviceArgument,
+            PcuHostArgument,
+            PcuHostDispatchError,
+            PcuHostKernelBackend,
+            PcuPreparedHostKernel,
+        };
+        use crate::MetalMixedHostArgument as Argument;
+        integer_fixture(PcuDispatchIntegerBinaryOp::Add, false, |kernel| {
+            let backend = open_backend();
+            let mut provider = backend.memory_provider(PcuMemoryPoolId(9));
+            let left =
+                PcuDeviceBuffer::<u32, _>::new(allocation(&mut provider, &[1, u32::MAX, 3]), 3);
+            let mut output = PcuDeviceBuffer::<u32, _>::new(allocation(&mut provider, &[91; 5]), 5);
+            let refs: Vec<_> = kernel
+                .bindings
+                .iter()
+                .map(|binding| binding.reference())
+                .collect();
+            let mut prepared = backend.prepare_host_kernel(kernel).unwrap();
+            assert!(!prepared.last_call_may_have_written());
+            let mut arguments = [
+                Argument::Resident(PcuDeviceArgument::read(refs[0], &left)),
+                Argument::Host(PcuHostArgument::read(refs[1], &[2_u32, 1, 4])),
+                Argument::Resident(PcuDeviceArgument::read_write(refs[2], &mut output)),
+            ];
+            assert!(matches!(prepared.call_mixed(&mut arguments),
+                Err(PcuHostDispatchError::Backend(MetalError::Arithmetic(fault)))
+                if fault.invocation_id == 1 && !fault.recovered));
+            assert!(prepared.last_call_may_have_written());
+            assert!(!prepared.last_call_completion_uncertain());
+            let after = read(&mut provider, output.resource());
+            assert_eq!(after[0], 3);
+            assert_eq!(&after[3..], &[91; 2]);
+            let mut arguments = [
+                Argument::Resident(PcuDeviceArgument::read(refs[0], &left)),
+                Argument::Host(PcuHostArgument::read(refs[1], &[2_u32, 1, 4])),
+                Argument::Resident(PcuDeviceArgument::read(refs[2], &output)),
+            ];
+            assert!(matches!(prepared.call_mixed(&mut arguments),
+                Err(PcuHostDispatchError::AccessMismatch(target)) if target == refs[2]));
+            assert!(!prepared.last_call_may_have_written());
+            assert_eq!(read(&mut provider, output.resource()), after);
+            let mut host_output = [91_u32; 5];
+            let mut arguments = [
+                PcuHostArgument::read(refs[0], &[1_u32, 2, 3]),
+                PcuHostArgument::read(refs[1], &[2_u32, 3, 4]),
+                PcuHostArgument::read_write(refs[2], &mut host_output),
+            ];
+            prepared.call(&mut arguments).unwrap();
+            assert!(prepared.last_call_may_have_written());
+            let mut arguments = [PcuHostArgument::read(refs[0], &[1_u32])];
+            assert!(matches!(
+                prepared.call(&mut arguments),
+                Err(PcuHostDispatchError::BufferTooSmall(_))
+            ));
+            assert!(!prepared.last_call_may_have_written());
+            assert_eq!(host_output, [3, 5, 7, 91, 91]);
+        });
+    }
+}
+
+#[test]
+fn div_rem_capability_is_exact_fourteen_integer_widths() {
+    let support = caps::support();
+    for scalar in PcuScalarType::ALL {
+        let expected = matches!(
+            scalar,
+            PcuScalarType::I8
+                | PcuScalarType::U8
+                | PcuScalarType::I16
+                | PcuScalarType::U16
+                | PcuScalarType::I32
+                | PcuScalarType::U32
+                | PcuScalarType::I64
+                | PcuScalarType::U64
+                | PcuScalarType::U128
+                | PcuScalarType::I128
+                | PcuScalarType::U256
+                | PcuScalarType::I256
+                | PcuScalarType::U512
+                | PcuScalarType::I512
+        );
+        assert_eq!(
+            support
+                .dispatch_support
+                .scalar_alu
+                .direct
+                .for_scalar(scalar)
+                .contains(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+            expected
+        );
     }
 }

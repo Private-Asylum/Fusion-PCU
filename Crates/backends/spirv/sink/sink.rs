@@ -2,6 +2,14 @@
 
 use super::error::PcuSpirvError;
 
+impl PcuSpirvSink for alloc::vec::Vec<u32> {
+    fn push_word(&mut self, word: u32) -> Result<(), PcuSpirvError> {
+        self.try_reserve(1).map_err(|_| PcuSpirvError::SinkFull)?;
+        self.push(word);
+        Ok(())
+    }
+}
+
 /// Word sink used by SPIR-V lowering.
 pub trait PcuSpirvSink {
     /// Appends one SPIR-V word.

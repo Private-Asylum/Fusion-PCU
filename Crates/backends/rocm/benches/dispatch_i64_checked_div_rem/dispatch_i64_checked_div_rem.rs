@@ -140,6 +140,7 @@ fn run_case<const N: usize>(
 
     let (bindings, kernel_ops) = build_ops::<N>(grid_stride);
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(0xD1_0001),
         entry: PcuDispatchEntryPoint {
             name: "checked_i64_div_rem",

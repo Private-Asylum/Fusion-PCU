@@ -102,7 +102,7 @@ pub enum PcuCommandOp<'a> {
     ReadResult {
         target: PcuTarget<'a>,
         result: PcuCommandResult,
-        width_bits: u8,
+        width_bits: u16,
         effect: PcuCommandEffectKind,
     },
     Write {

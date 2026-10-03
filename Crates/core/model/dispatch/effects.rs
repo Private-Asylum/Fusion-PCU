@@ -15,8 +15,13 @@ impl PcuDispatchKernelIr<'_> {
     ///
     /// This cold structural analysis recognizes only straight-line data instructions followed
     /// by an optional terminal return, or one grid-stride map with that same body shape. Every
-    /// successful invocation must store its own logical element, and no instruction may read
-    /// this binding. Unknown control flow and opaque effects return `None`.
+    /// successful invocation must store its own logical element before reading that element.
+    /// A subsequent same-lane load uses the value just stored, not caller input. Element-zero
+    /// loads qualify only when the logical extent is one; reads before a store, other indices,
+    /// unknown control flow and opaque effects return `None`.
+    /// Consequently, initialization of the returned prefix needs no incoming
+    /// contents from this binding. This is a preparation-time copy-elision fact,
+    /// not merely a statement that the binding is eventually written.
     ///
     /// The caller must separately admit the kernel's SSA/type rules, launch geometry, resource
     /// access and physical aliasing. This fact does not authorize aliasing, storage donation,
@@ -45,8 +50,16 @@ impl PcuDispatchKernelIr<'_> {
                 return None;
             };
             match data {
-                PcuDispatchDataOp::BindingLoad { binding, .. } if *binding == target => {
-                    return None;
+                PcuDispatchDataOp::BindingLoad {
+                    binding,
+                    index: load_index,
+                    ..
+                } if *binding == target => {
+                    let same_lane = *load_index == index
+                        || (extent == 1 && *load_index == PcuDispatchIndex::BindingElementZero);
+                    if !writes || !same_lane {
+                        return None;
+                    }
                 }
                 PcuDispatchDataOp::BindingStore {
                     binding,
@@ -133,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_require_original_contents_even_after_a_dense_store() {
+    fn only_reads_before_the_owning_lane_store_require_original_contents() {
         let read = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
             result: PcuDispatchValueId(1),
             binding: OUTPUT,
@@ -145,6 +158,72 @@ mod tests {
         );
         assert_eq!(
             coverage(&[store(PcuDispatchIndex::InvocationId), read], 65),
+            Some(65)
+        );
+    }
+
+    #[test]
+    fn stored_scalar_reloads_do_not_invent_a_cross_lane_initialization_proof() {
+        let read = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(1),
+            binding: OUTPUT,
+            index: PcuDispatchIndex::BindingElementZero,
+        });
+        let write = store(PcuDispatchIndex::InvocationId);
+        assert_eq!(coverage(&[write, read], 1), Some(1));
+        assert_eq!(coverage(&[read, write], 1), None);
+        assert_eq!(coverage(&[write, read], 65), None);
+        let arbitrary = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(1),
+            binding: OUTPUT,
+            index: PcuDispatchIndex::Value(PcuDispatchValueId(2)),
+        });
+        assert_eq!(coverage(&[write, arbitrary], 1), None);
+        assert_eq!(coverage(&[write, arbitrary], 65), None);
+    }
+
+    #[test]
+    fn grid_store_reload_uses_its_logical_index_and_extent() {
+        let read = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(1),
+            binding: OUTPUT,
+            index: PcuDispatchIndex::GridStrideId,
+        });
+        let body = [store(PcuDispatchIndex::GridStrideId), read];
+        assert_eq!(
+            coverage(
+                &[PcuDispatchOp::GridStrideLoop {
+                    extent: 1_024,
+                    body: &body
+                }],
+                250
+            ),
+            Some(1_024)
+        );
+        let scalar_read = PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+            result: PcuDispatchValueId(1),
+            binding: OUTPUT,
+            index: PcuDispatchIndex::BindingElementZero,
+        });
+        let body = [store(PcuDispatchIndex::GridStrideId), scalar_read];
+        assert_eq!(
+            coverage(
+                &[PcuDispatchOp::GridStrideLoop {
+                    extent: 1,
+                    body: &body
+                }],
+                250
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            coverage(
+                &[PcuDispatchOp::GridStrideLoop {
+                    extent: 65,
+                    body: &body
+                }],
+                1
+            ),
             None
         );
     }

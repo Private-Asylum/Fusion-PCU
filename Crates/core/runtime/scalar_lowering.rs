@@ -15,6 +15,8 @@ use crate::{
     PcuParameterValue,
     PcuRangePolicy,
     PcuScalar,
+    PcuCheckedFloat,
+    PcuCheckedInteger,
     PcuFloatUnderflowPolicy,
     PcuValueType,
 };
@@ -24,26 +26,27 @@ use core::marker::PhantomData;
 /// Maximum nested helper depth admitted during generated IR construction.
 pub const PCU_SCALAR_HELPER_MAX_DEPTH: u8 = 32;
 
-/// Floating scalar types admitted by the generated arithmetic-helper profile.
-pub trait PcuFloatScalar: PcuScalar {
+/// Sealed floating scalar types admitted by checked arithmetic lowering.
+///
+/// IR construction is independent of a backend's executable format coverage.
+pub trait PcuFloatScalar: PcuCheckedFloat {
     /// IR value type used by arithmetic on this scalar.
     const VALUE_TYPE: PcuValueType;
 }
 
-impl PcuFloatScalar for f32 {
-    const VALUE_TYPE: PcuValueType = PcuValueType::f32();
-}
-
-impl PcuFloatScalar for f64 {
-    const VALUE_TYPE: PcuValueType = PcuValueType::f64();
+impl<T: PcuCheckedFloat> PcuFloatScalar for T {
+    const VALUE_TYPE: PcuValueType = PcuValueType::Scalar(T::TYPE);
 }
 
 mod integer_sealed {
     pub trait Sealed {}
 }
-/// Fixed-width integer types admitted by checked arithmetic lowering.
+/// Fixed-width integer types with a native inline parameter representation.
+///
+/// Checked arithmetic lowering accepts the wider [`PcuCheckedInteger`] family separately;
+/// absence of an inline constant representation never implies absence of an exact integer type.
 #[allow(private_bounds)] // Only the exact-width built-in integer contracts are admitted.
-pub trait PcuIntegerScalar: PcuScalar + integer_sealed::Sealed {
+pub trait PcuIntegerScalar: PcuCheckedInteger + integer_sealed::Sealed {
     /// Exact IR type for this integer.
     const VALUE_TYPE: PcuValueType;
     /// Preserve the scalar's exact width in a constant.
@@ -244,11 +247,11 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         })?;
         Ok(PcuScalarValue::from_id(result))
     }
-    /// Emits checked exact-width integer addition, subtraction, or multiplication.
+    /// Emits checked exact-width integer arithmetic with this builder's range policy.
     ///
     /// # Errors
     /// Returns `ResourceExhausted` when value or operation capacity is exhausted.
-    pub fn checked_integer_binary_value<T: PcuIntegerScalar>(
+    pub fn checked_integer_binary_value<T: PcuCheckedInteger>(
         &mut self,
         op: crate::PcuDispatchIntegerBinaryOp,
         lhs: PcuScalarValue<T>,
@@ -256,8 +259,9 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
     ) -> Result<PcuScalarValue<T>, PcuError> {
         let result = self.fresh_value()?;
         self.push(PcuDispatchDataOp::CheckedIntegerBinary {
-            value_type: T::VALUE_TYPE,
+            value_type: PcuValueType::Scalar(T::TYPE),
             op,
+            range_policy: self.range_policy,
             result,
             lhs: lhs.id(),
             rhs: rhs.id(),
@@ -434,6 +438,9 @@ impl<'a, const MAX_OPS: usize> PcuScalarLowering<'a, MAX_OPS> {
         }
     }
 }
+
+#[path = "scalar_lowering/division/division.rs"]
+mod division;
 
 #[cfg(test)]
 mod tests {

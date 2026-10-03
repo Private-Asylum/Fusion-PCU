@@ -134,6 +134,7 @@ impl PcuCpuTypedSlice<'_> {
 /// Rejection or execution failure for the CPU typed conversion oracle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuTypedConversionReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidValueFlow(PcuTypedDispatchValidationError),
     UnsupportedProfile,
@@ -169,6 +170,15 @@ impl PcuTypedConversionReference {
         submission: PcuDispatchSubmission<'_>,
         bindings: &mut [PcuCpuTypedBinding<'_>],
     ) -> Result<(), PcuTypedConversionReferenceError> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuTypedConversionReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_dispatch_submission(submission)
             .map_err(|_| PcuTypedConversionReferenceError::InvalidSubmission)?;
         validate_typed_dispatch_value_flow(submission.kernel)
@@ -606,6 +616,7 @@ mod tests {
             PcuDispatchOp::Control(fusion_pcu::PcuDispatchControlOp::Return),
         ]));
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(10),
             entry: PcuDispatchEntryPoint {
                 name: "scalar_conversion",
@@ -744,6 +755,7 @@ mod tests {
             .union(PcuValueTypeCaps::for_scalar(target))
             .union(PcuValueTypeCaps::SCALAR_VALUES);
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(9),
             entry: PcuDispatchEntryPoint {
                 name: "typed_conversion",

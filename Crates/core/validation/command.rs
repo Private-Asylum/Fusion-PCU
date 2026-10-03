@@ -28,8 +28,8 @@ pub enum PcuCommandValidationError {
     NonScalarReadResult(PcuValueType),
     ReadWidthMismatch {
         step: usize,
-        expected: u8,
-        found: u8,
+        expected: u16,
+        found: u16,
     },
     ReadTargetTypeMismatch {
         expected: PcuValueType,
@@ -201,7 +201,7 @@ mod command_result_tests {
         PcuCommandStep,
     };
 
-    fn typed_read(id: u16, value_type: PcuValueType, width_bits: u8) -> PcuCommandOp<'static> {
+    fn typed_read(id: u16, value_type: PcuValueType, width_bits: u16) -> PcuCommandOp<'static> {
         PcuCommandOp::ReadResult {
             target: PcuTarget::Port("status"),
             result: PcuCommandResult {

@@ -50,6 +50,7 @@ use crate::{
 /// Admission, storage, or terminal arithmetic failure of an explicit checked CPU map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuCheckedFloatReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     UnsupportedProfile,
     Binding(PcuTypedConversionReferenceError),
@@ -101,6 +102,15 @@ impl PcuCheckedFloatReference {
         submission: PcuDispatchSubmission<'_>,
         bindings: &mut [PcuCpuTypedBinding<'_>],
     ) -> Result<(), PcuCheckedFloatReferenceError> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuCheckedFloatReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_profile(submission)?;
         validate_bindings(submission, bindings, false, 0)
             .map_err(PcuCheckedFloatReferenceError::Binding)?;
@@ -469,6 +479,15 @@ macro_rules! homogeneous {
                 bindings: &mut [PcuHostScalarBinding<'_, $scalar>],
                 _parameters: PcuInvocationParameters<'_>,
             ) -> Result<(), Self::Error> {
+                if submission
+                    .kernel
+                    .numerical_requirements
+                    .numerical_options
+                    .reproducibility
+                    == fusion_pcu::PcuReproducibility::PortableV1
+                {
+                    return Err(PcuCheckedFloatReferenceError::UnsupportedNumericalRequirements);
+                }
                 validate_host_scalar_bindings::<$scalar, ()>(submission, bindings)
                     .map_err(|_| PcuCheckedFloatReferenceError::InvalidSubmission)?;
                 validate_checked_float_map_kernel(

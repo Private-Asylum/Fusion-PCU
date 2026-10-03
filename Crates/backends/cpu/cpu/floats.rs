@@ -31,6 +31,7 @@ use crate::{
 /// Failure to interpret the bounded `f32` map profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuF32ReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     UnsupportedInstruction(usize),
     InvalidValue(PcuDispatchValueId),
@@ -75,6 +76,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<f32> for PcuF32Reference {
         bindings: &mut [PcuHostScalarBinding<'_, f32>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuF32ReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<f32, ()>(submission, bindings)
             .map_err(|_| PcuF32ReferenceError::InvalidSubmission)?;
         validation::validate_program(submission, bindings)?;
@@ -177,6 +187,7 @@ pub struct PcuBf16IdentityReference;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuHalfIdentityReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel,
 }
@@ -192,6 +203,15 @@ macro_rules! impl_half_identity {
                 bindings: &mut [PcuHostScalarBinding<'_, $ty>],
                 _parameters: PcuInvocationParameters<'_>,
             ) -> Result<(), Self::Error> {
+                if submission
+                    .kernel
+                    .numerical_requirements
+                    .numerical_options
+                    .reproducibility
+                    == fusion_pcu::PcuReproducibility::PortableV1
+                {
+                    return Err(PcuHalfIdentityReferenceError::UnsupportedNumericalRequirements);
+                }
                 validate_host_scalar_bindings::<$ty, ()>(submission, bindings)
                     .map_err(|_| PcuHalfIdentityReferenceError::InvalidSubmission)?;
                 $validator(submission.kernel)
@@ -349,6 +369,7 @@ mod half_identity_tests {
         };
         let kernel_bindings: &'static [PcuBinding<'static>] = Box::leak(Box::new(bindings));
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: fusion_pcu::PcuKernelId(1),
             entry: fusion_pcu::PcuDispatchEntryPoint {
                 name: "half_identity",
@@ -424,6 +445,7 @@ mod half_identity_tests {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuF64ReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel,
     MissingBinding(PcuBindingRef),
@@ -441,6 +463,15 @@ unsafe impl PcuSynchronousHostDispatchBackend<f64> for PcuF64Reference {
         bindings: &mut [PcuHostScalarBinding<'_, f64>],
         _parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuF64ReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<f64, ()>(submission, bindings)
             .map_err(|_| PcuF64ReferenceError::InvalidSubmission)?;
         validate_f64_map_kernel(submission.kernel)

@@ -2,7 +2,7 @@
 
 #[rustfmt::skip]
 use std::{
-    cell::Cell,
+    cell::{Cell,RefCell},
     fmt,
     path::Path,
     rc::Rc,
@@ -27,6 +27,8 @@ pub enum MlxError {
     UnsupportedScalar(fusion_pcu::PcuScalarType),
     InvalidRequest(String),
     Runtime(String),
+    /// Fixed checked synthesis failed; recovered range faults retain completed borrowed payloads.
+    Arithmetic(fusion_pcu::PcuExecutionFault),
     /// Work might remain in flight; real SDK owners and the library are quarantined.
     CompletionUnknown(String),
     #[cfg(feature = "tensor")]
@@ -127,7 +129,8 @@ pub struct MlxSession(Rc<Session>);
 pub enum MlxArrayResidency {
     /// Host data was copied to MLX-owned initialized storage, not yet used in GPU work.
     HostCopied,
-    /// A GPU `MatMul` produced this terminal array; its backing remains MLX-owned.
+    /// Explicit GPU work or a checked official GPU view produced this terminal array.
+    /// Its backing remains MLX-owned.
     GpuEvaluated,
     /// A host read materialized CPU-visible data from the MLX-owned backing.
     HostMaterialized,
@@ -136,10 +139,14 @@ pub enum MlxArrayResidency {
 struct Array {
     native: ffi::Array,
     residency: Cell<MlxArrayResidency>,
+    encoded_view: RefCell<Option<Rc<encoded::EncodedBacking>>>,
 }
 
-/// Immutable owned initialized F32 matrix. No mutable/no-copy or native Metal buffer import.
-/// Clones share the same SDK holder and backing; they do not duplicate physical allocations.
+/// Immutable owned initialized F32 matrix.
+///
+/// Host upload copies into MLX-owned storage. Official checked immutable views may share that owned storage after terminal validation.
+/// Native Metal buffer import is unsupported. Clones share the same SDK holder and backing;
+/// they do not duplicate physical allocations.
 #[derive(Clone)]
 pub struct MlxArray {
     session: MlxSession,
@@ -147,6 +154,244 @@ pub struct MlxArray {
 }
 
 impl MlxSession {
+    pub(crate) fn prepare_composed_native(
+        &self,
+        plan: crate::MlxCheckedMapPlan,
+    ) -> Result<ffi::Composed, MlxError> {
+        ffi::Composed::prepare(&self.0.native, plan)
+    }
+    #[cfg(feature = "benchmark-control")]
+    pub(crate) fn prepare_native_checked_map_control_internal(
+        &self,
+        plan: crate::MlxCheckedMapPlan,
+        header: String,
+        body: String,
+    ) -> Result<ffi::Composed, MlxError> {
+        ffi::Composed::prepare_control(&self.0.native, plan, header, body)
+    }
+    pub(crate) fn prepare_transport_native(
+        &self,
+        plan: &crate::MlxTransportPlan,
+    ) -> Result<ffi::Transport, MlxError> {
+        ffi::Transport::prepare(&self.0.native, plan)
+    }
+    pub(crate) fn prepare_transport_native_with_input_extents(
+        &self,
+        plan: &crate::MlxTransportPlan,
+        extents: &[usize],
+    ) -> Result<ffi::Transport, MlxError> {
+        ffi::Transport::prepare_with_input_extents(&self.0.native, plan, extents)
+    }
+    #[cfg(feature = "benchmark-control")]
+    pub(crate) fn prepare_native_transport_control_internal(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        element_count: usize,
+        workload: crate::MlxNativeTransportWorkload,
+        extents: &[usize],
+    ) -> Result<ffi::Transport, MlxError> {
+        ffi::Transport::prepare_native_control(
+            &self.0.native,
+            scalar,
+            element_count,
+            workload,
+            extents,
+        )
+    }
+    pub(crate) fn upload_transport_bytes(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        count: usize,
+        bytes: &[u8],
+    ) -> Result<MlxEncodedArray, MlxError> {
+        self.upload_encoded_bytes(scalar, count, bytes)
+    }
+    pub(crate) fn wrap_transport_output(&self, output: ffi::EncodedArray) -> MlxEncodedArray {
+        self.wrap_encoded(output)
+    }
+    #[cfg(test)]
+    pub(crate) fn native_for_binary_proof(&self) -> &ffi::Session {
+        &self.0.native
+    }
+    pub(crate) fn prepare_checked_div_rem_native(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        count: usize,
+        inputs: [usize; 2],
+        broadcast: [bool; 2],
+    ) -> Result<ffi::CheckedDivRem, MlxError> {
+        ffi::CheckedDivRem::prepare(&self.0.native, scalar, count, inputs, broadcast)
+    }
+    pub(crate) fn prepare_checked_div_rem_native_with_input_extents(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        count: usize,
+        inputs: [usize; 2],
+        broadcast: [bool; 2],
+    ) -> Result<ffi::CheckedDivRem, MlxError> {
+        ffi::CheckedDivRem::prepare_with_input_extents(
+            &self.0.native,
+            scalar,
+            count,
+            inputs,
+            broadcast,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Independent frozen integer operation, range and both operand extents/roles.
+    pub(crate) fn prepare_checked_integer_native(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        operation: fusion_pcu::PcuDispatchIntegerBinaryOp,
+        range: fusion_pcu::PcuRangePolicy,
+        count: usize,
+        inputs: [usize; 2],
+        broadcast: [bool; 2],
+    ) -> Result<ffi::CheckedInteger, MlxError> {
+        let operation = match operation {
+            fusion_pcu::PcuDispatchIntegerBinaryOp::Add => 0,
+            fusion_pcu::PcuDispatchIntegerBinaryOp::Sub => 1,
+            fusion_pcu::PcuDispatchIntegerBinaryOp::Mul => 2,
+        };
+        ffi::CheckedInteger::prepare(
+            &self.0.native,
+            scalar,
+            operation,
+            range,
+            count,
+            inputs,
+            broadcast,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Independent frozen integer operation, range and both operand extents/roles.
+    pub(crate) fn prepare_checked_integer_native_with_input_extents(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        operation: fusion_pcu::PcuDispatchIntegerBinaryOp,
+        range: fusion_pcu::PcuRangePolicy,
+        count: usize,
+        inputs: [usize; 2],
+        broadcast: [bool; 2],
+        full: [usize; 2],
+    ) -> Result<ffi::CheckedInteger, MlxError> {
+        let operation = match operation {
+            fusion_pcu::PcuDispatchIntegerBinaryOp::Add => 0,
+            fusion_pcu::PcuDispatchIntegerBinaryOp::Sub => 1,
+            fusion_pcu::PcuDispatchIntegerBinaryOp::Mul => 2,
+        };
+        ffi::CheckedInteger::prepare_with_input_extents(
+            &self.0.native,
+            scalar,
+            operation,
+            range,
+            count,
+            inputs,
+            broadcast,
+            full,
+        )
+    }
+    pub(crate) fn prepare_carrier_native(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        count: usize,
+        broadcast: bool,
+    ) -> Result<ffi::CarrierCopy, MlxError> {
+        ffi::CarrierCopy::prepare(&self.0.native, scalar, count, broadcast)
+    }
+    pub(crate) fn prepare_carrier_native_with_input_extent(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        count: usize,
+        broadcast: bool,
+        input_count: usize,
+    ) -> Result<ffi::CarrierCopy, MlxError> {
+        ffi::CarrierCopy::prepare_with_input_extent(
+            &self.0.native,
+            scalar,
+            count,
+            broadcast,
+            input_count,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Both cold operand extents/broadcast roles are independent.
+    pub(crate) fn prepare_checked_binary_native(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        operation: fusion_pcu::PcuDispatchFloatBinaryOp,
+        policy: fusion_pcu::PcuFloatUnderflowPolicy,
+        range: fusion_pcu::PcuRangePolicy,
+        count: usize,
+        inputs: [usize; 2],
+        broadcast: [bool; 2],
+    ) -> Result<ffi::CheckedBinary, MlxError> {
+        ffi::CheckedBinary::prepare(
+            &self.0.native,
+            scalar,
+            operation,
+            policy,
+            range,
+            count,
+            inputs,
+            broadcast,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Logical operand spans and physical full shapes are distinct cold dimensions.
+    pub(crate) fn prepare_checked_binary_native_with_input_extents(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        operation: fusion_pcu::PcuDispatchFloatBinaryOp,
+        policy: fusion_pcu::PcuFloatUnderflowPolicy,
+        range: fusion_pcu::PcuRangePolicy,
+        count: usize,
+        inputs: [usize; 2],
+        broadcast: [bool; 2],
+        full: [usize; 2],
+    ) -> Result<ffi::CheckedBinary, MlxError> {
+        ffi::CheckedBinary::prepare_with_input_extents(
+            &self.0.native,
+            scalar,
+            operation,
+            policy,
+            range,
+            count,
+            inputs,
+            broadcast,
+            full,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Independent cold scalar operation/policy/extent dimensions.
+    pub(crate) fn prepare_checked_unary_native(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        op: fusion_pcu::PcuDispatchFloatUnaryOp,
+        policy: fusion_pcu::PcuFloatUnderflowPolicy,
+        range: fusion_pcu::PcuRangePolicy,
+        count: usize,
+        broadcast: bool,
+    ) -> Result<ffi::CheckedUnary, MlxError> {
+        ffi::CheckedUnary::prepare(&self.0.native, scalar, op, policy, range, count, broadcast)
+    }
+    #[allow(clippy::too_many_arguments)] // Full resident capacity is separate from operation/policy/read span.
+    pub(crate) fn prepare_checked_unary_native_with_input_extent(
+        &self,
+        scalar: fusion_pcu::PcuScalarType,
+        op: fusion_pcu::PcuDispatchFloatUnaryOp,
+        policy: fusion_pcu::PcuFloatUnderflowPolicy,
+        range: fusion_pcu::PcuRangePolicy,
+        count: usize,
+        broadcast: bool,
+        input_extent: usize,
+    ) -> Result<ffi::CheckedUnary, MlxError> {
+        ffi::CheckedUnary::prepare_with_input_extent(
+            &self.0.native,
+            scalar,
+            op,
+            policy,
+            range,
+            count,
+            broadcast,
+            input_extent,
+        )
+    }
     /// Exact opaque runtime/stream affinity; equal physical GPU indices alone do not suffice.
     #[must_use]
     pub fn same_session(&self, other: &Self) -> bool {
@@ -215,6 +460,7 @@ impl MlxSession {
             array: Rc::new(Array {
                 native,
                 residency: Cell::new(MlxArrayResidency::GpuEvaluated),
+                encoded_view: RefCell::new(None),
             }),
         })
     }
@@ -239,6 +485,7 @@ impl MlxSession {
             array: Rc::new(Array {
                 native,
                 residency: Cell::new(MlxArrayResidency::GpuEvaluated),
+                encoded_view: RefCell::new(None),
             }),
         })
     }
@@ -266,6 +513,7 @@ impl MlxSession {
             array: Rc::new(Array {
                 native,
                 residency: Cell::new(MlxArrayResidency::GpuEvaluated),
+                encoded_view: RefCell::new(None),
             }),
         })
     }
@@ -292,6 +540,7 @@ impl MlxSession {
             array: Rc::new(Array {
                 native,
                 residency: Cell::new(MlxArrayResidency::HostCopied),
+                encoded_view: RefCell::new(None),
             }),
         })
     }
@@ -403,6 +652,7 @@ impl MlxSession {
             array: Rc::new(Array {
                 native,
                 residency: Cell::new(MlxArrayResidency::GpuEvaluated),
+                encoded_view: RefCell::new(None),
             }),
         })
     }
@@ -545,3 +795,31 @@ impl MlxPreparedMatmul {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(feature = "tensor")]
+#[path = "program/program.rs"]
+mod program;
+#[cfg(feature = "tensor")]
+pub use program::MlxProgramInput;
+
+#[path = "encoded/encoded.rs"]
+mod encoded;
+pub use encoded::{MlxEncodedArray, MlxEncodedCompletion, MlxPreparedEncodedPrefix};
+
+#[cfg(feature = "tensor")]
+#[path = "checked_program/checked_program.rs"]
+mod checked_program;
+#[cfg(feature = "tensor")]
+pub use checked_program::{MlxPreparedCheckedProgram, MlxCheckedProgramInput};
+
+#[cfg(feature = "tensor")]
+#[path = "tensor_binary/tensor_binary.rs"]
+mod tensor_binary;
+#[cfg(feature = "tensor")]
+pub use tensor_binary::MlxPreparedTensorBinaryProgram;
+
+#[cfg(feature = "tensor")]
+#[path = "tensor_integer/tensor_integer.rs"]
+mod tensor_integer;
+#[cfg(feature = "tensor")]
+pub use tensor_integer::MlxPreparedTensorIntegerProgram;

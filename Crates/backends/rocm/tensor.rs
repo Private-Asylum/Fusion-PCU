@@ -8,10 +8,12 @@
 
 #[path = "tensor/float.rs"]
 mod checked_float;
+pub use checked_float::lower_checked_float_tensor_to_hip_source;
 #[path = "tensor/consuming.rs"]
 mod consuming;
 mod feedback_runtime;
 mod integer;
+pub use integer::lower_checked_integer_tensor_to_hip_source;
 #[path = "tensor/native_execution/native_execution.rs"]
 mod native_execution;
 #[path = "tensor/native_loss/native_loss.rs"]
@@ -20,7 +22,21 @@ mod native_loss;
 mod native_policy;
 #[path = "tensor/native_sgd/native_sgd.rs"]
 mod native_sgd;
+pub use native_sgd::lower_native_sgd_to_hip_source;
+pub use native_loss::lower_native_mse_to_hip_source;
+#[path = "tensor/relu_backward/relu_backward.rs"]
+#[allow(clippy::redundant_pub_crate)] // Keep the generated-source factory internal to this backend.
+pub(crate) mod relu_backward;
+#[path = "tensor/strict_mse/strict_mse.rs"]
+#[allow(clippy::redundant_pub_crate)] // Private admitted source factory.
+pub(crate) mod strict_mse;
+pub use strict_mse::lower_strict_mse_to_hip_source;
+pub use relu_backward::lower_relu_backward_to_hip_source;
 use native_sgd::SgdUpdateMode;
+#[path = "tensor/literal/literal.rs"]
+mod literal;
+#[path = "tensor/owned_scratch/owned_scratch.rs"]
+mod owned_scratch;
 #[path = "tensor/pointwise.rs"]
 mod pointwise;
 #[path = "tensor/strict_matmul/strict_matmul.rs"]
@@ -213,13 +229,6 @@ type TensorExecutionResources =
     SmallVec<[Option<RocmMemoryResource>; TENSOR_EXECUTION_INLINE_NODES]>;
 type TensorExecutionUseCounts = SmallVec<[usize; TENSOR_EXECUTION_INLINE_NODES]>;
 type TensorExecutionOutputs<'session> = SmallVec<[RocmTensorInput<'session>; 4]>;
-const RELU_BACKWARD_SOURCE: &str = r#"
-extern "C" __global__ void tensor_relu_backward(
-    const float *input, const float *upstream, float *output, unsigned int n) {
-    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id < n) output[id] = input[id] > 0.0f ? upstream[id] : 0.0f;
-}
-"#;
 
 // Feature-off expansion preserves the original one-argument finish/wait call.
 #[cfg(feature = "insights")]
@@ -595,6 +604,10 @@ enum TensorDispatchKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum TensorPointwiseScalarType {
+    F16,
+    BF16,
+    F8E4M3FN,
+    F8E5M2,
     F32,
     F64,
     I8,
@@ -605,6 +618,12 @@ enum TensorPointwiseScalarType {
     U32,
     I64,
     U64,
+    I128,
+    U128,
+    I256,
+    U256,
+    I512,
+    U512,
 }
 
 impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
@@ -612,6 +631,10 @@ impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
 
     fn try_from(scalar_type: fusion_pcu::PcuScalarType) -> Result<Self, Self::Error> {
         match scalar_type {
+            fusion_pcu::PcuScalarType::F16 => Ok(Self::F16),
+            fusion_pcu::PcuScalarType::BF16 => Ok(Self::BF16),
+            fusion_pcu::PcuScalarType::F8E4M3FN => Ok(Self::F8E4M3FN),
+            fusion_pcu::PcuScalarType::F8E5M2 => Ok(Self::F8E5M2),
             fusion_pcu::PcuScalarType::F32 => Ok(Self::F32),
             fusion_pcu::PcuScalarType::F64 => Ok(Self::F64),
             fusion_pcu::PcuScalarType::I8 => Ok(Self::I8),
@@ -622,6 +645,12 @@ impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
             fusion_pcu::PcuScalarType::U32 => Ok(Self::U32),
             fusion_pcu::PcuScalarType::I64 => Ok(Self::I64),
             fusion_pcu::PcuScalarType::U64 => Ok(Self::U64),
+            fusion_pcu::PcuScalarType::I128 => Ok(Self::I128),
+            fusion_pcu::PcuScalarType::U128 => Ok(Self::U128),
+            fusion_pcu::PcuScalarType::I256 => Ok(Self::I256),
+            fusion_pcu::PcuScalarType::U256 => Ok(Self::U256),
+            fusion_pcu::PcuScalarType::I512 => Ok(Self::I512),
+            fusion_pcu::PcuScalarType::U512 => Ok(Self::U512),
             unsupported => Err(RocmTensorExecutionError::UnsupportedScalarType(unsupported)),
         }
     }
@@ -630,6 +659,10 @@ impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
 impl TensorPointwiseScalarType {
     const fn scalar_type(self) -> fusion_pcu::PcuScalarType {
         match self {
+            Self::F16 => fusion_pcu::PcuScalarType::F16,
+            Self::BF16 => fusion_pcu::PcuScalarType::BF16,
+            Self::F8E4M3FN => fusion_pcu::PcuScalarType::F8E4M3FN,
+            Self::F8E5M2 => fusion_pcu::PcuScalarType::F8E5M2,
             Self::F32 => fusion_pcu::PcuScalarType::F32,
             Self::F64 => fusion_pcu::PcuScalarType::F64,
             Self::I8 => fusion_pcu::PcuScalarType::I8,
@@ -640,11 +673,21 @@ impl TensorPointwiseScalarType {
             Self::U32 => fusion_pcu::PcuScalarType::U32,
             Self::I64 => fusion_pcu::PcuScalarType::I64,
             Self::U64 => fusion_pcu::PcuScalarType::U64,
+            Self::I128 => fusion_pcu::PcuScalarType::I128,
+            Self::U128 => fusion_pcu::PcuScalarType::U128,
+            Self::I256 => fusion_pcu::PcuScalarType::I256,
+            Self::U256 => fusion_pcu::PcuScalarType::U256,
+            Self::I512 => fusion_pcu::PcuScalarType::I512,
+            Self::U512 => fusion_pcu::PcuScalarType::U512,
         }
     }
 
     const fn value_type(self) -> PcuValueType {
         match self {
+            Self::F16 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+            Self::BF16 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+            Self::F8E4M3FN => PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+            Self::F8E5M2 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
             Self::F32 => PcuValueType::f32(),
             Self::F64 => PcuValueType::f64(),
             Self::I8 => PcuValueType::i8(),
@@ -655,12 +698,20 @@ impl TensorPointwiseScalarType {
             Self::U32 => PcuValueType::u32(),
             Self::I64 => PcuValueType::i64(),
             Self::U64 => PcuValueType::u64(),
+            Self::I128 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::I128),
+            Self::U128 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::U128),
+            Self::I256 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::I256),
+            Self::U256 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::U256),
+            Self::I512 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::I512),
+            Self::U512 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::U512),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TensorDispatchCacheKey {
+    ReluBackward(relu_backward::Profile),
+    StrictMse(strict_mse::Profile),
     StrictMatMul(strict_matmul::StrictMatMulSpec),
     StrictSgd(strict_sgd::StrictSgdSpec),
     Fixed(
@@ -668,7 +719,7 @@ enum TensorDispatchCacheKey {
         TensorPointwiseScalarType,
         u32,
         u8,
-        Option<PcuFloatUnderflowPolicy>,
+        fusion_pcu::PcuImplementationRequirements,
     ),
     ConsumingRelu(TensorPointwiseScalarType, u32),
     ConsumingBinary(
@@ -738,6 +789,8 @@ struct TensorDispatchCacheAdmission {
 
 #[derive(Clone, Debug)]
 enum TensorDispatchRequest<'graph> {
+    ReluBackward(relu_backward::Profile),
+    StrictMse(strict_mse::Profile),
     StrictMatMul(strict_matmul::StrictMatMulSpec),
     StrictSgd(strict_sgd::StrictSgdSpec),
     Fixed {
@@ -745,7 +798,7 @@ enum TensorDispatchRequest<'graph> {
         scalar_type: TensorPointwiseScalarType,
         logical_count: u32,
         scalar_mask: u8,
-        float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements,
     },
     BoundedPointwise {
         group: &'graph TensorBoundedPointwiseFusionGroup,
@@ -764,6 +817,8 @@ enum TensorDispatchRequest<'graph> {
 impl TensorDispatchRequest<'_> {
     fn key(&self) -> TensorDispatchCacheKey {
         match self {
+            Self::StrictMse(profile) => TensorDispatchCacheKey::StrictMse(*profile),
+            Self::ReluBackward(profile) => TensorDispatchCacheKey::ReluBackward(*profile),
             Self::StrictMatMul(spec) => TensorDispatchCacheKey::StrictMatMul(*spec),
             Self::StrictSgd(spec) => TensorDispatchCacheKey::StrictSgd(*spec),
             Self::Fixed {
@@ -771,13 +826,13 @@ impl TensorDispatchRequest<'_> {
                 scalar_type,
                 logical_count,
                 scalar_mask,
-                float_underflow_policy,
+                numerical_requirements,
             } => TensorDispatchCacheKey::Fixed(
                 *kind,
                 *scalar_type,
                 *logical_count,
                 *scalar_mask,
-                *float_underflow_policy,
+                *numerical_requirements,
             ),
             Self::BoundedPointwise {
                 logical_count,
@@ -889,15 +944,30 @@ const fn binary_dispatch_kind(
     match (float_kind, scalar_type) {
         (
             TensorDispatchKind::Add,
-            TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64,
+            TensorPointwiseScalarType::F16
+            | TensorPointwiseScalarType::BF16
+            | TensorPointwiseScalarType::F8E4M3FN
+            | TensorPointwiseScalarType::F8E5M2
+            | TensorPointwiseScalarType::F32
+            | TensorPointwiseScalarType::F64,
         ) => TensorDispatchKind::CheckedFloatAdd,
         (
             TensorDispatchKind::Sub,
-            TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64,
+            TensorPointwiseScalarType::F16
+            | TensorPointwiseScalarType::BF16
+            | TensorPointwiseScalarType::F8E4M3FN
+            | TensorPointwiseScalarType::F8E5M2
+            | TensorPointwiseScalarType::F32
+            | TensorPointwiseScalarType::F64,
         ) => TensorDispatchKind::CheckedFloatSub,
         (
             TensorDispatchKind::Mul,
-            TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64,
+            TensorPointwiseScalarType::F16
+            | TensorPointwiseScalarType::BF16
+            | TensorPointwiseScalarType::F8E4M3FN
+            | TensorPointwiseScalarType::F8E5M2
+            | TensorPointwiseScalarType::F32
+            | TensorPointwiseScalarType::F64,
         ) => TensorDispatchKind::CheckedFloatMul,
         (
             TensorDispatchKind::Add,
@@ -908,7 +978,13 @@ const fn binary_dispatch_kind(
             | TensorPointwiseScalarType::I32
             | TensorPointwiseScalarType::U32
             | TensorPointwiseScalarType::I64
-            | TensorPointwiseScalarType::U64,
+            | TensorPointwiseScalarType::U64
+            | TensorPointwiseScalarType::I128
+            | TensorPointwiseScalarType::U128
+            | TensorPointwiseScalarType::I256
+            | TensorPointwiseScalarType::U256
+            | TensorPointwiseScalarType::I512
+            | TensorPointwiseScalarType::U512,
         ) => TensorDispatchKind::CheckedIntegerAdd,
         (
             TensorDispatchKind::Sub,
@@ -919,7 +995,13 @@ const fn binary_dispatch_kind(
             | TensorPointwiseScalarType::I32
             | TensorPointwiseScalarType::U32
             | TensorPointwiseScalarType::I64
-            | TensorPointwiseScalarType::U64,
+            | TensorPointwiseScalarType::U64
+            | TensorPointwiseScalarType::I128
+            | TensorPointwiseScalarType::U128
+            | TensorPointwiseScalarType::I256
+            | TensorPointwiseScalarType::U256
+            | TensorPointwiseScalarType::I512
+            | TensorPointwiseScalarType::U512,
         ) => TensorDispatchKind::CheckedIntegerSub,
         (
             TensorDispatchKind::Mul,
@@ -930,7 +1012,13 @@ const fn binary_dispatch_kind(
             | TensorPointwiseScalarType::I32
             | TensorPointwiseScalarType::U32
             | TensorPointwiseScalarType::I64
-            | TensorPointwiseScalarType::U64,
+            | TensorPointwiseScalarType::U64
+            | TensorPointwiseScalarType::I128
+            | TensorPointwiseScalarType::U128
+            | TensorPointwiseScalarType::I256
+            | TensorPointwiseScalarType::U256
+            | TensorPointwiseScalarType::I512
+            | TensorPointwiseScalarType::U512,
         ) => TensorDispatchKind::CheckedIntegerMul,
         _ => float_kind,
     }
@@ -938,6 +1026,7 @@ const fn binary_dispatch_kind(
 
 fn add_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x5445_4e53 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_add",
@@ -960,6 +1049,7 @@ fn add_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'stati
 
 fn add_relu_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x4144_4452 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_add_relu",
@@ -982,6 +1072,7 @@ fn add_relu_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'
 
 fn sub_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x5355_4221 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_sub",
@@ -1004,6 +1095,7 @@ fn sub_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'stati
 
 fn mul_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x4d55_4c21 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_mul",
@@ -1026,6 +1118,7 @@ fn mul_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'stati
 
 fn relu_kernel(logical_count: u32) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x5245_4c55),
         entry: PcuDispatchEntryPoint {
             name: "tensor_relu",
@@ -1369,6 +1462,7 @@ pub enum RocmTensorExecutionError {
     BorrowedInputEscape,
     OutputResourceMismatch,
     ScratchMismatch,
+    ScratchBusy,
     FeedbackPlanMismatch,
     FeedbackStepUnavailable {
         requested: usize,
@@ -1433,9 +1527,8 @@ struct RocmTensorAssessorState {
     rocblas: OnceCell<Result<Rocblas, RocblasError>>,
     stream: HipStreamHandle,
     add_dispatches: RefCell<TensorDispatchCache>,
-    relu_backward: RefCell<Option<(HipKernel, HipStreamHandle)>>,
     native_sgd: native_sgd::NativeSgdKernels,
-    native_mse: RefCell<Option<HipKernel>>,
+    native_mse: [RefCell<Option<HipKernel>>; 2],
 }
 
 /// Rc-retained backend and warm tensor-assessor state for hosted per-function execution.
@@ -1456,9 +1549,8 @@ impl RocmTensorAssessorState {
             rocblas: OnceCell::new(),
             stream,
             add_dispatches: RefCell::new(VecDeque::new()),
-            relu_backward: RefCell::new(None),
             native_sgd: native_sgd::NativeSgdKernels::default(),
-            native_mse: RefCell::new(None),
+            native_mse: core::array::from_fn(|_| RefCell::new(None)),
         })
     }
 }
@@ -1718,7 +1810,7 @@ impl<'session> RocmTensorAssessor<'session> {
         scalar_type: TensorPointwiseScalarType,
         logical_count: u32,
         scalar_mask: u8,
-        float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements,
     ) -> Result<TensorDispatchCacheAdmission, RocmTensorExecutionError> {
         let invocations =
             NonZeroU32::new(logical_count).ok_or(RocmTensorExecutionError::SizeOverflow)?;
@@ -1728,14 +1820,17 @@ impl<'session> RocmTensorAssessor<'session> {
                 scalar_type,
                 logical_count,
                 scalar_mask,
-                float_underflow_policy,
+                numerical_requirements,
             ),
-            kind.kernel(
-                scalar_type,
-                logical_count,
-                scalar_mask,
-                float_underflow_policy,
-            )?,
+            PcuDispatchKernelIr {
+                numerical_requirements,
+                ..kind.kernel(
+                    scalar_type,
+                    logical_count,
+                    scalar_mask,
+                    Some(numerical_requirements.float_underflow),
+                )?
+            },
             PcuInvocationShape::invocations(invocations),
             false,
         )
@@ -1768,6 +1863,7 @@ impl<'session> RocmTensorAssessor<'session> {
         }
         let (kernel_bindings, kernel_ops) = bounded_pointwise_program(group, scalar_mask)?;
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: bounded_pointwise_kernel_id(topology, scalar_mask),
             entry: PcuDispatchEntryPoint {
                 name: match group.epilogue {
@@ -1816,6 +1912,7 @@ impl<'session> RocmTensorAssessor<'session> {
         }
         let (kernel_bindings, kernel_ops) = bounded_mul_program(group, scalar_mask)?;
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: bounded_pointwise_kernel_id(topology, scalar_mask),
             entry: PcuDispatchEntryPoint {
                 name: "tensor_bounded_mul",
@@ -1926,6 +2023,12 @@ impl<'session> RocmTensorAssessor<'session> {
 
         for request in &requests {
             let admission = match request {
+                TensorDispatchRequest::StrictMse(profile) => {
+                    self.ensure_strict_mse_cached(*profile)?
+                }
+                TensorDispatchRequest::ReluBackward(profile) => {
+                    self.ensure_relu_backward_cached(*profile)?
+                }
                 TensorDispatchRequest::StrictMatMul(spec) => {
                     self.ensure_strict_matmul_cached(*spec)?
                 }
@@ -1935,13 +2038,13 @@ impl<'session> RocmTensorAssessor<'session> {
                     scalar_type,
                     logical_count,
                     scalar_mask,
-                    float_underflow_policy,
+                    numerical_requirements,
                 } => self.ensure_fixed_dispatch_cached(
                     *kind,
                     *scalar_type,
                     *logical_count,
                     *scalar_mask,
-                    *float_underflow_policy,
+                    *numerical_requirements,
                 )?,
                 TensorDispatchRequest::BoundedPointwise {
                     group,
@@ -2095,18 +2198,17 @@ impl<'session> RocmTensorAssessor<'session> {
         let plan = prepare_graph_outputs_plan_with_policies(
             graph, outputs, self, policy, arithmetic, grouping,
         )?;
-        if plan
-            .nodes
-            .iter()
-            .any(|node| matches!(node.op, OpDescriptor::MeanSquaredError { .. }))
-        {
-            self.prepare_native_mse()?;
-        }
         for node in &plan.nodes {
+            if matches!(node.op, OpDescriptor::MeanSquaredError { .. })
+                && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
+            {
+                self.prepare_native_mse(node.scalar_type)?;
+            }
             if matches!(node.op, OpDescriptor::SgdUpdate { .. })
                 && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
             {
                 self.prepare_native_sgd(
+                    node.scalar_type,
                     node.numerical_options.precision
                         == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
                         || plan
@@ -2179,20 +2281,18 @@ impl<'session> RocmTensorAssessor<'session> {
         program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
     ) -> Result<RocmOwnedPreparedTensorGraph, RocmTensorExecutionError> {
         let data = prepare_owned_graph_data(&program, self)?;
-        if program.selected_nodes().iter().any(|&value| {
-            program
-                .graph()
-                .node(value)
-                .is_ok_and(|node| matches!(node.op, OpDescriptor::MeanSquaredError { .. }))
-        }) {
-            self.prepare_native_mse()?;
-        }
         for &value in program.selected_nodes() {
             let node = program.graph().node(value)?;
+            if matches!(node.op, OpDescriptor::MeanSquaredError { .. })
+                && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
+            {
+                self.prepare_native_mse(node.scalar_type)?;
+            }
             if matches!(node.op, OpDescriptor::SgdUpdate { .. })
                 && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
             {
                 self.prepare_native_sgd(
+                    node.scalar_type,
                     node.numerical_options.precision
                         == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
                         || data
@@ -2202,7 +2302,7 @@ impl<'session> RocmTensorAssessor<'session> {
                 )?;
             }
         }
-        Ok(RocmOwnedPreparedTensorGraph { program, data })
+        RocmOwnedPreparedTensorGraph::from_parts(program, data)
     }
 
     /// Executes a graph-owning selected program from typed device inputs and returns fresh,
@@ -2471,10 +2571,8 @@ impl<'session> RocmTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
         'session: 'input,
     {
-        if !matches!(
-            T::TYPE,
-            fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
-        ) && !prepared.data.transport_only_inputs
+        if !is_checked_float_type(T::TYPE)
+            && !prepared.data.transport_only_inputs
             && !is_checked_integer_scalar(T::TYPE)
         {
             return Err(RocmTensorExecutionError::UnsupportedScalarType(T::TYPE));
@@ -2483,6 +2581,16 @@ impl<'session> RocmTensorAssessor<'session> {
         validate_owned_scalar_profile::<T>(prepared.data.scalar_type)?;
         self.validate_execution_sources_view(&view, &[], inputs, pool)?;
 
+        let mut bank = prepared
+            .scratch
+            .bind(self.session.tensor_runtime(), &view, pool, memory)?;
+        if inputs.iter().any(|(_, input)| {
+            bank.physical
+                .iter()
+                .any(|resource| resource.may_overlap(input.resource()))
+        }) {
+            return Err(RocmTensorExecutionError::ScratchMismatch);
+        }
         let mut outputs = SmallVec::<[(ValueId, FreshTensorOutput<'_>); 1]>::new();
         outputs.reserve(view.outputs.len());
         for &value in &view.outputs {
@@ -2493,6 +2601,10 @@ impl<'session> RocmTensorAssessor<'session> {
                 || resource.device_buffer().len() < byte_len_for::<T>(shape)?
                 || !alignment_satisfies(resource.alignment_bytes(), scalar_layout(T::TYPE)?.1)
                 || resource.access() != PcuMemoryAccess::ReadWrite
+                || bank
+                    .physical
+                    .iter()
+                    .any(|scratch| scratch.may_overlap(&resource))
                 || inputs
                     .iter()
                     .any(|(_, input)| input.resource().may_overlap(&resource))
@@ -2514,6 +2626,16 @@ impl<'session> RocmTensorAssessor<'session> {
             ));
         }
 
+        validate_owned_storage(&view, inputs, &outputs, &bank.resources)?;
+
+        let bank_view = &mut *bank;
+        let mut scratch_view = RocmExecutionScratch {
+            resources: &bank_view.resources,
+            statuses: Some(&mut bank_view.statuses),
+            mse_squared: bank_view.mse_squared.as_ref(),
+            outputs: &view.outputs,
+            node_values: &view.node_values,
+        };
         let mut timings = NoopNodeTiming;
         // Cold eligibility excludes numerical status gates and host-copy outputs. For a chain
         // of native GEMMs the selected stream orders dependencies; one final event proves
@@ -2529,7 +2651,7 @@ impl<'session> RocmTensorAssessor<'session> {
             inputs,
             pool,
             memory,
-            None,
+            Some(&mut scratch_view),
             None,
             Some(&outputs),
             &mut timings,
@@ -2539,6 +2661,7 @@ impl<'session> RocmTensorAssessor<'session> {
         // On error Drop establishes quiescence or quarantines owners before private outputs
         // can be released. On success the scheduler has already waited its final event.
         drop(batch);
+        bank.finish(result.as_ref().err())?;
         let mut result = result?;
         drop(outputs);
         if result.len() != prepared.data.outputs.len() {
@@ -4018,13 +4141,20 @@ impl<'session> RocmTensorAssessor<'session> {
         timings.finish_scheduler_validation(validation_mark);
         validation?;
         let view = prepared.view();
+        let mut scratch_view = scratch.map(|scratch| RocmExecutionScratch {
+            statuses: None,
+            resources: &scratch.resources,
+            mse_squared: scratch.mse_squared.as_ref(),
+            outputs: &scratch.prepared.outputs,
+            node_values: &scratch.prepared.node_values,
+        });
         self.execute_prepared_schedule(
             &view,
             host_inputs,
             resource_inputs,
             pool,
             memory,
-            scratch,
+            scratch_view.as_mut(),
             output_bank,
             None,
             timings,
@@ -4045,7 +4175,7 @@ impl<'session> RocmTensorAssessor<'session> {
         resource_inputs: &[(ValueId, &I)],
         pool: PcuMemoryPoolId,
         memory: &mut P,
-        mut scratch: Option<&mut RocmTensorScratch<'_, '_, 'session>>,
+        mut scratch: Option<&mut RocmExecutionScratch<'_>>,
         output_bank: Option<&RocmTensorOutputBank<'_, '_, 'session>>,
         fresh_outputs: Option<&[(ValueId, FreshTensorOutput<'_>)]>,
         timings: &mut impl NodeTimingSink,
@@ -4132,89 +4262,142 @@ impl<'session> RocmTensorAssessor<'session> {
                     resources[index] = Some(upload_tensor(memory, pool, tensor)?);
                 }
                 OpDescriptor::Constant(tensor) => {
-                    let tensor = tensor.as_typed::<f32>().map_err(|_| {
-                        RocmTensorExecutionError::Unsupported {
-                            value: node.value,
-                            reason: TensorUnsupportedReason::ElementType,
+                    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            tensor_flush_batch!(batch, timings, false)?;
                         }
-                    })?;
-                    resources[index] = Some(
-                        if let Some(output) =
-                            tensor_output_view(output_bank, fresh_outputs, node.value)
-                        {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            let mut resource = output.resource.clone_for_tensor_input();
-                            let binding = proof.map(|_| resource.clone_for_tensor_input());
-                            let transferred = transfer_tensor(memory, &mut resource, tensor);
-                            if binding
-                                .as_ref()
-                                .is_some_and(|binding| !resource.same_binding(binding))
+                        resources[index] = Some(
+                            if let Some(scratch) = scratch
+                                .as_deref_mut()
+                                .filter(|_| !outputs.contains(&node.value))
                             {
-                                return Err(RocmTensorExecutionError::OutputResourceMismatch);
-                            }
-                            transferred?;
-                            resource
-                        } else if outputs.contains(&node.value) {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, tensor)?
-                        } else if let Some(scratch) = scratch.as_deref_mut() {
-                            scratch.lease(index)?
-                        } else {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, tensor)?
-                        },
-                    );
-                }
-                OpDescriptor::Uniform { value } => {
-                    // Only elementwise consumers use scalar binding indices; every other route
-                    // receives a dense fallback allocation during scratch preparation.
-                    let tensor = prepared.physical_layout(node.value)?.uniform_tensor(
-                        node.shape,
-                        value.as_typed::<f32>().map_err(|_| {
+                                scratch.lease(index)?
+                            } else {
+                                literal::upload_f64(
+                                    node,
+                                    plan.physical_layout(node.value)?,
+                                    tensor_output_view(output_bank, fresh_outputs, node.value)
+                                        .map(|output| output.resource),
+                                    pool,
+                                    memory,
+                                )?
+                            },
+                        );
+                    } else {
+                        let tensor = tensor.as_typed::<f32>().map_err(|_| {
                             RocmTensorExecutionError::Unsupported {
                                 value: node.value,
                                 reason: TensorUnsupportedReason::ElementType,
                             }
-                        })?,
-                    )?;
-                    resources[index] = Some(
-                        if let Some(output) =
-                            tensor_output_view(output_bank, fresh_outputs, node.value)
-                        {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            let mut resource = output.resource.clone_for_tensor_input();
-                            let binding = proof.map(|_| resource.clone_for_tensor_input());
-                            let transferred = transfer_tensor(memory, &mut resource, &tensor);
-                            if binding
-                                .as_ref()
-                                .is_some_and(|binding| !resource.same_binding(binding))
+                        })?;
+                        resources[index] = Some(
+                            if let Some(output) =
+                                tensor_output_view(output_bank, fresh_outputs, node.value)
                             {
-                                return Err(RocmTensorExecutionError::OutputResourceMismatch);
-                            }
-                            transferred?;
-                            resource
-                        } else if outputs.contains(&node.value) {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, &tensor)?
-                        } else if let Some(scratch) = scratch.as_deref_mut() {
-                            scratch.lease(index)?
-                        } else {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, &tensor)?
-                        },
-                    );
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                let mut resource = output.resource.clone_for_tensor_input();
+                                let binding = proof.map(|_| resource.clone_for_tensor_input());
+                                let transferred = transfer_tensor(memory, &mut resource, tensor);
+                                if binding
+                                    .as_ref()
+                                    .is_some_and(|binding| !resource.same_binding(binding))
+                                {
+                                    return Err(RocmTensorExecutionError::OutputResourceMismatch);
+                                }
+                                transferred?;
+                                resource
+                            } else if outputs.contains(&node.value) {
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, tensor)?
+                            } else if let Some(scratch) = scratch.as_deref_mut() {
+                                scratch.lease(index)?
+                            } else {
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, tensor)?
+                            },
+                        );
+                    }
+                }
+                OpDescriptor::Uniform { value } => {
+                    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            tensor_flush_batch!(batch, timings, false)?;
+                        }
+                        resources[index] = Some(
+                            if let Some(scratch) = scratch
+                                .as_deref_mut()
+                                .filter(|_| !outputs.contains(&node.value))
+                            {
+                                scratch.lease(index)?
+                            } else {
+                                literal::upload_f64(
+                                    node,
+                                    plan.physical_layout(node.value)?,
+                                    tensor_output_view(output_bank, fresh_outputs, node.value)
+                                        .map(|output| output.resource),
+                                    pool,
+                                    memory,
+                                )?
+                            },
+                        );
+                    } else {
+                        // Scratch already owns the immutable cold initialization, including dense
+                        // fallbacks. Materialize host data only for actual uploads/output copies;
+                        // merely leasing retained storage must not allocate another dense tensor.
+                        // Raw nonfinite encodings remain transport data until arithmetic consumes them.
+                        let materialize = || {
+                            prepared.physical_layout(node.value)?.uniform_tensor(
+                                node.shape,
+                                value.as_typed::<f32>().map_err(|_| {
+                                    RocmTensorExecutionError::Unsupported {
+                                        value: node.value,
+                                        reason: TensorUnsupportedReason::ElementType,
+                                    }
+                                })?,
+                            )
+                        };
+                        resources[index] = Some(
+                            if let Some(output) =
+                                tensor_output_view(output_bank, fresh_outputs, node.value)
+                            {
+                                let tensor = materialize()?;
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                let mut resource = output.resource.clone_for_tensor_input();
+                                let binding = proof.map(|_| resource.clone_for_tensor_input());
+                                let transferred = transfer_tensor(memory, &mut resource, &tensor);
+                                if binding
+                                    .as_ref()
+                                    .is_some_and(|binding| !resource.same_binding(binding))
+                                {
+                                    return Err(RocmTensorExecutionError::OutputResourceMismatch);
+                                }
+                                transferred?;
+                                resource
+                            } else if outputs.contains(&node.value) {
+                                let tensor = materialize()?;
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, &tensor)?
+                            } else if let Some(scratch) = scratch.as_deref_mut() {
+                                scratch.lease(index)?
+                            } else {
+                                let tensor = materialize()?;
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, &tensor)?
+                            },
+                        );
+                    }
                 }
                 OpDescriptor::MatMul {
                     left,
@@ -4255,6 +4438,9 @@ impl<'session> RocmTensorAssessor<'session> {
                             left_resource,
                             right_resource,
                             &result,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                     } else if let Some(batch) = batch.as_deref_mut() {
                         self.execute_matmul_row_major_flags(
@@ -4440,6 +4626,9 @@ impl<'session> RocmTensorAssessor<'session> {
                                 batch.as_deref_mut()
                             },
                             &mut elementwise_timing,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                         elementwise_host = timings.finish_elementwise(elementwise_timing);
                         resources[index] = Some(output);
@@ -4513,6 +4702,9 @@ impl<'session> RocmTensorAssessor<'session> {
                             },
                             batch.as_deref_mut(),
                             &mut NoopElementwiseTiming,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                         resources[index] = Some(output);
                         release_after_read(&mut resources, &mut remaining_uses, left_index)?;
@@ -4528,6 +4720,9 @@ impl<'session> RocmTensorAssessor<'session> {
                                 .ok_or(RocmTensorExecutionError::MissingResource(input))?,
                             &output,
                             batch.as_deref_mut(),
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                         resources[index] = Some(output);
                         release_after_read(&mut resources, &mut remaining_uses, input_index)?;
@@ -4551,8 +4746,11 @@ impl<'session> RocmTensorAssessor<'session> {
                         output_bank,
                         fresh_outputs,
                     )?;
-                    self.execute_relu_backward(
-                        node.shape,
+                    if let Some(batch) = batch.as_deref_mut() {
+                        tensor_flush_batch!(batch, timings, false)?;
+                    }
+                    self.execute_admitted_relu_backward(
+                        node,
                         resources[input_index]
                             .as_ref()
                             .ok_or(RocmTensorExecutionError::MissingResource(input))?,
@@ -4560,7 +4758,9 @@ impl<'session> RocmTensorAssessor<'session> {
                             .as_ref()
                             .ok_or(RocmTensorExecutionError::MissingResource(upstream))?,
                         &output,
-                        batch.as_deref_mut(),
+                        scratch
+                            .as_deref_mut()
+                            .and_then(|scratch| scratch.status(index)),
                     )?;
                     resources[index] = Some(output);
                     release_after_read(&mut resources, &mut remaining_uses, input_index)?;
@@ -4602,6 +4802,9 @@ impl<'session> RocmTensorAssessor<'session> {
                                 .as_ref()
                                 .ok_or(RocmTensorExecutionError::MissingResource(gradient))?,
                             &output,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                     } else {
                         self.execute_sgd_update(
@@ -4613,6 +4816,7 @@ impl<'session> RocmTensorAssessor<'session> {
                                 .as_ref()
                                 .ok_or(RocmTensorExecutionError::MissingResource(gradient))?,
                             SgdUpdateMode {
+                                scalar: node.scalar_type,
                                 learning_rate,
                                 contracted: node.numerical_options.precision
                                     == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
@@ -4639,64 +4843,120 @@ impl<'session> RocmTensorAssessor<'session> {
                     let target_index = plan
                         .index_of(target)
                         .ok_or(RocmTensorExecutionError::InvalidPlan(target))?;
-                    let shape = graph.shape(prediction)?;
-                    let count = shape
-                        .iter()
-                        .try_fold(1usize, |n, d| n.checked_mul(*d))
-                        .ok_or(RocmTensorExecutionError::SizeOverflow)?;
-                    if count == 0 || count > i32::MAX as usize {
-                        return Err(RocmTensorExecutionError::Unsupported {
-                            value: node.value,
-                            reason: TensorUnsupportedReason::Shape,
-                        });
-                    }
-                    let squared = if let Some(scratch) = scratch.as_ref() {
-                        let squared = scratch
-                            .mse_squared
-                            .as_ref()
-                            .ok_or(RocmTensorExecutionError::ScratchMismatch)?
-                            .clone_for_tensor_input();
-                        if !mse_scratch_length_fits(count, squared.device_buffer().len())? {
-                            return Err(RocmTensorExecutionError::ScratchMismatch);
-                        }
-                        squared
+                    if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) {
+                        let output = execution_resource(
+                            memory,
+                            pool,
+                            node.shape,
+                            node.scalar_type,
+                            index,
+                            node.value,
+                            &mut scratch,
+                            output_bank,
+                            fresh_outputs,
+                        )?;
+                        self.execute_strict_mse(
+                            graph,
+                            node,
+                            resources[prediction_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(prediction))?,
+                            resources[target_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(target))?,
+                            &output,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
+                        )?;
+                        resources[index] = Some(output);
+                        release_after_read(&mut resources, &mut remaining_uses, prediction_index)?;
+                        release_after_read(&mut resources, &mut remaining_uses, target_index)?;
                     } else {
-                        allocate_tensor(memory, pool, shape)?
-                    };
-                    self.execute_native_mse_squared(
-                        u32::try_from(count).map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
-                        resources[prediction_index]
-                            .as_ref()
-                            .ok_or(RocmTensorExecutionError::MissingResource(prediction))?,
-                        resources[target_index]
-                            .as_ref()
-                            .ok_or(RocmTensorExecutionError::MissingResource(target))?,
-                        &squared,
-                    )?;
-                    let output = execution_resource(
-                        memory,
-                        pool,
-                        node.shape,
-                        node.scalar_type,
-                        index,
-                        node.value,
-                        &mut scratch,
-                        output_bank,
-                        fresh_outputs,
-                    )?;
-                    self.rocblas()
-                        .map_err(RocmTensorError::from)?
-                        .sasum_scaled(
-                            count,
-                            squared.device_buffer(),
-                            1,
-                            mse_scale(count),
-                            output.device_buffer(),
-                        )
+                        let shape = graph.shape(prediction)?;
+                        let count = shape
+                            .iter()
+                            .try_fold(1usize, |n, d| n.checked_mul(*d))
+                            .ok_or(RocmTensorExecutionError::SizeOverflow)?;
+                        if count == 0 || count > i32::MAX as usize {
+                            return Err(RocmTensorExecutionError::Unsupported {
+                                value: node.value,
+                                reason: TensorUnsupportedReason::Shape,
+                            });
+                        }
+                        let squared = if let Some(scratch) = scratch.as_ref() {
+                            let squared = scratch
+                                .mse_squared
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::ScratchMismatch)?
+                                .clone_for_tensor_input();
+                            if !mse_scratch_length_fits_scalar(
+                                count,
+                                node.scalar_type,
+                                squared.device_buffer().len(),
+                            )? {
+                                return Err(RocmTensorExecutionError::ScratchMismatch);
+                            }
+                            squared
+                        } else {
+                            allocate_tensor_for_size(
+                                memory,
+                                pool,
+                                shape,
+                                usize::from(node.scalar_type.bit_width() / 8),
+                                usize::from(node.scalar_type.bit_width() / 8),
+                            )?
+                        };
+                        self.execute_native_mse_squared(
+                            u32::try_from(count)
+                                .map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
+                            node.scalar_type,
+                            resources[prediction_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(prediction))?,
+                            resources[target_index]
+                                .as_ref()
+                                .ok_or(RocmTensorExecutionError::MissingResource(target))?,
+                            &squared,
+                        )?;
+                        let output = execution_resource(
+                            memory,
+                            pool,
+                            node.shape,
+                            node.scalar_type,
+                            index,
+                            node.value,
+                            &mut scratch,
+                            output_bank,
+                            fresh_outputs,
+                        )?;
+                        let blas = self.rocblas().map_err(RocmTensorError::from)?;
+                        match node.scalar_type {
+                            fusion_pcu::PcuScalarType::F32 => blas.sasum_scaled(
+                                count,
+                                squared.device_buffer(),
+                                1,
+                                mse_scale(count)?,
+                                output.device_buffer(),
+                            ),
+                            fusion_pcu::PcuScalarType::F64 => blas.dasum_scaled(
+                                count,
+                                squared.device_buffer(),
+                                1,
+                                mse_scale_f64(count)?,
+                                output.device_buffer(),
+                            ),
+                            _ => {
+                                return Err(RocmTensorExecutionError::UnsupportedScalarType(
+                                    node.scalar_type,
+                                ));
+                            }
+                        }
                         .map_err(RocmTensorError::from)?;
-                    resources[index] = Some(output);
-                    release_after_read(&mut resources, &mut remaining_uses, prediction_index)?;
-                    release_after_read(&mut resources, &mut remaining_uses, target_index)?;
+                        resources[index] = Some(output);
+                        release_after_read(&mut resources, &mut remaining_uses, prediction_index)?;
+                        release_after_read(&mut resources, &mut remaining_uses, target_index)?;
+                    }
                 }
             }
             if plan.bounded_pointwise_by_output.contains_key(&node.value) {
@@ -4785,6 +5045,8 @@ impl<'session> RocmTensorAssessor<'session> {
         input: &RocmMemoryResource,
         output: &RocmMemoryResource,
         batch: Option<&mut HipCompletionBatch>,
+
+        status: Option<&mut owned_scratch::Status>,
     ) -> Result<(), RocmTensorExecutionError> {
         self.execute_elementwise(
             dispatch,
@@ -4795,6 +5057,7 @@ impl<'session> RocmTensorAssessor<'session> {
             },
             batch,
             &mut NoopElementwiseTiming,
+            status,
         )
     }
 
@@ -4829,6 +5092,8 @@ impl<'session> RocmTensorAssessor<'session> {
         left: &RocmMemoryResource,
         right: &RocmMemoryResource,
         output: &RocmMemoryResource,
+
+        mut status: Option<&mut owned_scratch::Status>,
     ) -> Result<(), RocmTensorExecutionError> {
         self.ensure_strict_matmul_cached(spec)?;
         let key = TensorDispatchCacheKey::StrictMatMul(spec);
@@ -4852,80 +5117,17 @@ impl<'session> RocmTensorAssessor<'session> {
             })
             .collect::<Result<SmallVec<[_; 3]>, _>>()
             .map_err(RocmTensorExecutionError::Backend)?;
-        let mut completion = prepared
-            .submit(&bindings)
-            .map_err(RocmTensorExecutionError::Backend)?;
-        match completion
+        let mut completion = owned_scratch::submit(prepared, &bindings, status.as_deref_mut())?;
+        let outcome = completion
             .wait()
-            .map_err(RocmTensorExecutionError::Completion)?
-        {
+            .map_err(RocmTensorExecutionError::Completion)?;
+        if let Some(status) = status {
+            status.observe(outcome);
+        }
+        match outcome {
             PcuCompletionOutcome::Succeeded => Ok(()),
             PcuCompletionOutcome::Failed => Err(RocmTensorExecutionError::FailedCompletion),
             PcuCompletionOutcome::Fault(fault) => Err(spec.fault_error(value, fault)?.into()),
-        }
-    }
-
-    fn execute_relu_backward(
-        &self,
-        shape: &[usize],
-        input: &RocmMemoryResource,
-        upstream: &RocmMemoryResource,
-        output: &RocmMemoryResource,
-        batch: Option<&mut HipCompletionBatch>,
-    ) -> Result<(), RocmTensorExecutionError> {
-        let count = shape
-            .iter()
-            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
-            .ok_or(RocmTensorExecutionError::SizeOverflow)?;
-        let count = u32::try_from(count)
-            .ok()
-            .filter(|count| *count > 0)
-            .ok_or(RocmTensorExecutionError::SizeOverflow)?;
-        if self.state().relu_backward.borrow().is_none() {
-            let runtime = self.session.tensor_runtime();
-            let image = self
-                .session
-                .compile_tensor_source(RELU_BACKWARD_SOURCE)
-                .map_err(RocmTensorExecutionError::Backend)?;
-            let module = runtime
-                .load_module(&image)
-                .map_err(RocmTensorExecutionError::Completion)?;
-            let kernel = module
-                .function(c"tensor_relu_backward")
-                .map_err(RocmTensorExecutionError::Completion)?;
-            let stream = self.state().stream.clone();
-            *self.state().relu_backward.borrow_mut() = Some((kernel, stream));
-        }
-        let cache = self.state().relu_backward.borrow();
-        let (kernel, stream) = cache
-            .as_ref()
-            .ok_or(RocmTensorExecutionError::SizeOverflow)?;
-        let count_bytes = count.to_ne_bytes();
-        let args = [
-            HipKernelArgument::Buffer(input.device_buffer()),
-            HipKernelArgument::Buffer(upstream.device_buffer()),
-            HipKernelArgument::Buffer(output.device_buffer()),
-            HipKernelArgument::Bytes(&count_bytes),
-        ];
-        if let Some(batch) = batch {
-            // SAFETY: the compiled kernel takes three f32 buffers and a u32 count. Assessed
-            // shapes and resource sizes cover all guarded indices; the batch retains owners
-            // before enqueue and waits for its final event before reuse.
-            #[allow(unsafe_code)]
-            unsafe {
-                kernel.launch_into_batch(batch, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
-            }
-            .map_err(RocmTensorExecutionError::Completion)
-        } else {
-            // SAFETY: the same assessed ABI and resource contract applies to direct submission.
-            #[allow(unsafe_code)]
-            let mut completion = unsafe {
-                kernel.launch(stream, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
-            }
-            .map_err(RocmTensorExecutionError::Completion)?;
-            completion
-                .wait()
-                .map_err(RocmTensorExecutionError::Completion)
         }
     }
 
@@ -5125,6 +5327,7 @@ impl<'session> RocmTensorAssessor<'session> {
         operands: ElementwiseOperands<'_>,
         batch: Option<&mut HipCompletionBatch>,
         timing: &mut T,
+        mut status: Option<&mut owned_scratch::Status>,
     ) -> Result<(), RocmTensorExecutionError> {
         let ElementwiseOperands {
             left,
@@ -5195,11 +5398,11 @@ impl<'session> RocmTensorAssessor<'session> {
                     .map_err(RocmTensorExecutionError::Backend)?;
                 None
             } else {
-                Some(
-                    prepared
-                        .submit(&bindings)
-                        .map_err(RocmTensorExecutionError::Backend)?,
-                )
+                Some(owned_scratch::submit(
+                    prepared,
+                    &bindings,
+                    status.as_deref_mut(),
+                )?)
             }
         };
         timing.finish(ElementwisePhase::Submit, submit_mark);
@@ -5209,6 +5412,9 @@ impl<'session> RocmTensorAssessor<'session> {
                 .wait()
                 .map_err(RocmTensorExecutionError::Completion)?;
             timing.finish(ElementwisePhase::Wait, wait_mark);
+            if let Some(status) = status {
+                status.observe(outcome);
+            }
             match outcome {
                 PcuCompletionOutcome::Succeeded => Ok(()),
                 PcuCompletionOutcome::Failed => Err(RocmTensorExecutionError::FailedCompletion),
@@ -5364,6 +5570,18 @@ fn flattened_invocation_count(shape: &[usize]) -> Result<u32, RocmTensorExecutio
         .ok_or(RocmTensorExecutionError::SizeOverflow)
 }
 
+fn mse_scratch_length_fits_scalar(
+    count: usize,
+    scalar: fusion_pcu::PcuScalarType,
+    squared_bytes: usize,
+) -> Result<bool, RocmTensorExecutionError> {
+    let required = count
+        .checked_mul(usize::from(scalar.bit_width() / 8))
+        .ok_or(RocmTensorExecutionError::SizeOverflow)?;
+    Ok(squared_bytes >= required)
+}
+
+#[cfg(test)]
 fn mse_scratch_length_fits(
     count: usize,
     squared_bytes: usize,
@@ -5435,9 +5653,10 @@ fn homogeneous_scalar_type(nodes: &[NodeDescriptor<'_>]) -> Option<fusion_pcu::P
 
 fn nodes_require_blas(nodes: &[NodeDescriptor<'_>]) -> bool {
     nodes.iter().any(|node| {
-        matches!(node.op, OpDescriptor::MeanSquaredError { .. })
-            || (matches!(node.op, OpDescriptor::MatMul { .. })
-                && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict))
+        matches!(
+            node.op,
+            OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. }
+        ) && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
     })
 }
 
@@ -5473,6 +5692,7 @@ fn validate_tensor_scalar_tag<T: fusion_pcu::PcuScalar>(
 /// Owning prepared tensor schedule. The selected graph and all backend indexes live together;
 /// there are no references from the schedule back into its graph.
 pub struct RocmOwnedPreparedTensorGraph {
+    scratch: owned_scratch::State,
     program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
     data: RocmPreparedGraphData,
 }
@@ -5596,6 +5816,23 @@ impl<'graph> RocmPreparedTensorGraph<'graph> {
 }
 
 impl RocmOwnedPreparedTensorGraph {
+    fn from_parts(
+        program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
+        data: RocmPreparedGraphData,
+    ) -> Result<Self, RocmTensorExecutionError> {
+        let view = RocmPreparedGraphView {
+            graph: program.graph(),
+            data: &data,
+            selected: SelectedPlanRef::Owned(&program),
+        };
+        let scratch = owned_scratch::State::new(&view)?;
+        Ok(Self {
+            scratch,
+            program,
+            data,
+        })
+    }
+
     fn view(&self) -> RocmPreparedGraphView<'_, '_> {
         RocmPreparedGraphView {
             graph: self.program.graph(),
@@ -6349,6 +6586,28 @@ pub struct RocmTensorScratch<'plan, 'graph, 'session> {
     poisoned: bool,
 }
 
+struct RocmExecutionScratch<'a> {
+    resources: &'a [Option<RocmMemoryResource>],
+    mse_squared: Option<&'a RocmMemoryResource>,
+    statuses: Option<&'a mut [Option<owned_scratch::Status>]>,
+    outputs: &'a [ValueId],
+    node_values: &'a [ValueId],
+}
+
+impl RocmExecutionScratch<'_> {
+    fn status(&mut self, index: usize) -> Option<&mut owned_scratch::Status> {
+        self.statuses.as_deref_mut()?.get_mut(index)?.as_mut()
+    }
+
+    fn lease(&self, index: usize) -> Result<RocmMemoryResource, RocmTensorExecutionError> {
+        self.resources
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(RocmMemoryResource::clone_for_tensor_input)
+            .ok_or_else(|| RocmTensorExecutionError::MissingResource(self.node_values[index]))
+    }
+}
+
 /// Caller-owned output allocations reusable for repeated execution of one exact prepared plan.
 pub struct RocmTensorOutputBank<'plan, 'graph, 'session> {
     prepared: &'plan RocmPreparedTensorGraph<'graph>,
@@ -6549,23 +6808,6 @@ fn physical_value_storage_requirement(
     })
 }
 
-impl RocmTensorScratch<'_, '_, '_> {
-    fn lease(&self, index: usize) -> Result<RocmMemoryResource, RocmTensorExecutionError> {
-        self.resources
-            .get(index)
-            .and_then(Option::as_ref)
-            .map(RocmMemoryResource::clone_for_tensor_input)
-            .ok_or_else(|| {
-                RocmTensorExecutionError::MissingResource(
-                    self.prepared
-                        .nodes
-                        .get(index)
-                        .map_or(self.prepared.output, |node| node.value),
-                )
-            })
-    }
-}
-
 // The destination may come from the persistent feedback bank, a fresh owned-result slot,
 // selected scratch storage, or the provider; keeping routing at the allocation boundary avoids
 // duplicating storage policy in every tensor operation branch.
@@ -6577,7 +6819,7 @@ fn execution_resource<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
     scalar_type: fusion_pcu::PcuScalarType,
     index: usize,
     value: ValueId,
-    scratch: &mut Option<&mut RocmTensorScratch<'_, '_, '_>>,
+    scratch: &mut Option<&mut RocmExecutionScratch<'_>>,
     output_bank: Option<&RocmTensorOutputBank<'_, '_, '_>>,
     fresh_outputs: Option<&[(ValueId, FreshTensorOutput<'_>)]>,
 ) -> Result<RocmMemoryResource, RocmTensorExecutionError> {
@@ -6585,7 +6827,7 @@ fn execution_resource<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
         return Ok(output.resource.clone_for_tensor_input());
     }
     if let Some(scratch) = scratch.as_deref_mut()
-        && !scratch.prepared.outputs.contains(&value)
+        && !scratch.outputs.contains(&value)
     {
         return scratch.lease(index);
     }
@@ -6596,6 +6838,28 @@ fn execution_resource<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
         shape,
         element_size,
         usize::try_from(alignment).map_err(|_| RocmTensorExecutionError::SizeOverflow)?,
+    )
+}
+
+fn validate_owned_storage(
+    view: &RocmPreparedGraphView<'_, '_>,
+    inputs: &[(ValueId, &RocmTensorInputRef<'_>)],
+    outputs: &[(ValueId, FreshTensorOutput<'_>)],
+    resources: &[Option<RocmMemoryResource>],
+) -> Result<(), RocmTensorExecutionError> {
+    validate_indexed_storage_constraints(
+        &view.indexed_storage_constraints,
+        |value, index, _output_index| {
+            fresh_output(Some(outputs), value)
+                .map(|output| &output.resource)
+                .or_else(|| {
+                    inputs
+                        .iter()
+                        .find(|(candidate, _)| *candidate == value)
+                        .map(|(_, input)| input.resource())
+                })
+                .or_else(|| resources.get(index).and_then(Option::as_ref))
+        },
     )
 }
 
@@ -6664,6 +6928,9 @@ fn mse_scratch_element_count(
         let OpDescriptor::MeanSquaredError { prediction, .. } = node.op else {
             return Ok(max_count);
         };
+        if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) {
+            return Ok(max_count);
+        }
         let shape = graph.shape(prediction)?;
         // The MSE output is scalar; size internal scratch from its prediction shape.
         let count = shape
@@ -6716,6 +6983,26 @@ fn collect_dispatch_requests<'graph>(
             continue;
         }
         let request = match node.op {
+            OpDescriptor::MeanSquaredError { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                Some(TensorDispatchRequest::StrictMse(
+                    strict_mse::Profile::from_node(prepared.graph, *node).map_err(|reason| {
+                        RocmTensorExecutionError::Unsupported {
+                            value: node.value,
+                            reason,
+                        }
+                    })?,
+                ))
+            }
+            OpDescriptor::ReluBackward { .. } => Some(TensorDispatchRequest::ReluBackward(
+                relu_backward::Profile::from_node(*node).map_err(|reason| {
+                    RocmTensorExecutionError::Unsupported {
+                        value: node.value,
+                        reason,
+                    }
+                })?,
+            )),
             OpDescriptor::SgdUpdate { .. }
                 if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
             {
@@ -6802,7 +7089,7 @@ fn collect_dispatch_requests<'graph>(
                         scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
-                        float_underflow_policy: None,
+                        numerical_requirements: fixed_numerical_requirements(*node),
                     })
                 } else {
                     Some(TensorDispatchRequest::Fixed {
@@ -6810,7 +7097,7 @@ fn collect_dispatch_requests<'graph>(
                         scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: 0,
-                        float_underflow_policy: None,
+                        numerical_requirements: fixed_numerical_requirements(*node),
                     })
                 }
             }
@@ -6819,7 +7106,6 @@ fn collect_dispatch_requests<'graph>(
             | OpDescriptor::Uniform { .. }
             | OpDescriptor::MatMul { .. }
             | OpDescriptor::MeanSquaredError { .. }
-            | OpDescriptor::ReluBackward { .. }
             | OpDescriptor::SgdUpdate { .. } => None,
         };
         if let Some(request) = request {
@@ -6835,6 +7121,27 @@ fn collect_dispatch_requests<'graph>(
     Ok(requests)
 }
 
+/// Scalar nodes deliberately omit compound exception granularity. Their canonical header
+/// is Boundary: one checked primitive has identical Boundary/Strict semantics. None never
+/// inherits mutable Graph defaults; captured options and underflow remain exact. Compound
+/// nodes retain their explicit Some(mode). Graph Clamp has no node contract yet.
+const fn fixed_numerical_requirements(
+    node: NodeDescriptor<'_>,
+) -> fusion_pcu::PcuImplementationRequirements {
+    fusion_pcu::PcuImplementationRequirements {
+        numerical_mode: match node.numerical_mode {
+            Some(mode) => mode,
+            None => fusion_pcu::PcuNumericalMode::Boundary,
+        },
+        numerical_options: node.numerical_options,
+        float_underflow: match node.float_underflow_policy {
+            Some(policy) => policy,
+            None => PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        },
+        range_policy: fusion_pcu::PcuRangePolicy::Reject,
+    }
+}
+
 fn fixed_binary_request(
     prepared: &RocmPreparedTensorGraph<'_>,
     node: NodeDescriptor<'_>,
@@ -6848,7 +7155,7 @@ fn fixed_binary_request(
         scalar_type,
         logical_count: flattened_invocation_count(node.shape)?,
         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
-        float_underflow_policy: node.float_underflow_policy,
+        numerical_requirements: fixed_numerical_requirements(node),
     })
 }
 
@@ -7022,7 +7329,15 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     let nodes = lowering_plan.nodes().to_vec();
     for node in &nodes {
         let expected_route = match node.op {
-            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+            OpDescriptor::ReluBackward { .. }
+                if relu_backward::Profile::from_node(*node)
+                    .is_ok_and(relu_backward::Profile::checked) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
+            OpDescriptor::SgdUpdate { .. }
+            | OpDescriptor::MatMul { .. }
+            | OpDescriptor::MeanSquaredError { .. }
                 if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
             {
                 TensorExecutionRoute::Synthesized
@@ -7195,18 +7510,21 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
                         | OpDescriptor::Mul { .. }
                 )
             });
-        if !matches!(
-            scalar_type,
-            fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
-        ) && !transport_only_inputs
-            && !integer_profile
-        {
+        if !is_checked_float_type(scalar_type) && !transport_only_inputs && !integer_profile {
             return Err(RocmTensorExecutionError::UnsupportedScalarType(scalar_type));
         }
     }
     for node in &nodes {
         let expected_route = match node.op {
-            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+            OpDescriptor::ReluBackward { .. }
+                if relu_backward::Profile::from_node(*node)
+                    .is_ok_and(relu_backward::Profile::checked) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
+            OpDescriptor::SgdUpdate { .. }
+            | OpDescriptor::MatMul { .. }
+            | OpDescriptor::MeanSquaredError { .. }
                 if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
             {
                 TensorExecutionRoute::Synthesized
@@ -7824,20 +8142,23 @@ fn prepare_fixed_dispatches(
             let invocations =
                 NonZeroU32::new(logical_count).ok_or(RocmTensorExecutionError::SizeOverflow)?;
             let scalar_type = TensorPointwiseScalarType::try_from(node.scalar_type)?;
-            let float_underflow_policy = node.float_underflow_policy;
+            let numerical_requirements = fixed_numerical_requirements(*node);
             let cache_key = TensorDispatchCacheKey::Fixed(
                 kind,
                 scalar_type,
                 logical_count,
                 scalar_mask,
-                float_underflow_policy,
+                numerical_requirements,
             );
-            let kernel = kind.kernel(
-                scalar_type,
-                logical_count,
-                scalar_mask,
-                float_underflow_policy,
-            )?;
+            let kernel = PcuDispatchKernelIr {
+                numerical_requirements,
+                ..kind.kernel(
+                    scalar_type,
+                    logical_count,
+                    scalar_mask,
+                    Some(numerical_requirements.float_underflow),
+                )?
+            };
             let value_type = scalar_type.value_type();
             let (left_binding, right_binding, output_binding) = fixed_binding_refs(kind);
             Ok(Some(PreparedFixedTensorDispatch {
@@ -8057,7 +8378,10 @@ const fn scalar_layout(
     scalar_type: fusion_pcu::PcuScalarType,
 ) -> Result<(usize, u64), RocmTensorExecutionError> {
     match scalar_type {
-        fusion_pcu::PcuScalarType::I8 | fusion_pcu::PcuScalarType::U8 => Ok((1, 1)),
+        fusion_pcu::PcuScalarType::I8
+        | fusion_pcu::PcuScalarType::U8
+        | fusion_pcu::PcuScalarType::F8E4M3FN
+        | fusion_pcu::PcuScalarType::F8E5M2 => Ok((1, 1)),
         fusion_pcu::PcuScalarType::I16
         | fusion_pcu::PcuScalarType::U16
         | fusion_pcu::PcuScalarType::F16
@@ -8068,6 +8392,36 @@ const fn scalar_layout(
         fusion_pcu::PcuScalarType::I64
         | fusion_pcu::PcuScalarType::U64
         | fusion_pcu::PcuScalarType::F64 => Ok((8, 8)),
+        fusion_pcu::PcuScalarType::I128 => {
+            Ok((size_of::<i128>(), core::mem::align_of::<i128>() as u64))
+        }
+        fusion_pcu::PcuScalarType::U128 => {
+            Ok((size_of::<u128>(), core::mem::align_of::<u128>() as u64))
+        }
+        fusion_pcu::PcuScalarType::I256 => Ok((
+            size_of::<fusion_pcu::PcuI256>(),
+            core::mem::align_of::<fusion_pcu::PcuI256>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::U256 => Ok((
+            size_of::<fusion_pcu::PcuU256>(),
+            core::mem::align_of::<fusion_pcu::PcuU256>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::I512 => Ok((
+            size_of::<fusion_pcu::PcuI512>(),
+            core::mem::align_of::<fusion_pcu::PcuI512>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::U512 => Ok((
+            size_of::<fusion_pcu::PcuU512>(),
+            core::mem::align_of::<fusion_pcu::PcuU512>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::F128 => Ok((
+            size_of::<fusion_pcu::PcuF128Bits>(),
+            core::mem::align_of::<fusion_pcu::PcuF128Bits>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::F256 => Ok((
+            size_of::<fusion_pcu::PcuF256Bits>(),
+            core::mem::align_of::<fusion_pcu::PcuF256Bits>() as u64,
+        )),
         unsupported => Err(RocmTensorExecutionError::UnsupportedScalarType(unsupported)),
     }
 }
@@ -8085,8 +8439,18 @@ const fn is_transport_scalar(scalar_type: fusion_pcu::PcuScalarType) -> bool {
             | fusion_pcu::PcuScalarType::U64
             | fusion_pcu::PcuScalarType::F16
             | fusion_pcu::PcuScalarType::BF16
+            | fusion_pcu::PcuScalarType::F8E4M3FN
+            | fusion_pcu::PcuScalarType::F8E5M2
             | fusion_pcu::PcuScalarType::F32
             | fusion_pcu::PcuScalarType::F64
+            | fusion_pcu::PcuScalarType::I128
+            | fusion_pcu::PcuScalarType::U128
+            | fusion_pcu::PcuScalarType::I256
+            | fusion_pcu::PcuScalarType::U256
+            | fusion_pcu::PcuScalarType::I512
+            | fusion_pcu::PcuScalarType::U512
+            | fusion_pcu::PcuScalarType::F128
+            | fusion_pcu::PcuScalarType::F256
     )
 }
 
@@ -8101,6 +8465,12 @@ const fn is_checked_integer_scalar(scalar_type: fusion_pcu::PcuScalarType) -> bo
             | fusion_pcu::PcuScalarType::U32
             | fusion_pcu::PcuScalarType::I64
             | fusion_pcu::PcuScalarType::U64
+            | fusion_pcu::PcuScalarType::I128
+            | fusion_pcu::PcuScalarType::U128
+            | fusion_pcu::PcuScalarType::I256
+            | fusion_pcu::PcuScalarType::U256
+            | fusion_pcu::PcuScalarType::I512
+            | fusion_pcu::PcuScalarType::U512
     )
 }
 
@@ -8115,10 +8485,25 @@ const fn is_checked_float_binary_node(node: NodeDescriptor<'_>) -> bool {
         )
 }
 
+const fn is_low_float_type(scalar_type: fusion_pcu::PcuScalarType) -> bool {
+    matches!(
+        scalar_type,
+        fusion_pcu::PcuScalarType::F16
+            | fusion_pcu::PcuScalarType::BF16
+            | fusion_pcu::PcuScalarType::F8E4M3FN
+            | fusion_pcu::PcuScalarType::F8E5M2
+    )
+}
+
 const fn is_checked_float_type(scalar_type: fusion_pcu::PcuScalarType) -> bool {
     matches!(
         scalar_type,
-        fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
+        fusion_pcu::PcuScalarType::F16
+            | fusion_pcu::PcuScalarType::BF16
+            | fusion_pcu::PcuScalarType::F8E4M3FN
+            | fusion_pcu::PcuScalarType::F8E5M2
+            | fusion_pcu::PcuScalarType::F32
+            | fusion_pcu::PcuScalarType::F64
     )
 }
 
@@ -8135,9 +8520,31 @@ const fn alignment_satisfies(reported: u64, required: u64) -> bool {
     required != 0 && reported >= required && reported.is_multiple_of(required)
 }
 
-#[allow(clippy::cast_precision_loss)] // Matches the tensor dialect's f32 mean divisor semantics.
-fn mse_scale(element_count: usize) -> f32 {
-    1.0 / element_count as f32
+/// Formation is fixed nearest-even even when the permitted library reduction is native.
+fn mse_scale(element_count: usize) -> Result<f32, RocmTensorExecutionError> {
+    use fusion_pcu::PcuCheckedFloat;
+    if element_count == 0 || element_count > i32::MAX as usize {
+        return Err(RocmTensorExecutionError::SizeOverflow);
+    }
+    1.0_f32
+        .pcu_checked_div(fusion_pcu::dialect::tensor::constants::count_f32(
+            element_count,
+        ))
+        .map_err(|_| RocmTensorExecutionError::SizeOverflow)
+}
+
+/// Native F64 reduction uses an exact integer count (bounded by i32) and a F64 reciprocal.
+fn mse_scale_f64(count: usize) -> Result<f64, RocmTensorExecutionError> {
+    use fusion_pcu::PcuCheckedFloat;
+    let count = u32::try_from(count)
+        .ok()
+        .filter(|n| *n > 0 && i32::try_from(*n).is_ok())
+        .ok_or(RocmTensorExecutionError::SizeOverflow)?;
+    1.0_f64
+        .pcu_checked_div(fusion_pcu::dialect::tensor::constants::count_f64(
+            count as usize,
+        ))
+        .map_err(|_| RocmTensorExecutionError::SizeOverflow)
 }
 
 fn allocate_tensor<P: PcuMemoryProvider<Resource = RocmMemoryResource>>(
@@ -8347,6 +8754,18 @@ const fn rocm_supports_operand_representation(
         return matches!(representation, TensorOperandRepresentation::Dense)
             && is_transport_scalar(node.scalar_type);
     }
+    if is_low_float_type(node.scalar_type) {
+        return matches!(representation, TensorOperandRepresentation::Dense)
+            && matches!(
+                node.op,
+                OpDescriptor::Add { .. }
+                    | OpDescriptor::Sub { .. }
+                    | OpDescriptor::Mul { .. }
+                    | OpDescriptor::Div { .. }
+                    | OpDescriptor::Relu { .. }
+                    | OpDescriptor::ReluBackward { .. }
+            );
+    }
     let supported_scalar = matches!(
         node.scalar_type,
         fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
@@ -8364,6 +8783,7 @@ const fn rocm_supports_operand_representation(
                 | OpDescriptor::Mul { .. }
                 | OpDescriptor::Div { .. }
                 | OpDescriptor::Relu { .. }
+                | OpDescriptor::ReluBackward { .. }
                 | OpDescriptor::Constant(_)
                 | OpDescriptor::Uniform { .. }
                 | OpDescriptor::MeanSquaredError { .. }
@@ -8387,6 +8807,14 @@ fn assess_float_matmul(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperati
     if graph.node(node.value).ok() != Some(node) {
         return TensorOperationSupport::Unsupported {
             reason: TensorUnsupportedReason::Operation,
+        };
+    }
+    // A permitted native contract may use the stronger ordered Strict implementation.
+    // Test this before the Boundary-only rocBLAS path; no native fast-path work changes.
+    if strict_matmul::StrictMatMulSpec::from_node(graph, node).is_some() {
+        return TensorOperationSupport::Supported {
+            route: TensorExecutionRoute::Synthesized,
+            workspace_bytes: Some(0),
         };
     }
     if node.numerical_options.compound_arithmetic
@@ -8416,21 +8844,15 @@ fn assess_float_matmul(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperati
             workspace_bytes: None,
         };
     }
-    if strict_matmul::StrictMatMulSpec::from_node(graph, node).is_some() {
-        TensorOperationSupport::Supported {
-            route: TensorExecutionRoute::Synthesized,
-            workspace_bytes: Some(0),
-        }
-    } else {
-        TensorOperationSupport::Unsupported {
-                reason: TensorUnsupportedReason::Other(
-                    "checked result-boundary MatMul is not implemented; select strict checking or explicitly permit native compound arithmetic".into(),
-                ),
-            }
+    TensorOperationSupport::Unsupported {
+        reason: TensorUnsupportedReason::Other(
+            "checked result-boundary MatMul is not implemented; select strict checking or explicitly permit native compound arithmetic".into(),
+        ),
     }
 }
 
 fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+    // The scalar dispatch Portable qualification does not certify an owned tensor program.
     if node.numerical_options.reproducibility != fusion_pcu::PcuReproducibility::Unspecified {
         return TensorOperationSupport::Unsupported {
             reason: TensorUnsupportedReason::NumericalPolicy {
@@ -8438,6 +8860,11 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
                 options: node.numerical_options,
             },
         };
+    }
+    if matches!(node.op, OpDescriptor::MeanSquaredError { .. })
+        && node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict)
+    {
+        return strict_mse::assess(graph, node);
     }
     if matches!(node.op, OpDescriptor::MeanSquaredError { .. }) {
         return native_loss::assess(graph, node);
@@ -8453,12 +8880,7 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
         };
     }
     if matches!(node.op, OpDescriptor::ReluBackward { .. }) {
-        return TensorOperationSupport::Unsupported {
-            reason: TensorUnsupportedReason::Other(
-                "compound operation has no checked floating numerical contract in either mode"
-                    .into(),
-            ),
-        };
+        return relu_backward::assess(graph, node);
     }
     if let OpDescriptor::MatMul {
         left,
@@ -8497,21 +8919,11 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
     if is_checked_integer_scalar(node.scalar_type) {
         return assess_checked_integer_node(graph, node);
     }
-    if node.scalar_type == fusion_pcu::PcuScalarType::F64
-        && !matches!(
-            node.op,
-            OpDescriptor::Input
-                | OpDescriptor::MatMul { .. }
-                | OpDescriptor::Add { .. }
-                | OpDescriptor::Sub { .. }
-                | OpDescriptor::Mul { .. }
-                | OpDescriptor::Div { .. }
-                | OpDescriptor::Relu { .. }
-        )
-    {
-        return TensorOperationSupport::Unsupported {
-            reason: TensorUnsupportedReason::ElementType,
-        };
+    if is_low_float_type(node.scalar_type) {
+        return assess_low_float_node(graph, node);
+    }
+    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+        return assess_f64_pointwise_or_literal_node(graph, node);
     }
     if !matches!(
         node.scalar_type,
@@ -8522,6 +8934,91 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
         };
     }
     assess_f32_tensor_node(graph, node)
+}
+
+// F64 producers are exact dense transport; checked scalar consumers keep their existing law.
+fn assess_f64_pointwise_or_literal_node(
+    graph: &Graph,
+    node: NodeDescriptor<'_>,
+) -> TensorOperationSupport {
+    if node.shape.contains(&0)
+        && matches!(
+            node.op,
+            OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+        )
+    {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::Shape,
+        };
+    }
+    if !matches!(
+        node.op,
+        OpDescriptor::Input
+            | OpDescriptor::Constant(_)
+            | OpDescriptor::Uniform { .. }
+            | OpDescriptor::MatMul { .. }
+            | OpDescriptor::Add { .. }
+            | OpDescriptor::Sub { .. }
+            | OpDescriptor::Mul { .. }
+            | OpDescriptor::Div { .. }
+            | OpDescriptor::Relu { .. }
+    ) {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::ElementType,
+        };
+    }
+    assess_f32_tensor_node(graph, node)
+}
+
+fn assess_low_float_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+    let operands = match node.op {
+        OpDescriptor::Add { left, right }
+        | OpDescriptor::Sub { left, right }
+        | OpDescriptor::Mul { left, right }
+        | OpDescriptor::Div { left, right } => [Some(left), Some(right)],
+        OpDescriptor::Relu { input } => [Some(input), None],
+        _ => {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+            };
+        }
+    };
+    let count = node
+        .shape
+        .iter()
+        .try_fold(1usize, |count, dim| count.checked_mul(*dim));
+    if !count.is_some_and(|count| count > 0 && u32::try_from(count).is_ok()) {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::Shape,
+        };
+    }
+    for value in operands.into_iter().flatten() {
+        let Ok(operand) = graph.node(value) else {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+            };
+        };
+        if operand.scalar_type != node.scalar_type
+            || operand.shape != node.shape
+            || !matches!(
+                operand.op,
+                OpDescriptor::Input
+                    | OpDescriptor::Add { .. }
+                    | OpDescriptor::Sub { .. }
+                    | OpDescriptor::Mul { .. }
+                    | OpDescriptor::Div { .. }
+                    | OpDescriptor::Relu { .. }
+            )
+        {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+            };
+        }
+    }
+    TensorOperationSupport::Supported {
+        route: TensorExecutionRoute::Synthesized,
+        workspace_bytes: Some(0),
+    }
 }
 
 fn assess_checked_integer_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
@@ -8812,6 +9309,10 @@ fn matmul_shape_supported(
 #[cfg(test)]
 #[path = "tensor/numerical_tests.rs"]
 mod numerical_tests;
+
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[path = "tensor/cold_constants/cold_constants.rs"]
+mod cold_constants;
 
 #[cfg(test)]
 mod tests {
@@ -9507,6 +10008,147 @@ mod tests {
     }
 
     #[test]
+    fn low_four_owned_preparation_retains_all_checked_pointwise_dispatches() {
+        for dtype in [
+            PcuScalarType::F16,
+            PcuScalarType::BF16,
+            PcuScalarType::F8E4M3FN,
+            PcuScalarType::F8E5M2,
+        ] {
+            for policy in [
+                PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+            ] {
+                let mut graph = Graph::default();
+                graph.set_numerical_mode(fusion_pcu::PcuNumericalMode::Strict);
+                let left = graph.input([65], dtype).unwrap();
+                let right = graph.input([65], dtype).unwrap();
+                let values = [
+                    graph.add(left, right).unwrap(),
+                    graph.sub(left, right).unwrap(),
+                    graph.mul(left, right).unwrap(),
+                    graph.div(left, right).unwrap(),
+                    graph.relu(left).unwrap(),
+                ];
+                for value in values {
+                    graph
+                        .set_value_float_underflow_policy(value, policy)
+                        .unwrap();
+                }
+                let program = graph
+                    .into_selected_program(
+                        &values,
+                        TensorArithmeticRewritePolicy::Disabled,
+                        TensorArithmeticCapability::Strict,
+                        TensorPointwiseGroupingPolicy::Disabled,
+                    )
+                    .unwrap();
+                let data = prepare_owned_graph_data(&program, &PureRocmAssessor).unwrap();
+                assert_eq!(data.scalar_type, Some(dtype));
+                assert!(!data.transport_only_inputs);
+                let dispatches = data.fixed_dispatches.iter().flatten().collect::<Vec<_>>();
+                assert_eq!(dispatches.len(), 5);
+                for dispatch in dispatches {
+                    let node = program.graph().node(dispatch.value).unwrap();
+                    assert_eq!(
+                        dispatch.kernel.numerical_requirements,
+                        super::fixed_numerical_requirements(node)
+                    );
+                    assert_eq!(
+                        dispatch.kernel.numerical_requirements.float_underflow,
+                        policy
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_captured_tuple_is_exact_and_scalar_none_is_canonical_boundary() {
+        use fusion_pcu::{PcuCompoundArithmeticPolicy, PcuNumericalMode, PcuPrecisionPolicy};
+        let mut graph = Graph::default();
+        graph.set_numerical_mode(PcuNumericalMode::Strict);
+        let input = graph.input([17], PcuScalarType::F16).unwrap();
+        let value = graph.add(input, input).unwrap();
+        let original = super::fixed_numerical_requirements(graph.node(value).unwrap());
+        assert_eq!(graph.node(value).unwrap().numerical_mode, None);
+        assert_eq!(original.numerical_mode, PcuNumericalMode::Boundary);
+        graph.set_numerical_mode(PcuNumericalMode::Boundary);
+        graph.set_numerical_options(fusion_pcu::PcuNumericalOptions {
+            compound_arithmetic: PcuCompoundArithmeticPolicy::BackendDefined,
+            precision: PcuPrecisionPolicy::BackendOptimized,
+            ..Default::default()
+        });
+        // Defaults changed after capture cannot alter a scalar node's header or cache key.
+        assert_eq!(
+            super::fixed_numerical_requirements(graph.node(value).unwrap()),
+            original
+        );
+        let node = graph.node(value).unwrap();
+        let prepared =
+            prepared_for_request_test(&graph, &[value], TensorPointwiseGroupingPolicy::Disabled);
+        let requests = collect_dispatch_requests(&prepared).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].key(),
+            prepared
+                .fixed_dispatches
+                .iter()
+                .flatten()
+                .find(|dispatch| dispatch.value == value)
+                .unwrap()
+                .cache_key
+        );
+        assert_eq!(
+            prepared
+                .fixed_dispatches
+                .iter()
+                .flatten()
+                .find(|dispatch| dispatch.value == value)
+                .unwrap()
+                .kernel
+                .numerical_requirements,
+            original
+        );
+        let mut distinct = Vec::new();
+        for mode in [None, Some(PcuNumericalMode::Strict)] {
+            for compound in [
+                PcuCompoundArithmeticPolicy::Checked,
+                PcuCompoundArithmeticPolicy::BackendDefined,
+            ] {
+                for precision in [
+                    PcuPrecisionPolicy::Preserve,
+                    PcuPrecisionPolicy::BackendOptimized,
+                ] {
+                    for underflow in [
+                        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                        PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+                    ] {
+                        let mut profile = node;
+                        profile.numerical_mode = mode;
+                        profile.numerical_options.compound_arithmetic = compound;
+                        profile.numerical_options.precision = precision;
+                        profile.float_underflow_policy = Some(underflow);
+                        let requirements = super::fixed_numerical_requirements(profile);
+                        let key = TensorDispatchCacheKey::Fixed(
+                            TensorDispatchKind::CheckedFloatAdd,
+                            TensorPointwiseScalarType::F16,
+                            17,
+                            0,
+                            requirements,
+                        );
+                        assert!(!distinct.contains(&key));
+                        distinct.push(key);
+                    }
+                }
+            }
+        }
+        assert_eq!(distinct.len(), 24);
+    }
+
+    #[test]
     fn mixed_float_policies_have_distinct_prewarm_keys_and_executables() {
         let mut graph = Graph::default();
         let left = graph.input([17], PcuScalarType::F32).unwrap();
@@ -9527,17 +10169,17 @@ mod tests {
             .map(|request| match request {
                 TensorDispatchRequest::Fixed {
                     kind: TensorDispatchKind::CheckedFloatAdd,
-                    float_underflow_policy,
+                    numerical_requirements,
                     ..
-                } => *float_underflow_policy,
+                } => numerical_requirements.float_underflow,
                 other => panic!("unexpected request: {other:?}"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
             policies,
             [
-                Some(PcuFloatUnderflowPolicy::IeeeAfterRounding),
-                Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow),
+                PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow,
             ]
         );
         assert_ne!(requests[0].key(), requests[1].key());
@@ -9698,10 +10340,8 @@ mod tests {
             )
             .unwrap();
         let data = prepare_owned_graph_data(&program, &PureRocmAssessor).unwrap();
-        let prepared = super::RocmOwnedPreparedTensorGraph {
-            program: Arc::new(program),
-            data,
-        };
+        let prepared =
+            super::RocmOwnedPreparedTensorGraph::from_parts(Arc::new(program), data).unwrap();
         let provider_allocations = Cell::new(0);
 
         let error = with_single_output_plan(&prepared, || {
@@ -9734,10 +10374,8 @@ mod tests {
             )
             .unwrap();
         let data = prepare_owned_graph_data(&program, &PureRocmAssessor).unwrap();
-        let prepared = super::RocmOwnedPreparedTensorGraph {
-            program: Arc::new(program),
-            data,
-        };
+        let prepared =
+            super::RocmOwnedPreparedTensorGraph::from_parts(Arc::new(program), data).unwrap();
         let provider_allocations = Cell::new(0);
 
         let result = with_single_output_plan(&prepared, || {
@@ -9855,7 +10493,7 @@ mod tests {
                     expected,
                     17,
                     0,
-                    Some(PcuFloatUnderflowPolicy::default()),
+                    PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 )
             );
             assert!(dispatch.kernel.ops.iter().any(|op| matches!(
@@ -9938,8 +10576,19 @@ mod tests {
         assert_transport_layout::<u64>(PcuScalarType::U64);
         assert_transport_layout::<PcuF16Bits>(PcuScalarType::F16);
         assert_transport_layout::<PcuBf16Bits>(PcuScalarType::BF16);
+        assert_transport_layout::<fusion_pcu::PcuF8E4M3FnBits>(PcuScalarType::F8E4M3FN);
+        assert_transport_layout::<fusion_pcu::PcuF8E5M2Bits>(PcuScalarType::F8E5M2);
         assert_transport_layout::<f32>(PcuScalarType::F32);
         assert_transport_layout::<f64>(PcuScalarType::F64);
+
+        assert_transport_layout::<i128>(PcuScalarType::I128);
+        assert_transport_layout::<u128>(PcuScalarType::U128);
+        assert_transport_layout::<fusion_pcu::PcuI256>(PcuScalarType::I256);
+        assert_transport_layout::<fusion_pcu::PcuU256>(PcuScalarType::U256);
+        assert_transport_layout::<fusion_pcu::PcuI512>(PcuScalarType::I512);
+        assert_transport_layout::<fusion_pcu::PcuU512>(PcuScalarType::U512);
+        assert_transport_layout::<fusion_pcu::PcuF128Bits>(PcuScalarType::F128);
+        assert_transport_layout::<fusion_pcu::PcuF256Bits>(PcuScalarType::F256);
 
         for scalar_type in [PcuScalarType::Bool, PcuScalarType::I4, PcuScalarType::U4] {
             assert!(!is_transport_scalar(scalar_type));
@@ -10128,7 +10777,7 @@ mod tests {
                 scalar_type: TensorPointwiseScalarType::F32,
                 logical_count: 16,
                 scalar_mask: 0,
-                float_underflow_policy: Some(PcuFloatUnderflowPolicy::IeeeAfterRounding),
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             }
         ));
         assert!(matches!(
@@ -10138,7 +10787,7 @@ mod tests {
                 scalar_type: TensorPointwiseScalarType::F32,
                 logical_count: 16,
                 scalar_mask: 0,
-                float_underflow_policy: None,
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             }
         ));
     }
@@ -10189,14 +10838,14 @@ mod tests {
             TensorPointwiseScalarType::F32,
             17,
             0,
-            Some(PcuFloatUnderflowPolicy::default()),
+            PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         );
         let f64_key = TensorDispatchCacheKey::Fixed(
             TensorDispatchKind::Add,
             TensorPointwiseScalarType::F64,
             17,
             0,
-            None,
+            PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         );
         assert_ne!(f32_key, f64_key);
         assert_ne!(
@@ -10309,7 +10958,7 @@ mod tests {
                     TensorPointwiseScalarType::F32,
                     count,
                     0,
-                    Some(PcuFloatUnderflowPolicy::default()),
+                    PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 )
             })
             .collect::<Vec<_>>();
@@ -10333,6 +10982,12 @@ mod tests {
             PcuScalarType::U32,
             PcuScalarType::I64,
             PcuScalarType::U64,
+            PcuScalarType::I128,
+            PcuScalarType::U128,
+            PcuScalarType::I256,
+            PcuScalarType::U256,
+            PcuScalarType::I512,
+            PcuScalarType::U512,
         ] {
             let mut graph = Graph::default();
             let left = graph.input([17], scalar).unwrap();
@@ -10535,6 +11190,337 @@ mod tests {
                 dispatch.cache_key,
                 TensorDispatchCacheKey::Fixed(kind, _, 5, 0, _) if kind == expected_kind
             ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native device; private scratch exclusivity, ownership and terminal retry"]
+    fn owned_private_scratch_is_exclusive_and_retries_after_terminal_fault() {
+        let (_discovery, session) = rocm_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0180);
+        let assessor = RocmTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        macro_rules! check {
+            ($ty:ty, $kind:ident) => {{
+                let mut graph = Graph::default();
+                let input = graph.input([65], PcuScalarType::$kind).unwrap();
+                let literal = graph.uniform_typed([65], 0.25 as $ty).unwrap();
+                let difference = graph.sub(input, literal.erase()).unwrap();
+                let output = graph.mul(difference, difference).unwrap();
+                let program = graph.into_selected_program(
+                    &[output], TensorArithmeticRewritePolicy::Disabled,
+                    TensorArithmeticCapability::Strict, TensorPointwiseGroupingPolicy::Disabled,
+                ).unwrap();
+                let prepared = assessor.prepare_owned_program(program).unwrap();
+                let owner = PcuDeviceTensor::new([65], session.upload_buffer(pool, &[2.0 as $ty; 65]).unwrap()).unwrap();
+                let bank = prepared.scratch.bind(session.tensor_runtime(), &prepared.view(), pool, &mut memory).unwrap();
+                #[cfg(feature = "allocation-census")]
+                crate::reset_rocm_api_census();
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory), Err(RocmTensorExecutionError::ScratchBusy)));
+                #[cfg(feature = "allocation-census")]
+                assert_eq!(crate::rocm_api_census().allocations, 0);
+                drop(bank);
+                let first = assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory).unwrap().pop().unwrap().1;
+                let changed = PcuDeviceTensor::new([65], session.upload_buffer(pool, &[1.0 as $ty; 65]).unwrap()).unwrap();
+                #[cfg(feature = "allocation-census")]
+                crate::reset_rocm_api_census();
+                let second = assessor.execute_owned_program_outputs(&prepared, &[(input, &changed)], pool, &mut memory).unwrap().pop().unwrap().1;
+                #[cfg(feature = "allocation-census")]
+                {
+                    let api = crate::rocm_api_census();
+                    // Only the escaped result is fresh. Private values and observed-sentinel
+                    // faultwords remain retained under the same exclusive bank borrow.
+                    assert_eq!(api.allocations, 1);
+                    assert_eq!(api.host_to_device_copies, 0);
+                    assert_eq!(api.symbol_resolutions, 0);
+                    assert_eq!(api.module_loads, 0);
+                }
+                let mut bad = [2.0 as $ty; 65];
+                bad[2] = <$ty>::INFINITY;
+                let invalid = PcuDeviceTensor::new([65], session.upload_buffer(pool, &bad).unwrap()).unwrap();
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &invalid)], pool, &mut memory), Err(RocmTensorExecutionError::ExecutionFault(fault)) if fault.invocation_id == 2 && fault.kind == fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand));
+                let mut unavailable_pool_provider = session.memory_provider(PcuMemoryPoolId(0x4352_0181));
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut unavailable_pool_provider), Err(RocmTensorExecutionError::Memory(_))));
+                #[cfg(feature = "allocation-census")]
+                crate::reset_rocm_api_census();
+                let retried = assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory).unwrap().pop().unwrap().1;
+                #[cfg(feature = "allocation-census")]
+                {
+                    let api = crate::rocm_api_census();
+                    assert_eq!(api.allocations, 1);
+                    // The faulted subtraction resets; the unexecuted multiply still has MAX.
+                    assert_eq!(api.host_to_device_copies, 1);
+                }
+
+                // Protocol injection, not a manufactured SDK failure: an unknown terminal
+                // result must retire every private owner and refuse a later call before work.
+                let mut bank = prepared.scratch.bind(session.tensor_runtime(), &prepared.view(), pool, &mut memory).unwrap();
+                let leased = bank.physical.iter().find(|resource| resource.device_buffer().len() == 8).unwrap().clone_for_tensor_input();
+                leased.device_buffer().with_access_lease_for_test(|| {
+                    bank.finish(Some(&RocmTensorExecutionError::FailedCompletion)).unwrap();
+                }).unwrap();
+                drop(bank);
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory), Err(RocmTensorExecutionError::ScratchMismatch)));
+                drop(prepared);
+                for (escaped, expected) in [(first, 3.0625 as $ty), (second, 0.5625 as $ty), (retried, 3.0625 as $ty)] {
+                    let mut actual = [99.0 as $ty; 66];
+                    session.download_buffer(pool, escaped.buffer(), &mut actual[..65]).unwrap();
+                    assert!(actual[..65].iter().all(|value| value.to_bits() == expected.to_bits()));
+                    assert_eq!(actual[65].to_bits(), (99.0 as $ty).to_bits());
+                }
+            }};
+        }
+        check!(f32, F32);
+        check!(f64, F64);
+    }
+
+    #[test]
+    #[ignore = "requires authorized device; exact F64 Uniform selected-result underflow"]
+    fn f64_uniform_consumers_preserve_all_underflow_policies() {
+        let (_discovery, session) = rocm_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0173);
+        let assessor = RocmTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        let owner =
+            PcuDeviceTensor::new([3], session.upload_buffer(pool, &[2.0_f64; 3]).unwrap()).unwrap();
+        for policy in [
+            fusion_pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult,
+            fusion_pcu::PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        ] {
+            let mut graph = Graph::default();
+            let input = graph.input([3], PcuScalarType::F64).unwrap();
+            let literal = graph
+                .uniform_value([3], TensorScalarValue::F64(f64::from_bits(1)))
+                .unwrap();
+            let output = graph.mul(input, literal).unwrap();
+            graph
+                .set_value_float_underflow_policy(output, policy)
+                .unwrap();
+            let program = graph
+                .into_selected_program(
+                    &[output],
+                    TensorArithmeticRewritePolicy::Disabled,
+                    TensorArithmeticCapability::Strict,
+                    TensorPointwiseGroupingPolicy::Disabled,
+                )
+                .unwrap();
+            let prepared = assessor.prepare_owned_program(program).unwrap();
+            for _ in 0..2 {
+                let result = assessor.execute_owned_program_outputs(
+                    &prepared,
+                    &[(input, &owner)],
+                    pool,
+                    &mut memory,
+                );
+                if policy == fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult {
+                    assert!(
+                        matches!(result,Err(RocmTensorExecutionError::ExecutionFault(fault))
+                        if fault.kind == fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow && fault.invocation_id == 0)
+                    );
+                } else {
+                    let outputs = result.unwrap();
+                    let mut actual = [99.0_f64; 4];
+                    session
+                        .download_buffer(pool, outputs[0].1.buffer(), &mut actual[..3])
+                        .unwrap();
+                    assert_eq!(actual.map(f64::to_bits), [2, 2, 2, 99.0_f64.to_bits()]);
+                }
+            }
+            let mut unchanged = [0.0_f64; 3];
+            session
+                .download_buffer(pool, owner.buffer(), &mut unchanged)
+                .unwrap();
+            assert_eq!(unchanged.map(f64::to_bits), [2.0_f64.to_bits(); 3]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires authorized native device; exact F64 literal/consumer law"]
+    #[allow(clippy::too_many_lines)] // Raw transport and the consuming fault share the same native owner proof.
+    fn f64_literals_preserve_payloads_and_fault_only_when_consumed() {
+        let (_discovery, session) = rocm_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0172);
+        let assessor = RocmTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        let patterns = [
+            0,
+            0x8000_0000_0000_0000,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff0_0000_0000_1234,
+            0xfff8_0000_0000_5678,
+            1,
+            0x8000_0000_0000_0001,
+            0x3ff0_0000_0000_1000,
+        ];
+        for strict in [false, true] {
+            for native in [false, true] {
+                for optimized in [false, true] {
+                    for uniform in [false, true] {
+                        let mut graph = Graph::default();
+                        if strict {
+                            graph.set_numerical_mode(fusion_pcu::PcuNumericalMode::Strict);
+                        }
+                        graph.set_numerical_options(fusion_pcu::PcuNumericalOptions {
+                            compound_arithmetic: if native {
+                                fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
+                            } else {
+                                fusion_pcu::PcuCompoundArithmeticPolicy::Checked
+                            },
+                            precision: if optimized {
+                                fusion_pcu::PcuPrecisionPolicy::BackendOptimized
+                            } else {
+                                fusion_pcu::PcuPrecisionPolicy::Preserve
+                            },
+                            ..Default::default()
+                        });
+                        let values = (0..17)
+                            .map(|i| f64::from_bits(patterns[i % patterns.len()]))
+                            .collect::<Vec<_>>();
+                        let literal = if uniform {
+                            graph
+                                .uniform_value([17], TensorScalarValue::F64(values[4]))
+                                .unwrap()
+                        } else {
+                            graph.constant_value(TensorValue::F64(
+                                Tensor::new([17], values.clone()).unwrap(),
+                            ))
+                        };
+                        let expected = if uniform {
+                            vec![patterns[4]; 17]
+                        } else {
+                            values.iter().map(|v| v.to_bits()).collect()
+                        };
+                        let program = graph
+                            .into_selected_program(
+                                &[literal],
+                                TensorArithmeticRewritePolicy::Disabled,
+                                TensorArithmeticCapability::Strict,
+                                TensorPointwiseGroupingPolicy::Disabled,
+                            )
+                            .unwrap();
+                        #[cfg(feature = "allocation-census")]
+                        crate::reset_rocm_api_census();
+                        let prepared = assessor.prepare_owned_program(program).unwrap();
+                        #[cfg(feature = "allocation-census")]
+                        {
+                            let api = crate::rocm_api_census();
+                            assert_eq!(api.allocations, 0);
+                            assert_eq!(api.module_loads, 0);
+                        }
+                        let first = assessor
+                            .execute_owned_program_output_from_inputs::<f64, _>(
+                                &prepared,
+                                &[],
+                                pool,
+                                &mut memory,
+                            )
+                            .unwrap();
+                        let second = assessor
+                            .execute_owned_program_output_from_inputs::<f64, _>(
+                                &prepared,
+                                &[],
+                                pool,
+                                &mut memory,
+                            )
+                            .unwrap();
+                        drop(prepared);
+                        for output in [first, second] {
+                            let mut observed = [99.0_f64; 18];
+                            session
+                                .download_buffer(pool, output.buffer(), &mut observed[..17])
+                                .unwrap();
+                            assert_eq!(
+                                observed[..17]
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                            assert_eq!(observed[17].to_bits(), 99.0_f64.to_bits());
+                        }
+                    }
+                }
+            }
+        }
+        let mut graph = Graph::default();
+        let input = graph.input([3], PcuScalarType::F64).unwrap();
+        let constant = graph.constant_value(TensorValue::F64(
+            Tensor::new([3], vec![1.0, 1.0, f64::from_bits(patterns[4])]).unwrap(),
+        ));
+        let output = graph.mul(input, constant).unwrap();
+        let program = graph
+            .into_selected_program(
+                &[output],
+                TensorArithmeticRewritePolicy::Disabled,
+                TensorArithmeticCapability::Strict,
+                TensorPointwiseGroupingPolicy::Disabled,
+            )
+            .unwrap();
+        let prepared = assessor.prepare_owned_program(program).unwrap();
+        let input_owner =
+            PcuDeviceTensor::new([3], session.upload_buffer(pool, &[2.0_f64; 3]).unwrap()).unwrap();
+        let result = assessor.execute_owned_program_outputs(
+            &prepared,
+            &[(input, &input_owner)],
+            pool,
+            &mut memory,
+        );
+        assert!(
+            matches!(result,Err(RocmTensorExecutionError::ExecutionFault(fault))
+            if fault.kind == fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand && fault.invocation_id == 2)
+        );
+        let mut unchanged = [0.0_f64; 3];
+        session
+            .download_buffer(pool, input_owner.buffer(), &mut unchanged)
+            .unwrap();
+        assert_eq!(unchanged.map(f64::to_bits), [2.0_f64.to_bits(); 3]);
+    }
+
+    #[test]
+    #[ignore = "requires authorized Rocm device"]
+    fn selected_uniform_preserves_raw_bits_with_scratch_and_output_bank() {
+        let (_discovery, session) = rocm_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0170);
+        let assessor = RocmTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        for bits in [
+            0x0000_0000,
+            0x8000_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_1234,
+            0x7fc0_5678,
+            0x0000_0001,
+            0x8000_0001,
+        ] {
+            let mut graph = Graph::default();
+            let uniform = graph
+                .uniform_value([17], TensorScalarValue::F32(f32::from_bits(bits)))
+                .unwrap();
+            let prepared = assessor.prepare_graph_outputs(&graph, &[uniform]).unwrap();
+            let mut scratch = assessor
+                .prepare_scratch(&prepared, pool, &mut memory)
+                .unwrap();
+            let mut bank = assessor
+                .prepare_output_bank(&prepared, pool, &mut memory)
+                .unwrap();
+            for _ in 0..2 {
+                assessor
+                    .execute_prepared_outputs_into_bank(
+                        &prepared,
+                        &[],
+                        &mut scratch,
+                        &mut bank,
+                        &mut memory,
+                    )
+                    .unwrap();
+                let observed = assessor
+                    .download_output(&bank.outputs()[0], pool, &mut memory)
+                    .unwrap();
+                assert!(observed.data().iter().all(|value| value.to_bits() == bits));
+            }
         }
     }
 
@@ -11165,6 +12151,14 @@ mod tests {
                 assert_eq!(
                     rocm_supports_operand_representation(node, TensorOperandRepresentation::Dense),
                     is_transport_input
+                        || (value == sum
+                            && matches!(
+                                scalar_type,
+                                PcuScalarType::F16
+                                    | PcuScalarType::BF16
+                                    | PcuScalarType::F8E4M3FN
+                                    | PcuScalarType::F8E5M2
+                            ))
                 );
                 assert!(!rocm_supports_operand_representation(
                     node,
@@ -11188,7 +12182,7 @@ mod tests {
     }
 
     #[test]
-    fn assessor_limits_f64_to_owned_dense_arithmetic_and_rejects_training_sources() {
+    fn assessor_admits_dense_f64_literals_and_arithmetic() {
         let mut graph = Graph::default();
         graph.set_numerical_mode(fusion_pcu::PcuNumericalMode::Strict);
         let input = graph.input_typed::<f64>([2, 2]).unwrap();
@@ -11235,18 +12229,13 @@ mod tests {
             let node = graph.nodes().find(|node| node.value == value).unwrap();
             assert_eq!(
                 assess_tensor_node(&graph, node),
-                TensorOperationSupport::Unsupported {
-                    reason: TensorUnsupportedReason::ElementType,
+                TensorOperationSupport::Supported {
+                    route: TensorExecutionRoute::Native,
+                    workspace_bytes: Some(0),
                 }
             );
         }
-        assert!(matches!(
-            prepare_graph(&graph, product.erase(), &PureRocmAssessor),
-            Err(RocmTensorExecutionError::Unsupported {
-                reason: TensorUnsupportedReason::ElementType,
-                ..
-            })
-        ));
+        assert!(prepare_graph(&graph, product.erase(), &PureRocmAssessor).is_ok());
     }
 
     #[test]
@@ -11289,7 +12278,10 @@ mod tests {
                     "relu_backward" => graph.relu_backward(first, second).unwrap(),
                     _ => unreachable!(),
                 };
-                if operation == "sgd" && mode == fusion_pcu::PcuNumericalMode::Strict {
+                if operation == "relu_backward"
+                    || ((operation == "sgd" || operation == "mse")
+                        && mode == fusion_pcu::PcuNumericalMode::Strict)
+                {
                     assert!(matches!(
                         assess_tensor_node(&graph, graph.node(output).unwrap()),
                         TensorOperationSupport::Supported {

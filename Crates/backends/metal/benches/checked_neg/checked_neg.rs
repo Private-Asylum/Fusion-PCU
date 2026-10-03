@@ -128,6 +128,7 @@ fn graph<const N: usize>(session: &MetalSession) -> MetalPreparedF32Kernel {
     ];
     session
         .prepare_f32_unary_kernel(&PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "checked_neg",

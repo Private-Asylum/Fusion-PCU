@@ -16,9 +16,20 @@ pub unsafe fn symbol<'library, T>(
     library: &'library Library,
     name: &[u8],
 ) -> Result<Symbol<'library, T>, libloading::Error> {
+    #[cfg(feature = "allocation-census")]
+    census::symbol();
     // SAFETY: the caller upholds the symbol name/type and library lifetime contract above.
     unsafe { library.get(name) }
 }
+
+#[cfg(feature = "allocation-census")]
+#[path = "census/census.rs"]
+mod census;
+#[cfg(feature = "allocation-census")]
+pub use census::{RocmApiCensus, rocm_api_census, reset_rocm_api_census};
+#[path = "retained/retained.rs"]
+mod retained;
+pub use retained::RetainedApi;
 
 #[path = "hip.rs"]
 pub mod hip;
@@ -396,44 +407,26 @@ use std::ffi::CStr;
 fn hip_call<T: Copy>(
     runtime: &HipRuntime,
     symbol: &'static str,
+    retained: &Result<T, HipError>,
     invoke: impl FnOnce(T) -> hip::HipResult,
 ) -> Result<(), HipError> {
+    // Resolve failures stay cold-owned but retain the same operation-specific error when used.
+    let function = *retained.as_ref().map_err(Clone::clone)?;
     if symbol != "hipSetDevice" {
-        // HIP's current device is thread-local, so select this runtime's device before each
-        // operation. This keeps cloned handles valid when used from another host thread.
-        let setter =
-            unsafe { crate::ffi::symbol::<hip::SetDevice>(&runtime.0.library, b"hipSetDevice\0") }
-                .map_err(|error| HipError::MissingSymbol {
-                    symbol: "hipSetDevice",
-                    detail: error.to_string(),
-                })?;
+        // HIP current-device state remains thread-local. Pointer retention removes resolution,
+        // never this per-operation selection required by cloned runtimes on another thread.
+        let setter = runtime.0.api.set_device.as_ref().map_err(Clone::clone)?;
+        #[cfg(feature = "allocation-census")]
+        census::call("hipSetDevice");
+        // SAFETY: RuntimeInner retains this exact HIP library and selected device ordinal.
         let status = unsafe { setter(runtime.0.device) };
         if status != hip::HIP_SUCCESS {
             return Err(runtime.error("hipSetDevice", status));
         }
     }
-    // libloading allocates a CString when the supplied symbol lacks a trailing NUL. All
-    // ordinary HIP symbols fit in this stack buffer; retain an overflow path for future ABI
-    // names rather than making symbol length an undocumented runtime limit.
-    let mut inline_symbol = [0_u8; 64];
-    let mut overflow_symbol = Vec::new();
-    let symbol_bytes = if symbol.len() < inline_symbol.len() {
-        inline_symbol[..symbol.len()].copy_from_slice(symbol.as_bytes());
-        &inline_symbol[..=symbol.len()]
-    } else {
-        overflow_symbol.extend_from_slice(symbol.as_bytes());
-        overflow_symbol.push(0);
-        &overflow_symbol
-    };
-    // SAFETY: `symbol` is loaded from the retained HIP runtime and `T` matches the named C ABI.
-    let function =
-        unsafe { crate::ffi::symbol::<T>(&runtime.0.library, symbol_bytes) }.map_err(|error| {
-            HipError::MissingSymbol {
-                symbol,
-                detail: error.to_string(),
-            }
-        })?;
-    let status = invoke(*function);
+    #[cfg(feature = "allocation-census")]
+    census::call(symbol);
+    let status = invoke(function);
     if status == hip::HIP_SUCCESS {
         Ok(())
     } else {
@@ -443,13 +436,20 @@ fn hip_call<T: Copy>(
 
 pub fn hip_error(runtime: &HipRuntime, operation: &'static str, code: hip::HipResult) -> HipError {
     // Error-string lookup is optional; preserve numeric status even if the symbol is absent.
-    let detail = unsafe {
-        crate::ffi::symbol::<hip::GetErrorString>(&runtime.0.library, b"hipGetErrorString\0")
-    }
-    .ok()
-    .map(|f| unsafe { f(code) })
-    .filter(|p| !p.is_null())
-    .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
+    let detail = runtime
+        .0
+        .api
+        .get_error_string
+        .as_ref()
+        .ok()
+        .map(|f| {
+            #[cfg(feature = "allocation-census")]
+            census::call("hipGetErrorString");
+            // SAFETY: exact retained HIP error-string entry; HIP owns the returned static string.
+            unsafe { f(code) }
+        })
+        .filter(|p| !p.is_null())
+        .map(|p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
     HipError::Runtime {
         operation,
         code,
@@ -472,6 +472,7 @@ pub unsafe fn invoke_hipGetDeviceCount(
     hip_call(
         runtime,
         "hipGetDeviceCount",
+        &runtime.0.api.get_device_count,
         |f: hip::GetDeviceCount| unsafe { f(count) },
     )
 }
@@ -492,6 +493,7 @@ pub unsafe fn invoke_hipDeviceTotalMem(
     hip_call(
         runtime,
         "hipDeviceTotalMem",
+        &runtime.0.api.device_total_mem,
         |f: hip::DeviceTotalMem| unsafe { f(bytes, device) },
     )
 }
@@ -509,9 +511,12 @@ pub unsafe fn invoke_hipMemGetInfo(
     free: *mut usize,
     total: *mut usize,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipMemGetInfo", |f: hip::MemGetInfo| unsafe {
-        f(free, total)
-    })
+    hip_call(
+        runtime,
+        "hipMemGetInfo",
+        &runtime.0.api.mem_get_info,
+        |f: hip::MemGetInfo| unsafe { f(free, total) },
+    )
 }
 
 /// Invoke `hipMalloc` on the retained selected HIP runtime.
@@ -527,9 +532,12 @@ pub unsafe fn invoke_hipMalloc(
     allocation: *mut *mut c_void,
     bytes: usize,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipMalloc", |f: hip::Malloc| unsafe {
-        f(allocation, bytes)
-    })
+    hip_call(
+        runtime,
+        "hipMalloc",
+        &runtime.0.api.malloc,
+        |f: hip::Malloc| unsafe { f(allocation, bytes) },
+    )
 }
 
 /// Invoke `hipModuleLoadData` on the retained selected HIP runtime.
@@ -548,6 +556,7 @@ pub unsafe fn invoke_hipModuleLoadData(
     hip_call(
         runtime,
         "hipModuleLoadData",
+        &runtime.0.api.module_load_data,
         |f: hip::ModuleLoadData| unsafe { f(module, image) },
     )
 }
@@ -564,9 +573,12 @@ pub unsafe fn invoke_hipStreamCreate(
     runtime: &HipRuntime,
     stream: *mut hip::HipStream,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipStreamCreate", |f: hip::StreamCreate| unsafe {
-        f(stream)
-    })
+    hip_call(
+        runtime,
+        "hipStreamCreate",
+        &runtime.0.api.stream_create,
+        |f: hip::StreamCreate| unsafe { f(stream) },
+    )
 }
 
 /// Invoke `hipEventCreateWithFlags` on the retained selected HIP runtime.
@@ -585,6 +597,7 @@ pub unsafe fn invoke_hipEventCreateWithFlags(
     hip_call(
         runtime,
         "hipEventCreateWithFlags",
+        &runtime.0.api.event_create_with_flags,
         |f: hip::EventCreate| unsafe { f(event, flags) },
     )
 }
@@ -606,6 +619,7 @@ pub unsafe fn invoke_hipEventElapsedTime(
     hip_call(
         runtime,
         "hipEventElapsedTime",
+        &runtime.0.api.event_elapsed_time,
         |f: hip::EventElapsedTime| unsafe { f(milliseconds, start, end) },
     )
 }
@@ -627,7 +641,31 @@ pub unsafe fn invoke_hipDeviceGetName(
     hip_call(
         runtime,
         "hipDeviceGetName",
+        &runtime.0.api.device_get_name,
         |f: hip::GetDeviceName| unsafe { f(name, capacity, device) },
+    )
+}
+
+/// Invoke the optional exact PCI-location ABI retained by this runtime.
+///
+/// # Safety
+/// The buffer must cover `capacity` writable bytes and ordinal must refer to this provider.
+#[inline]
+#[allow(non_snake_case)] // Exact private SDK boundary.
+pub unsafe fn invoke_hipDeviceGetPCIBusId(
+    runtime: &HipRuntime,
+    buffer: *mut c_char,
+    capacity: c_int,
+    ordinal: c_int,
+) -> Result<(), HipError> {
+    hip_call(
+        runtime,
+        "hipDeviceGetPCIBusId",
+        &runtime.0.api.device_get_pci_bus_id,
+        |function: hip::GetDevicePciBusId| {
+            // SAFETY: caller validates the exact capacity and retained provider ordinal.
+            unsafe { function(buffer, capacity, ordinal) }
+        },
     )
 }
 
@@ -644,9 +682,12 @@ pub unsafe fn invoke_hipDeviceGet(
     device: *mut hip::HipDevice,
     ordinal: c_int,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipDeviceGet", |f: hip::GetDevice| unsafe {
-        f(device, ordinal)
-    })
+    hip_call(
+        runtime,
+        "hipDeviceGet",
+        &runtime.0.api.device_get,
+        |f: hip::GetDevice| unsafe { f(device, ordinal) },
+    )
 }
 
 /// Invoke `hipSetDevice` on the retained selected HIP runtime.
@@ -661,9 +702,12 @@ pub unsafe fn invoke_hipSetDevice(
     runtime: &HipRuntime,
     device: hip::HipDevice,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipSetDevice", |f: hip::SetDevice| unsafe {
-        f(device)
-    })
+    hip_call(
+        runtime,
+        "hipSetDevice",
+        &runtime.0.api.set_device,
+        |f: hip::SetDevice| unsafe { f(device) },
+    )
 }
 
 /// Invoke `hipFree` on the retained selected HIP runtime.
@@ -678,7 +722,12 @@ pub unsafe fn invoke_hipFree(
     runtime: &HipRuntime,
     allocation: *mut c_void,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipFree", |f: hip::Free| unsafe { f(allocation) })
+    hip_call(
+        runtime,
+        "hipFree",
+        &runtime.0.api.free,
+        |f: hip::Free| unsafe { f(allocation) },
+    )
 }
 
 /// Invoke `hipMemcpy` on the retained selected HIP runtime.
@@ -696,9 +745,16 @@ pub unsafe fn invoke_hipMemcpy(
     bytes: usize,
     direction: c_int,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipMemcpy", |f: hip::Memcpy| unsafe {
-        f(destination, source, bytes, direction)
-    })
+    hip_call(
+        runtime,
+        "hipMemcpy",
+        &runtime.0.api.memcpy,
+        |f: hip::Memcpy| unsafe {
+            #[cfg(feature = "allocation-census")]
+            census::copy(direction);
+            f(destination, source, bytes, direction)
+        },
+    )
 }
 
 /// Invoke `hipDeviceSynchronize` on the retained selected HIP runtime.
@@ -713,6 +769,7 @@ pub unsafe fn invoke_hipDeviceSynchronize(runtime: &HipRuntime) -> Result<(), Hi
     hip_call(
         runtime,
         "hipDeviceSynchronize",
+        &runtime.0.api.device_synchronize,
         |f: hip::HipNoArgStatus| unsafe { f() },
     )
 }
@@ -732,6 +789,7 @@ pub unsafe fn invoke_hipStreamDestroy(
     hip_call(
         runtime,
         "hipStreamDestroy",
+        &runtime.0.api.stream_destroy,
         |f: hip::StreamDestroy| unsafe { f(stream) },
     )
 }
@@ -751,6 +809,7 @@ pub unsafe fn invoke_hipStreamSynchronize(
     hip_call(
         runtime,
         "hipStreamSynchronize",
+        &runtime.0.api.stream_synchronize,
         |f: hip::StreamSynchronize| unsafe { f(stream) },
     )
 }
@@ -768,9 +827,12 @@ pub unsafe fn invoke_hipEventRecord(
     event: hip::HipEvent,
     stream: hip::HipStream,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipEventRecord", |f: hip::EventRecord| unsafe {
-        f(event, stream)
-    })
+    hip_call(
+        runtime,
+        "hipEventRecord",
+        &runtime.0.api.event_record,
+        |f: hip::EventRecord| unsafe { f(event, stream) },
+    )
 }
 
 /// Invoke `hipEventDestroy` on the retained selected HIP runtime.
@@ -785,9 +847,12 @@ pub unsafe fn invoke_hipEventDestroy(
     runtime: &HipRuntime,
     event: hip::HipEvent,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipEventDestroy", |f: hip::EventDestroy| unsafe {
-        f(event)
-    })
+    hip_call(
+        runtime,
+        "hipEventDestroy",
+        &runtime.0.api.event_destroy,
+        |f: hip::EventDestroy| unsafe { f(event) },
+    )
 }
 
 /// Invoke `hipEventSynchronize` on the retained selected HIP runtime.
@@ -805,6 +870,7 @@ pub unsafe fn invoke_hipEventSynchronize(
     hip_call(
         runtime,
         "hipEventSynchronize",
+        &runtime.0.api.event_synchronize,
         |f: hip::EventSynchronize| unsafe { f(event) },
     )
 }
@@ -821,9 +887,12 @@ pub unsafe fn invoke_hipModuleUnload(
     runtime: &HipRuntime,
     module: hip::ModuleHandle,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipModuleUnload", |f: hip::ModuleUnload| unsafe {
-        f(module)
-    })
+    hip_call(
+        runtime,
+        "hipModuleUnload",
+        &runtime.0.api.module_unload,
+        |f: hip::ModuleUnload| unsafe { f(module) },
+    )
 }
 
 /// Invoke `hipModuleGetFunction` on the retained selected HIP runtime.
@@ -843,6 +912,7 @@ pub unsafe fn invoke_hipModuleGetFunction(
     hip_call(
         runtime,
         "hipModuleGetFunction",
+        &runtime.0.api.module_get_function,
         |f: hip::ModuleGetFunction| unsafe { f(kernel, module, name) },
     )
 }
@@ -863,9 +933,16 @@ pub unsafe fn invoke_hipMemcpyAsync(
     direction: c_int,
     stream: hip::HipStream,
 ) -> Result<(), HipError> {
-    hip_call(runtime, "hipMemcpyAsync", |f: hip::MemcpyAsync| unsafe {
-        f(destination, source, bytes, direction, stream)
-    })
+    hip_call(
+        runtime,
+        "hipMemcpyAsync",
+        &runtime.0.api.memcpy_async,
+        |f: hip::MemcpyAsync| unsafe {
+            #[cfg(feature = "allocation-census")]
+            census::copy(direction);
+            f(destination, source, bytes, direction, stream)
+        },
+    )
 }
 
 /// Invoke `hipStreamWaitEvent` on the retained selected HIP runtime.
@@ -885,6 +962,7 @@ pub unsafe fn invoke_hipStreamWaitEvent(
     hip_call(
         runtime,
         "hipStreamWaitEvent",
+        &runtime.0.api.stream_wait_event,
         |f: hip::StreamWaitEvent| unsafe { f(stream, event, flags) },
     )
 }
@@ -915,6 +993,7 @@ pub unsafe fn invoke_hipModuleLaunchKernel(
     hip_call(
         runtime,
         "hipModuleLaunchKernel",
+        &runtime.0.api.module_launch_kernel,
         |f: hip::ModuleLaunchKernel| unsafe {
             f(
                 kernel,
@@ -1369,3 +1448,77 @@ pub fn check_hiprtc(
         detail,
     })
 }
+
+/// Resolve the exact `rocblas_dasum` ABI while retaining the library borrow.
+///
+/// # Safety
+/// The library must be a compatible rocBLAS provider and remain loaded through every use.
+pub unsafe fn require_rocblas_dasum(
+    library: &Library,
+) -> Result<Symbol<'_, rocblas::Dasum>, libloading::Error> {
+    // SAFETY: SDK name and ABI are paired here; caller retains the compatible library.
+    unsafe { symbol(library, b"rocblas_dasum\0") }
+}
+/// Invoke `rocblas_dasum` with the caller's validated selected-device resources.
+///
+/// # Safety
+/// The function must originate from a retained compatible library. Handles must be live on
+/// the selected device. Pointers must cover validated typed extents and appropriate host/device
+/// pointer mode; retained leases must prevent conflicting access through terminal completion.
+#[inline]
+pub unsafe fn invoke_rocblas_dasum(
+    function: &rocblas::Dasum,
+    handle: rocblas::RocblasHandle,
+    length: c_int,
+    input: *const f64,
+    stride: c_int,
+    result: *mut f64,
+) -> rocblas::RocblasStatus {
+    // SAFETY: caller supplies the validated pointer, handle, library and lease contract above.
+    unsafe { function(handle, length, input, stride, result) }
+}
+
+/// Resolve the exact `rocblas_dscal` ABI while retaining the library borrow.
+///
+/// # Safety
+/// The library must be a compatible rocBLAS provider and remain loaded through every use.
+pub unsafe fn require_rocblas_dscal(
+    library: &Library,
+) -> Result<Symbol<'_, rocblas::Dscal>, libloading::Error> {
+    // SAFETY: SDK name and ABI are paired here; caller retains the compatible library.
+    unsafe { symbol(library, b"rocblas_dscal\0") }
+}
+/// Invoke `rocblas_dscal` with the caller's validated selected-device resources.
+///
+/// # Safety
+/// The function must originate from a retained compatible library. Handles must be live on
+/// the selected device. Pointers must cover validated typed extents and appropriate host/device
+/// pointer mode; retained leases must prevent conflicting access through terminal completion.
+#[inline]
+pub unsafe fn invoke_rocblas_dscal(
+    function: &rocblas::Dscal,
+    handle: rocblas::RocblasHandle,
+    length: c_int,
+    alpha: *const f64,
+    values: *mut f64,
+    stride: c_int,
+) -> rocblas::RocblasStatus {
+    // SAFETY: caller supplies the validated pointer, handle, library and lease contract above.
+    unsafe { function(handle, length, alpha, values, stride) }
+}
+
+#[path = "blas_vector/blas_vector.rs"]
+mod blas_vector;
+#[rustfmt::skip]
+pub use blas_vector::{
+    VectorFunctions,
+    retain as retain_blas_vector_functions,
+};
+
+#[path = "blas_handle/blas_handle.rs"]
+mod blas_handle;
+#[rustfmt::skip]
+pub use blas_handle::{
+    BlasHandleFunctions,
+    retain as retain_blas_handle_functions,
+};

@@ -1,0 +1,111 @@
+#version 450
+// Per-operand indexing is independent of physical input bank; repeated-bank descriptors alias one actual input owner.
+// Exact checked integer +-*. Native U32 only: no Int64, narrow storage or floating features.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint ELEMENT_BYTES=4u;
+layout(constant_id=1) const uint SIGNED=0u;
+layout(constant_id=2) const uint OP=0u;
+layout(constant_id=3) const uint EXTENT=1u;
+layout(constant_id=4) const uint BROADCAST_A=0u;
+layout(constant_id=5) const uint BROADCAST_B=0u;
+layout(constant_id=6) const uint OPERAND_A=0u;
+layout(constant_id=7) const uint OPERAND_B=1u;
+layout(constant_id=8) const uint CLAMP=0u;
+layout(set=0,binding=0,std430) readonly buffer A {uint words[];} source_a;
+layout(set=0,binding=1,std430) readonly buffer B {uint words[];} source_b;
+layout(set=0,binding=2,std430) writeonly buffer C {uint words[];} output_data;
+layout(set=0,binding=3,std430) writeonly buffer Status {uint codes[];} status_data;
+uint width(){return max(ELEMENT_BYTES/4u,1u);}
+uint mask(){return ELEMENT_BYTES==1u?0xffu:ELEMENT_BYTES==2u?0xffffu:0xffffffffu;}
+uint sign_bit(){return ELEMENT_BYTES==1u?0x80u:ELEMENT_BYTES==2u?0x8000u:0x80000000u;}
+uint load_word(uint source,uint lane,uint limb,uint broadcast) {
+    uint index=broadcast!=0u?0u:lane;
+    // Cold admission proves ELEMENT_BYTES*EXTENT<=UINT_MAX and width<=16.
+    // Narrow offsets are only0/8/16/24, so every shift is strictly below32.
+    uint byte=index*ELEMENT_BYTES;
+    uint word=byte/4u+limb;
+    uint value=source==0u?source_a.words[word]:source_b.words[word];
+    return ELEMENT_BYTES<4u?(value>>((byte%4u)*8u))&mask():value;
+}
+void negate(in uint source[16],out uint result[16]) {
+    for(uint limb=0u;limb<16u;limb++)result[limb]=0u;
+    uint carry=1u;
+    for(uint limb=0u;limb<width();limb++) {uint value=(~source[limb])+carry;carry=uint(carry!=0u&&value==0u);result[limb]=value;}
+    result[width()-1u]&=mask();
+}
+void saturate(uint code,out uint result[16]) {
+    for(uint limb=0u;limb<16u;limb++)result[limb]=0u;
+    for(uint limb=0u;limb<width();limb++)result[limb]=code==2u?0u:0xffffffffu;
+    if(SIGNED!=0u)result[width()-1u]=code==2u?sign_bit():sign_bit()-1u;
+    else result[width()-1u]&=mask();
+}
+uint evaluate(uint lane,out uint result[16]) {
+    uint left[16],right[16];uint n=width();
+    for(uint limb=0u;limb<16u;limb++){left[limb]=0u;right[limb]=0u;result[limb]=0u;}
+    for(uint limb=0u;limb<n;limb++){left[limb]=load_word(OPERAND_A,lane,limb,BROADCAST_A);right[limb]=load_word(OPERAND_B,lane,limb,BROADCAST_B);}
+    bool left_negative=SIGNED!=0u&&(left[n-1u]&sign_bit())!=0u;
+    bool right_negative=SIGNED!=0u&&(right[n-1u]&sign_bit())!=0u;
+    uint code=0u;
+    if(OP<2u) {
+        uint carry=0u;
+        for(uint limb=0u;limb<n;limb++) {
+            uint intermediate=OP==0u?left[limb]+right[limb]:left[limb]-right[limb];
+            uint first=OP==0u?uint(intermediate<left[limb]):uint(left[limb]<right[limb]);
+            uint value=OP==0u?intermediate+carry:intermediate-carry;
+            uint second=OP==0u?uint(value<intermediate):uint(intermediate<carry);
+            result[limb]=value;carry=first|second;
+        }
+        bool extra=(result[n-1u]&~mask())!=0u;result[n-1u]&=mask();
+        if(SIGNED==0u) {if(OP==0u&&(carry!=0u||extra))code=3u;if(OP==1u&&carry!=0u)code=2u;}
+        else {
+            bool negative=(result[n-1u]&sign_bit())!=0u;
+            bool fault=OP==0u?(left_negative==right_negative&&negative!=left_negative):(left_negative!=right_negative&&negative!=left_negative);
+            if(fault)code=left_negative?2u:3u;
+        }
+    } else {
+        uint magnitude_a[16],magnitude_b[16];
+        for(uint i=0u;i<16u;i++){magnitude_a[i]=0u;magnitude_b[i]=0u;}
+        if(left_negative)negate(left,magnitude_a);else for(uint i=0u;i<n;i++)magnitude_a[i]=left[i];
+        if(right_negative)negate(right,magnitude_b);else for(uint i=0u;i<n;i++)magnitude_b[i]=right[i];
+        uint product[32];for(uint i=0u;i<32u;i++)product[i]=0u;
+        for(uint i=0u;i<n;i++) {
+            uint carry=0u;
+            for(uint j=0u;j<n;j++) {
+                uint high,low;umulExtended(magnitude_a[i],magnitude_b[j],high,low);
+                uint sum=product[i+j]+low;uint first=uint(sum<product[i+j]);
+                uint value=sum+carry;uint second=uint(value<sum);product[i+j]=value;
+                // A 32x32 product plus one prior limb and carry is at most2^64-1.
+                // Thus high+first+second fitsU32, including UINT_MAX operands.
+                carry=high+first+second;
+            }
+            // This slot has not been written by an earlier row; no carry is discarded.
+            product[i+n]=carry;
+        }
+        bool negative=left_negative!=right_negative;
+        bool large=false;for(uint i=n;i<2u*n;i++)large=large||product[i]!=0u;
+        uint limit=SIGNED==0u?mask():negative?sign_bit():sign_bit()-1u;
+        large=large||product[n-1u]>limit;
+        if(SIGNED!=0u&&negative&&product[n-1u]==limit)for(uint i=0u;i+1u<n;i++)large=large||product[i]!=0u;
+        if(large)code=SIGNED!=0u&&negative?2u:3u;
+        for(uint i=0u;i<n;i++)left[i]=product[i];
+        if(negative)negate(left,result);else for(uint i=0u;i<n;i++)result[i]=left[i];
+        result[n-1u]&=mask();
+    }
+    if(code!=0u&&CLAMP!=0u)saturate(code,result);
+    return code;
+}
+void main() {
+    uint pack=ELEMENT_BYTES<4u?4u/ELEMENT_BYTES:1u;
+    uint word=gl_GlobalInvocationID.x;
+    // No round-up multiplication: admission bounds bytes and host rounds dispatch by division.
+    if(word>=EXTENT/pack+uint(EXTENT%pack!=0u))return;
+    uint packed=0u;
+    for(uint sublane=0u;sublane<pack;sublane++) {
+        uint lane=word*pack+sublane;if(lane>=EXTENT)break;
+        uint result[16];uint code=evaluate(lane,result);status_data.codes[lane]=code;
+        if(ELEMENT_BYTES<4u)packed|=result[0]<<(sublane*ELEMENT_BYTES*8u);
+        else for(uint limb=0u;limb<width();limb++)output_data.words[lane*width()+limb]=result[limb];
+    }
+    // Exactly one invocation owns each complete narrow output word, including odd tails.
+    if(ELEMENT_BYTES<4u)output_data.words[word]=packed;
+}

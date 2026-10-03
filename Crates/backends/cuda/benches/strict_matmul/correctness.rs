@@ -86,6 +86,7 @@ fn packed_fault(error: &TensorError) -> u64 {
 pub fn run<T: Scalar + TensorElement>(
     backend: &Rc<CudaOwnedDispatchBackend>,
     runtime: &CudaRuntime,
+    options: fusion_pcu::PcuNumericalOptions,
 ) -> Result<(), Box<dyn Error>> {
     let zero = T::default();
     let one = T::small(1);
@@ -167,6 +168,7 @@ pub fn run<T: Scalar + TensorElement>(
         let right = right.map(|value| [value]);
         let mut graph = Graph::default();
         graph.set_numerical_mode(PcuNumericalMode::Strict);
+        graph.set_numerical_options(options);
         let left_id = graph.input([1, 3], T::TYPE)?;
         let right_id = graph.input([3, 1], T::TYPE)?;
         let output_id = graph.matmul(left_id, right_id)?;

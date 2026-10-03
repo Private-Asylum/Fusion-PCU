@@ -1,6 +1,56 @@
 //! Real annotated helpers capture independent numerical options without executing a backend.
 
 extern crate std;
+
+#[path = "numerical_tests/identity/identity.rs"]
+mod identity;
+
+macro_rules! low_binary_helper {
+    ($name:ident, $operation:ident) => {
+        #[crate::pcu(crate_path = crate, flag(reject_subnormal_result))]
+        fn $name<T: crate::PcuCheckedFloat>(
+            left: &[T],
+            right: &[T],
+        ) -> Result<crate::PcuTensor<T>, crate::PcuExecutionError> {
+            pcu::$operation(left, right)
+        }
+    };
+}
+low_binary_helper!(low_add, add);
+low_binary_helper!(low_sub, sub);
+low_binary_helper!(low_mul, mul);
+low_binary_helper!(low_div, div);
+
+fn low_policy<T: crate::PcuCheckedFloat>() {
+    let shape = PcuSourceShape::Slice { length: 5 };
+    let (mut capture, values) = PcuTensorGraphCapture::new::<T, 2>([shape; 2]).unwrap();
+    for operation in [
+        low_add::__pcu_capture_entry::<T>,
+        low_sub::__pcu_capture_entry::<T>,
+        low_mul::__pcu_capture_entry::<T>,
+        low_div::__pcu_capture_entry::<T>,
+    ] {
+        let output = operation(&mut capture, values).unwrap();
+        let node = capture.graph.node(output.value.erase()).unwrap();
+        assert_eq!(node.scalar_type, T::TYPE);
+        assert_eq!(
+            node.float_underflow_policy,
+            Some(crate::PcuFloatUnderflowPolicy::RejectSubnormalResult)
+        );
+        assert_eq!(
+            capture.float_underflow_policy.get(),
+            crate::PcuFloatUnderflowPolicy::IeeeAfterRounding
+        );
+    }
+}
+
+#[test]
+fn low_float_owned_binary_helpers_capture_local_underflow_policy() {
+    low_policy::<crate::PcuF16Bits>();
+    low_policy::<crate::PcuBf16Bits>();
+    low_policy::<crate::PcuF8E4M3FnBits>();
+    low_policy::<crate::PcuF8E5M2Bits>();
+}
 #[rustfmt::skip]
 use super::{
     PcuExecutionError,

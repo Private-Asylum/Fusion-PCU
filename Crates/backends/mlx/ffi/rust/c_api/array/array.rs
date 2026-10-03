@@ -61,6 +61,20 @@ impl Array {
         }
         Ok(())
     }
+    pub fn encoded_f32_view(&self) -> Result<super::encoded::EncodedArray, MlxError> {
+        self.session.ensure_ready()?;
+        self.validate()?;
+        #[cfg(feature = "view-census")]
+        super::view::census::record(super::view::census::Call::Clone);
+        let input = self.session.clone_array(self)?;
+        let owner = super::view::complete_view(&self.session, input, self.shape, false)?;
+        super::encoded::EncodedArray::from_owner(
+            &self.session,
+            fusion_pcu::PcuScalarType::F32,
+            self.shape[0] * self.shape[1],
+            owner,
+        )
+    }
     pub const fn shape(&self) -> [usize; 2] {
         self.shape
     }

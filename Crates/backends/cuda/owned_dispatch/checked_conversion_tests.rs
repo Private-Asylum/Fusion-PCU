@@ -86,6 +86,7 @@ fn prepare_conversion(
     ];
     backend
         .prepare_host_kernel(&PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: fusion_pcu::PcuKernelId(0xc070),
             entry: PcuDispatchEntryPoint {
                 name: "cuda_checked_conversion",

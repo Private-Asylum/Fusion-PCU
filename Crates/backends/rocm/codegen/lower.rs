@@ -147,6 +147,123 @@ impl fmt::Display for RocmLowerError {
 
 impl std::error::Error for RocmLowerError {}
 
+/// Detached schemas for independently admitted checked maps and byte-only transport.
+#[derive(Clone, Copy)]
+pub enum MapBindingProjection {
+    Float(fusion_pcu::CheckedFloatBinaryOperandSchema),
+    Integer(fusion_pcu::CheckedIntegerBinaryOperandSchema),
+    Joint(fusion_pcu::CheckedIntegerDivRemOperandSchema),
+    Composed(composed::ComposedProjection),
+    Transport(transport::TransportProjection),
+}
+
+impl MapBindingProjection {
+    pub fn input_bindings(&self) -> &[PcuBindingRef] {
+        match self {
+            Self::Float(schema) => schema.input_bindings(),
+            Self::Integer(schema) => schema.input_bindings(),
+            Self::Joint(schema) => schema.input_bindings(),
+            Self::Composed(schema) => schema.input_bindings(),
+            Self::Transport(schema) => schema.input_bindings(),
+        }
+    }
+
+    pub fn contains_output(self, binding: PcuBindingRef) -> bool {
+        match self {
+            Self::Float(schema) => schema.output_binding() == binding,
+            Self::Integer(schema) => schema.output_binding() == binding,
+            Self::Joint(schema) => schema.output_bindings().contains(&binding),
+            Self::Composed(schema) => schema.contains_output(binding),
+            Self::Transport(schema) => schema.contains_output(binding),
+        }
+    }
+}
+
+/// Cold opt-in preserves actual loads, independent indices and mathematical SSA roles.
+/// The neutral schema owns read obligations and joint quotient/remainder destinations.
+/// Emission retains original declaration order and typed SSA; only unread declarations
+/// leave the device ABI. The original exact numerical request is never rewritten.
+pub fn map_binding_projection(kernel: &PcuDispatchKernelIr<'_>) -> Option<MapBindingProjection> {
+    if let Some(schema) = checked_float_binary_operand_schema(kernel) {
+        return Some(MapBindingProjection::Float(schema));
+    }
+    if let Some((value_type, op)) = validation::checked_integer_binary_profile(kernel)
+        && admitted_integer(value_type)
+        && let Ok(schema) = fusion_pcu::assess_checked_integer_binary_operands(
+            kernel,
+            value_type,
+            op,
+            PcuValueTypeCaps::for_scalar(value_type.scalar_type()),
+        )
+    {
+        return Some(MapBindingProjection::Integer(schema));
+    }
+    if let Some(schema) = composed::project(kernel) {
+        return Some(MapBindingProjection::Composed(schema));
+    }
+    if let Some(schema) = transport::project(kernel) {
+        return Some(MapBindingProjection::Transport(schema));
+    }
+    let value_type = validation::checked_integer_div_rem_profile(kernel)?;
+    if !admitted_integer(value_type) {
+        return None;
+    }
+    fusion_pcu::assess_checked_integer_div_rem_operands(
+        kernel,
+        value_type,
+        PcuValueTypeCaps::for_scalar(value_type.scalar_type()),
+    )
+    .ok()
+    .map(MapBindingProjection::Joint)
+}
+
+const fn admitted_integer(value_type: PcuValueType) -> bool {
+    matches!(
+        value_type.scalar_type(),
+        PcuScalarType::I8
+            | PcuScalarType::U8
+            | PcuScalarType::I16
+            | PcuScalarType::U16
+            | PcuScalarType::I32
+            | PcuScalarType::U32
+            | PcuScalarType::I64
+            | PcuScalarType::U64
+            | PcuScalarType::I128
+            | PcuScalarType::U128
+            | PcuScalarType::I256
+            | PcuScalarType::U256
+            | PcuScalarType::I512
+            | PcuScalarType::U512
+    )
+}
+
+/// Cold, bounded binary-map operand roles; numerical conformance remains provider-owned.
+pub fn checked_float_binary_operand_schema(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Option<fusion_pcu::CheckedFloatBinaryOperandSchema> {
+    let value_type = validation::checked_float_binary_profile(kernel)?;
+    if !matches!(
+        value_type.scalar_type(),
+        PcuScalarType::F16
+            | PcuScalarType::BF16
+            | PcuScalarType::F8E4M3FN
+            | PcuScalarType::F8E5M2
+            | PcuScalarType::F32
+            | PcuScalarType::F64
+    ) {
+        return None;
+    }
+    let (op, underflow) = validation::low_binary_profile(kernel.ops)?;
+    fusion_pcu::assess_checked_float_binary_operands(
+        kernel,
+        value_type,
+        op,
+        underflow,
+        PcuValueTypeCaps::for_scalar(value_type.scalar_type()),
+    )
+    .ok()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HipScalarKind {
     F32,
@@ -161,6 +278,11 @@ enum HipScalarKind {
     I64,
     F16Bits,
     Bf16Bits,
+    F8E4M3FnBits,
+    F8E5M2Bits,
+    Bits128,
+    Bits256,
+    Bits512,
 }
 
 impl HipScalarKind {
@@ -171,8 +293,19 @@ impl HipScalarKind {
             .find_map(|binding| match binding.binding_type {
                 PcuBindingType::Value(PcuValueType::Scalar(scalar)) => Some(match scalar {
                     fusion_pcu::PcuScalarType::F64 => Self::F64,
+                    fusion_pcu::PcuScalarType::I128
+                    | fusion_pcu::PcuScalarType::U128
+                    | fusion_pcu::PcuScalarType::F128 => Self::Bits128,
+                    fusion_pcu::PcuScalarType::I256
+                    | fusion_pcu::PcuScalarType::U256
+                    | fusion_pcu::PcuScalarType::F256 => Self::Bits256,
+                    fusion_pcu::PcuScalarType::I512 | fusion_pcu::PcuScalarType::U512 => {
+                        Self::Bits512
+                    }
                     fusion_pcu::PcuScalarType::F16 => Self::F16Bits,
                     fusion_pcu::PcuScalarType::BF16 => Self::Bf16Bits,
+                    fusion_pcu::PcuScalarType::F8E4M3FN => Self::F8E4M3FnBits,
+                    fusion_pcu::PcuScalarType::F8E5M2 => Self::F8E5M2Bits,
                     fusion_pcu::PcuScalarType::U8 => Self::U8,
                     fusion_pcu::PcuScalarType::I8 => {
                         if kernel_uses_checked_fault(kernel) {
@@ -210,7 +343,7 @@ impl HipScalarKind {
         match self {
             Self::F32 => "float",
             Self::F64 => "double",
-            Self::U8 => "unsigned char",
+            Self::U8 | Self::F8E4M3FnBits | Self::F8E5M2Bits => "unsigned char",
             Self::I8 => "signed char",
             Self::U16 | Self::F16Bits | Self::Bf16Bits => "unsigned short",
             Self::I16 => "short",
@@ -218,6 +351,9 @@ impl HipScalarKind {
             Self::I32 => "int",
             Self::U64 => "unsigned long long",
             Self::I64 => "long long",
+            Self::Bits128 => "FusionBits128",
+            Self::Bits256 => "FusionBits256",
+            Self::Bits512 => "FusionBits512",
         }
     }
 
@@ -227,8 +363,8 @@ impl HipScalarKind {
             (Self::F32, false) => "float*",
             (Self::F64, true) => "const double*",
             (Self::F64, false) => "double*",
-            (Self::U8, true) => "const unsigned char*",
-            (Self::U8, false) => "unsigned char*",
+            (Self::U8 | Self::F8E4M3FnBits | Self::F8E5M2Bits, true) => "const unsigned char*",
+            (Self::U8 | Self::F8E4M3FnBits | Self::F8E5M2Bits, false) => "unsigned char*",
             (Self::I8, true) => "const signed char*",
             (Self::I8, false) => "signed char*",
             (Self::U16 | Self::F16Bits | Self::Bf16Bits, true) => "const unsigned short*",
@@ -243,6 +379,12 @@ impl HipScalarKind {
             (Self::U64, false) => "unsigned long long*",
             (Self::I64, true) => "const long long*",
             (Self::I64, false) => "long long*",
+            (Self::Bits128, true) => "const FusionBits128*",
+            (Self::Bits128, false) => "FusionBits128*",
+            (Self::Bits256, true) => "const FusionBits256*",
+            (Self::Bits256, false) => "FusionBits256*",
+            (Self::Bits512, true) => "const FusionBits512*",
+            (Self::Bits512, false) => "FusionBits512*",
         }
     }
 }
@@ -284,7 +426,16 @@ fn scalar_kind_for_binding(
 pub fn lower_dispatch_to_hip_source(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<String, RocmLowerError> {
-    lower_dispatch_to_hip_source_with_preamble(kernel, true)
+    lower_dispatch_to_hip_source_with_preamble(kernel, true).map(|mut source| {
+        source.insert_str(
+            0,
+            &format!(
+                "// PCU numerical requirements: {:?}\n",
+                kernel.numerical_requirements
+            ),
+        );
+        source
+    })
 }
 
 /// Lower the same kernel for HIPRTC, whose online compiler supplies HIP builtins directly.
@@ -295,7 +446,16 @@ pub fn lower_dispatch_to_hip_source(
 pub fn lower_dispatch_to_hip_rtc_source(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<String, RocmLowerError> {
-    lower_dispatch_to_hip_source_with_preamble(kernel, false)
+    lower_dispatch_to_hip_source_with_preamble(kernel, false).map(|mut source| {
+        source.insert_str(
+            0,
+            &format!(
+                "// PCU numerical requirements: {:?}\n",
+                kernel.numerical_requirements
+            ),
+        );
+        source
+    })
 }
 
 #[allow(clippy::too_many_lines)] // Keep direct and loop emission visibly parallel for this small subset.
@@ -329,11 +489,33 @@ fn lower_dispatch_to_hip_source_with_preamble(
     // Ordinary IR arithmetic preserves each operation's rounding boundary.
     // Explicit fused operations remain explicit intrinsics.
     source.push_str("#pragma clang fp contract(off)\n");
+    // Padding-free little-endian storage aggregates. These are representation carriers;
+    // structural admission separately rejects unqualified arithmetic on every wide format.
+    if matches!(
+        scalar_kind,
+        HipScalarKind::Bits128 | HipScalarKind::Bits256 | HipScalarKind::Bits512
+    ) {
+        source.push_str("struct FusionBits128 { unsigned long long limbs[2]; };\nstruct FusionBits256 { unsigned long long limbs[4]; };\nstruct FusionBits512 { unsigned long long limbs[8]; };\nstatic_assert(sizeof(FusionBits128) == 16 && sizeof(FusionBits256) == 32 && sizeof(FusionBits512) == 64, \"PCU carrier sizes\");\n");
+    }
+    checked_integer::emit_helpers(&mut source, kernel);
     if checked_float::uses_checked_float(kernel) {
         checked_float::emit_helpers(&mut source, kernel);
     }
     source.push_str("extern \"C\" __global__ void fusion_kernel(");
-    for (index, binding) in kernel.bindings.iter().enumerate() {
+    // Only this qualified bounded map projects unused declarations from the device ABI.
+    // The host adapter retains their exact declaration metadata, without fabricating buffers.
+    let operands = map_binding_projection(kernel);
+    for (index, binding) in kernel
+        .bindings
+        .iter()
+        .filter(|binding| {
+            operands.is_none_or(|schema| {
+                schema.contains_output(binding.reference())
+                    || schema.input_bindings().contains(&binding.reference())
+            })
+        })
+        .enumerate()
+    {
         if index != 0 {
             source.push_str(", ");
         }
@@ -481,6 +663,7 @@ fn lower_dispatch_to_hip_source_with_preamble(
                 }
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+                range_policy,
                 value_type: PcuValueType::Scalar(scalar),
                 op,
                 result,
@@ -492,6 +675,7 @@ fn lower_dispatch_to_hip_source_with_preamble(
                 "fusion_gid",
                 scalar,
                 op,
+                range_policy,
                 result,
                 lhs,
                 rhs,
@@ -551,6 +735,37 @@ fn lower_dispatch_to_hip_source_with_preamble(
                 result,
                 value,
             )?,
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+                value_type: PcuValueType::Scalar(scalar),
+                flags,
+                quotient,
+                remainder,
+                lhs,
+                rhs,
+            }) if matches!(
+                scalar,
+                fusion_pcu::PcuScalarType::I128
+                    | fusion_pcu::PcuScalarType::U128
+                    | fusion_pcu::PcuScalarType::I256
+                    | fusion_pcu::PcuScalarType::U256
+                    | fusion_pcu::PcuScalarType::I512
+                    | fusion_pcu::PcuScalarType::U512
+            ) =>
+            {
+                if flags.bits() != 0 {
+                    return Err(RocmLowerError::UnsupportedKernelInterface);
+                }
+                checked_integer::emit_div_rem(
+                    &mut source,
+                    "    ",
+                    "fusion_gid",
+                    scalar,
+                    quotient,
+                    remainder,
+                    lhs,
+                    rhs,
+                )?;
+            }
             PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
                 value_type: PcuValueType::Scalar(fusion_pcu::PcuScalarType::U8),
                 flags,
@@ -775,6 +990,7 @@ fn ops_use_range_clamp(ops: &[PcuDispatchOp<'_>]) -> bool {
     ops.iter().any(|op| match op {
         PcuDispatchOp::Data(
             PcuDispatchDataOp::CheckedFloatBinary { range_policy, .. }
+            | PcuDispatchDataOp::CheckedIntegerBinary { range_policy, .. }
             | PcuDispatchDataOp::CheckedFloatUnary { range_policy, .. }
             | PcuDispatchDataOp::CheckedFloatConvert { range_policy, .. },
         ) => *range_policy == fusion_pcu::PcuRangePolicy::Clamp,
@@ -1566,6 +1782,7 @@ fn emit_hip_data_op(
             }
         }
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            range_policy,
             value_type: PcuValueType::Scalar(scalar),
             op,
             result,
@@ -1576,7 +1793,15 @@ fn emit_hip_data_op(
                 return Err(RocmLowerError::UnsupportedKernelInterface);
             }
             emit_checked_integer_binary(
-                source, "        ", index_name, scalar, op, result, lhs, rhs,
+                source,
+                "        ",
+                index_name,
+                scalar,
+                op,
+                range_policy,
+                result,
+                lhs,
+                rhs,
             )
         }
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
@@ -1647,6 +1872,30 @@ fn emit_hip_data_op(
                 range_policy,
                 result,
                 value,
+            )
+        }
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
+            value_type: PcuValueType::Scalar(scalar),
+            flags,
+            quotient,
+            remainder,
+            lhs,
+            rhs,
+        }) if matches!(
+            scalar,
+            fusion_pcu::PcuScalarType::I128
+                | fusion_pcu::PcuScalarType::U128
+                | fusion_pcu::PcuScalarType::I256
+                | fusion_pcu::PcuScalarType::U256
+                | fusion_pcu::PcuScalarType::I512
+                | fusion_pcu::PcuScalarType::U512
+        ) =>
+        {
+            if !checked_fault || flags.bits() != 0 {
+                return Err(RocmLowerError::UnsupportedKernelInterface);
+            }
+            checked_integer::emit_div_rem(
+                source, "        ", index_name, scalar, quotient, remainder, lhs, rhs,
             )
         }
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem {
@@ -1974,6 +2223,7 @@ mod tests {
         bindings: &'a [PcuBinding<'a>],
     ) -> PcuDispatchKernelIr<'a> {
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "test",
@@ -2042,8 +2292,10 @@ mod tests {
                 ];
                 let ir = kernel(if grid { &loop_ops } else { &direct }, &bindings);
                 let expected_type = match scalar {
-                    PcuScalarType::Bool | PcuScalarType::I4 | PcuScalarType::U4 => None,
-                    PcuScalarType::I8 | PcuScalarType::U8 => Some("unsigned char"),
+                    PcuScalarType::I8
+                    | PcuScalarType::U8
+                    | PcuScalarType::F8E4M3FN
+                    | PcuScalarType::F8E5M2 => Some("unsigned char"),
                     PcuScalarType::I16
                     | PcuScalarType::U16
                     | PcuScalarType::F16
@@ -2053,6 +2305,14 @@ mod tests {
                     PcuScalarType::I64 | PcuScalarType::U64 => Some("unsigned long long"),
                     PcuScalarType::F32 => Some("float"),
                     PcuScalarType::F64 => Some("double"),
+                    PcuScalarType::I128 | PcuScalarType::U128 | PcuScalarType::F128 => {
+                        Some("FusionBits128")
+                    }
+                    PcuScalarType::I256 | PcuScalarType::U256 | PcuScalarType::F256 => {
+                        Some("FusionBits256")
+                    }
+                    PcuScalarType::I512 | PcuScalarType::U512 => Some("FusionBits512"),
+                    _ => None,
                 };
                 match expected_type {
                     Some(expected) => {
@@ -3846,3 +4106,29 @@ mod tests {
         assert!(lower_dispatch_to_hip_rtc_source(&kernel(&unsupported, &f16_bindings)).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "lower/operand_tests.rs"]
+mod operand_tests;
+
+#[cfg(test)]
+#[path = "lower/wide_div_rem_tests.rs"]
+mod wide_div_rem_tests;
+
+#[path = "lower/composed/composed.rs"]
+mod composed;
+
+#[cfg(test)]
+#[path = "lower/composed/tests.rs"]
+mod composed_tests;
+
+#[cfg(test)]
+#[path = "lower/portable_unary_tests.rs"]
+mod portable_unary_tests;
+
+#[path = "lower/transport/transport.rs"]
+mod transport;
+
+#[cfg(test)]
+#[path = "lower/transport/tests.rs"]
+mod transport_tests;

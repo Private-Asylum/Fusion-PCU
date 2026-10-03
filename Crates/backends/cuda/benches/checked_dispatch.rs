@@ -1,5 +1,13 @@
 //! Matched native-driver and checked PCU retained dispatch benchmark.
-extern crate fusion_pcu_core as fusion_pcu;
+extern crate pcu_facade as fusion_pcu;
+
+#[cfg(feature = "allocation-census")]
+#[path = "support/allocations/allocations.rs"]
+mod allocations;
+#[path = "checked_dispatch/source/source.rs"]
+mod source;
+#[path = "checked_dispatch/fixture/fixture.rs"]
+mod source_fixture;
 
 #[path = "support/checked_dispatch.rs"]
 mod support;
@@ -109,11 +117,14 @@ fn bench_graph(
 fn checked_dispatch(criterion: &mut Criterion) {
     activity_guard();
     let (_discovery, backend) = support::selected_device();
+    source_fixture::configure(&backend);
+    source_fixture::case::<256>(criterion, &backend);
+    source_fixture::case::<65536>(criterion, &backend);
     let mut group = criterion.benchmark_group("cuda_checked_u32_add_retained");
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(3));
     for extent in [256_u32, 65536] {
-        activity_guard();
+        activity::compute_owner_guard();
         let prepared = support::prepare(&backend, PcuDispatchIntegerBinaryOp::Add, extent, false);
         let byte_len = usize::try_from(extent).unwrap() * size_of::<u32>();
         let mut left = backend.allocate(byte_len).unwrap();

@@ -379,6 +379,9 @@ fn multiply<const CLAMP: bool>(
     }
 }
 
+// The denominator is already proved nonzero; retain the quotient/remainder pair
+// that classifies rounding inexactness rather than adding a separate divisibility API.
+#[allow(clippy::manual_is_multiple_of)]
 fn divide<const CLAMP: bool>(
     left: f64,
     right: f64,
@@ -430,6 +433,23 @@ fn divide<const CLAMP: bool>(
 }
 
 impl PcuCheckedFloat for f64 {
+    fn pcu_checked_relu_backward_with_policy(
+        self,
+        upstream: Self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuExecutionFaultKind> {
+        if !self.is_finite() || !upstream.is_finite() {
+            return Err(PcuExecutionFaultKind::InvalidFloatingOperand);
+        }
+        // IEEE 754 binary64 selection is exact. Classify the encoding so a
+        // caller's flush-input mode cannot turn a positive subnormal into zero.
+        let bits = self.to_bits();
+        let positive = bits & 0x8000_0000_0000_0000 == 0 && bits & 0x7fff_ffff_ffff_ffff != 0;
+        let result = if positive { upstream } else { 0.0 };
+        result
+            .pcu_checked_neg_with_policy(policy)?
+            .pcu_checked_neg()
+    }
     fn pcu_checked_neg(self) -> Result<Self, PcuExecutionFaultKind> {
         self.pcu_checked_neg_with_policy(PcuFloatUnderflowPolicy::default())
     }

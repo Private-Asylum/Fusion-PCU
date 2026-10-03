@@ -1,0 +1,11 @@
+# Packed low-format checked binary peers
+
+The four formats are F16, BF16, E4M3FN and E5M2. Each Add/Sub/Mul/Div workload is an actual generic `#[pcu]` function. Reject and observable Clamp have separate source functions. Each format/operation/range/extent has four matched boundaries: prepared annotated source, ordinary cached annotated source, explicit graph diagnostic and a separately owned native ash/compiler control. N=1 and N=4096 give 256 semantic peers.
+
+All owners, compilation, discovery and buffer allocation are cold. Warm calls upload both logical inputs, submit, wait for terminal completion, scan every logical status and publish exactly the logical output bytes. Clamp peers deliberately return a recovered overflow notice alongside useful maximum-finite output. Every route has a separate 64-call census with changing inputs; it requires zero Rust allocations, reallocations and frees and no further ordinary source scoring. This does not measure or claim zero allocations inside the Vulkan driver.
+
+The native control shares the audited integer GLSL arithmetic. Its compiler, physical-device UUID selection, logical device, buffers, descriptors, command and fence ownership are independent of PCU preparation/lowering/execution. It is a lifecycle/performance control, not an independent arithmetic oracle. The independent arithmetic oracle uses manually decoded dyadics, native binary64 arithmetic and midpoint search; the hardware fixture checks 20,447,232 private result/status pairs, including every FP8 pair and every half/BF16 encoding against twelve partners. Public output transaction rules are tested separately.
+
+Packed source/storage words use only 32-bit integers. A single invocation owns each complete output word; private padding is initialized cold, and publication never copies padding. No native floating arithmetic, FloatControls premise, Int64 or 8/16-bit storage feature is required. PortableV1 is not admitted by this normal proof cut.
+
+Run `cargo bench -p fusion-pcu-vulkan --features hosted --bench low_binary -- --test` for semantic peers. Statistical sampling additionally requires the GPU idle guard, explicit coordination and no known competing user workload; a brief idle reading does not remove a known active workload.

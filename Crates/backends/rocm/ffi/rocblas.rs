@@ -55,6 +55,10 @@ pub type Sasum =
     unsafe extern "C" fn(RocblasHandle, c_int, *const f32, c_int, *mut f32) -> RocblasStatus;
 pub type Sscal =
     unsafe extern "C" fn(RocblasHandle, c_int, *const f32, *mut f32, c_int) -> RocblasStatus;
+pub type Dasum =
+    unsafe extern "C" fn(RocblasHandle, c_int, *const f64, c_int, *mut f64) -> RocblasStatus;
+pub type Dscal =
+    unsafe extern "C" fn(RocblasHandle, c_int, *const f64, *mut f64, c_int) -> RocblasStatus;
 pub type GetPointerMode = unsafe extern "C" fn(RocblasHandle, *mut c_int) -> RocblasStatus;
 pub type SetPointerMode = unsafe extern "C" fn(RocblasHandle, c_int) -> RocblasStatus;
 pub type SetStream = unsafe extern "C" fn(RocblasHandle, *mut c_void) -> RocblasStatus;

@@ -37,7 +37,7 @@ use super::{
     LaunchAccessLeases,
     LaunchResources,
     ensure_batch_open,
-    owned_dispatch::decode_fault_word,
+    owned_dispatch::CudaPreparedFaultContract,
 };
 
 /// One validated prepared dispatch and its owned device bindings to capture.
@@ -93,6 +93,7 @@ pub struct CudaNativeGraph {
     retained: Option<CudaCompletionBatch>,
     poisoned: bool,
     fault_word: Option<DeviceBuffer>,
+    fault_contract: Option<CudaPreparedFaultContract>,
 }
 
 impl CudaRuntime {
@@ -109,6 +110,7 @@ impl CudaRuntime {
         dispatches: &[CudaGraphDispatch<'_>],
     ) -> Result<CudaNativeGraph, CudaNativeGraphError> {
         validate_dispatches(dispatches)?;
+        let fault_contract = dispatches[0].dispatch.checked_fault_contract();
         let stream = self.create_stream()?;
         let mut retained = CudaCompletionBatch::new(&stream);
         let fault_word = if dispatches[0].dispatch.requires_checked_fault_word() {
@@ -161,6 +163,7 @@ impl CudaRuntime {
             retained: Some(retained),
             poisoned: false,
             fault_word,
+            fault_contract,
         })
     }
 }
@@ -235,12 +238,19 @@ impl CudaNativeGraph {
         &mut self,
     ) -> Result<PcuCompletionOutcome, CudaNativeGraphError> {
         self.launch_and_wait()?;
+        self.read_checked_outcome()
+    }
+
+    fn read_checked_outcome(&mut self) -> Result<PcuCompletionOutcome, CudaNativeGraphError> {
         let Some(fault_word) = self.fault_word.clone() else {
             return Ok(PcuCompletionOutcome::Succeeded);
         };
         let mut bytes = [0; size_of::<u64>()];
         let outcome = self.readback(&fault_word, 0, &mut bytes).and_then(|()| {
-            decode_fault_word(u64::from_le_bytes(bytes))
+            let word = u64::from_le_bytes(bytes);
+            self.fault_contract
+                .ok_or(CudaError::InvalidExecutionFaultWord(word))?
+                .decode(word)
                 .map(|fault| {
                     fault.map_or(PcuCompletionOutcome::Succeeded, PcuCompletionOutcome::Fault)
                 })
@@ -292,7 +302,9 @@ impl CudaNativeGraph {
         let result = copy(batch);
         // Transfers retain leases and synchronize on CUDA errors. Preserve the graph owner until
         // a final stream wait proves release safe; uncertainty must quarantine every capture owner.
-        if result.is_err() && batch.stream.synchronize().is_err() {
+        if result.is_err()
+            && (batch.stream.synchronize().is_err() || batch.graph_has_poisoned_access())
+        {
             self.poisoned = true;
             if let Some(mut batch) = self.retained.take() {
                 batch.quarantine_and_forget();
@@ -336,6 +348,18 @@ impl CudaNativeGraph {
 // These helpers belong to retained graph ownership: the private stream never escapes, and
 // access is serialized by the graph's exclusive borrow. Ordinary DeviceBuffer clones stay busy.
 impl CudaCompletionBatch {
+    fn graph_has_poisoned_access(&self) -> bool {
+        self.resources.iter().any(|resource| {
+            resource.access_leases.inline[..resource.access_leases.inline_len]
+                .iter()
+                .flatten()
+                .chain(resource.access_leases.overflow.iter())
+                .any(|lease| {
+                    lease.allocation.access.state.get() == super::AllocationAccessState::Poisoned
+                })
+        })
+    }
+
     fn graph_reset_fault_word(&mut self, buffer: &DeviceBuffer) -> Result<(), CudaError> {
         ensure_batch_open(self.failed)?;
         self.stream
@@ -396,6 +420,15 @@ impl CudaCompletionBatch {
     ) -> Result<(), CudaError> {
         self.graph_validate_transfer(buffer, offset, bytes.len())?;
         let lease = buffer.acquire_stream_access(&self.stream)?;
+        let mut scratch = buffer
+            .allocation
+            .host_transfer
+            .try_borrow_mut()
+            .map_err(|_| CudaError::Busy)?;
+        if scratch.len() < bytes.len() {
+            scratch.resize(bytes.len(), 0);
+        }
+        scratch[..bytes.len()].copy_from_slice(bytes);
         let result = unsafe {
             crate::ffi::invoke_cudaMemcpy(
                 &self.stream.inner.runtime,
@@ -405,11 +438,12 @@ impl CudaCompletionBatch {
                     .cast::<u8>()
                     .wrapping_add(offset)
                     .cast(),
-                bytes.as_ptr().cast(),
+                scratch.as_ptr().cast(),
                 bytes.len(),
                 CUDA_MEMCPY_HOST_TO_DEVICE,
             )
         };
+        drop(scratch);
         lease.finish_synchronous(result)
     }
 
@@ -421,10 +455,18 @@ impl CudaCompletionBatch {
     ) -> Result<(), CudaError> {
         self.graph_validate_transfer(buffer, offset, bytes.len())?;
         let lease = buffer.acquire_stream_access(&self.stream)?;
+        let mut scratch = buffer
+            .allocation
+            .host_transfer
+            .try_borrow_mut()
+            .map_err(|_| CudaError::Busy)?;
+        if scratch.len() < bytes.len() {
+            scratch.resize(bytes.len(), 0);
+        }
         let result = unsafe {
             crate::ffi::invoke_cudaMemcpy(
                 &self.stream.inner.runtime,
-                bytes.as_mut_ptr().cast(),
+                scratch.as_mut_ptr().cast(),
                 buffer
                     .allocation
                     .pointer
@@ -435,6 +477,11 @@ impl CudaCompletionBatch {
                 CUDA_MEMCPY_DEVICE_TO_HOST,
             )
         };
+        if result.is_ok() {
+            // The synchronous D2H succeeded; publish while the RAM borrow remains exclusive.
+            bytes.copy_from_slice(&scratch[..bytes.len()]);
+        }
+        drop(scratch);
         lease.finish_synchronous(result)
     }
 }
@@ -464,6 +511,7 @@ mod tests {
     use super::{
         *,
     };
+    use crate::owned_dispatch::decode_fault_word;
     #[test]
     fn empty_graph_is_rejected_without_loading_cuda() {
         assert!(matches!(
@@ -505,6 +553,63 @@ mod tests {
         ));
         assert!(validate_replay(false, true, true).is_ok());
         assert!(validate_replay(false, false, false).is_ok());
+    }
+
+    fn add_contract(extent: u64) -> CudaPreparedFaultContract {
+        CudaPreparedFaultContract::scalar(
+            extent,
+            fusion_pcu::PcuCheckedScalarFaultLaw::integer_binary(
+                fusion_pcu::PcuScalarType::U512,
+                fusion_pcu::PcuDispatchIntegerBinaryOp::Add,
+                fusion_pcu::PcuRangePolicy::Reject,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn graph_completion_rejects_faults_outside_the_prepared_extent() {
+        let contract = add_contract(4);
+        assert!(contract.decode((8 << 3) | 3).is_err());
+        assert!(contract.decode((3 << 3) | 3).is_ok());
+        assert_eq!(contract.decode(u64::MAX).unwrap(), None);
+        // A logical grid extent19 may be visited by only three submitted lanes.
+        assert!(add_contract(19).decode((8 << 3) | 3).is_ok());
+    }
+
+    #[test]
+    fn graph_completion_rejects_impossible_operation_and_recovery_tags() {
+        let contract = add_contract(4);
+        assert!(contract.decode(1).is_err());
+        assert!(contract.decode((1 << 63) | 3).is_err());
+        assert!(contract.decode(0).is_err());
+        assert!(
+            contract
+                .decode(((u64::from(u32::MAX) + 1) << 3) | 3)
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "tensor")]
+    #[test]
+    fn graph_completion_retains_compound_event_extent_and_wide_encoding() {
+        use fusion_pcu::dialect::tensor::TensorStrictFaultDomain;
+        use fusion_pcu::{PcuFloatUnderflowPolicy, PcuScalarType};
+        let policy = PcuFloatUnderflowPolicy::IeeeAfterRounding;
+        let mse = CudaPreparedFaultContract::compound(
+            TensorStrictFaultDomain::mse(PcuScalarType::F32, 3, policy).unwrap(),
+        );
+        // Final mean is event9, independent of the single scalar output's capacity.
+        assert!(mse.decode((9 << 3) | 4).is_ok());
+        assert!(mse.decode((10 << 3) | 4).is_err());
+        assert!(mse.decode((9 << 3) | 1).is_err());
+        let event = u64::from(u32::MAX) + 2;
+        let sgd = CudaPreparedFaultContract::compound(
+            TensorStrictFaultDomain::sgd(PcuScalarType::F64, event / 2 + 1, policy).unwrap(),
+        );
+        // A subtract event may exceed the scalar map's u32 index limit.
+        assert!(sgd.decode((event << 3) | 5).is_ok());
+        assert!(sgd.decode((1 << 63) | (event << 3) | 3).is_err());
     }
 
     #[test]
@@ -626,6 +731,7 @@ extern "C" __global__ void increment(unsigned int* value) {
             retained: Some(retained),
             poisoned: false,
             fault_word: None,
+            fault_contract: None,
         };
         drop(kernel);
         drop(module);
@@ -728,6 +834,7 @@ extern "C" __global__ void increment(unsigned int* value) {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(0x670),
             entry: PcuDispatchEntryPoint {
                 name: "graph_identity",
@@ -747,6 +854,114 @@ extern "C" __global__ void increment(unsigned int* value) {
                 shape: PcuInvocationShape::invocations(std::num::NonZeroU32::new(4).unwrap()),
             })
             .expect("prepare identity dispatch")
+    }
+
+    fn endpoint_identity_graph() -> (CudaNativeGraph, [DeviceBuffer; 2]) {
+        let (_discovery, backend) = selected_device();
+        let prepared = prepare_identity(&backend);
+        let buffers = std::array::from_fn(|_| backend.allocate(16).unwrap());
+        let bindings = std::array::from_fn::<_, 2, _>(|slot| {
+            backend
+                .binding(
+                    PcuBindingRef::new(0, u32::try_from(slot).unwrap()),
+                    if slot == 0 {
+                        PcuBindingAccess::ReadOnly
+                    } else {
+                        PcuBindingAccess::WriteOnly
+                    },
+                    PcuBindingType::Value(PcuValueType::u32()),
+                    buffers[slot].clone(),
+                )
+                .unwrap()
+        });
+        let graph = CudaNativeGraph::capture(&[CudaGraphDispatch {
+            dispatch: &prepared,
+            bindings: &bindings,
+        }])
+        .unwrap();
+        (graph, buffers)
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and device access"]
+    fn graph_owned_ram_reuses_endpoints_and_refuses_borrowed_publication_before_completion() {
+        let (mut graph, buffers) = endpoint_identity_graph();
+        let input = [0x19_u8; 16];
+        graph.refresh_input(&buffers[0], 0, &input).unwrap();
+        let pointer = buffers[0].allocation.host_transfer.borrow().as_ptr();
+        for bank in [0x27, 0x81, 0xf3] {
+            let expected = [bank; 16];
+            graph.refresh_input(&buffers[0], 0, &expected).unwrap();
+            assert_eq!(
+                buffers[0].allocation.host_transfer.borrow().as_ptr(),
+                pointer
+            );
+            graph.replay_and_wait().unwrap();
+            let mut actual = [0x55; 17];
+            let held = buffers[1].allocation.host_transfer.borrow_mut();
+            assert!(matches!(
+                graph.readback(&buffers[1], 0, &mut actual[..16]),
+                Err(CudaNativeGraphError::Cuda(CudaError::Busy))
+            ));
+            assert_eq!(actual, [0x55; 17]);
+            drop(held);
+            graph.readback(&buffers[1], 0, &mut actual[..16]).unwrap();
+            assert_eq!(&actual[..16], &expected);
+            assert_eq!(actual[16], 0x55);
+            assert!(buffers[1].readback_owned_at(0, 16).is_err());
+            let before = actual;
+            assert!(graph.readback(&buffers[1], 1, &mut actual[..16]).is_err());
+            assert_eq!(actual, before);
+            assert!(!graph.poisoned);
+        }
+        drop(graph);
+        let ticket = buffers[1].readback_owned_at(0, 16).unwrap();
+        let mut actual = [0; 16];
+        ticket.publish_to(&mut actual);
+        assert_eq!(actual, [0xf3; 16]);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU; deterministic retirement after known quiescence, not driver loss"]
+    #[allow(
+        clippy::used_underscore_binding,
+        reason = "inspect the actual retained module root in this drop witness"
+    )]
+    fn graph_unknown_copy_retirement_keeps_ram_module_stream_and_runtime_after_owner_drop() {
+        let (mut graph, buffers) = endpoint_identity_graph();
+        graph.refresh_input(&buffers[0], 0, &[0x39; 16]).unwrap();
+        graph.replay_and_wait().unwrap();
+        let batch = graph.retained.as_ref().unwrap();
+        batch.stream.synchronize().unwrap();
+        let stream = std::rc::Rc::downgrade(&batch.stream.inner);
+        let runtime = std::sync::Arc::downgrade(&batch.stream.inner.runtime.0);
+        let module = std::rc::Rc::downgrade(
+            batch
+                .resources
+                .iter()
+                .find_map(|resource| resource._module.as_ref())
+                .unwrap(),
+        );
+        let allocation = std::rc::Rc::downgrade(&buffers[0].allocation);
+        let lease = buffers[0].acquire_stream_access(&batch.stream).unwrap();
+        // Exercise the actual error-only retention branch after known quiescence.
+        lease.retain_after_unknown_completion();
+        assert!(batch.graph_has_poisoned_access());
+        assert!(graph.transfer(|_| Err(CudaError::Busy)).is_err());
+        assert!(graph.poisoned && graph.retained.is_none());
+        assert!(graph.replay_and_wait().is_err());
+        drop(graph);
+        drop(buffers);
+        assert!(stream.upgrade().is_some());
+        assert!(module.upgrade().is_some());
+        assert!(runtime.upgrade().is_some());
+        let allocation = allocation.upgrade().unwrap();
+        assert_eq!(&allocation.host_transfer.borrow()[..16], &[0x39; 16]);
+        assert_eq!(
+            allocation.access.state.get(),
+            super::super::AllocationAccessState::Poisoned
+        );
+        // Allocation/module/stream roots each retain their actual runtime/loader context.
     }
 
     #[test]
@@ -858,6 +1073,10 @@ extern "C" __global__ void increment(unsigned int* value) {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: fusion_pcu::PcuImplementationRequirements {
+                range_policy: policy,
+                ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+            },
             id: PcuKernelId(0x672),
             entry: PcuDispatchEntryPoint {
                 name: "checked_graph_add",
@@ -882,6 +1101,58 @@ extern "C" __global__ void increment(unsigned int* value) {
                 shape: PcuInvocationShape::invocations(std::num::NonZeroU32::new(2).unwrap()),
             })
             .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU and device access"]
+    fn checked_graph_retains_prepared_fault_contract_after_dispatch_drop() {
+        let (_discovery, backend) = selected_device();
+        for word in [(8_u64 << 3) | 3, 1, (1 << 63) | 3] {
+            let prepared = prepare_checked_add(&backend, PcuRangePolicy::Reject);
+            let buffers = std::array::from_fn::<_, 3, _>(|_| backend.allocate(8).unwrap());
+            let bindings = std::array::from_fn::<_, 3, _>(|slot| {
+                backend
+                    .binding(
+                        PcuBindingRef::new(0, u32::try_from(slot).unwrap()),
+                        if slot == 2 {
+                            PcuBindingAccess::WriteOnly
+                        } else {
+                            PcuBindingAccess::ReadOnly
+                        },
+                        PcuBindingType::Value(PcuValueType::f32()),
+                        buffers[slot].clone(),
+                    )
+                    .unwrap()
+            });
+            let mut graph = CudaNativeGraph::capture(&[CudaGraphDispatch {
+                dispatch: &prepared,
+                bindings: &bindings,
+            }])
+            .unwrap();
+            drop(prepared);
+            drop(bindings);
+            for buffer in &buffers[..2] {
+                graph.refresh_input(buffer, 0, &[0; 8]).unwrap();
+            }
+            assert!(matches!(
+                graph.replay_checked_and_wait().unwrap(),
+                PcuCompletionOutcome::Succeeded
+            ));
+            let fault_word = graph.fault_word.clone().unwrap();
+            // Deterministic protocol injection after real replay and known quiescence;
+            // this is not a generated arithmetic fault or simulated driver loss.
+            graph
+                .refresh_input(&fault_word, 0, &word.to_le_bytes())
+                .unwrap();
+            assert!(matches!(graph.read_checked_outcome(),
+                Err(CudaNativeGraphError::Cuda(CudaError::InvalidExecutionFaultWord(actual)))
+                    if actual == word));
+            assert!(graph.poisoned);
+            assert!(matches!(
+                graph.replay_checked_and_wait(),
+                Err(CudaNativeGraphError::Poisoned)
+            ));
+        }
     }
 
     #[test]

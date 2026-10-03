@@ -85,6 +85,7 @@ fn prepare_unary(
     backend
         .prepare_dispatch(PcuDispatchSubmission {
             kernel: &PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: fusion_pcu::PcuKernelId(0xf17e),
                 entry: PcuDispatchEntryPoint {
                     name: "rocm_checked_unary",

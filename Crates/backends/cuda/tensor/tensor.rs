@@ -16,12 +16,14 @@ pub use strict_sgd::lower_strict_sgd_to_cuda_source;
 
 #[path = "float.rs"]
 mod checked_float;
+pub use checked_float::lower_checked_float_tensor_to_cuda_source;
 #[path = "consuming.rs"]
 mod consuming;
 #[path = "feedback_runtime.rs"]
 mod feedback_runtime;
 #[path = "integer.rs"]
 mod integer;
+pub use integer::lower_checked_integer_tensor_to_cuda_source;
 #[cfg(test)]
 #[path = "native_matmul/native_matmul.rs"]
 mod native_matmul;
@@ -29,8 +31,22 @@ mod native_matmul;
 pub mod native_mse;
 #[path = "native_sgd/native_sgd.rs"]
 mod native_sgd;
+pub use native_sgd::lower_native_sgd_to_cuda_source;
+pub use native_mse::lower_native_mse_to_cuda_source;
+#[path = "literal/literal.rs"]
+mod literal;
+#[path = "owned_scratch/owned_scratch.rs"]
+mod owned_scratch;
 #[path = "pointwise.rs"]
 mod pointwise;
+#[path = "relu_backward/relu_backward.rs"]
+#[allow(clippy::redundant_pub_crate)] // Keep the generated-source factory internal to this backend.
+pub(crate) mod relu_backward;
+#[path = "strict_mse/strict_mse.rs"]
+#[allow(clippy::redundant_pub_crate)] // Private admitted source factory.
+pub(crate) mod strict_mse;
+pub use strict_mse::lower_strict_mse_to_cuda_source;
+pub use relu_backward::lower_relu_backward_to_cuda_source;
 pub use feedback_runtime::CudaTensorExecution;
 #[rustfmt::skip]
 pub use feedback_runtime::{
@@ -163,34 +179,6 @@ type TensorExecutionResources =
     SmallVec<[Option<CudaMemoryResource>; TENSOR_EXECUTION_INLINE_NODES]>;
 type TensorExecutionUseCounts = SmallVec<[usize; TENSOR_EXECUTION_INLINE_NODES]>;
 type TensorExecutionOutputs<'session> = SmallVec<[CudaTensorInput<'session>; 4]>;
-const RELU_BACKWARD_SOURCE: &str = r#"
-extern "C" __global__ void tensor_relu_backward(
-    const float *input, const float *upstream, float *output, unsigned int n) {
-    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id < n) output[id] = input[id] > 0.0f ? upstream[id] : 0.0f;
-}
-"#;
-const SGD_UPDATE_SOURCE: &str = r#"
-extern "C" __global__ void tensor_sgd_update(
-    const float *weights, const float *gradient, float *output,
-    float learning_rate, unsigned int n) {
-    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id < n) {
-        // Explicit native Preserve offer: two destination-width rounded operations.
-        const float product = __fmul_rn(learning_rate, gradient[id]);
-        output[id] = __fsub_rn(weights[id], product);
-    }
-}
-"#;
-const SGD_UPDATE_CONTRACTED_SOURCE: &str = r#"
-extern "C" __global__ void tensor_sgd_update_contracted(
-    const float *weights, const float *gradient, float *output,
-    float learning_rate, unsigned int n) {
-    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id < n) output[id] = __fmaf_rn(-learning_rate, gradient[id], weights[id]);
-}
-"#;
-
 // Feature-off expansion preserves the original one-argument finish/wait call.
 #[cfg(feature = "insights")]
 macro_rules! tensor_flush_batch {
@@ -632,6 +620,10 @@ enum TensorDispatchKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum TensorPointwiseScalarType {
+    F16,
+    BF16,
+    F8E4M3FN,
+    F8E5M2,
     F32,
     F64,
     I8,
@@ -642,6 +634,12 @@ enum TensorPointwiseScalarType {
     U32,
     I64,
     U64,
+    I128,
+    U128,
+    I256,
+    U256,
+    I512,
+    U512,
 }
 
 impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
@@ -649,6 +647,10 @@ impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
 
     fn try_from(scalar_type: fusion_pcu::PcuScalarType) -> Result<Self, Self::Error> {
         match scalar_type {
+            fusion_pcu::PcuScalarType::F16 => Ok(Self::F16),
+            fusion_pcu::PcuScalarType::BF16 => Ok(Self::BF16),
+            fusion_pcu::PcuScalarType::F8E4M3FN => Ok(Self::F8E4M3FN),
+            fusion_pcu::PcuScalarType::F8E5M2 => Ok(Self::F8E5M2),
             fusion_pcu::PcuScalarType::F32 => Ok(Self::F32),
             fusion_pcu::PcuScalarType::F64 => Ok(Self::F64),
             fusion_pcu::PcuScalarType::I8 => Ok(Self::I8),
@@ -659,6 +661,12 @@ impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
             fusion_pcu::PcuScalarType::U32 => Ok(Self::U32),
             fusion_pcu::PcuScalarType::I64 => Ok(Self::I64),
             fusion_pcu::PcuScalarType::U64 => Ok(Self::U64),
+            fusion_pcu::PcuScalarType::I128 => Ok(Self::I128),
+            fusion_pcu::PcuScalarType::U128 => Ok(Self::U128),
+            fusion_pcu::PcuScalarType::I256 => Ok(Self::I256),
+            fusion_pcu::PcuScalarType::U256 => Ok(Self::U256),
+            fusion_pcu::PcuScalarType::I512 => Ok(Self::I512),
+            fusion_pcu::PcuScalarType::U512 => Ok(Self::U512),
             unsupported => Err(CudaTensorExecutionError::UnsupportedScalarType(unsupported)),
         }
     }
@@ -667,6 +675,10 @@ impl TryFrom<fusion_pcu::PcuScalarType> for TensorPointwiseScalarType {
 impl TensorPointwiseScalarType {
     const fn scalar_type(self) -> fusion_pcu::PcuScalarType {
         match self {
+            Self::F16 => fusion_pcu::PcuScalarType::F16,
+            Self::BF16 => fusion_pcu::PcuScalarType::BF16,
+            Self::F8E4M3FN => fusion_pcu::PcuScalarType::F8E4M3FN,
+            Self::F8E5M2 => fusion_pcu::PcuScalarType::F8E5M2,
             Self::F32 => fusion_pcu::PcuScalarType::F32,
             Self::F64 => fusion_pcu::PcuScalarType::F64,
             Self::I8 => fusion_pcu::PcuScalarType::I8,
@@ -677,11 +689,21 @@ impl TensorPointwiseScalarType {
             Self::U32 => fusion_pcu::PcuScalarType::U32,
             Self::I64 => fusion_pcu::PcuScalarType::I64,
             Self::U64 => fusion_pcu::PcuScalarType::U64,
+            Self::I128 => fusion_pcu::PcuScalarType::I128,
+            Self::U128 => fusion_pcu::PcuScalarType::U128,
+            Self::I256 => fusion_pcu::PcuScalarType::I256,
+            Self::U256 => fusion_pcu::PcuScalarType::U256,
+            Self::I512 => fusion_pcu::PcuScalarType::I512,
+            Self::U512 => fusion_pcu::PcuScalarType::U512,
         }
     }
 
     const fn value_type(self) -> PcuValueType {
         match self {
+            Self::F16 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+            Self::BF16 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+            Self::F8E4M3FN => PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+            Self::F8E5M2 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
             Self::F32 => PcuValueType::f32(),
             Self::F64 => PcuValueType::f64(),
             Self::I8 => PcuValueType::i8(),
@@ -692,12 +714,20 @@ impl TensorPointwiseScalarType {
             Self::U32 => PcuValueType::u32(),
             Self::I64 => PcuValueType::i64(),
             Self::U64 => PcuValueType::u64(),
+            Self::I128 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::I128),
+            Self::U128 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::U128),
+            Self::I256 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::I256),
+            Self::U256 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::U256),
+            Self::I512 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::I512),
+            Self::U512 => PcuValueType::Scalar(fusion_pcu::PcuScalarType::U512),
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TensorDispatchCacheKey {
+    ReluBackward(relu_backward::Profile),
+    StrictMse(strict_mse::Profile),
     StrictMatMul(strict_matmul::Profile),
     StrictSgd(strict_sgd::Profile),
     Fixed(
@@ -705,7 +735,7 @@ enum TensorDispatchCacheKey {
         TensorPointwiseScalarType,
         u32,
         u8,
-        Option<PcuFloatUnderflowPolicy>,
+        fusion_pcu::PcuImplementationRequirements,
     ),
     ConsumingRelu(TensorPointwiseScalarType, u32),
     ConsumingBinary(
@@ -775,6 +805,8 @@ struct TensorDispatchCacheAdmission {
 
 #[derive(Clone, Debug)]
 enum TensorDispatchRequest<'graph> {
+    ReluBackward(relu_backward::Profile),
+    StrictMse(strict_mse::Profile),
     StrictMatMul(strict_matmul::Profile),
     StrictSgd(strict_sgd::Profile),
     Fixed {
@@ -782,7 +814,7 @@ enum TensorDispatchRequest<'graph> {
         scalar_type: TensorPointwiseScalarType,
         logical_count: u32,
         scalar_mask: u8,
-        float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements,
     },
     BoundedPointwise {
         group: &'graph TensorBoundedPointwiseFusionGroup,
@@ -801,6 +833,8 @@ enum TensorDispatchRequest<'graph> {
 impl TensorDispatchRequest<'_> {
     fn key(&self) -> TensorDispatchCacheKey {
         match self {
+            Self::StrictMse(profile) => TensorDispatchCacheKey::StrictMse(*profile),
+            Self::ReluBackward(profile) => TensorDispatchCacheKey::ReluBackward(*profile),
             Self::StrictMatMul(profile) => TensorDispatchCacheKey::StrictMatMul(*profile),
             Self::StrictSgd(profile) => TensorDispatchCacheKey::StrictSgd(*profile),
             Self::Fixed {
@@ -808,13 +842,13 @@ impl TensorDispatchRequest<'_> {
                 scalar_type,
                 logical_count,
                 scalar_mask,
-                float_underflow_policy,
+                numerical_requirements,
             } => TensorDispatchCacheKey::Fixed(
                 *kind,
                 *scalar_type,
                 *logical_count,
                 *scalar_mask,
-                *float_underflow_policy,
+                *numerical_requirements,
             ),
             Self::BoundedPointwise {
                 logical_count,
@@ -919,15 +953,30 @@ const fn binary_dispatch_kind(
     match (float_kind, scalar_type) {
         (
             TensorDispatchKind::Add,
-            TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64,
+            TensorPointwiseScalarType::F16
+            | TensorPointwiseScalarType::BF16
+            | TensorPointwiseScalarType::F8E4M3FN
+            | TensorPointwiseScalarType::F8E5M2
+            | TensorPointwiseScalarType::F32
+            | TensorPointwiseScalarType::F64,
         ) => TensorDispatchKind::CheckedFloatAdd,
         (
             TensorDispatchKind::Sub,
-            TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64,
+            TensorPointwiseScalarType::F16
+            | TensorPointwiseScalarType::BF16
+            | TensorPointwiseScalarType::F8E4M3FN
+            | TensorPointwiseScalarType::F8E5M2
+            | TensorPointwiseScalarType::F32
+            | TensorPointwiseScalarType::F64,
         ) => TensorDispatchKind::CheckedFloatSub,
         (
             TensorDispatchKind::Mul,
-            TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64,
+            TensorPointwiseScalarType::F16
+            | TensorPointwiseScalarType::BF16
+            | TensorPointwiseScalarType::F8E4M3FN
+            | TensorPointwiseScalarType::F8E5M2
+            | TensorPointwiseScalarType::F32
+            | TensorPointwiseScalarType::F64,
         ) => TensorDispatchKind::CheckedFloatMul,
         (
             TensorDispatchKind::Add,
@@ -938,7 +987,13 @@ const fn binary_dispatch_kind(
             | TensorPointwiseScalarType::I32
             | TensorPointwiseScalarType::U32
             | TensorPointwiseScalarType::I64
-            | TensorPointwiseScalarType::U64,
+            | TensorPointwiseScalarType::U64
+            | TensorPointwiseScalarType::I128
+            | TensorPointwiseScalarType::U128
+            | TensorPointwiseScalarType::I256
+            | TensorPointwiseScalarType::U256
+            | TensorPointwiseScalarType::I512
+            | TensorPointwiseScalarType::U512,
         ) => TensorDispatchKind::CheckedIntegerAdd,
         (
             TensorDispatchKind::Sub,
@@ -949,7 +1004,13 @@ const fn binary_dispatch_kind(
             | TensorPointwiseScalarType::I32
             | TensorPointwiseScalarType::U32
             | TensorPointwiseScalarType::I64
-            | TensorPointwiseScalarType::U64,
+            | TensorPointwiseScalarType::U64
+            | TensorPointwiseScalarType::I128
+            | TensorPointwiseScalarType::U128
+            | TensorPointwiseScalarType::I256
+            | TensorPointwiseScalarType::U256
+            | TensorPointwiseScalarType::I512
+            | TensorPointwiseScalarType::U512,
         ) => TensorDispatchKind::CheckedIntegerSub,
         (
             TensorDispatchKind::Mul,
@@ -960,7 +1021,13 @@ const fn binary_dispatch_kind(
             | TensorPointwiseScalarType::I32
             | TensorPointwiseScalarType::U32
             | TensorPointwiseScalarType::I64
-            | TensorPointwiseScalarType::U64,
+            | TensorPointwiseScalarType::U64
+            | TensorPointwiseScalarType::I128
+            | TensorPointwiseScalarType::U128
+            | TensorPointwiseScalarType::I256
+            | TensorPointwiseScalarType::U256
+            | TensorPointwiseScalarType::I512
+            | TensorPointwiseScalarType::U512,
         ) => TensorDispatchKind::CheckedIntegerMul,
         _ => float_kind,
     }
@@ -968,6 +1035,7 @@ const fn binary_dispatch_kind(
 
 fn mse_kernel(logical_count: u32) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x4d53_4521),
         entry: PcuDispatchEntryPoint {
             name: "tensor_mse_squared_difference",
@@ -984,6 +1052,7 @@ fn mse_kernel(logical_count: u32) -> PcuDispatchKernelIr<'static> {
 
 fn add_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x5445_4e53 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_add",
@@ -1006,6 +1075,7 @@ fn add_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'stati
 
 fn add_relu_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x4144_4452 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_add_relu",
@@ -1028,6 +1098,7 @@ fn add_relu_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'
 
 fn sub_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x5355_4221 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_sub",
@@ -1050,6 +1121,7 @@ fn sub_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'stati
 
 fn mul_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x4d55_4c21 + u32::from(scalar_mask)),
         entry: PcuDispatchEntryPoint {
             name: "tensor_mul",
@@ -1072,6 +1144,7 @@ fn mul_kernel(logical_count: u32, scalar_mask: u8) -> PcuDispatchKernelIr<'stati
 
 fn relu_kernel(logical_count: u32) -> PcuDispatchKernelIr<'static> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(0x5245_4c55),
         entry: PcuDispatchEntryPoint {
             name: "tensor_relu",
@@ -1426,6 +1499,7 @@ pub enum CudaTensorExecutionError {
     BorrowedInputEscape,
     OutputResourceMismatch,
     ScratchMismatch,
+    ScratchBusy,
     FeedbackPlanMismatch,
     FeedbackStepUnavailable {
         requested: usize,
@@ -1489,9 +1563,8 @@ struct CudaTensorAssessorState {
     native_cublas: Box<CudaNativeCublasState>,
     stream: CudaStreamHandle,
     add_dispatches: RefCell<TensorDispatchCache>,
-    relu_backward: RefCell<Option<(CudaKernel, CudaStreamHandle)>>,
-    sgd_update: RefCell<Option<(CudaKernel, CudaStreamHandle)>>,
-    sgd_update_contracted: RefCell<Option<(CudaKernel, CudaStreamHandle)>>,
+    sgd_update: [RefCell<Option<(CudaKernel, CudaStreamHandle)>>; 2],
+    sgd_update_contracted: [RefCell<Option<(CudaKernel, CudaStreamHandle)>>; 2],
 }
 
 struct CudaNativeCublasState {
@@ -1520,9 +1593,8 @@ impl CudaTensorAssessorState {
             }),
             stream,
             add_dispatches: RefCell::new(VecDeque::new()),
-            relu_backward: RefCell::new(None),
-            sgd_update: RefCell::new(None),
-            sgd_update_contracted: RefCell::new(None),
+            sgd_update: core::array::from_fn(|_| RefCell::new(None)),
+            sgd_update_contracted: core::array::from_fn(|_| RefCell::new(None)),
         })
     }
 }
@@ -1855,11 +1927,11 @@ impl<'session> CudaTensorAssessor<'session> {
         let native_mse_count = match key {
             TensorDispatchCacheKey::Fixed(
                 TensorDispatchKind::SquaredDifference,
-                TensorPointwiseScalarType::F32,
+                scalar @ (TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64),
                 count,
                 0,
                 _,
-            ) => Some(count),
+            ) => Some((count, scalar)),
             _ => None,
         };
         self.cache_prepared_dispatch(key, || {
@@ -1880,9 +1952,12 @@ impl<'session> CudaTensorAssessor<'session> {
                             )
                         }
                     },
-                    |count| {
-                        self.session
-                            .prepare_native_mse_dispatch(count, &self.state().stream)
+                    |(count, scalar)| {
+                        self.session.prepare_native_mse_dispatch(
+                            count,
+                            scalar.scalar_type(),
+                            &self.state().stream,
+                        )
                     },
                 )
                 .map_err(CudaTensorExecutionError::Backend)
@@ -1916,7 +1991,7 @@ impl<'session> CudaTensorAssessor<'session> {
         scalar_type: TensorPointwiseScalarType,
         logical_count: u32,
         scalar_mask: u8,
-        float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements,
     ) -> Result<TensorDispatchCacheAdmission, CudaTensorExecutionError> {
         let invocations =
             NonZeroU32::new(logical_count).ok_or(CudaTensorExecutionError::SizeOverflow)?;
@@ -1926,14 +2001,17 @@ impl<'session> CudaTensorAssessor<'session> {
                 scalar_type,
                 logical_count,
                 scalar_mask,
-                float_underflow_policy,
+                numerical_requirements,
             ),
-            kind.kernel(
-                scalar_type,
-                logical_count,
-                scalar_mask,
-                float_underflow_policy,
-            )?,
+            PcuDispatchKernelIr {
+                numerical_requirements,
+                ..kind.kernel(
+                    scalar_type,
+                    logical_count,
+                    scalar_mask,
+                    Some(numerical_requirements.float_underflow),
+                )?
+            },
             PcuInvocationShape::invocations(invocations),
             false,
         )
@@ -1966,6 +2044,7 @@ impl<'session> CudaTensorAssessor<'session> {
         }
         let (kernel_bindings, kernel_ops) = bounded_pointwise_program(group, scalar_mask)?;
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: bounded_pointwise_kernel_id(topology, scalar_mask),
             entry: PcuDispatchEntryPoint {
                 name: match group.epilogue {
@@ -2014,6 +2093,7 @@ impl<'session> CudaTensorAssessor<'session> {
         }
         let (kernel_bindings, kernel_ops) = bounded_mul_program(group, scalar_mask)?;
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: bounded_pointwise_kernel_id(topology, scalar_mask),
             entry: PcuDispatchEntryPoint {
                 name: "tensor_bounded_mul",
@@ -2124,6 +2204,12 @@ impl<'session> CudaTensorAssessor<'session> {
 
         for request in &requests {
             let admission = match request {
+                TensorDispatchRequest::StrictMse(profile) => {
+                    self.ensure_strict_mse_cached(*profile)?
+                }
+                TensorDispatchRequest::ReluBackward(profile) => {
+                    self.ensure_relu_backward_cached(*profile)?
+                }
                 TensorDispatchRequest::StrictMatMul(profile) => {
                     self.ensure_strict_matmul_cached(*profile)?
                 }
@@ -2135,13 +2221,13 @@ impl<'session> CudaTensorAssessor<'session> {
                     scalar_type,
                     logical_count,
                     scalar_mask,
-                    float_underflow_policy,
+                    numerical_requirements,
                 } => self.ensure_fixed_dispatch_cached(
                     *kind,
                     *scalar_type,
                     *logical_count,
                     *scalar_mask,
-                    *float_underflow_policy,
+                    *numerical_requirements,
                 )?,
                 TensorDispatchRequest::BoundedPointwise {
                     group,
@@ -2363,7 +2449,7 @@ impl<'session> CudaTensorAssessor<'session> {
     ) -> Result<CudaOwnedPreparedTensorGraph, CudaTensorExecutionError> {
         let mut data = prepare_owned_graph_data(&program, self)?;
         self.prepare_native_matmul_plans(program.graph(), &mut data)?;
-        Ok(CudaOwnedPreparedTensorGraph { program, data })
+        CudaOwnedPreparedTensorGraph::from_parts(program, data)
     }
 
     /// Executes a graph-owning selected program from typed device inputs and returns fresh,
@@ -2629,10 +2715,8 @@ impl<'session> CudaTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = CudaMemoryResource>,
         'session: 'input,
     {
-        if !matches!(
-            T::TYPE,
-            fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
-        ) && !prepared.data.transport_only_inputs
+        if !is_checked_float_type(T::TYPE)
+            && !prepared.data.transport_only_inputs
             && !is_checked_integer_scalar(T::TYPE)
         {
             return Err(CudaTensorExecutionError::UnsupportedScalarType(T::TYPE));
@@ -2641,6 +2725,16 @@ impl<'session> CudaTensorAssessor<'session> {
         validate_owned_scalar_profile::<T>(prepared.data.scalar_type)?;
         self.validate_execution_sources_view(&view, &[], inputs, pool)?;
 
+        let mut bank = prepared
+            .scratch
+            .bind(self.session.tensor_runtime(), &view, pool, memory)?;
+        if inputs.iter().any(|(_, input)| {
+            bank.physical
+                .iter()
+                .any(|resource| resource.may_overlap(input.resource()))
+        }) {
+            return Err(CudaTensorExecutionError::ScratchMismatch);
+        }
         let mut outputs = SmallVec::<[(ValueId, FreshTensorOutput<'_>); 1]>::new();
         outputs.reserve(view.outputs.len());
         for &value in &view.outputs {
@@ -2651,6 +2745,10 @@ impl<'session> CudaTensorAssessor<'session> {
                 || resource.device_buffer().len() < byte_len_for::<T>(shape)?
                 || !alignment_satisfies(resource.alignment_bytes(), scalar_layout(T::TYPE)?.1)
                 || resource.access() != PcuMemoryAccess::ReadWrite
+                || bank
+                    .physical
+                    .iter()
+                    .any(|scratch| scratch.may_overlap(&resource))
                 || inputs
                     .iter()
                     .any(|(_, input)| input.resource().may_overlap(&resource))
@@ -2672,6 +2770,16 @@ impl<'session> CudaTensorAssessor<'session> {
             ));
         }
 
+        validate_owned_storage(&view, inputs, &outputs, &bank.resources)?;
+
+        let bank_view = &mut *bank;
+        let mut scratch_view = CudaExecutionScratch {
+            resources: &bank_view.resources,
+            statuses: Some(&mut bank_view.statuses),
+            mse_squared: bank_view.mse_squared.as_ref(),
+            outputs: &view.outputs,
+            node_values: &view.node_values,
+        };
         let mut timings = NoopNodeTiming;
         let mut batch = prepared
             .data
@@ -2683,7 +2791,7 @@ impl<'session> CudaTensorAssessor<'session> {
             inputs,
             pool,
             memory,
-            None,
+            Some(&mut scratch_view),
             None,
             Some(&outputs),
             &mut timings,
@@ -2693,6 +2801,7 @@ impl<'session> CudaTensorAssessor<'session> {
         // Any queued operation establishes terminal ownership or quarantines its retained
         // resources before fresh output owners are released on an execution error.
         drop(batch);
+        bank.finish(execution.as_ref().err())?;
         let mut result = execution?;
         drop(outputs);
         if result.len() != prepared.data.outputs.len() {
@@ -4161,13 +4270,20 @@ impl<'session> CudaTensorAssessor<'session> {
         timings.finish_scheduler_validation(validation_mark);
         validation?;
         let view = prepared.view();
+        let mut scratch_view = scratch.map(|scratch| CudaExecutionScratch {
+            statuses: None,
+            resources: &scratch.resources,
+            mse_squared: scratch.mse_squared.as_ref(),
+            outputs: &scratch.prepared.outputs,
+            node_values: &scratch.prepared.node_values,
+        });
         self.execute_prepared_schedule(
             &view,
             host_inputs,
             resource_inputs,
             pool,
             memory,
-            scratch,
+            scratch_view.as_mut(),
             output_bank,
             None,
             timings,
@@ -4188,7 +4304,7 @@ impl<'session> CudaTensorAssessor<'session> {
         resource_inputs: &[(ValueId, &I)],
         pool: PcuMemoryPoolId,
         memory: &mut P,
-        mut scratch: Option<&mut CudaTensorScratch<'_, '_, 'session>>,
+        mut scratch: Option<&mut CudaExecutionScratch<'_>>,
         output_bank: Option<&CudaTensorOutputBank<'_, '_, 'session>>,
         fresh_outputs: Option<&[(ValueId, FreshTensorOutput<'_>)]>,
         timings: &mut impl NodeTimingSink,
@@ -4275,89 +4391,142 @@ impl<'session> CudaTensorAssessor<'session> {
                     resources[index] = Some(upload_tensor(memory, pool, tensor)?);
                 }
                 OpDescriptor::Constant(tensor) => {
-                    let tensor = tensor.as_typed::<f32>().map_err(|_| {
-                        CudaTensorExecutionError::Unsupported {
-                            value: node.value,
-                            reason: TensorUnsupportedReason::ElementType,
+                    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            tensor_flush_batch!(batch, timings, false)?;
                         }
-                    })?;
-                    resources[index] = Some(
-                        if let Some(output) =
-                            tensor_output_view(output_bank, fresh_outputs, node.value)
-                        {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            let mut resource = output.resource.clone_for_tensor_input();
-                            let binding = proof.map(|_| resource.clone_for_tensor_input());
-                            let transferred = transfer_tensor(memory, &mut resource, tensor);
-                            if binding
-                                .as_ref()
-                                .is_some_and(|binding| !resource.same_binding(binding))
+                        resources[index] = Some(
+                            if let Some(scratch) = scratch
+                                .as_deref_mut()
+                                .filter(|_| !outputs.contains(&node.value))
                             {
-                                return Err(CudaTensorExecutionError::OutputResourceMismatch);
-                            }
-                            transferred?;
-                            resource
-                        } else if outputs.contains(&node.value) {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, tensor)?
-                        } else if let Some(scratch) = scratch.as_deref_mut() {
-                            scratch.lease(index)?
-                        } else {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, tensor)?
-                        },
-                    );
-                }
-                OpDescriptor::Uniform { value } => {
-                    // Only elementwise consumers use scalar binding indices; every other route
-                    // receives a dense fallback allocation during scratch preparation.
-                    let tensor = prepared.physical_layout(node.value)?.uniform_tensor(
-                        node.shape,
-                        value.as_typed::<f32>().map_err(|_| {
+                                scratch.lease(index)?
+                            } else {
+                                literal::upload_f64(
+                                    node,
+                                    plan.physical_layout(node.value)?,
+                                    tensor_output_view(output_bank, fresh_outputs, node.value)
+                                        .map(|output| output.resource),
+                                    pool,
+                                    memory,
+                                )?
+                            },
+                        );
+                    } else {
+                        let tensor = tensor.as_typed::<f32>().map_err(|_| {
                             CudaTensorExecutionError::Unsupported {
                                 value: node.value,
                                 reason: TensorUnsupportedReason::ElementType,
                             }
-                        })?,
-                    )?;
-                    resources[index] = Some(
-                        if let Some(output) =
-                            tensor_output_view(output_bank, fresh_outputs, node.value)
-                        {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            let mut resource = output.resource.clone_for_tensor_input();
-                            let binding = proof.map(|_| resource.clone_for_tensor_input());
-                            let transferred = transfer_tensor(memory, &mut resource, &tensor);
-                            if binding
-                                .as_ref()
-                                .is_some_and(|binding| !resource.same_binding(binding))
+                        })?;
+                        resources[index] = Some(
+                            if let Some(output) =
+                                tensor_output_view(output_bank, fresh_outputs, node.value)
                             {
-                                return Err(CudaTensorExecutionError::OutputResourceMismatch);
-                            }
-                            transferred?;
-                            resource
-                        } else if outputs.contains(&node.value) {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, &tensor)?
-                        } else if let Some(scratch) = scratch.as_deref_mut() {
-                            scratch.lease(index)?
-                        } else {
-                            if let Some(batch) = batch.as_deref_mut() {
-                                tensor_flush_batch!(batch, timings, false)?;
-                            }
-                            upload_tensor(memory, pool, &tensor)?
-                        },
-                    );
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                let mut resource = output.resource.clone_for_tensor_input();
+                                let binding = proof.map(|_| resource.clone_for_tensor_input());
+                                let transferred = transfer_tensor(memory, &mut resource, tensor);
+                                if binding
+                                    .as_ref()
+                                    .is_some_and(|binding| !resource.same_binding(binding))
+                                {
+                                    return Err(CudaTensorExecutionError::OutputResourceMismatch);
+                                }
+                                transferred?;
+                                resource
+                            } else if outputs.contains(&node.value) {
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, tensor)?
+                            } else if let Some(scratch) = scratch.as_deref_mut() {
+                                scratch.lease(index)?
+                            } else {
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, tensor)?
+                            },
+                        );
+                    }
+                }
+                OpDescriptor::Uniform { value } => {
+                    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            tensor_flush_batch!(batch, timings, false)?;
+                        }
+                        resources[index] = Some(
+                            if let Some(scratch) = scratch
+                                .as_deref_mut()
+                                .filter(|_| !outputs.contains(&node.value))
+                            {
+                                scratch.lease(index)?
+                            } else {
+                                literal::upload_f64(
+                                    node,
+                                    plan.physical_layout(node.value)?,
+                                    tensor_output_view(output_bank, fresh_outputs, node.value)
+                                        .map(|output| output.resource),
+                                    pool,
+                                    memory,
+                                )?
+                            },
+                        );
+                    } else {
+                        // Scratch already owns the immutable cold initialization, including dense
+                        // fallbacks. Materialize host data only for actual uploads/output copies;
+                        // merely leasing retained storage must not allocate another dense tensor.
+                        // Raw nonfinite encodings remain transport data until arithmetic consumes them.
+                        let materialize = || {
+                            prepared.physical_layout(node.value)?.uniform_tensor(
+                                node.shape,
+                                value.as_typed::<f32>().map_err(|_| {
+                                    CudaTensorExecutionError::Unsupported {
+                                        value: node.value,
+                                        reason: TensorUnsupportedReason::ElementType,
+                                    }
+                                })?,
+                            )
+                        };
+                        resources[index] = Some(
+                            if let Some(output) =
+                                tensor_output_view(output_bank, fresh_outputs, node.value)
+                            {
+                                let tensor = materialize()?;
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                let mut resource = output.resource.clone_for_tensor_input();
+                                let binding = proof.map(|_| resource.clone_for_tensor_input());
+                                let transferred = transfer_tensor(memory, &mut resource, &tensor);
+                                if binding
+                                    .as_ref()
+                                    .is_some_and(|binding| !resource.same_binding(binding))
+                                {
+                                    return Err(CudaTensorExecutionError::OutputResourceMismatch);
+                                }
+                                transferred?;
+                                resource
+                            } else if outputs.contains(&node.value) {
+                                let tensor = materialize()?;
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, &tensor)?
+                            } else if let Some(scratch) = scratch.as_deref_mut() {
+                                scratch.lease(index)?
+                            } else {
+                                let tensor = materialize()?;
+                                if let Some(batch) = batch.as_deref_mut() {
+                                    tensor_flush_batch!(batch, timings, false)?;
+                                }
+                                upload_tensor(memory, pool, &tensor)?
+                            },
+                        );
+                    }
                 }
                 OpDescriptor::MatMul {
                     left,
@@ -4398,6 +4567,9 @@ impl<'session> CudaTensorAssessor<'session> {
                             left_resource,
                             right_resource,
                             &result,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                     } else if let Some(lt) =
                         plan.native_matmul_plans.get(index).and_then(Option::as_ref)
@@ -4605,6 +4777,9 @@ impl<'session> CudaTensorAssessor<'session> {
                                 batch.as_deref_mut()
                             },
                             &mut elementwise_timing,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                         elementwise_host = timings.finish_elementwise(elementwise_timing);
                         resources[index] = Some(output);
@@ -4678,6 +4853,9 @@ impl<'session> CudaTensorAssessor<'session> {
                             },
                             batch.as_deref_mut(),
                             &mut NoopElementwiseTiming,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                         resources[index] = Some(output);
                         release_after_read(&mut resources, &mut remaining_uses, left_index)?;
@@ -4696,6 +4874,9 @@ impl<'session> CudaTensorAssessor<'session> {
                                 .ok_or(CudaTensorExecutionError::MissingResource(input))?,
                             &output,
                             None,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                         resources[index] = Some(output);
                         release_after_read(&mut resources, &mut remaining_uses, input_index)?;
@@ -4719,8 +4900,11 @@ impl<'session> CudaTensorAssessor<'session> {
                         output_bank,
                         fresh_outputs,
                     )?;
-                    self.execute_relu_backward(
-                        node.shape,
+                    if let Some(batch) = batch.as_deref_mut() {
+                        tensor_flush_batch!(batch, timings, false)?;
+                    }
+                    self.execute_admitted_relu_backward(
+                        node,
                         resources[input_index]
                             .as_ref()
                             .ok_or(CudaTensorExecutionError::MissingResource(input))?,
@@ -4728,7 +4912,9 @@ impl<'session> CudaTensorAssessor<'session> {
                             .as_ref()
                             .ok_or(CudaTensorExecutionError::MissingResource(upstream))?,
                         &output,
-                        batch.as_deref_mut(),
+                        scratch
+                            .as_deref_mut()
+                            .and_then(|scratch| scratch.status(index)),
                     )?;
                     resources[index] = Some(output);
                     release_after_read(&mut resources, &mut remaining_uses, input_index)?;
@@ -4770,6 +4956,9 @@ impl<'session> CudaTensorAssessor<'session> {
                                 .as_ref()
                                 .ok_or(CudaTensorExecutionError::MissingResource(gradient))?,
                             &output,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
                         )?;
                     } else {
                         self.execute_sgd_update(
@@ -4781,6 +4970,7 @@ impl<'session> CudaTensorAssessor<'session> {
                                 .as_ref()
                                 .ok_or(CudaTensorExecutionError::MissingResource(gradient))?,
                             SgdUpdateMode {
+                                scalar: node.scalar_type,
                                 learning_rate,
                                 contracted: node.numerical_options.precision
                                     == fusion_pcu::PcuPrecisionPolicy::BackendOptimized
@@ -4807,73 +4997,132 @@ impl<'session> CudaTensorAssessor<'session> {
                     let target_index = plan
                         .index_of(target)
                         .ok_or(CudaTensorExecutionError::InvalidPlan(target))?;
-                    let shape = graph.shape(prediction)?;
-                    let count = shape
-                        .iter()
-                        .try_fold(1usize, |n, d| n.checked_mul(*d))
-                        .ok_or(CudaTensorExecutionError::SizeOverflow)?;
-                    if count == 0 || count > i32::MAX as usize {
-                        return Err(CudaTensorExecutionError::Unsupported {
-                            value: node.value,
-                            reason: TensorUnsupportedReason::Shape,
-                        });
-                    }
-                    let squared = if let Some(scratch) = scratch.as_ref() {
-                        let squared = scratch
-                            .mse_squared
-                            .as_ref()
-                            .ok_or(CudaTensorExecutionError::ScratchMismatch)?
-                            .clone_for_tensor_input();
-                        if !mse_scratch_length_fits(count, squared.device_buffer().len())? {
-                            return Err(CudaTensorExecutionError::ScratchMismatch);
-                        }
-                        squared
-                    } else {
-                        allocate_tensor(memory, pool, shape)?
-                    };
-                    self.execute_elementwise(
-                        plan.fixed_dispatch(index)?,
-                        ElementwiseOperands {
-                            left: resources[prediction_index]
+                    if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) {
+                        let output = execution_resource(
+                            memory,
+                            pool,
+                            node.shape,
+                            node.scalar_type,
+                            index,
+                            node.value,
+                            &mut scratch,
+                            output_bank,
+                            fresh_outputs,
+                        )?;
+                        self.execute_strict_mse(
+                            graph,
+                            node,
+                            resources[prediction_index]
                                 .as_ref()
                                 .ok_or(CudaTensorExecutionError::MissingResource(prediction))?,
-                            right: Some(
-                                resources[target_index]
+                            resources[target_index]
+                                .as_ref()
+                                .ok_or(CudaTensorExecutionError::MissingResource(target))?,
+                            &output,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
+                        )?;
+                        resources[index] = Some(output);
+                        release_after_read(&mut resources, &mut remaining_uses, prediction_index)?;
+                        release_after_read(&mut resources, &mut remaining_uses, target_index)?;
+                    } else {
+                        let shape = graph.shape(prediction)?;
+                        let count = shape
+                            .iter()
+                            .try_fold(1usize, |n, d| n.checked_mul(*d))
+                            .ok_or(CudaTensorExecutionError::SizeOverflow)?;
+                        if count == 0 || count > i32::MAX as usize {
+                            return Err(CudaTensorExecutionError::Unsupported {
+                                value: node.value,
+                                reason: TensorUnsupportedReason::Shape,
+                            });
+                        }
+                        let squared = if let Some(scratch) = scratch.as_ref() {
+                            let squared = scratch
+                                .mse_squared
+                                .as_ref()
+                                .ok_or(CudaTensorExecutionError::ScratchMismatch)?
+                                .clone_for_tensor_input();
+                            if !mse_scratch_length_fits_scalar(
+                                count,
+                                node.scalar_type,
+                                squared.device_buffer().len(),
+                            )? {
+                                return Err(CudaTensorExecutionError::ScratchMismatch);
+                            }
+                            squared
+                        } else {
+                            allocate_tensor_for_size(
+                                memory,
+                                pool,
+                                shape,
+                                usize::from(node.scalar_type.bit_width() / 8),
+                                usize::from(node.scalar_type.bit_width() / 8),
+                            )?
+                        };
+                        self.execute_elementwise(
+                            plan.fixed_dispatch(index)?,
+                            ElementwiseOperands {
+                                left: resources[prediction_index]
                                     .as_ref()
-                                    .ok_or(CudaTensorExecutionError::MissingResource(target))?,
+                                    .ok_or(CudaTensorExecutionError::MissingResource(prediction))?,
+                                right: Some(
+                                    resources[target_index]
+                                        .as_ref()
+                                        .ok_or(CudaTensorExecutionError::MissingResource(target))?,
+                                ),
+                                output: &squared,
+                            },
+                            batch.as_deref_mut(),
+                            &mut NoopElementwiseTiming,
+                            scratch
+                                .as_deref_mut()
+                                .and_then(|scratch| scratch.status(index)),
+                        )?;
+                        if let Some(batch) = batch.as_deref_mut() {
+                            tensor_flush_batch!(batch, timings, false)?;
+                        }
+                        let output = execution_resource(
+                            memory,
+                            pool,
+                            node.shape,
+                            node.scalar_type,
+                            index,
+                            node.value,
+                            &mut scratch,
+                            output_bank,
+                            fresh_outputs,
+                        )?;
+                        let blas = self
+                            .native_cublas(node.scalar_type, node.numerical_options.precision)
+                            .map_err(CudaTensorError::from)?;
+                        match node.scalar_type {
+                            fusion_pcu::PcuScalarType::F32 => blas.sasum_scaled(
+                                count,
+                                squared.device_buffer(),
+                                1,
+                                mse_scale(count)?,
+                                output.device_buffer(),
                             ),
-                            output: &squared,
-                        },
-                        batch.as_deref_mut(),
-                        &mut NoopElementwiseTiming,
-                    )?;
-                    if let Some(batch) = batch.as_deref_mut() {
-                        tensor_flush_batch!(batch, timings, false)?;
-                    }
-                    let output = execution_resource(
-                        memory,
-                        pool,
-                        node.shape,
-                        node.scalar_type,
-                        index,
-                        node.value,
-                        &mut scratch,
-                        output_bank,
-                        fresh_outputs,
-                    )?;
-                    self.native_cublas(node.scalar_type, node.numerical_options.precision)
-                        .map_err(CudaTensorError::from)?
-                        .sasum_scaled(
-                            count,
-                            squared.device_buffer(),
-                            1,
-                            mse_scale(count),
-                            output.device_buffer(),
-                        )
+                            fusion_pcu::PcuScalarType::F64 => blas.dasum_scaled(
+                                count,
+                                squared.device_buffer(),
+                                1,
+                                mse_scale_f64(count)?,
+                                output.device_buffer(),
+                            ),
+                            _ => {
+                                return Err(CudaTensorExecutionError::UnsupportedScalarType(
+                                    node.scalar_type,
+                                ));
+                            }
+                        }
                         .map_err(CudaTensorError::from)?;
-                    resources[index] = Some(output);
-                    release_after_read(&mut resources, &mut remaining_uses, prediction_index)?;
-                    release_after_read(&mut resources, &mut remaining_uses, target_index)?;
+                        resources[index] = Some(output);
+                        release_after_read(&mut resources, &mut remaining_uses, prediction_index)?;
+                        release_after_read(&mut resources, &mut remaining_uses, target_index)?;
+                    }
                 }
             }
             if plan.bounded_pointwise_by_output.contains_key(&node.value) {
@@ -4962,6 +5211,8 @@ impl<'session> CudaTensorAssessor<'session> {
         input: &CudaMemoryResource,
         output: &CudaMemoryResource,
         batch: Option<&mut CudaCompletionBatch>,
+
+        status: Option<&mut owned_scratch::Status>,
     ) -> Result<(), CudaTensorExecutionError> {
         self.execute_elementwise(
             dispatch,
@@ -4972,71 +5223,8 @@ impl<'session> CudaTensorAssessor<'session> {
             },
             batch,
             &mut NoopElementwiseTiming,
+            status,
         )
-    }
-
-    fn execute_relu_backward(
-        &self,
-        shape: &[usize],
-        input: &CudaMemoryResource,
-        upstream: &CudaMemoryResource,
-        output: &CudaMemoryResource,
-        batch: Option<&mut CudaCompletionBatch>,
-    ) -> Result<(), CudaTensorExecutionError> {
-        let count = shape
-            .iter()
-            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
-            .ok_or(CudaTensorExecutionError::SizeOverflow)?;
-        let count = u32::try_from(count)
-            .ok()
-            .filter(|count| *count > 0)
-            .ok_or(CudaTensorExecutionError::SizeOverflow)?;
-        if self.state().relu_backward.borrow().is_none() {
-            let runtime = self.session.tensor_runtime();
-            let image = self
-                .session
-                .compile_tensor_source(RELU_BACKWARD_SOURCE)
-                .map_err(CudaTensorExecutionError::Backend)?;
-            let module = runtime
-                .load_module(&image)
-                .map_err(CudaTensorExecutionError::Completion)?;
-            let kernel = module
-                .function(c"tensor_relu_backward")
-                .map_err(CudaTensorExecutionError::Completion)?;
-            let stream = self.state().stream.clone();
-            *self.state().relu_backward.borrow_mut() = Some((kernel, stream));
-        }
-        let cache = self.state().relu_backward.borrow();
-        let (kernel, stream) = cache
-            .as_ref()
-            .ok_or(CudaTensorExecutionError::SizeOverflow)?;
-        let count_bytes = count.to_ne_bytes();
-        let args = [
-            CudaKernelArgument::Buffer(input.device_buffer()),
-            CudaKernelArgument::Buffer(upstream.device_buffer()),
-            CudaKernelArgument::Buffer(output.device_buffer()),
-            CudaKernelArgument::Bytes(&count_bytes),
-        ];
-        if let Some(batch) = batch {
-            // SAFETY: the compiled kernel takes three f32 buffers and a u32 count. Assessed
-            // shapes and resource sizes cover all guarded indices; the batch retains owners
-            // before enqueue and waits for its final event before reuse.
-            #[allow(unsafe_code)]
-            unsafe {
-                kernel.launch_into_batch(batch, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
-            }
-            .map_err(CudaTensorExecutionError::Completion)
-        } else {
-            // SAFETY: the same assessed ABI and resource contract applies to direct submission.
-            #[allow(unsafe_code)]
-            let mut completion = unsafe {
-                kernel.launch(stream, [count.div_ceil(256), 1, 1], [256, 1, 1], 0, &args)
-            }
-            .map_err(CudaTensorExecutionError::Completion)?;
-            completion
-                .wait()
-                .map_err(CudaTensorExecutionError::Completion)
-        }
     }
 
     fn execute_sgd_update(
@@ -5058,18 +5246,15 @@ impl<'session> CudaTensorAssessor<'session> {
             .ok_or(CudaTensorExecutionError::SizeOverflow)?;
         let cache = if mode.contracted {
             &self.state().sgd_update_contracted
+                [usize::from(mode.scalar == fusion_pcu::PcuScalarType::F64)]
         } else {
-            &self.state().sgd_update
+            &self.state().sgd_update[usize::from(mode.scalar == fusion_pcu::PcuScalarType::F64)]
         };
         if cache.borrow().is_none() {
             let runtime = self.session.tensor_runtime();
             let image = self
                 .session
-                .compile_tensor_source(if mode.contracted {
-                    SGD_UPDATE_CONTRACTED_SOURCE
-                } else {
-                    SGD_UPDATE_SOURCE
-                })
+                .compile_tensor_source(native_sgd::source(mode.scalar, mode.contracted))
                 .map_err(CudaTensorExecutionError::Backend)?;
             let module = runtime
                 .load_module(&image)
@@ -5088,13 +5273,19 @@ impl<'session> CudaTensorAssessor<'session> {
         let (kernel, stream) = cached
             .as_ref()
             .ok_or(CudaTensorExecutionError::SizeOverflow)?;
-        let learning_rate_bytes = mode.learning_rate.to_ne_bytes();
+        let rate_f32_bytes = mode.learning_rate.to_ne_bytes();
+        let rate_f64_bytes = fusion_pcu::widen_f32_exact(mode.learning_rate).to_ne_bytes();
+        let learning_rate_bytes = if mode.scalar == fusion_pcu::PcuScalarType::F64 {
+            rate_f64_bytes.as_slice()
+        } else {
+            rate_f32_bytes.as_slice()
+        };
         let count_bytes = count.to_ne_bytes();
         let args = [
             CudaKernelArgument::Buffer(weights.device_buffer()),
             CudaKernelArgument::Buffer(gradient.device_buffer()),
             CudaKernelArgument::Buffer(output.device_buffer()),
-            CudaKernelArgument::Bytes(&learning_rate_bytes),
+            CudaKernelArgument::Bytes(learning_rate_bytes),
             CudaKernelArgument::Bytes(&count_bytes),
         ];
         if let Some(batch) = batch {
@@ -5315,6 +5506,7 @@ impl<'session> CudaTensorAssessor<'session> {
         operands: ElementwiseOperands<'_>,
         batch: Option<&mut CudaCompletionBatch>,
         timing: &mut T,
+        mut status: Option<&mut owned_scratch::Status>,
     ) -> Result<(), CudaTensorExecutionError> {
         let ElementwiseOperands {
             left,
@@ -5385,11 +5577,11 @@ impl<'session> CudaTensorAssessor<'session> {
                     .map_err(CudaTensorExecutionError::Backend)?;
                 None
             } else {
-                Some(
-                    prepared
-                        .submit(&bindings)
-                        .map_err(CudaTensorExecutionError::Backend)?,
-                )
+                Some(owned_scratch::submit(
+                    prepared,
+                    &bindings,
+                    status.as_deref_mut(),
+                )?)
             }
         };
         timing.finish(ElementwisePhase::Submit, submit_mark);
@@ -5399,6 +5591,9 @@ impl<'session> CudaTensorAssessor<'session> {
                 .wait()
                 .map_err(CudaTensorExecutionError::Completion)?;
             timing.finish(ElementwisePhase::Wait, wait_mark);
+            if let Some(status) = status {
+                status.observe(outcome);
+            }
             match outcome {
                 PcuCompletionOutcome::Succeeded => Ok(()),
                 PcuCompletionOutcome::Failed => Err(CudaTensorExecutionError::FailedCompletion),
@@ -5531,6 +5726,18 @@ fn flattened_invocation_count(shape: &[usize]) -> Result<u32, CudaTensorExecutio
         .ok_or(CudaTensorExecutionError::SizeOverflow)
 }
 
+fn mse_scratch_length_fits_scalar(
+    count: usize,
+    scalar: fusion_pcu::PcuScalarType,
+    squared_bytes: usize,
+) -> Result<bool, CudaTensorExecutionError> {
+    let required = count
+        .checked_mul(usize::from(scalar.bit_width() / 8))
+        .ok_or(CudaTensorExecutionError::SizeOverflow)?;
+    Ok(squared_bytes >= required)
+}
+
+#[cfg(test)]
 fn mse_scratch_length_fits(
     count: usize,
     squared_bytes: usize,
@@ -5614,6 +5821,23 @@ impl CudaPreparedTensorGraph<'_> {
     }
 }
 impl CudaOwnedPreparedTensorGraph {
+    fn from_parts(
+        program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
+        data: CudaPreparedGraphData,
+    ) -> Result<Self, CudaTensorExecutionError> {
+        let view = CudaPreparedGraphView {
+            graph: program.graph(),
+            data: &data,
+            selected: SelectedPlanRef::Owned(&program),
+        };
+        let scratch = owned_scratch::State::new(&view)?;
+        Ok(Self {
+            scratch,
+            program,
+            data,
+        })
+    }
+
     /// Selected cold Lt algorithms retained by this graph-owning schedule.
     #[must_use]
     pub fn native_matmul_implementations(&self) -> Vec<(ValueId, crate::CublasLtPlanIdentity)> {
@@ -5633,9 +5857,8 @@ fn nodes_require_blas(nodes: &[NodeDescriptor<'_>]) -> bool {
     nodes.iter().any(|node| {
         matches!(
             node.op,
-            OpDescriptor::MatMul { .. } if node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
-        ) || matches!(node.op, OpDescriptor::MeanSquaredError { .. }
-        )
+            OpDescriptor::MatMul { .. } | OpDescriptor::MeanSquaredError { .. }
+        ) && node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict)
     })
 }
 
@@ -5684,6 +5907,7 @@ fn validate_tensor_scalar_tag<T: fusion_pcu::PcuScalar>(
 /// Owning prepared tensor schedule. The selected graph and all backend indexes live together;
 /// there are no references from the schedule back into its graph.
 pub struct CudaOwnedPreparedTensorGraph {
+    scratch: owned_scratch::State,
     program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
     data: CudaPreparedGraphData,
 }
@@ -6417,6 +6641,7 @@ const fn operation_insight_index(op: OpDescriptor<'_>) -> usize {
 
 #[derive(Clone, Copy)]
 struct SgdUpdateMode {
+    scalar: fusion_pcu::PcuScalarType,
     learning_rate: f32,
     contracted: bool,
 }
@@ -6564,6 +6789,28 @@ pub struct CudaTensorScratch<'plan, 'graph, 'session> {
     resources: Vec<Option<CudaMemoryResource>>,
     mse_squared: Option<CudaMemoryResource>,
     poisoned: bool,
+}
+
+struct CudaExecutionScratch<'a> {
+    resources: &'a [Option<CudaMemoryResource>],
+    mse_squared: Option<&'a CudaMemoryResource>,
+    statuses: Option<&'a mut [Option<owned_scratch::Status>]>,
+    outputs: &'a [ValueId],
+    node_values: &'a [ValueId],
+}
+
+impl CudaExecutionScratch<'_> {
+    fn status(&mut self, index: usize) -> Option<&mut owned_scratch::Status> {
+        self.statuses.as_deref_mut()?.get_mut(index)?.as_mut()
+    }
+
+    fn lease(&self, index: usize) -> Result<CudaMemoryResource, CudaTensorExecutionError> {
+        self.resources
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(CudaMemoryResource::clone_for_tensor_input)
+            .ok_or_else(|| CudaTensorExecutionError::MissingResource(self.node_values[index]))
+    }
 }
 
 /// Caller-owned output allocations reusable for repeated execution of one exact prepared plan.
@@ -6766,23 +7013,6 @@ fn physical_value_storage_requirement(
     })
 }
 
-impl CudaTensorScratch<'_, '_, '_> {
-    fn lease(&self, index: usize) -> Result<CudaMemoryResource, CudaTensorExecutionError> {
-        self.resources
-            .get(index)
-            .and_then(Option::as_ref)
-            .map(CudaMemoryResource::clone_for_tensor_input)
-            .ok_or_else(|| {
-                CudaTensorExecutionError::MissingResource(
-                    self.prepared
-                        .nodes
-                        .get(index)
-                        .map_or(self.prepared.output, |node| node.value),
-                )
-            })
-    }
-}
-
 // The destination may come from the persistent feedback bank, a fresh owned-result slot,
 // selected scratch storage, or the provider; keeping routing at the allocation boundary avoids
 // duplicating storage policy in every tensor operation branch.
@@ -6794,7 +7024,7 @@ fn execution_resource<P: PcuMemoryProvider<Resource = CudaMemoryResource>>(
     scalar_type: fusion_pcu::PcuScalarType,
     index: usize,
     value: ValueId,
-    scratch: &mut Option<&mut CudaTensorScratch<'_, '_, '_>>,
+    scratch: &mut Option<&mut CudaExecutionScratch<'_>>,
     output_bank: Option<&CudaTensorOutputBank<'_, '_, '_>>,
     fresh_outputs: Option<&[(ValueId, FreshTensorOutput<'_>)]>,
 ) -> Result<CudaMemoryResource, CudaTensorExecutionError> {
@@ -6802,7 +7032,7 @@ fn execution_resource<P: PcuMemoryProvider<Resource = CudaMemoryResource>>(
         return Ok(output.resource.clone_for_tensor_input());
     }
     if let Some(scratch) = scratch.as_deref_mut()
-        && !scratch.prepared.outputs.contains(&value)
+        && !scratch.outputs.contains(&value)
     {
         return scratch.lease(index);
     }
@@ -6813,6 +7043,28 @@ fn execution_resource<P: PcuMemoryProvider<Resource = CudaMemoryResource>>(
         shape,
         element_size,
         usize::try_from(alignment).map_err(|_| CudaTensorExecutionError::SizeOverflow)?,
+    )
+}
+
+fn validate_owned_storage(
+    view: &CudaPreparedGraphView<'_, '_>,
+    inputs: &[(ValueId, &CudaTensorInputRef<'_>)],
+    outputs: &[(ValueId, FreshTensorOutput<'_>)],
+    resources: &[Option<CudaMemoryResource>],
+) -> Result<(), CudaTensorExecutionError> {
+    validate_indexed_storage_constraints(
+        &view.indexed_storage_constraints,
+        |value, index, _output_index| {
+            fresh_output(Some(outputs), value)
+                .map(|output| &output.resource)
+                .or_else(|| {
+                    inputs
+                        .iter()
+                        .find(|(candidate, _)| *candidate == value)
+                        .map(|(_, input)| input.resource())
+                })
+                .or_else(|| resources.get(index).and_then(Option::as_ref))
+        },
     )
 }
 
@@ -6881,6 +7133,9 @@ fn mse_scratch_element_count(
         let OpDescriptor::MeanSquaredError { prediction, .. } = node.op else {
             return Ok(max_count);
         };
+        if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) {
+            return Ok(max_count);
+        }
         let shape = graph.shape(prediction)?;
         // The MSE output is scalar; size internal scratch from its prediction shape.
         let count = shape
@@ -6933,6 +7188,26 @@ fn collect_dispatch_requests<'graph>(
             continue;
         }
         let request = match node.op {
+            OpDescriptor::MeanSquaredError { .. }
+                if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
+            {
+                Some(TensorDispatchRequest::StrictMse(
+                    strict_mse::Profile::from_node(prepared.graph, *node).map_err(|reason| {
+                        CudaTensorExecutionError::Unsupported {
+                            value: node.value,
+                            reason,
+                        }
+                    })?,
+                ))
+            }
+            OpDescriptor::ReluBackward { .. } => Some(TensorDispatchRequest::ReluBackward(
+                relu_backward::Profile::from_node(*node).map_err(|reason| {
+                    CudaTensorExecutionError::Unsupported {
+                        value: node.value,
+                        reason,
+                    }
+                })?,
+            )),
             OpDescriptor::MatMul { .. }
                 if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
             {
@@ -7019,7 +7294,7 @@ fn collect_dispatch_requests<'graph>(
                         scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
-                        float_underflow_policy: None,
+                        numerical_requirements: fixed_numerical_requirements(*node),
                     })
                 } else {
                     Some(TensorDispatchRequest::Fixed {
@@ -7027,7 +7302,7 @@ fn collect_dispatch_requests<'graph>(
                         scalar_type: TensorPointwiseScalarType::try_from(node.scalar_type)?,
                         logical_count: flattened_invocation_count(node.shape)?,
                         scalar_mask: 0,
-                        float_underflow_policy: None,
+                        numerical_requirements: fixed_numerical_requirements(*node),
                     })
                 }
             }
@@ -7039,14 +7314,13 @@ fn collect_dispatch_requests<'graph>(
                     )?,
                     logical_count: flattened_invocation_count(prepared.graph.shape(prediction)?)?,
                     scalar_mask: 0,
-                    float_underflow_policy: None,
+                    numerical_requirements: fixed_numerical_requirements(*node),
                 })
             }
             OpDescriptor::Input
             | OpDescriptor::Constant(_)
             | OpDescriptor::Uniform { .. }
             | OpDescriptor::MatMul { .. }
-            | OpDescriptor::ReluBackward { .. }
             | OpDescriptor::SgdUpdate { .. } => None,
         };
         if let Some(request) = request {
@@ -7062,6 +7336,27 @@ fn collect_dispatch_requests<'graph>(
     Ok(requests)
 }
 
+/// Scalar nodes deliberately omit compound exception granularity. Their canonical header
+/// is Boundary: one checked primitive has identical Boundary/Strict semantics. None never
+/// inherits mutable Graph defaults; captured options and underflow remain exact. Compound
+/// nodes retain their explicit Some(mode). Graph Clamp has no node contract yet.
+const fn fixed_numerical_requirements(
+    node: NodeDescriptor<'_>,
+) -> fusion_pcu::PcuImplementationRequirements {
+    fusion_pcu::PcuImplementationRequirements {
+        numerical_mode: match node.numerical_mode {
+            Some(mode) => mode,
+            None => fusion_pcu::PcuNumericalMode::Boundary,
+        },
+        numerical_options: node.numerical_options,
+        float_underflow: match node.float_underflow_policy {
+            Some(policy) => policy,
+            None => PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        },
+        range_policy: fusion_pcu::PcuRangePolicy::Reject,
+    }
+}
+
 fn fixed_binary_request(
     prepared: &CudaPreparedTensorGraph<'_>,
     node: NodeDescriptor<'_>,
@@ -7075,7 +7370,7 @@ fn fixed_binary_request(
         scalar_type,
         logical_count: flattened_invocation_count(node.shape)?,
         scalar_mask: scalar_mask_for_operands(prepared, left, right)?,
-        float_underflow_policy: node.float_underflow_policy,
+        numerical_requirements: fixed_numerical_requirements(node),
     })
 }
 
@@ -7272,7 +7567,15 @@ fn prepare_graph_outputs_plan_with_policies<'a, A: TensorOperationAssessor>(
     let nodes = lowering_plan.nodes().to_vec();
     for node in &nodes {
         let expected_route = match node.op {
-            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+            OpDescriptor::ReluBackward { .. }
+                if relu_backward::Profile::from_node(*node)
+                    .is_ok_and(relu_backward::Profile::checked) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
+            OpDescriptor::SgdUpdate { .. }
+            | OpDescriptor::MatMul { .. }
+            | OpDescriptor::MeanSquaredError { .. }
                 if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
             {
                 TensorExecutionRoute::Synthesized
@@ -7443,18 +7746,21 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
                         | OpDescriptor::Mul { .. }
                 )
             });
-        if !matches!(
-            scalar_type,
-            fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
-        ) && !transport_only_inputs
-            && !integer_profile
-        {
+        if !is_checked_float_type(scalar_type) && !transport_only_inputs && !integer_profile {
             return Err(CudaTensorExecutionError::UnsupportedScalarType(scalar_type));
         }
     }
     for node in &nodes {
         let expected_route = match node.op {
-            OpDescriptor::SgdUpdate { .. } | OpDescriptor::MatMul { .. }
+            OpDescriptor::ReluBackward { .. }
+                if relu_backward::Profile::from_node(*node)
+                    .is_ok_and(relu_backward::Profile::checked) =>
+            {
+                TensorExecutionRoute::Synthesized
+            }
+            OpDescriptor::SgdUpdate { .. }
+            | OpDescriptor::MatMul { .. }
+            | OpDescriptor::MeanSquaredError { .. }
                 if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) =>
             {
                 TensorExecutionRoute::Synthesized
@@ -8065,31 +8371,38 @@ fn prepare_fixed_dispatches(
                         (TensorDispatchKind::Relu, node.shape, 0)
                     }
                 }
-                OpDescriptor::MeanSquaredError { prediction, .. } => (
-                    TensorDispatchKind::SquaredDifference,
-                    graph.shape(prediction)?,
-                    0,
-                ),
+                OpDescriptor::MeanSquaredError { prediction, .. }
+                    if node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Strict) =>
+                {
+                    (
+                        TensorDispatchKind::SquaredDifference,
+                        graph.shape(prediction)?,
+                        0,
+                    )
+                }
                 _ => return Ok(None),
             };
             let logical_count = flattened_invocation_count(shape)?;
             let invocations =
                 NonZeroU32::new(logical_count).ok_or(CudaTensorExecutionError::SizeOverflow)?;
             let scalar_type = TensorPointwiseScalarType::try_from(node.scalar_type)?;
-            let float_underflow_policy = node.float_underflow_policy;
+            let numerical_requirements = fixed_numerical_requirements(*node);
             let cache_key = TensorDispatchCacheKey::Fixed(
                 kind,
                 scalar_type,
                 logical_count,
                 scalar_mask,
-                float_underflow_policy,
+                numerical_requirements,
             );
-            let kernel = kind.kernel(
-                scalar_type,
-                logical_count,
-                scalar_mask,
-                float_underflow_policy,
-            )?;
+            let kernel = PcuDispatchKernelIr {
+                numerical_requirements,
+                ..kind.kernel(
+                    scalar_type,
+                    logical_count,
+                    scalar_mask,
+                    Some(numerical_requirements.float_underflow),
+                )?
+            };
             let value_type = scalar_type.value_type();
             let (left_binding, right_binding, output_binding) = fixed_binding_refs(kind);
             Ok(Some(PreparedFixedTensorDispatch {
@@ -8312,7 +8625,10 @@ const fn scalar_layout(
     scalar_type: fusion_pcu::PcuScalarType,
 ) -> Result<(usize, u64), CudaTensorExecutionError> {
     match scalar_type {
-        fusion_pcu::PcuScalarType::I8 | fusion_pcu::PcuScalarType::U8 => Ok((1, 1)),
+        fusion_pcu::PcuScalarType::I8
+        | fusion_pcu::PcuScalarType::U8
+        | fusion_pcu::PcuScalarType::F8E4M3FN
+        | fusion_pcu::PcuScalarType::F8E5M2 => Ok((1, 1)),
         fusion_pcu::PcuScalarType::I16
         | fusion_pcu::PcuScalarType::U16
         | fusion_pcu::PcuScalarType::F16
@@ -8323,6 +8639,36 @@ const fn scalar_layout(
         fusion_pcu::PcuScalarType::I64
         | fusion_pcu::PcuScalarType::U64
         | fusion_pcu::PcuScalarType::F64 => Ok((8, 8)),
+        fusion_pcu::PcuScalarType::I128 => {
+            Ok((size_of::<i128>(), core::mem::align_of::<i128>() as u64))
+        }
+        fusion_pcu::PcuScalarType::U128 => {
+            Ok((size_of::<u128>(), core::mem::align_of::<u128>() as u64))
+        }
+        fusion_pcu::PcuScalarType::I256 => Ok((
+            size_of::<fusion_pcu::PcuI256>(),
+            core::mem::align_of::<fusion_pcu::PcuI256>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::U256 => Ok((
+            size_of::<fusion_pcu::PcuU256>(),
+            core::mem::align_of::<fusion_pcu::PcuU256>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::I512 => Ok((
+            size_of::<fusion_pcu::PcuI512>(),
+            core::mem::align_of::<fusion_pcu::PcuI512>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::U512 => Ok((
+            size_of::<fusion_pcu::PcuU512>(),
+            core::mem::align_of::<fusion_pcu::PcuU512>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::F128 => Ok((
+            size_of::<fusion_pcu::PcuF128Bits>(),
+            core::mem::align_of::<fusion_pcu::PcuF128Bits>() as u64,
+        )),
+        fusion_pcu::PcuScalarType::F256 => Ok((
+            size_of::<fusion_pcu::PcuF256Bits>(),
+            core::mem::align_of::<fusion_pcu::PcuF256Bits>() as u64,
+        )),
         unsupported => Err(CudaTensorExecutionError::UnsupportedScalarType(unsupported)),
     }
 }
@@ -8340,8 +8686,18 @@ const fn is_transport_scalar(scalar_type: fusion_pcu::PcuScalarType) -> bool {
             | fusion_pcu::PcuScalarType::U64
             | fusion_pcu::PcuScalarType::F16
             | fusion_pcu::PcuScalarType::BF16
+            | fusion_pcu::PcuScalarType::F8E4M3FN
+            | fusion_pcu::PcuScalarType::F8E5M2
             | fusion_pcu::PcuScalarType::F32
             | fusion_pcu::PcuScalarType::F64
+            | fusion_pcu::PcuScalarType::I128
+            | fusion_pcu::PcuScalarType::U128
+            | fusion_pcu::PcuScalarType::I256
+            | fusion_pcu::PcuScalarType::U256
+            | fusion_pcu::PcuScalarType::I512
+            | fusion_pcu::PcuScalarType::U512
+            | fusion_pcu::PcuScalarType::F128
+            | fusion_pcu::PcuScalarType::F256
     )
 }
 
@@ -8356,6 +8712,12 @@ const fn is_checked_integer_scalar(scalar_type: fusion_pcu::PcuScalarType) -> bo
             | fusion_pcu::PcuScalarType::U32
             | fusion_pcu::PcuScalarType::I64
             | fusion_pcu::PcuScalarType::U64
+            | fusion_pcu::PcuScalarType::I128
+            | fusion_pcu::PcuScalarType::U128
+            | fusion_pcu::PcuScalarType::I256
+            | fusion_pcu::PcuScalarType::U256
+            | fusion_pcu::PcuScalarType::I512
+            | fusion_pcu::PcuScalarType::U512
     )
 }
 
@@ -8370,10 +8732,25 @@ const fn is_checked_float_binary_node(node: NodeDescriptor<'_>) -> bool {
         )
 }
 
+const fn is_low_float_type(scalar_type: fusion_pcu::PcuScalarType) -> bool {
+    matches!(
+        scalar_type,
+        fusion_pcu::PcuScalarType::F16
+            | fusion_pcu::PcuScalarType::BF16
+            | fusion_pcu::PcuScalarType::F8E4M3FN
+            | fusion_pcu::PcuScalarType::F8E5M2
+    )
+}
+
 const fn is_checked_float_type(scalar_type: fusion_pcu::PcuScalarType) -> bool {
     matches!(
         scalar_type,
-        fusion_pcu::PcuScalarType::F32 | fusion_pcu::PcuScalarType::F64
+        fusion_pcu::PcuScalarType::F16
+            | fusion_pcu::PcuScalarType::BF16
+            | fusion_pcu::PcuScalarType::F8E4M3FN
+            | fusion_pcu::PcuScalarType::F8E5M2
+            | fusion_pcu::PcuScalarType::F32
+            | fusion_pcu::PcuScalarType::F64
     )
 }
 
@@ -8390,9 +8767,31 @@ const fn alignment_satisfies(reported: u64, required: u64) -> bool {
     required != 0 && reported >= required && reported.is_multiple_of(required)
 }
 
-#[allow(clippy::cast_precision_loss)] // Matches the tensor dialect's f32 mean divisor semantics.
-fn mse_scale(element_count: usize) -> f32 {
-    1.0 / element_count as f32
+/// Formation is fixed nearest-even even when the permitted library reduction is native.
+fn mse_scale(element_count: usize) -> Result<f32, CudaTensorExecutionError> {
+    use fusion_pcu::PcuCheckedFloat;
+    if element_count == 0 || element_count > i32::MAX as usize {
+        return Err(CudaTensorExecutionError::SizeOverflow);
+    }
+    1.0_f32
+        .pcu_checked_div(fusion_pcu::dialect::tensor::constants::count_f32(
+            element_count,
+        ))
+        .map_err(|_| CudaTensorExecutionError::SizeOverflow)
+}
+
+/// Native F64 reduction uses an exact integer count (bounded by i32) and a F64 reciprocal.
+fn mse_scale_f64(count: usize) -> Result<f64, CudaTensorExecutionError> {
+    use fusion_pcu::PcuCheckedFloat;
+    let count = u32::try_from(count)
+        .ok()
+        .filter(|n| *n > 0 && i32::try_from(*n).is_ok())
+        .ok_or(CudaTensorExecutionError::SizeOverflow)?;
+    1.0_f64
+        .pcu_checked_div(fusion_pcu::dialect::tensor::constants::count_f64(
+            count as usize,
+        ))
+        .map_err(|_| CudaTensorExecutionError::SizeOverflow)
 }
 
 fn allocate_tensor<P: PcuMemoryProvider<Resource = CudaMemoryResource>>(
@@ -8585,6 +8984,11 @@ impl TensorOperationAssessor for CudaTensorAssessor<'_> {
             return TensorOperationSupport::Unsupported { reason };
         }
         if matches!(node.op, OpDescriptor::MeanSquaredError { .. })
+            && node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict)
+        {
+            return strict_mse::assess(graph, node);
+        }
+        if matches!(node.op, OpDescriptor::MeanSquaredError { .. })
             && let Err(reason) =
                 assess_native_mse_numerical_options(node, &self.state().native_cublas.environment)
         {
@@ -8619,15 +9023,10 @@ impl TensorOperationAssessor for CudaTensorAssessor<'_> {
                 },
             };
         }
-        // Native compound offers are individually admitted above. The derivative still has no
-        // checked or explicitly native contract in this adapter.
         if matches!(node.op, OpDescriptor::ReluBackward { .. }) {
-            return TensorOperationSupport::Unsupported {
-                reason: TensorUnsupportedReason::Other(
-                    "CUDA operation requires a defined checked numerical contract".into(),
-                ),
-            };
+            return relu_backward::assess(graph, node);
         }
+
         assess_tensor_node(graph, node)
     }
 
@@ -8656,13 +9055,7 @@ fn assess_matmul_numerical_options(
         ));
     }
     if node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict) {
-        if node.numerical_options.compound_arithmetic
-            == fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
-        {
-            return Err(unsupported(
-                fusion_pcu::PcuNumericalRequirement::CompoundArithmetic,
-            ));
-        }
+        // Strict always selects the stronger ordered checker, even under native permissions.
         return Ok(());
     }
     if node.numerical_mode != Some(fusion_pcu::PcuNumericalMode::Boundary)
@@ -8707,9 +9100,6 @@ fn assess_native_mse_numerical_options(
         });
     }
     assess_matmul_numerical_options(node, environment)?;
-    if node.scalar_type != fusion_pcu::PcuScalarType::F32 {
-        return Err(TensorUnsupportedReason::ElementType);
-    }
     Ok(())
 }
 
@@ -8720,6 +9110,18 @@ const fn cuda_supports_operand_representation(
     if matches!(node.op, OpDescriptor::Input) {
         return matches!(representation, TensorOperandRepresentation::Dense)
             && is_transport_scalar(node.scalar_type);
+    }
+    if is_low_float_type(node.scalar_type) {
+        return matches!(representation, TensorOperandRepresentation::Dense)
+            && matches!(
+                node.op,
+                OpDescriptor::Add { .. }
+                    | OpDescriptor::Sub { .. }
+                    | OpDescriptor::Mul { .. }
+                    | OpDescriptor::Div { .. }
+                    | OpDescriptor::Relu { .. }
+                    | OpDescriptor::ReluBackward { .. }
+            );
     }
     let supported_scalar = matches!(
         node.scalar_type,
@@ -8740,6 +9142,7 @@ const fn cuda_supports_operand_representation(
                 | OpDescriptor::Mul { .. }
                 | OpDescriptor::Div { .. }
                 | OpDescriptor::Relu { .. }
+                | OpDescriptor::ReluBackward { .. }
                 | OpDescriptor::Constant(_)
                 | OpDescriptor::Uniform { .. }
         ),
@@ -8759,6 +9162,24 @@ const fn cuda_supports_operand_representation(
 }
 
 fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+    // The scalar dispatch Portable qualification does not certify an owned tensor program.
+    if node.numerical_options.reproducibility != fusion_pcu::PcuReproducibility::Unspecified {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::NumericalPolicy {
+                requirement: fusion_pcu::PcuNumericalRequirement::Reproducibility,
+                options: node.numerical_options,
+            },
+        };
+    }
+    if matches!(node.op, OpDescriptor::ReluBackward { .. }) {
+        return relu_backward::assess(graph, node);
+    }
+    if matches!(node.op, OpDescriptor::MeanSquaredError { .. })
+        && node.numerical_mode == Some(fusion_pcu::PcuNumericalMode::Strict)
+    {
+        return strict_mse::assess(graph, node);
+    }
+
     if matches!(node.op, OpDescriptor::Input) && is_transport_scalar(node.scalar_type) {
         return TensorOperationSupport::Supported {
             route: TensorExecutionRoute::Native,
@@ -8768,21 +9189,11 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
     if is_checked_integer_scalar(node.scalar_type) {
         return assess_checked_integer_node(graph, node);
     }
-    if node.scalar_type == fusion_pcu::PcuScalarType::F64
-        && !matches!(
-            node.op,
-            OpDescriptor::Input
-                | OpDescriptor::MatMul { .. }
-                | OpDescriptor::Add { .. }
-                | OpDescriptor::Sub { .. }
-                | OpDescriptor::Mul { .. }
-                | OpDescriptor::Div { .. }
-                | OpDescriptor::Relu { .. }
-        )
-    {
-        return TensorOperationSupport::Unsupported {
-            reason: TensorUnsupportedReason::ElementType,
-        };
+    if is_low_float_type(node.scalar_type) {
+        return assess_low_float_node(graph, node);
+    }
+    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+        return assess_f64_pointwise_or_literal_node(graph, node);
     }
     if !matches!(
         node.scalar_type,
@@ -8793,6 +9204,93 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
         };
     }
     assess_f32_tensor_node(graph, node)
+}
+
+// F64 producers are exact dense transport; checked scalar consumers keep their existing law.
+fn assess_f64_pointwise_or_literal_node(
+    graph: &Graph,
+    node: NodeDescriptor<'_>,
+) -> TensorOperationSupport {
+    if node.shape.contains(&0)
+        && matches!(
+            node.op,
+            OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+        )
+    {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::Shape,
+        };
+    }
+    if !matches!(
+        node.op,
+        OpDescriptor::Input
+            | OpDescriptor::Constant(_)
+            | OpDescriptor::Uniform { .. }
+            | OpDescriptor::MatMul { .. }
+            | OpDescriptor::Add { .. }
+            | OpDescriptor::Sub { .. }
+            | OpDescriptor::Mul { .. }
+            | OpDescriptor::Div { .. }
+            | OpDescriptor::Relu { .. }
+            | OpDescriptor::SgdUpdate { .. }
+            | OpDescriptor::MeanSquaredError { .. }
+    ) {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::ElementType,
+        };
+    }
+    assess_f32_tensor_node(graph, node)
+}
+
+fn assess_low_float_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+    let operands = match node.op {
+        OpDescriptor::Add { left, right }
+        | OpDescriptor::Sub { left, right }
+        | OpDescriptor::Mul { left, right }
+        | OpDescriptor::Div { left, right } => [Some(left), Some(right)],
+        OpDescriptor::Relu { input } => [Some(input), None],
+        _ => {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+            };
+        }
+    };
+    let count = node
+        .shape
+        .iter()
+        .try_fold(1usize, |count, dim| count.checked_mul(*dim));
+    if !count.is_some_and(|count| count > 0 && u32::try_from(count).is_ok()) {
+        return TensorOperationSupport::Unsupported {
+            reason: TensorUnsupportedReason::Shape,
+        };
+    }
+    for value in operands.into_iter().flatten() {
+        let Ok(operand) = graph.node(value) else {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+            };
+        };
+        if operand.scalar_type != node.scalar_type
+            || operand.shape != node.shape
+            || !matches!(
+                operand.op,
+                OpDescriptor::Input
+                    | OpDescriptor::Add { .. }
+                    | OpDescriptor::Sub { .. }
+                    | OpDescriptor::Mul { .. }
+                    | OpDescriptor::Div { .. }
+                    | OpDescriptor::Relu { .. }
+            )
+        {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::ElementType,
+            };
+        }
+    }
+    TensorOperationSupport::Supported {
+        route: TensorExecutionRoute::Synthesized,
+        workspace_bytes: Some(0),
+    }
 }
 
 fn assess_checked_integer_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
@@ -8946,26 +9444,7 @@ fn assess_f32_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOper
         OpDescriptor::SgdUpdate {
             weights, gradient, ..
         } => assess_sgd_update(graph, node.shape, weights, gradient),
-        OpDescriptor::MeanSquaredError { prediction, target } => {
-            match (graph.shape(prediction), graph.shape(target)) {
-                (Ok(left), Ok(right)) if left == right && node.shape.is_empty() => {
-                    let count = left.iter().try_fold(1usize, |n, d| n.checked_mul(*d));
-                    if count.is_some_and(|n| n > 0 && i32::try_from(n).is_ok()) {
-                        TensorOperationSupport::Supported {
-                            route: TensorExecutionRoute::Library,
-                            workspace_bytes: None,
-                        }
-                    } else {
-                        TensorOperationSupport::Unsupported {
-                            reason: TensorUnsupportedReason::Shape,
-                        }
-                    }
-                }
-                _ => TensorOperationSupport::Unsupported {
-                    reason: TensorUnsupportedReason::Shape,
-                },
-            }
-        }
+        OpDescriptor::MeanSquaredError { .. } => native_mse::assess_graph(graph, node),
     }
 }
 
@@ -9078,6 +9557,10 @@ fn matmul_shape_supported(
         .all(|(a, b)| a.checked_mul(b).and_then(|n| n.checked_mul(4)).is_some())
         && output_shape == [rows, columns]
 }
+
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[path = "cold_constants/cold_constants.rs"]
+mod cold_constants;
 
 #[cfg(test)]
 mod tests {
@@ -9727,6 +10210,147 @@ mod tests {
     }
 
     #[test]
+    fn low_four_owned_preparation_retains_all_checked_pointwise_dispatches() {
+        for dtype in [
+            PcuScalarType::F16,
+            PcuScalarType::BF16,
+            PcuScalarType::F8E4M3FN,
+            PcuScalarType::F8E5M2,
+        ] {
+            for policy in [
+                PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+            ] {
+                let mut graph = Graph::default();
+                graph.set_numerical_mode(fusion_pcu::PcuNumericalMode::Strict);
+                let left = graph.input([65], dtype).unwrap();
+                let right = graph.input([65], dtype).unwrap();
+                let values = [
+                    graph.add(left, right).unwrap(),
+                    graph.sub(left, right).unwrap(),
+                    graph.mul(left, right).unwrap(),
+                    graph.div(left, right).unwrap(),
+                    graph.relu(left).unwrap(),
+                ];
+                for value in values {
+                    graph
+                        .set_value_float_underflow_policy(value, policy)
+                        .unwrap();
+                }
+                let program = graph
+                    .into_selected_program(
+                        &values,
+                        TensorArithmeticRewritePolicy::Disabled,
+                        TensorArithmeticCapability::Strict,
+                        TensorPointwiseGroupingPolicy::Disabled,
+                    )
+                    .unwrap();
+                let data = prepare_owned_graph_data(&program, &PureCudaAssessor).unwrap();
+                assert_eq!(data.scalar_type, Some(dtype));
+                assert!(!data.transport_only_inputs);
+                let dispatches = data.fixed_dispatches.iter().flatten().collect::<Vec<_>>();
+                assert_eq!(dispatches.len(), 5);
+                for dispatch in dispatches {
+                    let node = program.graph().node(dispatch.value).unwrap();
+                    assert_eq!(
+                        dispatch.kernel.numerical_requirements,
+                        super::fixed_numerical_requirements(node)
+                    );
+                    assert_eq!(
+                        dispatch.kernel.numerical_requirements.float_underflow,
+                        policy
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_captured_tuple_is_exact_and_scalar_none_is_canonical_boundary() {
+        use fusion_pcu::{PcuCompoundArithmeticPolicy, PcuNumericalMode, PcuPrecisionPolicy};
+        let mut graph = Graph::default();
+        graph.set_numerical_mode(PcuNumericalMode::Strict);
+        let input = graph.input([17], PcuScalarType::F16).unwrap();
+        let value = graph.add(input, input).unwrap();
+        let original = super::fixed_numerical_requirements(graph.node(value).unwrap());
+        assert_eq!(graph.node(value).unwrap().numerical_mode, None);
+        assert_eq!(original.numerical_mode, PcuNumericalMode::Boundary);
+        graph.set_numerical_mode(PcuNumericalMode::Boundary);
+        graph.set_numerical_options(fusion_pcu::PcuNumericalOptions {
+            compound_arithmetic: PcuCompoundArithmeticPolicy::BackendDefined,
+            precision: PcuPrecisionPolicy::BackendOptimized,
+            ..Default::default()
+        });
+        // Defaults changed after capture cannot alter a scalar node's header or cache key.
+        assert_eq!(
+            super::fixed_numerical_requirements(graph.node(value).unwrap()),
+            original
+        );
+        let node = graph.node(value).unwrap();
+        let prepared =
+            prepared_for_request_test(&graph, &[value], TensorPointwiseGroupingPolicy::Disabled);
+        let requests = collect_dispatch_requests(&prepared).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].key(),
+            prepared
+                .fixed_dispatches
+                .iter()
+                .flatten()
+                .find(|dispatch| dispatch.value == value)
+                .unwrap()
+                .cache_key
+        );
+        assert_eq!(
+            prepared
+                .fixed_dispatches
+                .iter()
+                .flatten()
+                .find(|dispatch| dispatch.value == value)
+                .unwrap()
+                .kernel
+                .numerical_requirements,
+            original
+        );
+        let mut distinct = Vec::new();
+        for mode in [None, Some(PcuNumericalMode::Strict)] {
+            for compound in [
+                PcuCompoundArithmeticPolicy::Checked,
+                PcuCompoundArithmeticPolicy::BackendDefined,
+            ] {
+                for precision in [
+                    PcuPrecisionPolicy::Preserve,
+                    PcuPrecisionPolicy::BackendOptimized,
+                ] {
+                    for underflow in [
+                        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                        PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+                    ] {
+                        let mut profile = node;
+                        profile.numerical_mode = mode;
+                        profile.numerical_options.compound_arithmetic = compound;
+                        profile.numerical_options.precision = precision;
+                        profile.float_underflow_policy = Some(underflow);
+                        let requirements = super::fixed_numerical_requirements(profile);
+                        let key = TensorDispatchCacheKey::Fixed(
+                            TensorDispatchKind::CheckedFloatAdd,
+                            TensorPointwiseScalarType::F16,
+                            17,
+                            0,
+                            requirements,
+                        );
+                        assert!(!distinct.contains(&key));
+                        distinct.push(key);
+                    }
+                }
+            }
+        }
+        assert_eq!(distinct.len(), 24);
+    }
+
+    #[test]
     fn mixed_float_policies_have_distinct_prewarm_keys_and_executables() {
         let mut graph = Graph::default();
         let left = graph.input([17], PcuScalarType::F32).unwrap();
@@ -9747,17 +10371,17 @@ mod tests {
             .map(|request| match request {
                 TensorDispatchRequest::Fixed {
                     kind: TensorDispatchKind::CheckedFloatAdd,
-                    float_underflow_policy,
+                    numerical_requirements,
                     ..
-                } => *float_underflow_policy,
+                } => numerical_requirements.float_underflow,
                 other => panic!("unexpected request: {other:?}"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
             policies,
             [
-                Some(PcuFloatUnderflowPolicy::IeeeAfterRounding),
-                Some(PcuFloatUnderflowPolicy::AllowGradualUnderflow),
+                PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow,
             ]
         );
         assert_ne!(requests[0].key(), requests[1].key());
@@ -9894,10 +10518,8 @@ mod tests {
             )
             .unwrap();
         let data = prepare_owned_graph_data(&program, &PureCudaAssessor).unwrap();
-        let prepared = super::CudaOwnedPreparedTensorGraph {
-            program: Arc::new(program),
-            data,
-        };
+        let prepared =
+            super::CudaOwnedPreparedTensorGraph::from_parts(Arc::new(program), data).unwrap();
         let provider_allocations = Cell::new(0);
 
         let error = with_single_output_plan(&prepared, || {
@@ -9930,10 +10552,8 @@ mod tests {
             )
             .unwrap();
         let data = prepare_owned_graph_data(&program, &PureCudaAssessor).unwrap();
-        let prepared = super::CudaOwnedPreparedTensorGraph {
-            program: Arc::new(program),
-            data,
-        };
+        let prepared =
+            super::CudaOwnedPreparedTensorGraph::from_parts(Arc::new(program), data).unwrap();
         let provider_allocations = Cell::new(0);
 
         let result = with_single_output_plan(&prepared, || {
@@ -10052,7 +10672,7 @@ mod tests {
                     expected,
                     17,
                     0,
-                    Some(PcuFloatUnderflowPolicy::default()),
+                    PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 )
             );
             assert!(dispatch.kernel.ops.iter().any(|op| matches!(
@@ -10135,8 +10755,19 @@ mod tests {
         assert_transport_layout::<u64>(PcuScalarType::U64);
         assert_transport_layout::<PcuF16Bits>(PcuScalarType::F16);
         assert_transport_layout::<PcuBf16Bits>(PcuScalarType::BF16);
+        assert_transport_layout::<fusion_pcu::PcuF8E4M3FnBits>(PcuScalarType::F8E4M3FN);
+        assert_transport_layout::<fusion_pcu::PcuF8E5M2Bits>(PcuScalarType::F8E5M2);
         assert_transport_layout::<f32>(PcuScalarType::F32);
         assert_transport_layout::<f64>(PcuScalarType::F64);
+
+        assert_transport_layout::<i128>(PcuScalarType::I128);
+        assert_transport_layout::<u128>(PcuScalarType::U128);
+        assert_transport_layout::<fusion_pcu::PcuI256>(PcuScalarType::I256);
+        assert_transport_layout::<fusion_pcu::PcuU256>(PcuScalarType::U256);
+        assert_transport_layout::<fusion_pcu::PcuI512>(PcuScalarType::I512);
+        assert_transport_layout::<fusion_pcu::PcuU512>(PcuScalarType::U512);
+        assert_transport_layout::<fusion_pcu::PcuF128Bits>(PcuScalarType::F128);
+        assert_transport_layout::<fusion_pcu::PcuF256Bits>(PcuScalarType::F256);
 
         for scalar_type in [PcuScalarType::Bool, PcuScalarType::I4, PcuScalarType::U4] {
             assert!(!is_transport_scalar(scalar_type));
@@ -10291,7 +10922,7 @@ mod tests {
                 scalar_type: TensorPointwiseScalarType::F32,
                 logical_count: 16,
                 scalar_mask: 0,
-                float_underflow_policy: Some(PcuFloatUnderflowPolicy::IeeeAfterRounding),
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             }
         ));
         assert!(matches!(
@@ -10301,7 +10932,7 @@ mod tests {
                 scalar_type: TensorPointwiseScalarType::F32,
                 logical_count: 16,
                 scalar_mask: 0,
-                float_underflow_policy: None,
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             }
         ));
     }
@@ -10350,14 +10981,14 @@ mod tests {
             TensorPointwiseScalarType::F32,
             17,
             0,
-            Some(PcuFloatUnderflowPolicy::default()),
+            PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         );
         let f64_key = TensorDispatchCacheKey::Fixed(
             TensorDispatchKind::Add,
             TensorPointwiseScalarType::F64,
             17,
             0,
-            None,
+            PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         );
         assert_ne!(f32_key, f64_key);
         assert_ne!(
@@ -10381,10 +11012,8 @@ mod tests {
     #[test]
     fn f64_fixed_pointwise_factory_rejects_unsupported_profiles_and_uniform_masks() {
         assert!(matches!(
-            pointwise::kernel(TensorDispatchKind::SquaredDifference, 17, 0),
-            Err(CudaTensorExecutionError::UnsupportedScalarType(
-                PcuScalarType::F64
-            ))
+            pointwise::kernel(TensorDispatchKind::SquaredDifference, 17, 1),
+            Err(CudaTensorExecutionError::InvalidPointwiseProfile)
         ));
         assert!(matches!(
             pointwise::kernel(TensorDispatchKind::Relu, 17, 1),
@@ -10476,7 +11105,7 @@ mod tests {
                     TensorPointwiseScalarType::F32,
                     count,
                     0,
-                    Some(PcuFloatUnderflowPolicy::default()),
+                    PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 )
             })
             .collect::<Vec<_>>();
@@ -10500,6 +11129,12 @@ mod tests {
             PcuScalarType::U32,
             PcuScalarType::I64,
             PcuScalarType::U64,
+            PcuScalarType::I128,
+            PcuScalarType::U128,
+            PcuScalarType::I256,
+            PcuScalarType::U256,
+            PcuScalarType::I512,
+            PcuScalarType::U512,
         ] {
             let mut graph = Graph::default();
             let left = graph.input([17], scalar).unwrap();
@@ -10747,6 +11382,337 @@ mod tests {
                 data.map(f32::to_bits),
                 [expected, -expected].map(f32::to_bits)
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native device; private scratch exclusivity, ownership and terminal retry"]
+    fn owned_private_scratch_is_exclusive_and_retries_after_terminal_fault() {
+        let (_discovery, session) = cuda_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0180);
+        let assessor = CudaTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        macro_rules! check {
+            ($ty:ty, $kind:ident) => {{
+                let mut graph = Graph::default();
+                let input = graph.input([65], PcuScalarType::$kind).unwrap();
+                let literal = graph.uniform_typed([65], 0.25 as $ty).unwrap();
+                let difference = graph.sub(input, literal.erase()).unwrap();
+                let output = graph.mul(difference, difference).unwrap();
+                let program = graph.into_selected_program(
+                    &[output], TensorArithmeticRewritePolicy::Disabled,
+                    TensorArithmeticCapability::Strict, TensorPointwiseGroupingPolicy::Disabled,
+                ).unwrap();
+                let prepared = assessor.prepare_owned_program(program).unwrap();
+                let owner = PcuDeviceTensor::new([65], session.upload_buffer(pool, &[2.0 as $ty; 65]).unwrap()).unwrap();
+                let bank = prepared.scratch.bind(session.tensor_runtime(), &prepared.view(), pool, &mut memory).unwrap();
+                #[cfg(feature = "allocation-census")]
+                crate::reset_cuda_api_census();
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory), Err(CudaTensorExecutionError::ScratchBusy)));
+                #[cfg(feature = "allocation-census")]
+                assert_eq!(crate::cuda_api_census().allocations, 0);
+                drop(bank);
+                let first = assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory).unwrap().pop().unwrap().1;
+                let changed = PcuDeviceTensor::new([65], session.upload_buffer(pool, &[1.0 as $ty; 65]).unwrap()).unwrap();
+                #[cfg(feature = "allocation-census")]
+                crate::reset_cuda_api_census();
+                let second = assessor.execute_owned_program_outputs(&prepared, &[(input, &changed)], pool, &mut memory).unwrap().pop().unwrap().1;
+                #[cfg(feature = "allocation-census")]
+                {
+                    let api = crate::cuda_api_census();
+                    // Only the escaped result is fresh. Private values and observed-sentinel
+                    // faultwords remain retained under the same exclusive bank borrow.
+                    assert_eq!(api.allocations, 1);
+                    assert_eq!(api.host_to_device_copies, 0);
+                    assert_eq!(api.symbol_resolutions, 0);
+                    assert_eq!(api.module_loads, 0);
+                }
+                let mut bad = [2.0 as $ty; 65];
+                bad[2] = <$ty>::INFINITY;
+                let invalid = PcuDeviceTensor::new([65], session.upload_buffer(pool, &bad).unwrap()).unwrap();
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &invalid)], pool, &mut memory), Err(CudaTensorExecutionError::ExecutionFault(fault)) if fault.invocation_id == 2 && fault.kind == fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand));
+                let mut unavailable_pool_provider = session.memory_provider(PcuMemoryPoolId(0x4352_0181));
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut unavailable_pool_provider), Err(CudaTensorExecutionError::Memory(_))));
+                #[cfg(feature = "allocation-census")]
+                crate::reset_cuda_api_census();
+                let retried = assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory).unwrap().pop().unwrap().1;
+                #[cfg(feature = "allocation-census")]
+                {
+                    let api = crate::cuda_api_census();
+                    assert_eq!(api.allocations, 1);
+                    // The faulted subtraction resets; the unexecuted multiply still has MAX.
+                    assert_eq!(api.host_to_device_copies, 1);
+                }
+
+                // Protocol injection, not a manufactured SDK failure: an unknown terminal
+                // result must retire every private owner and refuse a later call before work.
+                let mut bank = prepared.scratch.bind(session.tensor_runtime(), &prepared.view(), pool, &mut memory).unwrap();
+                let leased = bank.physical.iter().find(|resource| resource.device_buffer().len() == 8).unwrap().clone_for_tensor_input();
+                leased.device_buffer().with_access_lease_for_test(|| {
+                    bank.finish(Some(&CudaTensorExecutionError::FailedCompletion)).unwrap();
+                }).unwrap();
+                drop(bank);
+                assert!(matches!(assessor.execute_owned_program_outputs(&prepared, &[(input, &owner)], pool, &mut memory), Err(CudaTensorExecutionError::ScratchMismatch)));
+                drop(prepared);
+                for (escaped, expected) in [(first, 3.0625 as $ty), (second, 0.5625 as $ty), (retried, 3.0625 as $ty)] {
+                    let mut actual = [99.0 as $ty; 66];
+                    session.download_buffer(pool, escaped.buffer(), &mut actual[..65]).unwrap();
+                    assert!(actual[..65].iter().all(|value| value.to_bits() == expected.to_bits()));
+                    assert_eq!(actual[65].to_bits(), (99.0 as $ty).to_bits());
+                }
+            }};
+        }
+        check!(f32, F32);
+        check!(f64, F64);
+    }
+
+    #[test]
+    #[ignore = "requires authorized device; exact F64 Uniform selected-result underflow"]
+    fn f64_uniform_consumers_preserve_all_underflow_policies() {
+        let (_discovery, session) = cuda_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0173);
+        let assessor = CudaTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        let owner =
+            PcuDeviceTensor::new([3], session.upload_buffer(pool, &[2.0_f64; 3]).unwrap()).unwrap();
+        for policy in [
+            fusion_pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult,
+            fusion_pcu::PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+        ] {
+            let mut graph = Graph::default();
+            let input = graph.input([3], PcuScalarType::F64).unwrap();
+            let literal = graph
+                .uniform_value([3], TensorScalarValue::F64(f64::from_bits(1)))
+                .unwrap();
+            let output = graph.mul(input, literal).unwrap();
+            graph
+                .set_value_float_underflow_policy(output, policy)
+                .unwrap();
+            let program = graph
+                .into_selected_program(
+                    &[output],
+                    TensorArithmeticRewritePolicy::Disabled,
+                    TensorArithmeticCapability::Strict,
+                    TensorPointwiseGroupingPolicy::Disabled,
+                )
+                .unwrap();
+            let prepared = assessor.prepare_owned_program(program).unwrap();
+            for _ in 0..2 {
+                let result = assessor.execute_owned_program_outputs(
+                    &prepared,
+                    &[(input, &owner)],
+                    pool,
+                    &mut memory,
+                );
+                if policy == fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult {
+                    assert!(
+                        matches!(result,Err(CudaTensorExecutionError::ExecutionFault(fault))
+                        if fault.kind == fusion_pcu::PcuExecutionFaultKind::ArithmeticUnderflow && fault.invocation_id == 0)
+                    );
+                } else {
+                    let outputs = result.unwrap();
+                    let mut actual = [99.0_f64; 4];
+                    session
+                        .download_buffer(pool, outputs[0].1.buffer(), &mut actual[..3])
+                        .unwrap();
+                    assert_eq!(actual.map(f64::to_bits), [2, 2, 2, 99.0_f64.to_bits()]);
+                }
+            }
+            let mut unchanged = [0.0_f64; 3];
+            session
+                .download_buffer(pool, owner.buffer(), &mut unchanged)
+                .unwrap();
+            assert_eq!(unchanged.map(f64::to_bits), [2.0_f64.to_bits(); 3]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires authorized native device; exact F64 literal/consumer law"]
+    #[allow(clippy::too_many_lines)] // Raw transport and the consuming fault share the same native owner proof.
+    fn f64_literals_preserve_payloads_and_fault_only_when_consumed() {
+        let (_discovery, session) = cuda_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0172);
+        let assessor = CudaTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        let patterns = [
+            0,
+            0x8000_0000_0000_0000,
+            0x7ff0_0000_0000_0000,
+            0xfff0_0000_0000_0000,
+            0x7ff0_0000_0000_1234,
+            0xfff8_0000_0000_5678,
+            1,
+            0x8000_0000_0000_0001,
+            0x3ff0_0000_0000_1000,
+        ];
+        for strict in [false, true] {
+            for native in [false, true] {
+                for optimized in [false, true] {
+                    for uniform in [false, true] {
+                        let mut graph = Graph::default();
+                        if strict {
+                            graph.set_numerical_mode(fusion_pcu::PcuNumericalMode::Strict);
+                        }
+                        graph.set_numerical_options(fusion_pcu::PcuNumericalOptions {
+                            compound_arithmetic: if native {
+                                fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined
+                            } else {
+                                fusion_pcu::PcuCompoundArithmeticPolicy::Checked
+                            },
+                            precision: if optimized {
+                                fusion_pcu::PcuPrecisionPolicy::BackendOptimized
+                            } else {
+                                fusion_pcu::PcuPrecisionPolicy::Preserve
+                            },
+                            ..Default::default()
+                        });
+                        let values = (0..17)
+                            .map(|i| f64::from_bits(patterns[i % patterns.len()]))
+                            .collect::<Vec<_>>();
+                        let literal = if uniform {
+                            graph
+                                .uniform_value([17], TensorScalarValue::F64(values[4]))
+                                .unwrap()
+                        } else {
+                            graph.constant_value(TensorValue::F64(
+                                Tensor::new([17], values.clone()).unwrap(),
+                            ))
+                        };
+                        let expected = if uniform {
+                            vec![patterns[4]; 17]
+                        } else {
+                            values.iter().map(|v| v.to_bits()).collect()
+                        };
+                        let program = graph
+                            .into_selected_program(
+                                &[literal],
+                                TensorArithmeticRewritePolicy::Disabled,
+                                TensorArithmeticCapability::Strict,
+                                TensorPointwiseGroupingPolicy::Disabled,
+                            )
+                            .unwrap();
+                        #[cfg(feature = "allocation-census")]
+                        crate::reset_cuda_api_census();
+                        let prepared = assessor.prepare_owned_program(program).unwrap();
+                        #[cfg(feature = "allocation-census")]
+                        {
+                            let api = crate::cuda_api_census();
+                            assert_eq!(api.allocations, 0);
+                            assert_eq!(api.module_loads, 0);
+                        }
+                        let first = assessor
+                            .execute_owned_program_output_from_inputs::<f64, _>(
+                                &prepared,
+                                &[],
+                                pool,
+                                &mut memory,
+                            )
+                            .unwrap();
+                        let second = assessor
+                            .execute_owned_program_output_from_inputs::<f64, _>(
+                                &prepared,
+                                &[],
+                                pool,
+                                &mut memory,
+                            )
+                            .unwrap();
+                        drop(prepared);
+                        for output in [first, second] {
+                            let mut observed = [99.0_f64; 18];
+                            session
+                                .download_buffer(pool, output.buffer(), &mut observed[..17])
+                                .unwrap();
+                            assert_eq!(
+                                observed[..17]
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect::<Vec<_>>(),
+                                expected
+                            );
+                            assert_eq!(observed[17].to_bits(), 99.0_f64.to_bits());
+                        }
+                    }
+                }
+            }
+        }
+        let mut graph = Graph::default();
+        let input = graph.input([3], PcuScalarType::F64).unwrap();
+        let constant = graph.constant_value(TensorValue::F64(
+            Tensor::new([3], vec![1.0, 1.0, f64::from_bits(patterns[4])]).unwrap(),
+        ));
+        let output = graph.mul(input, constant).unwrap();
+        let program = graph
+            .into_selected_program(
+                &[output],
+                TensorArithmeticRewritePolicy::Disabled,
+                TensorArithmeticCapability::Strict,
+                TensorPointwiseGroupingPolicy::Disabled,
+            )
+            .unwrap();
+        let prepared = assessor.prepare_owned_program(program).unwrap();
+        let input_owner =
+            PcuDeviceTensor::new([3], session.upload_buffer(pool, &[2.0_f64; 3]).unwrap()).unwrap();
+        let result = assessor.execute_owned_program_outputs(
+            &prepared,
+            &[(input, &input_owner)],
+            pool,
+            &mut memory,
+        );
+        assert!(
+            matches!(result,Err(CudaTensorExecutionError::ExecutionFault(fault))
+            if fault.kind == fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand && fault.invocation_id == 2)
+        );
+        let mut unchanged = [0.0_f64; 3];
+        session
+            .download_buffer(pool, input_owner.buffer(), &mut unchanged)
+            .unwrap();
+        assert_eq!(unchanged.map(f64::to_bits), [2.0_f64.to_bits(); 3]);
+    }
+
+    #[test]
+    #[ignore = "requires authorized Cuda device"]
+    fn selected_uniform_preserves_raw_bits_with_scratch_and_output_bank() {
+        let (_discovery, session) = cuda_test_session();
+        let pool = PcuMemoryPoolId(0x4352_0170);
+        let assessor = CudaTensorAssessor::new(&session).unwrap();
+        let mut memory = session.memory_provider(pool);
+        for bits in [
+            0x0000_0000,
+            0x8000_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7f80_1234,
+            0x7fc0_5678,
+            0x0000_0001,
+            0x8000_0001,
+        ] {
+            let mut graph = Graph::default();
+            let uniform = graph
+                .uniform_value([17], TensorScalarValue::F32(f32::from_bits(bits)))
+                .unwrap();
+            let prepared = assessor.prepare_graph_outputs(&graph, &[uniform]).unwrap();
+            let mut scratch = assessor
+                .prepare_scratch(&prepared, pool, &mut memory)
+                .unwrap();
+            let mut bank = assessor
+                .prepare_output_bank(&prepared, pool, &mut memory)
+                .unwrap();
+            for _ in 0..2 {
+                assessor
+                    .execute_prepared_outputs_into_bank(
+                        &prepared,
+                        &[],
+                        &mut scratch,
+                        &mut bank,
+                        &mut memory,
+                    )
+                    .unwrap();
+                let observed = assessor
+                    .download_output(&bank.outputs()[0], pool, &mut memory)
+                    .unwrap();
+                assert!(observed.data().iter().all(|value| value.to_bits() == bits));
+            }
         }
     }
 
@@ -11416,6 +12382,14 @@ mod tests {
                 assert_eq!(
                     cuda_supports_operand_representation(node, TensorOperandRepresentation::Dense),
                     is_transport_input
+                        || (value == sum
+                            && matches!(
+                                scalar_type,
+                                PcuScalarType::F16
+                                    | PcuScalarType::BF16
+                                    | PcuScalarType::F8E4M3FN
+                                    | PcuScalarType::F8E5M2
+                            ))
                 );
                 assert!(!cuda_supports_operand_representation(
                     node,
@@ -11439,7 +12413,7 @@ mod tests {
     }
 
     #[test]
-    fn assessor_limits_f64_to_owned_dense_arithmetic_and_rejects_training_sources() {
+    fn assessor_admits_dense_f64_literals_and_arithmetic() {
         let mut graph = Graph::default();
         let input = graph.input_typed::<f64>([2, 2]).unwrap();
         let constant = graph.constant_typed(Tensor::<f64>::splat([2, 2], 1.0).unwrap());
@@ -11485,18 +12459,13 @@ mod tests {
             let node = graph.nodes().find(|node| node.value == value).unwrap();
             assert_eq!(
                 assess_tensor_node(&graph, node),
-                TensorOperationSupport::Unsupported {
-                    reason: TensorUnsupportedReason::ElementType,
+                TensorOperationSupport::Supported {
+                    route: TensorExecutionRoute::Native,
+                    workspace_bytes: Some(0),
                 }
             );
         }
-        assert!(matches!(
-            prepare_graph(&graph, product.erase(), &PureCudaAssessor),
-            Err(CudaTensorExecutionError::Unsupported {
-                reason: TensorUnsupportedReason::ElementType,
-                ..
-            })
-        ));
+        assert!(prepare_graph(&graph, product.erase(), &PureCudaAssessor).is_ok());
     }
 
     #[test]
@@ -11548,7 +12517,7 @@ mod tests {
             assess_tensor_node(&graph, node),
             TensorOperationSupport::Supported {
                 route: TensorExecutionRoute::Library,
-                workspace_bytes: None,
+                workspace_bytes: Some(16),
             }
         );
     }

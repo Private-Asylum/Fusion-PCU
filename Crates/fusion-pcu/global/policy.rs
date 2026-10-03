@@ -17,7 +17,8 @@ pub(super) struct PolicySnapshot {
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 ))]
 pub(super) struct PolicyRoute {
     pub(super) generation: u64,
@@ -36,6 +37,8 @@ const fn backend_tag(backend: super::PcuBackendChoice) -> u64 {
         super::PcuBackendChoice::Vulkan => 4,
         #[cfg(feature = "cpu")]
         super::PcuBackendChoice::Cpu => 5,
+        #[cfg(feature = "mlx")]
+        super::PcuBackendChoice::Mlx => 6,
     }
 }
 
@@ -45,7 +48,8 @@ const ROUTE_TAG_BITS: u32 = 4;
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 ))]
 const ROUTE_TAG_MASK: u64 = (1 << ROUTE_TAG_BITS) - 1;
 
@@ -57,7 +61,8 @@ const fn encode_route(generation: u64, backend: super::PcuBackendChoice) -> u64 
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 ))]
 const fn decode_backend(tag: u64) -> super::PcuBackendChoice {
     match tag {
@@ -70,6 +75,8 @@ const fn decode_backend(tag: u64) -> super::PcuBackendChoice {
         4 => super::PcuBackendChoice::Vulkan,
         #[cfg(feature = "cpu")]
         5 => super::PcuBackendChoice::Cpu,
+        #[cfg(feature = "mlx")]
+        6 => super::PcuBackendChoice::Mlx,
         _ => super::PcuBackendChoice::Automatic,
     }
 }
@@ -100,7 +107,8 @@ static POLICY: RwLock<PolicySnapshot> = RwLock::new(PolicySnapshot {
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 ))]
 pub(super) fn snapshot() -> Result<PolicySnapshot, PcuExecutionError> {
     POLICY
@@ -118,7 +126,8 @@ pub(super) fn generation() -> u64 {
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 ))]
 pub(super) fn route() -> PolicyRoute {
     let packed = ROUTE.load(Ordering::Acquire);
@@ -145,9 +154,13 @@ pub(super) fn configure(policy: PcuExecutionPolicy) -> Result<(), PcuExecutionEr
 }
 
 #[cfg(test)]
+pub(super) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn numerical_mode_configuration_advances_cache_generation() {
+        let _guard = super::TEST_LOCK.lock().unwrap();
         let initial = *super::POLICY.read().unwrap();
         let mode = match initial.policy.numerical_mode {
             crate::PcuNumericalMode::Boundary => crate::PcuNumericalMode::Strict,

@@ -4,9 +4,10 @@ The canonical Criterion target executes an actual `#[pcu(flag(strict))]` functio
 a frozen explicit graph and an independent native launch of the exact admitted
 CUDA checker. Both F32 and F64 use a finite frozen F32 rate, widened exactly for
 F64: first round/check `rate * gradient`, then round/check `weights - product`.
-Checked, Preserve and unspecified reproducibility are mandatory. No contraction
-or FMA is allowed. Default checked Boundary, Strict native-compound, optimized
-precision and PortableV1 combinations remain unsupported.
+Unspecified reproducibility and Strict checking are required. Native compound
+and optimized precision are permissions served by the same stronger ordered
+checker; the full requested tuple remains in cold cache identity. No contraction
+or FMA is used. Default checked Boundary and PortableV1 remain unsupported.
 
 IEEE underflow means tiny **after rounding and inexact**. Exact subnormals remain
 legal under IEEE; `reject_subnormal_result` rejects them and
@@ -72,3 +73,11 @@ called cuBLAS/NVRTC/initialization routines; they count attempted calls rather
 than successes. Resident census also includes the untimed full readback/oracle.
 A warm call must launch once and load no module. Diagnostic counts do not imply
 zero device/driver allocation or a general fastest-provider claim.
+
+The current permission extension adds all four independent compound/precision
+combinations and all three underflow policies at the small boundary. Original
+larger default-profile cases remain. Benchmark group and census labels retain
+the requested tuple. New hardware acceptance is recorded separately in the
+backend plan; these executable definitions alone do not establish device proof.
+Warm census runs 64 changing-input calls for each source/graph/native route,
+including matched completion, explicit output readback, oracle and release.

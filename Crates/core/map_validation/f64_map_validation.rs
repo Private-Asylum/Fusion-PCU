@@ -460,6 +460,7 @@ mod tests {
             PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "f64_map",
@@ -579,6 +580,7 @@ mod tests {
             PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(3),
             entry: PcuDispatchEntryPoint {
                 name: "f64_min_max",
@@ -674,6 +676,7 @@ mod tests {
             PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(2),
             entry: PcuDispatchEntryPoint {
                 name: "f64_grid_stride",

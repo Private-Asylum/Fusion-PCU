@@ -137,6 +137,10 @@ fn ordinary_cpu_source_reuses_selection_and_preserves_fault_outputs() {
     assert_eq!(output.map(f32::to_bits), previous);
     binary64_source();
     integer_faults();
+    f32_binary::verify();
+    f64_binary::verify();
+    generic_wide_transport();
+    checked_source_conversions();
     let before = SCORES.load(Ordering::Relaxed);
     configure(); // No explicit cache clear: the generation itself must invalidate selection.
     s8::verify();
@@ -210,4 +214,126 @@ fn integer_faults() {
         ))
     ));
     assert_eq!(output, [31; 20]);
+}
+
+macro_rules! float_binary_sources {
+    ($module:ident, $ty:ty) => {
+        mod $module {
+            use fusion_pcu::{pcu, PcuCheckedFloat, PcuExecutionFaultKind};
+            #[pcu(invocations = N)]
+            fn add<const N: usize>(a: &[$ty; N], b: &[$ty; N], output: &mut [$ty]) {
+                let id = pcu::context::global_invocation_id();
+                output[id] = a[id] + b[id];
+            }
+            #[pcu(invocations = N)]
+            fn sub<const N: usize>(a: &[$ty; N], b: &[$ty; N], output: &mut [$ty]) {
+                let id = pcu::context::global_invocation_id();
+                output[id] = a[id] - b[id];
+            }
+            #[pcu(invocations = N)]
+            fn mul<const N: usize>(a: &[$ty; N], b: &[$ty; N], output: &mut [$ty]) {
+                let id = pcu::context::global_invocation_id();
+                output[id] = a[id] * b[id];
+            }
+            #[pcu(invocations = N)]
+            fn div<const N: usize>(a: &[$ty; N], b: &[$ty; N], output: &mut [$ty]) {
+                let id = pcu::context::global_invocation_id();
+                output[id] = a[id] / b[id];
+            }
+            pub fn verify() {
+                for phase in [1.0, 2.0, 3.0] {
+                    let input = [phase, -0.0, -2.5, 16.0];
+                    let rhs = [2.0; 4];
+                    let mut output = [19.0; 7];
+                    add(&input, &rhs, &mut output).unwrap();
+                    assert_eq!(output[..4], input.map(|v| v.pcu_checked_add(2.0).unwrap()));
+                    sub(&input, &rhs, &mut output).unwrap();
+                    assert_eq!(output[..4], input.map(|v| v.pcu_checked_sub(2.0).unwrap()));
+                    mul(&input, &rhs, &mut output).unwrap();
+                    assert_eq!(output[..4], input.map(|v| v.pcu_checked_mul(2.0).unwrap()));
+                    div(&input, &rhs, &mut output).unwrap();
+                    assert_eq!(output[..4], input.map(|v| v.pcu_checked_div(2.0).unwrap()));
+                    assert_eq!(output[1].to_bits(), (-0.0 as $ty).to_bits());
+                    assert_eq!(output[4..], [19.0; 3]);
+                }
+                let mut output = [23.0; 7];
+                let before = output.map(<$ty>::to_bits);
+                let error =
+                    div(&[1.0, 2.0, 3.0, 4.0], &[1.0, 1.0, 0.0, 0.0], &mut output).unwrap_err();
+                assert!(matches!(
+                    error,
+                    fusion_pcu::PcuExecutionError::ArithmeticFault(fusion_pcu::PcuExecutionFault {
+                        invocation_id: 2,
+                        kind: PcuExecutionFaultKind::DivideByZero,
+                        recovered: false
+                    })
+                ));
+                assert_eq!(output.map(<$ty>::to_bits), before);
+                div(&[1.0; 4], &[2.0; 4], &mut output).unwrap();
+                assert_eq!(output[..4], [0.5; 4]);
+            }
+        }
+    };
+}
+float_binary_sources!(f32_binary, f32);
+float_binary_sources!(f64_binary, f64);
+
+#[pcu(invocations = N)]
+fn copy_generic<T: fusion_pcu::PcuScalar, const N: usize>(input: &[T; N], output: &mut [T; N]) {
+    let id = pcu::context::global_invocation_id();
+    output[id] = input[id];
+}
+
+fn generic_wide_transport() {
+    let words = fusion_pcu::PcuU512::from_limbs_le([1, 2, 3, 4, 5, 6, 7, u64::MAX]);
+    let input = [words; 3];
+    let mut output = [fusion_pcu::PcuU512::ZERO; 3];
+    copy_generic(&input, &mut output).unwrap();
+    assert_eq!(output, input);
+    let nan = fusion_pcu::PcuF256Bits::from_limbs_le([17, 23, 47, u64::MAX]);
+    let mut output = [fusion_pcu::PcuF256Bits::from_limbs_le([0; 4]); 3];
+    copy_generic(&[nan; 3], &mut output).unwrap();
+    assert_eq!(output, [nan; 3]);
+}
+
+#[pcu(invocations = N)]
+fn widen<const N: usize>(input: &[f32; N], output: &mut [f64]) {
+    let id = pcu::context::global_invocation_id();
+    output[id] = input[id] as f64;
+}
+#[pcu(invocations = N)]
+fn narrow<const N: usize>(input: &[f64; N], output: &mut [f32]) {
+    let id = pcu::context::global_invocation_id();
+    output[id] = input[id] as f32;
+}
+
+fn checked_source_conversions() {
+    let input = [f32::from_bits(1), -0.0, f32::MAX];
+    let mut wide = [23.0_f64; 5];
+    widen(&input, &mut wide).unwrap();
+    assert_eq!(wide[..3], input.map(f64::from));
+    assert_eq!(wide[1].to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(wide[3..], [23.0; 2]);
+    let mut restored = [19.0_f32; 5];
+    narrow(&[wide[0], wide[1], wide[2]], &mut restored).unwrap();
+    assert_eq!(
+        restored[..3]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        input.map(f32::to_bits)
+    );
+    let before = restored.map(f32::to_bits);
+    let error = narrow(&[1.0, f64::MAX, 2.0], &mut restored).unwrap_err();
+    assert!(matches!(
+        error,
+        global::PcuExecutionError::ArithmeticFault(PcuExecutionFault {
+            invocation_id: 1,
+            kind: PcuExecutionFaultKind::ArithmeticOverflow,
+            recovered: false
+        })
+    ));
+    assert_eq!(restored.map(f32::to_bits), before);
+    narrow(&[2.0, 3.0, 4.0], &mut restored).unwrap();
+    assert_eq!(restored[..3], [2.0, 3.0, 4.0]);
 }

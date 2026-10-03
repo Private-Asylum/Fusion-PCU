@@ -17,6 +17,11 @@ pub fn activity_guard() {
             .all(|line| line.trim().parse::<u32>().is_ok_and(|value| value <= 10)),
         "GPU activity exceeds 10 percent"
     );
+    compute_owner_guard();
+}
+
+/// Detect foreign compute owners between phases without sampling our own recent GPU activity.
+pub fn compute_owner_guard() {
     let applications = Command::new("nvidia-smi")
         .args(["--query-compute-apps=pid", "--format=csv,noheader,nounits"])
         .output()

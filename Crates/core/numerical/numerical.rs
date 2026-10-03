@@ -114,3 +114,7 @@ pub enum PcuNumericalRequirement {
 
 #[cfg(test)]
 mod tests;
+
+#[path = "portable/portable.rs"]
+mod portable;
+pub use portable::*;

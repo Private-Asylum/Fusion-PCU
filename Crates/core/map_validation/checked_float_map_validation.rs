@@ -1,5 +1,21 @@
 //! Admission for homogeneous scalar maps whose floating arithmetic is explicitly checked.
 
+#[path = "checked_float_map_validation/resources/resources.rs"]
+mod resources;
+#[rustfmt::skip]
+pub use resources::{
+    assess_checked_float_map_resources,
+};
+
+#[path = "checked_float_map_validation/unary/unary.rs"]
+mod unary;
+#[rustfmt::skip]
+pub use unary::{
+    describe_checked_float_unary_map,
+    PcuCheckedFloatUnaryMapDescription,
+    PcuCheckedFloatUnaryMapError,
+};
+
 #[rustfmt::skip]
 use crate::{
     PcuBindingAccess,
@@ -14,6 +30,7 @@ use crate::{
     PcuDispatchOp,
     PcuDispatchFloatUnaryOp,
     PcuParameterValue,
+    PcuScalarType,
     PcuValueType,
     PcuValueTypeCaps,
 };
@@ -34,9 +51,9 @@ pub enum CheckedFloatMapValidationError {
     MissingStoreOrReturn,
 }
 
-/// Validate a homogeneous F32 or F64 map in which every arithmetic operation is checked.
+/// Validate a homogeneous checked map over the six sealed checked-float formats.
 ///
-/// The accepted body consists only of scalar bindings, matching-width float constants,
+/// The accepted body consists only of scalar bindings, matching-width F32/F64 constants,
 /// loads, stores, `CheckedFloatBinary`, `CheckedFloatUnary`, and a terminal return. It may be a direct invocation
 /// body or exactly one grid-stride body followed by Return. A checked operation carries its
 /// own underflow policy; policies may differ between operations. Loads may use the canonical
@@ -53,12 +70,18 @@ pub fn validate_checked_float_map_kernel(
     value_type: PcuValueType,
     scalar_caps: PcuValueTypeCaps,
 ) -> Result<(), CheckedFloatMapValidationError> {
-    let cap = if value_type == PcuValueType::f32() {
-        PcuValueTypeCaps::FLOAT32
-    } else if value_type == PcuValueType::f64() {
-        PcuValueTypeCaps::FLOAT64
-    } else {
-        return Err(CheckedFloatMapValidationError::UnsupportedType);
+    // Structural eligibility follows the sealed reference contract. It never
+    // grants a provider an implementation or an extra PortableV1 operation.
+    let cap = match value_type {
+        PcuValueType::Scalar(
+            scalar @ (PcuScalarType::F16
+            | PcuScalarType::BF16
+            | PcuScalarType::F8E4M3FN
+            | PcuScalarType::F8E5M2
+            | PcuScalarType::F32
+            | PcuScalarType::F64),
+        ) => PcuValueTypeCaps::for_scalar(scalar),
+        _ => return Err(CheckedFloatMapValidationError::UnsupportedType),
     };
     if !kernel.ports.is_empty() || !kernel.parameters.is_empty() || kernel.bindings.is_empty() {
         return Err(CheckedFloatMapValidationError::UnsupportedInterface);

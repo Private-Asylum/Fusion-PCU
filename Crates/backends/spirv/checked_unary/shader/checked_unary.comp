@@ -1,0 +1,60 @@
+#version 450
+// Exact representation selection/sign toggle. PCU rejects every nonfinite input before
+// ReLU selection, including negative NaNs/infinity; this departs from IEEE default results.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint FORMAT=0u; // 0 F16,1 BF16,2 E4M3FN,3 E5M2,4 F32,5 F64.
+layout(constant_id=1) const uint OP=0u; // 0 Neg,1 ReLU.
+layout(constant_id=2) const uint POLICY=0u; // 0 IEEE after rounding,1 reject result subnormal,2 gradual.
+layout(constant_id=3) const uint EXTENT=1u;
+layout(constant_id=4) const uint BROADCAST=0u;
+layout(set=0,binding=0,std430) readonly buffer Input {uint data[];} source;
+layout(set=0,binding=1,std430) writeonly buffer Output {uint data[];} destination;
+layout(set=0,binding=2,std430) writeonly buffer Status {uint data[];} status;
+uvec3 unary(uint low,uint high) {
+    if(FORMAT==5u) {
+        uint magnitude=high&0x7fffffffu;
+        if(magnitude>0x7fefffffu)return uvec3(0u,0u,1u);
+        if(OP==0u)high^=0x80000000u;
+        else if((high&0x80000000u)!=0u || (magnitude==0u && low==0u)) {low=0u;high=0u;}
+        magnitude=high&0x7fffffffu;
+        uint code=POLICY==1u && magnitude<0x00100000u && (magnitude!=0u || low!=0u)?2u:0u;
+        return uvec3(low,high,code);
+    }
+    uint sign=FORMAT<2u?0x8000u:FORMAT<4u?0x80u:0x80000000u;
+    uint maximum=FORMAT==0u?0x7bffu:FORMAT==1u?0x7f7fu:FORMAT==2u?0x7eu:FORMAT==3u?0x7bu:0x7f7fffffu;
+    uint minimum=FORMAT==0u?0x400u:FORMAT==1u?0x80u:FORMAT==2u?0x8u:FORMAT==3u?0x4u:0x00800000u;
+    uint magnitude=low&(sign-1u);
+    if(magnitude>maximum)return uvec3(0u,0u,1u);
+    if(OP==0u)low^=sign;
+    else if((low&sign)!=0u || magnitude==0u)low=0u;
+    magnitude=low&(sign-1u);
+    uint code=POLICY==1u && magnitude!=0u && magnitude<minimum?2u:0u;
+    return uvec3(low,0u,code);
+}
+void main() {
+    uint word=gl_GlobalInvocationID.x;
+    if(FORMAT==5u) {
+        if(word>=EXTENT)return;
+        // Cold admission bounds EXTENT<=UINT_MAX/2; both doubled indices are representable.
+        uint incoming=BROADCAST!=0u?0u:word*2u;
+        uvec3 result=unary(source.data[incoming],source.data[incoming+1u]);
+        destination.data[word*2u]=result.x;destination.data[word*2u+1u]=result.y;
+        status.data[word]=result.z;return;
+    }
+    uint width=FORMAT<2u?16u:FORMAT<4u?8u:32u;
+    uint lanes=32u/width;
+    uint words=EXTENT/lanes+uint(EXTENT%lanes!=0u);
+    if(word>=words)return;
+    // Each invocation owns one complete output word. lane<EXTENT-base before addition
+    // prevents last-word padding/overflow from becoming logical input or diagnostic work.
+    uint base=word*lanes;uint packed=0u;
+    for(uint lane=0u;lane<lanes && lane<EXTENT-base;++lane) {
+        uint logical=base+lane;uint incoming=BROADCAST!=0u?0u:logical;
+        uint shift=(incoming%lanes)*width; // 0,8,16,24 or0,16 or0: always<32.
+        uint mask=0xffffffffu>>(32u-width);
+        uint bits=(source.data[incoming/lanes]>>shift)&mask;
+        uvec3 result=unary(bits,0u);packed|=result.x<<(lane*width);
+        status.data[logical]=result.z;
+    }
+    destination.data[word]=packed;
+}

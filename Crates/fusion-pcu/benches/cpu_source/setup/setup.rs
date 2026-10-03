@@ -10,11 +10,14 @@ pub fn configure() {
     global::configure(global::PcuExecutionPolicy {
         backend: global::PcuBackendChoice::Cpu,
         numerical_mode: PcuNumericalMode::Strict,
+        #[cfg(feature = "cpu-benchmark-control")]
+        score_invocation: Some(super::census::score),
         ..Default::default()
     })
     .unwrap();
     global::clear_thread_cache().unwrap();
 }
+#[allow(clippy::unnecessary_box_returns)] // Cold heap construction avoids materializing million-element const arrays on the stack.
 pub fn array<T: Clone, const N: usize>(value: T) -> Box<[T; N]> {
     std::vec![value; N]
         .into_boxed_slice()

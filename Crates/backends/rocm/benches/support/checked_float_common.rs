@@ -142,6 +142,7 @@ macro_rules! define_checked_float_benchmark {
 
         fn kernel(elements: usize) -> Result<PcuDispatchKernelIr<'static>, Box<dyn Error>> {
             Ok(PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: fusion_pcu::PcuKernelId($kernel_id),
                 entry: PcuDispatchEntryPoint {
                     name: $group,

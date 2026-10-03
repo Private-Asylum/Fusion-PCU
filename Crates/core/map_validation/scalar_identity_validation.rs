@@ -48,6 +48,31 @@ pub fn validate_scalar_identity_kernel(
     kernel: &PcuDispatchKernelIr<'_>,
     scalar: PcuScalarType,
 ) -> Result<(), PcuScalarIdentityValidationError> {
+    validate_scalar_transport(kernel, scalar, false)
+}
+
+/// Validates a representation-preserving broadcast from one read-only scalar.
+///
+/// The source always loads element zero; direct/grid output remains indexed.
+/// This separate admission entry deliberately leaves dense identity validation
+/// unchanged: an executor that only implements prefix copies must reject broadcast.
+/// Backend binding spans, ownership and launch validation remain separate obligations.
+///
+/// # Errors
+/// Returns the first invalid schema, SSA, index or access role.
+pub fn validate_scalar_broadcast_kernel(
+    kernel: &PcuDispatchKernelIr<'_>,
+    scalar: PcuScalarType,
+) -> Result<(), PcuScalarIdentityValidationError> {
+    validate_scalar_transport(kernel, scalar, true)
+}
+
+#[allow(clippy::too_many_lines)] // Keep exact load/store/SSA admission in a single cold pass.
+fn validate_scalar_transport(
+    kernel: &PcuDispatchKernelIr<'_>,
+    scalar: PcuScalarType,
+    broadcast: bool,
+) -> Result<(), PcuScalarIdentityValidationError> {
     use PcuScalarIdentityValidationError as Error;
 
     if !kernel.ports.is_empty() || !kernel.parameters.is_empty() || kernel.bindings.len() != 2 {
@@ -85,7 +110,7 @@ pub fn validate_scalar_identity_kernel(
         if *extent == 0 {
             return Err(Error::UnsupportedOperation(0));
         }
-        return validate_grid_body(kernel, body);
+        return validate_grid_body(kernel, body, broadcast);
     }
 
     if kernel.ops.len() != 3 {
@@ -100,8 +125,16 @@ pub fn validate_scalar_identity_kernel(
         PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
             result,
             binding,
-            index: PcuDispatchIndex::InvocationId,
-        }) => (result, binding),
+            index,
+        }) if index
+            == if broadcast {
+                PcuDispatchIndex::BindingElementZero
+            } else {
+                PcuDispatchIndex::InvocationId
+            } =>
+        {
+            (result, binding)
+        }
         PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { .. }) => {
             return Err(Error::InvalidIndex(0));
         }
@@ -111,6 +144,9 @@ pub fn validate_scalar_identity_kernel(
         return Err(Error::InvalidValue(value));
     }
     validate_input(kernel, input)?;
+    if broadcast {
+        validate_broadcast_input(kernel, input)?;
+    }
     match kernel.ops[1] {
         PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
             binding,
@@ -142,6 +178,7 @@ pub fn validate_scalar_identity_kernel(
 fn validate_grid_body(
     kernel: &PcuDispatchKernelIr<'_>,
     body: &[PcuDispatchOp<'_>],
+    broadcast: bool,
 ) -> Result<(), PcuScalarIdentityValidationError> {
     use PcuScalarIdentityValidationError as Error;
 
@@ -149,7 +186,7 @@ fn validate_grid_body(
         PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
             result,
             binding: input,
-            index: PcuDispatchIndex::GridStrideId,
+            index,
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
             binding: output,
@@ -160,6 +197,14 @@ fn validate_grid_body(
     else {
         return Err(Error::UnsupportedOperation(0));
     };
+    let expected = if broadcast {
+        PcuDispatchIndex::BindingElementZero
+    } else {
+        PcuDispatchIndex::GridStrideId
+    };
+    if *index != expected {
+        return Err(Error::UnsupportedOperation(0));
+    }
     if result.0 == 0 || value != result {
         return Err(Error::InvalidValue(*value));
     }
@@ -167,7 +212,23 @@ fn validate_grid_body(
         return Err(Error::InvalidBinding(*output));
     }
     validate_input(kernel, *input)?;
+    if broadcast {
+        validate_broadcast_input(kernel, *input)?;
+    }
     validate_output(kernel, *output)
+}
+
+fn validate_broadcast_input(
+    kernel: &PcuDispatchKernelIr<'_>,
+    target: PcuBindingRef,
+) -> Result<(), PcuScalarIdentityValidationError> {
+    if kernel.bindings.iter().any(|binding| {
+        binding.reference() == target && binding.access == PcuBindingAccess::ReadOnly
+    }) {
+        Ok(())
+    } else {
+        Err(PcuScalarIdentityValidationError::InvalidBinding(target))
+    }
 }
 
 fn validate_input(
@@ -215,6 +276,7 @@ mod tests {
     #[rustfmt::skip]
     use super::{
         PcuScalarIdentityValidationError as Error,
+        validate_scalar_broadcast_kernel,
         validate_scalar_identity_kernel,
     };
     #[rustfmt::skip]
@@ -236,7 +298,7 @@ mod tests {
         PcuValueTypeCaps,
     };
 
-    const SCALAR_TYPES: [PcuScalarType; 15] = [
+    const SCALAR_TYPES: [PcuScalarType; PcuScalarType::COUNT] = [
         PcuScalarType::Bool,
         PcuScalarType::I4,
         PcuScalarType::U4,
@@ -252,6 +314,16 @@ mod tests {
         PcuScalarType::I16,
         PcuScalarType::I32,
         PcuScalarType::I64,
+        PcuScalarType::I128,
+        PcuScalarType::U128,
+        PcuScalarType::I256,
+        PcuScalarType::U256,
+        PcuScalarType::I512,
+        PcuScalarType::U512,
+        PcuScalarType::F128,
+        PcuScalarType::F256,
+        PcuScalarType::F8E4M3FN,
+        PcuScalarType::F8E5M2,
     ];
 
     fn bindings(scalar: PcuScalarType) -> [PcuBinding<'static>; 2] {
@@ -280,6 +352,7 @@ mod tests {
         ops: &'a [PcuDispatchOp<'a>],
     ) -> PcuDispatchKernelIr<'a> {
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: crate::PcuDispatchEntryPoint {
                 name: "identity",
@@ -291,6 +364,57 @@ mod tests {
             ops,
             type_caps: PcuValueTypeCaps::empty(),
             feature_caps: PcuDispatchFeatureCaps::empty(),
+        }
+    }
+
+    #[test]
+    fn scalar_broadcast_is_separate_from_dense_copy_and_keeps_readonly_access() {
+        for scalar in SCALAR_TYPES {
+            let bindings = bindings(scalar);
+            for grid in [false, true] {
+                let output_index = if grid {
+                    PcuDispatchIndex::GridStrideId
+                } else {
+                    PcuDispatchIndex::InvocationId
+                };
+                let body = [
+                    PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                        result: PcuDispatchValueId(1),
+                        binding: PcuBindingRef::new(0, 0),
+                        index: PcuDispatchIndex::BindingElementZero,
+                    }),
+                    PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+                        binding: PcuBindingRef::new(0, 1),
+                        index: output_index,
+                        value: PcuDispatchValueId(1),
+                    }),
+                ];
+                let direct = [
+                    body[0],
+                    body[1],
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ];
+                let looped = [
+                    PcuDispatchOp::GridStrideLoop {
+                        extent: 17,
+                        body: &body,
+                    },
+                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                ];
+                let ir = kernel(&bindings, if grid { &looped } else { &direct });
+                validate_scalar_broadcast_kernel(&ir, scalar).unwrap();
+                assert!(validate_scalar_identity_kernel(&ir, scalar).is_err());
+                let mut wrong_access = bindings;
+                wrong_access[0].access = PcuBindingAccess::ReadWrite;
+                let wrong = PcuDispatchKernelIr {
+                    bindings: &wrong_access,
+                    ..ir
+                };
+                assert_eq!(
+                    validate_scalar_broadcast_kernel(&wrong, scalar),
+                    Err(Error::InvalidBinding(PcuBindingRef::new(0, 0)))
+                );
+            }
         }
     }
 

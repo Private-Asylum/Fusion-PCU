@@ -85,14 +85,32 @@ fn every_numerical_axis_and_boundary_stays_part_of_admission() {
             Err(PcuImplementationOfferMismatch::Requirements)
         );
     }
-    let query = PcuImplementationRequest {
-        boundary: PcuCostBoundary::Host,
-        ..request(&operation)
-    };
-    assert_eq!(
-        offer().validate_request(&query),
-        Err(PcuImplementationOfferMismatch::Boundary)
-    );
+    // A benchmark ending at escaped-owner publication cannot reuse a full
+    // host-readback estimate, nor a resident estimate that omitted staging.
+    let boundaries = [
+        PcuCostBoundary::Resident,
+        PcuCostBoundary::Host,
+        PcuCostBoundary::HostInputsResidentOutput,
+        PcuCostBoundary::MixedInputsResidentOutput,
+    ];
+    for offered in boundaries {
+        let mut candidate = offer();
+        candidate.cost = PcuImplementationCost::unknown(offered);
+        for required in boundaries {
+            let query = PcuImplementationRequest {
+                boundary: required,
+                ..request(&operation)
+            };
+            assert_eq!(
+                candidate.validate_request(&query),
+                if offered == required {
+                    Ok(())
+                } else {
+                    Err(PcuImplementationOfferMismatch::Boundary)
+                },
+            );
+        }
+    }
 }
 
 #[test]

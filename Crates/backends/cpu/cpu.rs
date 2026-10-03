@@ -3,15 +3,54 @@
 //! The implementation is split by semantic concern: integer maps, floating-point maps,
 //! stream transforms, checked F32/F64 invocation maps, and explicit unchecked float oracles.
 //! Prepared host backends execute canonical checked integer Add/Sub/Mul with exact scalar
-//! semantics and checked F32/F64 Neg using an explicitly selected scalar/SIMD implementation.
+//! semantics, checked F32/F64 binary arithmetic and conversions using core integer-significand
+//! oracles, dense identity transport, and checked Neg with explicitly selected scalar/SIMD instructions.
 //! Default builds remain `no_std`; hosted runtime feature
 //! detection requires the optional `std` feature. No automatic CPU fallback is provided.
 
 #![no_std]
 
 extern crate fusion_pcu_core as fusion_pcu;
+#[cfg(any(feature = "std", feature = "tensor"))]
+extern crate alloc;
 #[cfg(any(test, feature = "std"))]
 extern crate std;
+
+#[cfg(any(feature = "std", feature = "tensor"))]
+#[path = "composed/composed.rs"]
+mod composed;
+#[cfg(any(feature = "std", feature = "tensor"))]
+#[rustfmt::skip]
+pub use composed::{
+    PcuCpuCheckedComposedMap,
+    PcuCpuPreparedComposedMap,
+    PcuCpuComposedMapError,
+};
+
+#[cfg(any(feature = "std", feature = "tensor"))]
+#[path = "transport/transport.rs"]
+mod transport;
+#[cfg(any(feature = "std", feature = "tensor"))]
+#[rustfmt::skip]
+pub use transport::{
+    PcuCpuPreparedScalarTransport,
+    PcuCpuScalarTransportError,
+};
+
+#[cfg(feature = "tensor")]
+#[path = "prepared_tensor/prepared_tensor.rs"]
+mod prepared_tensor;
+#[cfg(feature = "tensor")]
+#[rustfmt::skip]
+pub use prepared_tensor::{
+    PcuCpuPreparedTensorGraph,
+    PcuCpuPreparedScalarTensorGraph,
+    PcuCpuScalarTensorAssessor,
+    PcuCpuPreparedIntegerTensorGraph,
+    PcuCpuIntegerTensorAssessor,
+    PcuCpuTensorAssessor,
+    PcuCpuTensorBinding,
+};
 
 #[cfg(feature = "std")]
 #[path = "discovery/discovery.rs"]
@@ -34,6 +73,44 @@ pub use host::{
     PcuCpuHostOfferError,
     PcuCpuHostOffers,
     PcuCpuPreparedHost,
+};
+
+#[path = "prepared_conversion/prepared_conversion.rs"]
+mod prepared_conversion;
+#[rustfmt::skip]
+pub use prepared_conversion::{PcuCpuCheckedConversion, PcuCpuPreparedConversion};
+
+#[path = "prepared_identity/prepared_identity.rs"]
+mod prepared_identity;
+#[rustfmt::skip]
+pub use prepared_identity::{PcuCpuIdentity, PcuCpuPreparedIdentity};
+
+#[path = "prepared_unary/prepared_unary.rs"]
+mod prepared_unary;
+#[rustfmt::skip]
+pub use prepared_unary::{PcuCpuCheckedUnary,PcuCpuPreparedUnary};
+#[cfg(any(feature = "std", feature = "tensor"))]
+pub use prepared_unary::PcuCpuPreparedUnaryRoles;
+
+#[path = "prepared_binary/prepared_binary.rs"]
+mod prepared_binary;
+#[rustfmt::skip]
+pub use prepared_binary::{
+    PCU_CPU_FLOAT_BINARY_IMPLEMENTATION_REVISION,
+    PcuCpuCheckedBinary,
+    PcuCpuPreparedBinary,
+    PcuCpuPreparedBinaryError,
+    PcuCheckedBinaryReference,
+    PcuCheckedBinaryReferenceError,
+};
+
+#[path = "checked_div_rem/checked_div_rem.rs"]
+mod checked_div_rem;
+#[rustfmt::skip]
+pub use checked_div_rem::{
+    PCU_CPU_DIV_REM_IMPLEMENTATION_REVISION,
+    PcuCpuCheckedDivRem,
+    PcuCpuPreparedDivRem,
 };
 
 #[path = "checked_integer/checked_integer.rs"]
@@ -238,6 +315,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "u32_map",
@@ -357,6 +435,7 @@ mod tests {
             ])),
         };
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(77),
             entry: PcuDispatchEntryPoint {
                 name: "checked_divrem",
@@ -513,6 +592,7 @@ mod tests {
             ])),
         };
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(78),
             entry: PcuDispatchEntryPoint {
                 name: "checked_divrem_u64",
@@ -686,6 +766,7 @@ mod tests {
             ])),
         };
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(79),
             entry: PcuDispatchEntryPoint {
                 name: "checked_divrem_i16",
@@ -781,6 +862,7 @@ mod tests {
             ])),
         };
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(79),
             entry: PcuDispatchEntryPoint {
                 name: "checked_divrem_i32",
@@ -876,6 +958,7 @@ mod tests {
             ])),
         };
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(79),
             entry: PcuDispatchEntryPoint {
                 name: "checked_divrem_i64",
@@ -1437,6 +1520,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "u16_map",
@@ -1559,6 +1643,7 @@ mod tests {
                 ])),
             };
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(43),
                 entry: PcuDispatchEntryPoint {
                     name: "u16_checked_divrem",
@@ -1712,6 +1797,7 @@ mod tests {
                 ])),
             };
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(43),
                 entry: PcuDispatchEntryPoint {
                     name: "u8_checked_divrem",
@@ -1861,6 +1947,7 @@ mod tests {
                 ])),
             };
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(43),
                 entry: PcuDispatchEntryPoint {
                     name: "i8_checked_divrem",
@@ -1994,6 +2081,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "u8_map",
@@ -2090,6 +2178,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "u64_map",
@@ -2189,6 +2278,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "i64_map",
@@ -2288,6 +2378,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "i32_map",
@@ -2387,6 +2478,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "i16_map",
@@ -2483,6 +2575,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(42),
                 entry: PcuDispatchEntryPoint {
                     name: "i8_map",
@@ -2553,6 +2646,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(99),
             entry: PcuDispatchEntryPoint {
                 name: "u64_identity",
@@ -2645,6 +2739,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(43),
             entry: PcuDispatchEntryPoint {
                 name: "u32_chain",
@@ -2938,6 +3033,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "min_max",
@@ -3097,6 +3193,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(18),
             entry: PcuDispatchEntryPoint {
                 name: "grid_stride",
@@ -3183,6 +3280,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(95),
             entry: PcuDispatchEntryPoint {
                 name: "f64_add",

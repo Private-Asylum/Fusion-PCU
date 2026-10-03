@@ -3,6 +3,10 @@
 #[path = "dispatch/effects.rs"]
 mod effects;
 
+#[cfg(test)]
+#[path = "dispatch/numerical/numerical.rs"]
+mod numerical;
+
 #[rustfmt::skip]
 use core::ops::{
     BitAnd,
@@ -58,7 +62,8 @@ pub enum PcuDispatchIntegerBinaryOp {
     Mul,
 }
 
-/// Exact binary operation admitted by checked F32/F64 arithmetic.
+/// Exact binary operation in the checked scalar floating contract.
+/// Format-specific execution support must be admitted separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuDispatchFloatBinaryOp {
     Add,
@@ -250,11 +255,15 @@ pub enum PcuDispatchDataOp {
         lhs: PcuDispatchValueId,
         rhs: PcuDispatchValueId,
     },
-    /// Computes checked exact-width integer Add/Sub/Mul. Overflow or underflow is an
-    /// execution fault reported by completion; the result payload is undefined on fault.
+    /// Computes checked exact-width integer Add/Sub/Mul using the explicit range policy.
+    ///
+    /// Reject reports overflow or underflow without a usable result. Clamp retains the
+    /// saturated integer endpoint and reports a recovered range fault. Completion must
+    /// still expose that fault; Clamp never turns exceptional arithmetic into silent success.
     CheckedIntegerBinary {
         value_type: PcuValueType,
         op: PcuDispatchIntegerBinaryOp,
+        range_policy: crate::PcuRangePolicy,
         result: PcuDispatchValueId,
         lhs: PcuDispatchValueId,
         rhs: PcuDispatchValueId,
@@ -492,9 +501,19 @@ pub struct PcuDispatchKernelIr<'a> {
     pub ops: &'a [PcuDispatchOp<'a>],
     pub type_caps: PcuValueTypeCaps,
     pub feature_caps: PcuDispatchFeatureCaps,
+    /// Effective function requirements, frozen during cold lowering and preparation.
+    ///
+    /// Explicit instruction policies remain authoritative within their lexical scope.
+    /// Compound/precision permissions never weaken a checked scalar instruction, and
+    /// reproducibility requires separate proved admission for the complete kernel.
+    pub numerical_requirements: crate::PcuImplementationRequirements,
 }
 
 impl PcuDispatchKernelIr<'_> {
+    /// Default requirements for hand-authored constant dispatch IR.
+    pub const DEFAULT_REQUIREMENTS: crate::PcuImplementationRequirements =
+        crate::PcuImplementationRequirements::DEFAULT;
+
     /// Returns the minimum element count required for buffer bindings by this launch.
     /// A grid-stride map uses its semantic extent; direct maps use submitted launch width.
     #[must_use]
@@ -769,7 +788,11 @@ impl PcuDispatchKernelIr<'_> {
 fn contains_range_clamp(ops: &[PcuDispatchOp<'_>]) -> bool {
     ops.iter().any(|op| match op {
         PcuDispatchOp::Data(
-            PcuDispatchDataOp::CheckedFloatBinary {
+            PcuDispatchDataOp::CheckedIntegerBinary {
+                range_policy: crate::PcuRangePolicy::Clamp,
+                ..
+            }
+            | PcuDispatchDataOp::CheckedFloatBinary {
                 range_policy: crate::PcuRangePolicy::Clamp,
                 ..
             }
@@ -916,6 +939,7 @@ pub struct PcuDispatchKernelBuilder<'a, const MAX_OPS: usize = DEFAULT_OP_CAPACI
     op_len: usize,
     type_caps: PcuValueTypeCaps,
     feature_caps: PcuDispatchFeatureCaps,
+    numerical_requirements: crate::PcuImplementationRequirements,
 }
 
 impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
@@ -935,6 +959,7 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
             op_len: 0,
             type_caps: PcuValueTypeCaps::empty(),
             feature_caps: PcuDispatchFeatureCaps::empty(),
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         }
     }
 
@@ -970,6 +995,18 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
     #[must_use]
     pub const fn with_feature_caps(mut self, feature_caps: PcuDispatchFeatureCaps) -> Self {
         self.feature_caps = feature_caps;
+        self
+    }
+
+    /// Freezes the complete function-level numerical tuple in the borrowed IR view.
+    ///
+    /// This does not rewrite explicit instruction policies or establish backend support.
+    #[must_use]
+    pub const fn with_numerical_requirements(
+        mut self,
+        requirements: crate::PcuImplementationRequirements,
+    ) -> Self {
+        self.numerical_requirements = requirements;
         self
     }
 
@@ -1103,6 +1140,7 @@ impl<'a, const MAX_OPS: usize> PcuDispatchKernelBuilder<'a, MAX_OPS> {
             ops: &self.ops[..self.op_len],
             type_caps: self.type_caps,
             feature_caps: self.feature_caps,
+            numerical_requirements: self.numerical_requirements,
         }
     }
 
@@ -1138,6 +1176,16 @@ pub struct PcuGridStrideKernelBuilder<'a, const MAX_OPS: usize> {
 }
 
 impl<'a, const MAX_OPS: usize> PcuGridStrideKernelBuilder<'a, MAX_OPS> {
+    /// Freezes requirements without changing the owned loop body's instruction policies.
+    #[must_use]
+    pub const fn with_numerical_requirements(
+        mut self,
+        requirements: crate::PcuImplementationRequirements,
+    ) -> Self {
+        self.body = self.body.with_numerical_requirements(requirements);
+        self
+    }
+
     /// Wraps a nonempty scalar body with a grid-stride loop and terminal return.
     ///
     /// # Errors
@@ -1230,6 +1278,7 @@ mod tests {
             })
         });
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "scalar-table",
@@ -1265,6 +1314,7 @@ mod tests {
         );
         let ops = [PcuDispatchOp::Data(checked)];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(2),
             entry: PcuDispatchEntryPoint {
                 name: "checked-div-rem",
@@ -1336,6 +1386,7 @@ mod tests {
             rhs: PcuDispatchValueId(2),
         })];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(5),
             entry: PcuDispatchEntryPoint {
                 name: "checked-f64-capability",
@@ -1391,6 +1442,7 @@ mod tests {
             PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
         ];
         let direct = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(8),
             entry: PcuDispatchEntryPoint {
                 name: "range-clamp-direct",
@@ -1461,6 +1513,7 @@ mod tests {
         let checked = PcuDispatchDataOp::CheckedIntegerBinary {
             value_type: PcuValueType::i32(),
             op: super::PcuDispatchIntegerBinaryOp::Add,
+            range_policy: crate::PcuRangePolicy::Reject,
             result: PcuDispatchValueId(3),
             lhs: PcuDispatchValueId(1),
             rhs: PcuDispatchValueId(2),
@@ -1471,6 +1524,7 @@ mod tests {
         );
         let ops = [PcuDispatchOp::Data(checked)];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(3),
             entry: PcuDispatchEntryPoint {
                 name: "checked-integer-binary",
@@ -1502,6 +1556,48 @@ mod tests {
     }
 
     #[test]
+    fn integer_clamp_requires_feature_even_with_a_stale_reject_header() {
+        let instruction = PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            value_type: PcuValueType::u32(),
+            op: super::PcuDispatchIntegerBinaryOp::Sub,
+            range_policy: crate::PcuRangePolicy::Clamp,
+            result: PcuDispatchValueId(3),
+            lhs: PcuDispatchValueId(1),
+            rhs: PcuDispatchValueId(2),
+        });
+        let body = [instruction];
+        let direct = [
+            instruction,
+            PcuDispatchOp::Control(crate::PcuDispatchControlOp::Return),
+        ];
+        let grid = [PcuDispatchOp::GridStrideLoop {
+            extent: 17,
+            body: &body,
+        }];
+        for ops in [&direct[..], &grid[..]] {
+            let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
+                id: crate::PcuKernelId(3),
+                entry: PcuDispatchEntryPoint {
+                    name: "clamp",
+                    logical_shape: [3, 1, 1],
+                },
+                bindings: &[],
+                ports: &[],
+                parameters: &[],
+                ops,
+                type_caps: PcuValueTypeCaps::empty(),
+                feature_caps: PcuDispatchFeatureCaps::empty(),
+            };
+            assert!(
+                kernel
+                    .required_feature_support()
+                    .contains(PcuDispatchFeatureCaps::RANGE_CLAMP)
+            );
+        }
+    }
+
+    #[test]
     fn checked_float_binary_advertises_only_f32_checked_support() {
         let checked = PcuDispatchDataOp::CheckedFloatBinary {
             value_type: PcuValueType::f32(),
@@ -1518,6 +1614,7 @@ mod tests {
         );
         let ops = [PcuDispatchOp::Data(checked)];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(4),
             entry: PcuDispatchEntryPoint {
                 name: "checked-float-binary",
@@ -1571,6 +1668,7 @@ mod tests {
         );
         let ops = [PcuDispatchOp::Data(checked)];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(5),
             entry: PcuDispatchEntryPoint {
                 name: "checked-float-unary",

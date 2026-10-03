@@ -88,10 +88,7 @@ fn native_mse_independent_policy_matrix_rejects_unproved_combinations_cold() {
         }
         node.float_underflow_policy = None;
         node.scalar_type = PcuScalarType::F64;
-        assert_eq!(
-            assess_native_mse_numerical_options(node, &environment),
-            Err(TensorUnsupportedReason::ElementType)
-        );
+        assert!(assess_native_mse_numerical_options(node, &environment).is_ok());
         node.scalar_type = PcuScalarType::F32;
     }
 }
@@ -139,7 +136,7 @@ fn native_mse_dense_scalar_output_precision_cache_and_exception_permission() {
             let sum: u16 = (0..17_u16)
                 .map(|index| (index + phase) * (index + phase))
                 .sum();
-            let expected = f32::from(sum) * super::super::mse_scale(17);
+            let expected = f32::from(sum) * super::super::mse_scale(17).unwrap();
             let a =
                 PcuDeviceTensor::new([17], session.upload_buffer(pool, &left).unwrap()).unwrap();
             let b =
@@ -230,4 +227,35 @@ fn native_mse_dense_scalar_output_precision_cache_and_exception_permission() {
             .unwrap();
         assert_eq!(actual[0].to_bits(), ((127_u32 - 46) << 23));
     }
+}
+
+#[test]
+fn native_f64_mse_uses_double_extents_and_preserved_destination_rounding() {
+    let mut graph = Graph::default();
+    graph.set_numerical_options(options(PcuPrecisionPolicy::Preserve));
+    let p = graph.input([65], PcuScalarType::F64).unwrap();
+    let t = graph.input([65], PcuScalarType::F64).unwrap();
+    let loss = graph.mean_squared_error(p, t).unwrap();
+    let source = super::lower_native_mse_to_cuda_source(&graph, loss).unwrap();
+    assert!(source.contains("const double* prediction"));
+    assert!(source.contains("__dsub_rn"));
+    assert!(source.contains("__dmul_rn"));
+    assert!(!source.contains("status"));
+    let requirements = super::requirements(65, PcuScalarType::F64);
+    assert!(requirements.iter().all(|r| r.min_required_bytes == 520));
+    assert!(super::super::mse_scratch_length_fits_scalar(65, PcuScalarType::F64, 520).unwrap());
+    assert!(!super::super::mse_scratch_length_fits_scalar(65, PcuScalarType::F64, 519).unwrap());
+    assert!(
+        super::super::mse_scratch_length_fits_scalar(usize::MAX, PcuScalarType::F64, usize::MAX)
+            .is_err()
+    );
+    assert_eq!(
+        super::super::mse_scale_f64(65).unwrap().to_bits(),
+        0x3f8f_81f8_1f81_f820
+    );
+    assert!(super::super::mse_scale_f64(0).is_err());
+    graph
+        .set_value_numerical_options(loss, PcuNumericalOptions::default())
+        .unwrap();
+    assert!(super::lower_native_mse_to_cuda_source(&graph, loss).is_err());
 }

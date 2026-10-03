@@ -65,6 +65,15 @@ impl PcuSpirvBitMapProfile {
 pub fn validate_float_bit_map(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<PcuSpirvBitMapProfile, PcuSpirvError> {
+    // Exact scalar arithmetic does not certify the complete PortableV1 contract.
+    if kernel
+        .numerical_requirements
+        .numerical_options
+        .reproducibility
+        == fusion_pcu::PcuReproducibility::PortableV1
+    {
+        return Err(PcuSpirvError::UnsupportedNumericalRequirements);
+    }
     let (body, extent, index) = match kernel.ops {
         [
             PcuDispatchOp::GridStrideLoop { extent, body },
@@ -142,6 +151,12 @@ pub fn validate_float_bit_map(
             ));
         }
     };
+    if let PcuSpirvBitOperation::CheckedNeg(underflow) = operation
+        && (kernel.numerical_requirements.float_underflow != underflow
+            || kernel.numerical_requirements.range_policy != PcuRangePolicy::Reject)
+    {
+        return Err(PcuSpirvError::UnsupportedNumericalRequirements);
+    }
     match operation {
         PcuSpirvBitOperation::Copy => {
             match scalar {

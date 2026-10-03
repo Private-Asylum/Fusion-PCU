@@ -103,6 +103,14 @@ pub struct NativeFullyBatchedTickProfile {
 }
 
 const SOURCE: &str = r#"
+extern "C" __global__ void training_mse_squared(
+    const float *prediction, const float *target, float *squared, unsigned int n) {
+    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id < n) {
+        volatile float difference = prediction[id] - target[id];
+        squared[id] = difference * difference;
+    }
+}
 extern "C" __global__ void training_error(
     const float *prediction, const float *target, const float *factor,
     float *error, unsigned int n) {
@@ -142,6 +150,12 @@ enum TrainingRoute {
     Strict { learning_rate: f32 },
 }
 
+struct NativeForwardLoss {
+    squared_kernel: HipKernel,
+    squared: DeviceBuffer,
+    result: DeviceBuffer,
+}
+
 /// Preallocated direct HIP/rocBLAS route; all graph inputs stay device resident.
 pub struct NativeTrainStep {
     stream: HipStreamHandle,
@@ -165,6 +179,7 @@ pub struct NativeTrainStep {
     rows: usize,
     features: usize,
     route: TrainingRoute,
+    forward_loss: Option<NativeForwardLoss>,
 }
 
 #[cfg(feature = "insights")]
@@ -214,7 +229,7 @@ impl NativeTrainStep {
         device: PcuObjectRef,
         input: &TrainInputs<'_>,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::prepare_with_route(discovery, device, input, TrainingRoute::Combined)
+        Self::prepare_with_route(discovery, device, input, TrainingRoute::Combined, false)
     }
 
     /// Prepares a route-matched peer for PCU's strict `delta -> scale -> sgd_update` graph.
@@ -232,7 +247,25 @@ impl NativeTrainStep {
             device,
             input,
             TrainingRoute::Strict { learning_rate },
+            false,
         )
+    }
+
+    /// Complete forward/loss/derivative/update workload for ordinary source comparisons.
+    ///
+    /// The library reduction and pointwise kernels remain unchecked native controls. Their
+    /// retained storage is reported separately from fresh escaped PCU outputs.
+    #[allow(dead_code)] // Shared by legacy diagnostics that do not invoke the full source peer.
+    pub fn prepare_with_forward_loss(
+        discovery: &RocmDiscovery,
+        device: PcuObjectRef,
+        input: &TrainInputs<'_>,
+        separated_learning_rate: Option<f32>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let route = separated_learning_rate.map_or(TrainingRoute::Combined, |learning_rate| {
+            TrainingRoute::Strict { learning_rate }
+        });
+        Self::prepare_with_route(discovery, device, input, route, true)
     }
 
     fn prepare_with_route(
@@ -240,6 +273,7 @@ impl NativeTrainStep {
         device: PcuObjectRef,
         input: &TrainInputs<'_>,
         route: TrainingRoute,
+        include_forward_loss: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let TrainInputs {
             rows,
@@ -273,6 +307,15 @@ impl NativeTrainStep {
             TrainingRoute::Combined => Some(upload(&runtime, rate)?),
             TrainingRoute::Strict { .. } => None,
         };
+        let forward_loss = if include_forward_loss {
+            Some(NativeForwardLoss {
+                squared_kernel: module.function(c"training_mse_squared")?,
+                squared: allocate(&runtime, rows)?,
+                result: allocate(&runtime, 1)?,
+            })
+        } else {
+            None
+        };
         let prediction = allocate(&runtime, rows)?;
         let error = allocate(&runtime, rows)?;
         let gradient = allocate(&runtime, features)?;
@@ -303,6 +346,7 @@ impl NativeTrainStep {
             rows,
             features,
             route,
+            forward_loss,
         })
     }
 
@@ -374,6 +418,9 @@ impl NativeTrainStep {
         &self,
         #[cfg(feature = "insights")] timings: &mut impl FullyBatchedTimingSink,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
+        if self.forward_loss.is_some() {
+            return Err("full forward-loss control requires synchronous execute_two".into());
+        }
         let TrainingRoute::Strict { learning_rate } = self.route else {
             return Err("fully batched execution requires the strict native route".into());
         };
@@ -499,6 +546,9 @@ impl NativeTrainStep {
     /// The returned durations are delta+scale, update, delta+scale, update in milliseconds.
     /// SGEMM and readback remain outside the four measured device segments.
     pub fn execute_two_batched_device_timed(&self) -> Result<(Vec<f32>, Vec<f32>), Box<dyn Error>> {
+        if self.forward_loss.is_some() {
+            return Err("full forward-loss control requires synchronous execute_two".into());
+        }
         let TrainingRoute::Strict { learning_rate } = self.route else {
             return Err("batched execution requires the strict native route".into());
         };
@@ -594,6 +644,9 @@ impl NativeTrainStep {
         if batched && matches!(self.route, TrainingRoute::Combined) {
             return Err("batched execution requires the strict native route".into());
         }
+        if batched && self.forward_loss.is_some() {
+            return Err("full forward-loss control requires synchronous execute_two".into());
+        }
         for (weights, updated) in [
             (&self.initial_weights, &self.weights),
             (&self.weights, &self.updated),
@@ -647,6 +700,23 @@ impl NativeTrainStep {
                     )
                 },
             )?;
+            if let Some(loss) = &self.forward_loss {
+                // Match the source's live MSE effect before starting reverse arithmetic. This
+                // is the same Boundary native squared-difference + ASUM/scale work as the backend.
+                launch_binary(
+                    &loss.squared_kernel,
+                    &self.stream,
+                    &self.prediction,
+                    &self.target,
+                    &loss.squared,
+                    self.rows,
+                    None,
+                )?;
+                #[allow(clippy::cast_precision_loss)] // Native mean uses the target F32 count.
+                let scale = 1.0 / self.rows as f32;
+                self.blas
+                    .sasum_scaled(self.rows, &loss.squared, 1, scale, &loss.result)?;
+            }
             match self.route {
                 TrainingRoute::Combined => timed(
                     timings

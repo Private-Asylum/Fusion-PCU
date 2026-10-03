@@ -3,6 +3,14 @@
 #[rustfmt::skip]
 use fusion_pcu_core::{
     PcuBf16Bits,
+    PcuU256,
+    PcuI256,
+    PcuU512,
+    PcuI512,
+    PcuF128Bits,
+    PcuF256Bits,
+    PcuF8E4M3FnBits,
+    PcuF8E5M2Bits,
     PcuF16Bits,
     core::{PcuExecutionFaultKind, PcuScalarType},
     dialect::tensor::{
@@ -41,6 +49,16 @@ same_bits_by_equality!(
     i64,
     PcuF16Bits,
     PcuBf16Bits,
+    PcuU256,
+    PcuI256,
+    PcuU512,
+    PcuI512,
+    PcuF128Bits,
+    PcuF256Bits,
+    PcuF8E4M3FnBits,
+    PcuF8E5M2Bits,
+    u128,
+    i128,
 );
 
 impl SameBits for f32 {
@@ -88,7 +106,78 @@ where
 }
 
 #[test]
-fn every_dense_host_scalar_transports_through_inputs_constants_and_uniforms() {
+fn wide_and_fp8_scalars_preserve_inputs_constants_and_uniforms() {
+    assert_scalar_transport([u128::MIN, 1 << 100, u128::MAX], u128::MAX);
+    assert_scalar_transport([i128::MIN, -1, i128::MAX], i128::MIN);
+    assert_scalar_transport(
+        [
+            PcuU256::ZERO,
+            PcuU256::from_limbs_le([0, 0, 1, 0]),
+            PcuU256::MAX,
+        ],
+        PcuU256::MAX,
+    );
+    assert_scalar_transport(
+        [
+            PcuI256::MIN,
+            PcuI256::from_limbs_le([u64::MAX; 4]),
+            PcuI256::MAX,
+        ],
+        PcuI256::MIN,
+    );
+    assert_scalar_transport(
+        [
+            PcuU512::ZERO,
+            PcuU512::from_limbs_le([0, 0, 0, 0, 0, 0, 1, 0]),
+            PcuU512::MAX,
+        ],
+        PcuU512::MAX,
+    );
+    assert_scalar_transport(
+        [
+            PcuI512::MIN,
+            PcuI512::from_limbs_le([u64::MAX; 8]),
+            PcuI512::MAX,
+        ],
+        PcuI512::MIN,
+    );
+    // Leaf transport preserves even nonfinite bit patterns; no arithmetic is requested.
+    assert_scalar_transport(
+        [
+            PcuF128Bits::from_limbs_le([0, 1 << 63]),
+            PcuF128Bits::from_limbs_le([1, 0]),
+            PcuF128Bits::from_limbs_le([0xdead_beef, 0x7fff_0000_0000_0000]),
+        ],
+        PcuF128Bits::from_limbs_le([0, 1 << 63]),
+    );
+    assert_scalar_transport(
+        [
+            PcuF256Bits::from_limbs_le([0, 0, 0, 1 << 63]),
+            PcuF256Bits::from_limbs_le([1, 0, 0, 0]),
+            PcuF256Bits::from_limbs_le([0xdead_beef, 0, 0, 0x7fff_f000_0000_0000]),
+        ],
+        PcuF256Bits::from_limbs_le([0, 0, 0, 1 << 63]),
+    );
+    assert_scalar_transport(
+        [
+            PcuF8E4M3FnBits::from_bits(0x80),
+            PcuF8E4M3FnBits::from_bits(1),
+            PcuF8E4M3FnBits::from_bits(0x7f),
+        ],
+        PcuF8E4M3FnBits::from_bits(0xff),
+    );
+    assert_scalar_transport(
+        [
+            PcuF8E5M2Bits::from_bits(0x80),
+            PcuF8E5M2Bits::from_bits(1),
+            PcuF8E5M2Bits::from_bits(0x7e),
+        ],
+        PcuF8E5M2Bits::from_bits(0xfc),
+    );
+}
+
+#[test]
+fn compact_scalars_preserve_inputs_constants_and_uniforms() {
     assert_scalar_transport(
         [
             PcuF16Bits::from_bits(0xfc00),

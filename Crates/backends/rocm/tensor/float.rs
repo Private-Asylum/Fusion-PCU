@@ -1,4 +1,4 @@
-//! Fixed checked f32/f64 tensor Dispatch factories.
+//! Fixed checked six-format floating tensor Dispatch factories.
 
 #[rustfmt::skip]
 use fusion_pcu::{
@@ -685,13 +685,671 @@ const ADD_RELU_F64_OPS: [[&[PcuDispatchOp<'static>]; 4]; 3] = [
     ],
 ];
 
-/// Builds a fixed dense checked f32/f64 `ReLU` kernel with its per-node policy.
+const F16_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("left"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+    ),
+    PcuBinding::value(
+        Some("right"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        2,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+    ),
+];
+const F16_PROFILE: CheckedFloatProfile = CheckedFloatProfile {
+    bindings: F16_BINDINGS,
+    type_caps: PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F16)
+        .union(PcuValueTypeCaps::SCALAR_VALUES),
+    kernel_prefix: 0x4645_1000,
+    names: [
+        [
+            "tensor_checked_f16_add_ieee",
+            "tensor_checked_f16_sub_ieee",
+            "tensor_checked_f16_mul_ieee",
+            "tensor_checked_f16_div_ieee",
+        ],
+        [
+            "tensor_checked_f16_add_reject_subnormal",
+            "tensor_checked_f16_sub_reject_subnormal",
+            "tensor_checked_f16_mul_reject_subnormal",
+            "tensor_checked_f16_div_reject_subnormal",
+        ],
+        [
+            "tensor_checked_f16_add_gradual",
+            "tensor_checked_f16_sub_gradual",
+            "tensor_checked_f16_mul_gradual",
+            "tensor_checked_f16_div_gradual",
+        ],
+    ],
+    ops: [
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+        ],
+    ],
+};
+const BF16_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("left"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+    ),
+    PcuBinding::value(
+        Some("right"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        2,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+    ),
+];
+const BF16_PROFILE: CheckedFloatProfile = CheckedFloatProfile {
+    bindings: BF16_BINDINGS,
+    type_caps: PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::BF16)
+        .union(PcuValueTypeCaps::SCALAR_VALUES),
+    kernel_prefix: 0x4645_b000,
+    names: [
+        [
+            "tensor_checked_bf16_add_ieee",
+            "tensor_checked_bf16_sub_ieee",
+            "tensor_checked_bf16_mul_ieee",
+            "tensor_checked_bf16_div_ieee",
+        ],
+        [
+            "tensor_checked_bf16_add_reject_subnormal",
+            "tensor_checked_bf16_sub_reject_subnormal",
+            "tensor_checked_bf16_mul_reject_subnormal",
+            "tensor_checked_bf16_div_reject_subnormal",
+        ],
+        [
+            "tensor_checked_bf16_add_gradual",
+            "tensor_checked_bf16_sub_gradual",
+            "tensor_checked_bf16_mul_gradual",
+            "tensor_checked_bf16_div_gradual",
+        ],
+    ],
+    ops: [
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+        ],
+    ],
+};
+const F8E4M3FN_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("left"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+    ),
+    PcuBinding::value(
+        Some("right"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        2,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+    ),
+];
+const F8E4M3FN_PROFILE: CheckedFloatProfile = CheckedFloatProfile {
+    bindings: F8E4M3FN_BINDINGS,
+    type_caps: PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F8E4M3FN)
+        .union(PcuValueTypeCaps::SCALAR_VALUES),
+    kernel_prefix: 0x4645_e400,
+    names: [
+        [
+            "tensor_checked_e4m3fn_add_ieee",
+            "tensor_checked_e4m3fn_sub_ieee",
+            "tensor_checked_e4m3fn_mul_ieee",
+            "tensor_checked_e4m3fn_div_ieee",
+        ],
+        [
+            "tensor_checked_e4m3fn_add_reject_subnormal",
+            "tensor_checked_e4m3fn_sub_reject_subnormal",
+            "tensor_checked_e4m3fn_mul_reject_subnormal",
+            "tensor_checked_e4m3fn_div_reject_subnormal",
+        ],
+        [
+            "tensor_checked_e4m3fn_add_gradual",
+            "tensor_checked_e4m3fn_sub_gradual",
+            "tensor_checked_e4m3fn_mul_gradual",
+            "tensor_checked_e4m3fn_div_gradual",
+        ],
+    ],
+    ops: [
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+        ],
+    ],
+};
+const F8E5M2_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("left"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+    ),
+    PcuBinding::value(
+        Some("right"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        2,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+    ),
+];
+const F8E5M2_PROFILE: CheckedFloatProfile = CheckedFloatProfile {
+    bindings: F8E5M2_BINDINGS,
+    type_caps: PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F8E5M2)
+        .union(PcuValueTypeCaps::SCALAR_VALUES),
+    kernel_prefix: 0x4645_e500,
+    names: [
+        [
+            "tensor_checked_e5m2_add_ieee",
+            "tensor_checked_e5m2_sub_ieee",
+            "tensor_checked_e5m2_mul_ieee",
+            "tensor_checked_e5m2_div_ieee",
+        ],
+        [
+            "tensor_checked_e5m2_add_reject_subnormal",
+            "tensor_checked_e5m2_sub_reject_subnormal",
+            "tensor_checked_e5m2_mul_reject_subnormal",
+            "tensor_checked_e5m2_div_reject_subnormal",
+        ],
+        [
+            "tensor_checked_e5m2_add_gradual",
+            "tensor_checked_e5m2_sub_gradual",
+            "tensor_checked_e5m2_mul_gradual",
+            "tensor_checked_e5m2_div_gradual",
+        ],
+    ],
+    ops: [
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::IeeeAfterRounding
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::RejectSubnormalResult
+            ),
+        ],
+        [
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Add,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Sub,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Mul,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+            binary_ops!(
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuDispatchFloatBinaryOp::Div,
+                PcuFloatUnderflowPolicy::AllowGradualUnderflow
+            ),
+        ],
+    ],
+};
+
+const RELU_F16_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("input"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+    ),
+];
+const RELU_F16_NAMES: [&str; 3] = [
+    "checked_relu_f16_ieee",
+    "checked_relu_f16_reject_subnormal",
+    "checked_relu_f16_gradual",
+];
+const RELU_F16_OPS: [&[PcuDispatchOp<'static>]; 3] = [
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+        PcuFloatUnderflowPolicy::IeeeAfterRounding
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+        PcuFloatUnderflowPolicy::RejectSubnormalResult
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+        PcuFloatUnderflowPolicy::AllowGradualUnderflow
+    ),
+];
+const RELU_BF16_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("input"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+    ),
+];
+const RELU_BF16_NAMES: [&str; 3] = [
+    "checked_relu_bf16_ieee",
+    "checked_relu_bf16_reject_subnormal",
+    "checked_relu_bf16_gradual",
+];
+const RELU_BF16_OPS: [&[PcuDispatchOp<'static>]; 3] = [
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+        PcuFloatUnderflowPolicy::IeeeAfterRounding
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+        PcuFloatUnderflowPolicy::RejectSubnormalResult
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+        PcuFloatUnderflowPolicy::AllowGradualUnderflow
+    ),
+];
+const RELU_F8E4M3FN_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("input"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+    ),
+];
+const RELU_F8E4M3FN_NAMES: [&str; 3] = [
+    "checked_relu_e4m3fn_ieee",
+    "checked_relu_e4m3fn_reject_subnormal",
+    "checked_relu_e4m3fn_gradual",
+];
+const RELU_F8E4M3FN_OPS: [&[PcuDispatchOp<'static>]; 3] = [
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+        PcuFloatUnderflowPolicy::IeeeAfterRounding
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+        PcuFloatUnderflowPolicy::RejectSubnormalResult
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+        PcuFloatUnderflowPolicy::AllowGradualUnderflow
+    ),
+];
+const RELU_F8E5M2_BINDINGS: &[PcuBinding<'static>] = &[
+    PcuBinding::value(
+        Some("input"),
+        0,
+        0,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::ReadOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+    ),
+    PcuBinding::value(
+        Some("output"),
+        0,
+        1,
+        PcuBindingStorageClass::Storage,
+        PcuBindingAccess::WriteOnly,
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+    ),
+];
+const RELU_F8E5M2_NAMES: [&str; 3] = [
+    "checked_relu_e5m2_ieee",
+    "checked_relu_e5m2_reject_subnormal",
+    "checked_relu_e5m2_gradual",
+];
+const RELU_F8E5M2_OPS: [&[PcuDispatchOp<'static>]; 3] = [
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+        PcuFloatUnderflowPolicy::IeeeAfterRounding
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+        PcuFloatUnderflowPolicy::RejectSubnormalResult
+    ),
+    relu_ops!(
+        PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+        PcuFloatUnderflowPolicy::AllowGradualUnderflow
+    ),
+];
+
+/// Builds a fixed dense checked floating `ReLU` kernel with its per-node policy.
 pub(super) const fn relu_kernel(
     scalar_type: fusion_pcu::PcuScalarType,
     policy: PcuFloatUnderflowPolicy,
     logical_count: u32,
 ) -> Result<PcuDispatchKernelIr<'static>, super::RocmTensorExecutionError> {
     let (bindings, names, kernel_prefix, type_caps, ops) = match scalar_type {
+        fusion_pcu::PcuScalarType::F16 => (
+            RELU_F16_BINDINGS,
+            &RELU_F16_NAMES,
+            0x5245_1000,
+            PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F16),
+            &RELU_F16_OPS,
+        ),
+        fusion_pcu::PcuScalarType::BF16 => (
+            RELU_BF16_BINDINGS,
+            &RELU_BF16_NAMES,
+            0x5245_b000,
+            PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::BF16),
+            &RELU_BF16_OPS,
+        ),
+        fusion_pcu::PcuScalarType::F8E4M3FN => (
+            RELU_F8E4M3FN_BINDINGS,
+            &RELU_F8E4M3FN_NAMES,
+            0x5245_e400,
+            PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+            &RELU_F8E4M3FN_OPS,
+        ),
+        fusion_pcu::PcuScalarType::F8E5M2 => (
+            RELU_F8E5M2_BINDINGS,
+            &RELU_F8E5M2_NAMES,
+            0x5245_e500,
+            PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F8E5M2),
+            &RELU_F8E5M2_OPS,
+        ),
         fusion_pcu::PcuScalarType::F32 => (
             RELU_F32_BINDINGS,
             &RELU_F32_NAMES,
@@ -710,6 +1368,10 @@ pub(super) const fn relu_kernel(
     };
     let (policy_index, policy_offset) = policy_index_and_offset(policy);
     Ok(PcuDispatchKernelIr {
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements {
+            float_underflow: policy,
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: PcuKernelId(kernel_prefix + policy_offset),
         entry: PcuDispatchEntryPoint {
             name: names[policy_index],
@@ -764,6 +1426,10 @@ pub(super) const fn add_relu_kernel(
     };
     let (policy_index, policy_offset) = policy_index_and_offset(policy);
     Ok(PcuDispatchKernelIr {
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements {
+            float_underflow: policy,
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: PcuKernelId(kernel_prefix + policy_offset + scalar_mask as u32),
         entry: PcuDispatchEntryPoint {
             name: names[policy_index],
@@ -786,6 +1452,10 @@ pub(super) const fn kernel(
     logical_count: u32,
 ) -> Result<PcuDispatchKernelIr<'static>, super::RocmTensorExecutionError> {
     let profile = match scalar_type {
+        fusion_pcu::PcuScalarType::F16 => F16_PROFILE,
+        fusion_pcu::PcuScalarType::BF16 => BF16_PROFILE,
+        fusion_pcu::PcuScalarType::F8E4M3FN => F8E4M3FN_PROFILE,
+        fusion_pcu::PcuScalarType::F8E5M2 => F8E5M2_PROFILE,
         fusion_pcu::PcuScalarType::F32 => F32_PROFILE,
         fusion_pcu::PcuScalarType::F64 => F64_PROFILE,
         _ => return Err(super::RocmTensorExecutionError::InvalidPointwiseProfile),
@@ -794,6 +1464,10 @@ pub(super) const fn kernel(
     let (policy_index, policy_offset) = policy_index_and_offset(policy);
     let id = profile.kernel_prefix + policy_offset + op_tag;
     Ok(PcuDispatchKernelIr {
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements {
+            float_underflow: policy,
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: PcuKernelId(id),
         entry: PcuDispatchEntryPoint {
             name: profile.names[policy_index][op_index],
@@ -806,6 +1480,88 @@ pub(super) const fn kernel(
         type_caps: profile.type_caps,
         feature_caps: PcuDispatchFeatureCaps::empty(),
     })
+}
+
+/// Lowers one dense checked floating Add/Sub/Mul/Div or `ReLU` tensor node.
+///
+/// This is the executor's integer-encoding runtime-compiler body with the captured
+/// numerical tuple. Binary ABI: left, right, fresh output, u64 fault; `ReLU` ABI:
+/// input, fresh output, u64 fault. Initialize fault to MAX, wait and inspect status
+/// before publishing. No tensor Clamp, Uniform, training or `PortableV1` is offered.
+///
+/// # Errors
+/// Returns unsupported graph operation, dtype, dense shape or numerical requirements.
+pub fn lower_checked_float_tensor_to_hip_source(
+    graph: &fusion_pcu::dialect::tensor::Graph,
+    value: fusion_pcu::dialect::tensor::ValueId,
+) -> Result<String, super::RocmTensorExecutionError> {
+    use fusion_pcu::dialect::tensor::{OpDescriptor, TensorOperationSupport, TensorUnsupportedReason};
+    let node = graph.node(value)?;
+    if node.numerical_options.reproducibility != fusion_pcu::PcuReproducibility::Unspecified {
+        return Err(super::RocmTensorExecutionError::Unsupported {
+            value,
+            reason: TensorUnsupportedReason::NumericalPolicy {
+                requirement: fusion_pcu::PcuNumericalRequirement::Reproducibility,
+                options: node.numerical_options,
+            },
+        });
+    }
+    if !super::is_checked_float_type(node.scalar_type) {
+        return Err(super::RocmTensorExecutionError::UnsupportedScalarType(
+            node.scalar_type,
+        ));
+    }
+    if let TensorOperationSupport::Unsupported { reason } =
+        super::assess_low_float_node(graph, node)
+    {
+        return Err(super::RocmTensorExecutionError::Unsupported { value, reason });
+    }
+    let count = node
+        .shape
+        .iter()
+        .try_fold(1u32, |count, &dim| {
+            u32::try_from(dim)
+                .ok()
+                .and_then(|dim| count.checked_mul(dim))
+        })
+        .ok_or(super::RocmTensorExecutionError::SizeOverflow)?;
+    let requirements = super::fixed_numerical_requirements(node);
+    let base = match node.op {
+        OpDescriptor::Relu { .. } => {
+            relu_kernel(node.scalar_type, requirements.float_underflow, count)?
+        }
+        OpDescriptor::Add { .. } => kernel(
+            PcuDispatchFloatBinaryOp::Add,
+            node.scalar_type,
+            requirements.float_underflow,
+            count,
+        )?,
+        OpDescriptor::Sub { .. } => kernel(
+            PcuDispatchFloatBinaryOp::Sub,
+            node.scalar_type,
+            requirements.float_underflow,
+            count,
+        )?,
+        OpDescriptor::Mul { .. } => kernel(
+            PcuDispatchFloatBinaryOp::Mul,
+            node.scalar_type,
+            requirements.float_underflow,
+            count,
+        )?,
+        OpDescriptor::Div { .. } => kernel(
+            PcuDispatchFloatBinaryOp::Div,
+            node.scalar_type,
+            requirements.float_underflow,
+            count,
+        )?,
+        _ => return Err(super::RocmTensorExecutionError::InvalidPointwiseProfile),
+    };
+    let ir = PcuDispatchKernelIr {
+        numerical_requirements: requirements,
+        ..base
+    };
+    crate::lower_dispatch_to_hip_rtc_source(&ir)
+        .map_err(|error| super::RocmTensorExecutionError::Backend(error.into()))
 }
 
 #[cfg(test)]
@@ -874,6 +1630,26 @@ mod tests {
         let mut identities = Vec::new();
         for (scalar_type, value_type, type_cap) in [
             (
+                fusion_pcu::PcuScalarType::F16,
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F16),
+                PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F16),
+            ),
+            (
+                fusion_pcu::PcuScalarType::BF16,
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::BF16),
+                PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::BF16),
+            ),
+            (
+                fusion_pcu::PcuScalarType::F8E4M3FN,
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+                PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F8E4M3FN),
+            ),
+            (
+                fusion_pcu::PcuScalarType::F8E5M2,
+                PcuValueType::Scalar(fusion_pcu::PcuScalarType::F8E5M2),
+                PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::F8E5M2),
+            ),
+            (
                 fusion_pcu::PcuScalarType::F32,
                 PcuValueType::f32(),
                 PcuValueTypeCaps::FLOAT32,
@@ -929,7 +1705,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(identities.len(), 24);
+        assert_eq!(identities.len(), 72);
     }
 
     #[test]
@@ -937,7 +1713,7 @@ mod tests {
         assert!(matches!(
             kernel(
                 PcuDispatchFloatBinaryOp::Add,
-                fusion_pcu::PcuScalarType::F16,
+                fusion_pcu::PcuScalarType::F128,
                 PcuFloatUnderflowPolicy::IeeeAfterRounding,
                 1,
             ),

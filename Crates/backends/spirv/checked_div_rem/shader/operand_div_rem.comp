@@ -1,0 +1,45 @@
+#version 450
+// Exact integer quotient/remainder with U32 limbs, never native signed division/Int64.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint ELEMENT_BYTES=4u;
+layout(constant_id=1) const uint SIGNED=0u;
+layout(constant_id=2) const uint EXTENT=1u;
+layout(constant_id=3) const uint OPERAND_A=0u;
+layout(constant_id=4) const uint OPERAND_B=1u;
+layout(constant_id=5) const uint OPERAND_A_ZERO=0u;
+layout(constant_id=6) const uint OPERAND_B_ZERO=0u;
+layout(set=0,binding=0,std430) readonly buffer A{uint words[];}source_a;
+layout(set=0,binding=1,std430) readonly buffer B{uint words[];}source_b;
+layout(set=0,binding=2,std430) writeonly buffer Q{uint words[];}quotient_data;
+layout(set=0,binding=3,std430) writeonly buffer R{uint words[];}remainder_data;
+layout(set=0,binding=4,std430) writeonly buffer Status{uint codes[];}status_data;
+uint width(){return max(ELEMENT_BYTES/4u,1u);}
+uint mask(){return ELEMENT_BYTES==1u?0xffu:ELEMENT_BYTES==2u?0xffffu:0xffffffffu;}
+uint sign_bit(){return ELEMENT_BYTES==1u?0x80u:ELEMENT_BYTES==2u?0x8000u:0x80000000u;}
+uint load_word(uint source,uint lane,uint limb){uint byte=lane*ELEMENT_BYTES;uint index=byte/4u+limb;uint value=source==0u?source_a.words[index]:source_b.words[index];return ELEMENT_BYTES<4u?(value>>((byte%4u)*8u))&mask():value;}
+void negate(in uint value[2],out uint result[2]){result[0]=0u;result[1]=0u;uint carry=1u;for(uint i=0u;i<width();i++){uint next=(~value[i])+carry;carry=uint(carry!=0u&&next==0u);result[i]=next;}result[width()-1u]&=mask();}
+uint evaluate(uint lane,out uint quotient[2],out uint remainder[2]){
+    uint left[2],right[2];for(uint i=0u;i<2u;i++){left[i]=0u;right[i]=0u;quotient[i]=0u;remainder[i]=0u;}uint n=width();
+    for(uint i=0u;i<n;i++){left[i]=load_word(OPERAND_A,OPERAND_A_ZERO!=0u?0u:lane,i);right[i]=load_word(OPERAND_B,OPERAND_B_ZERO!=0u?0u:lane,i);}
+    if((right[0]|right[1])==0u)return 4u;
+    bool left_negative=SIGNED!=0u&&(left[n-1u]&sign_bit())!=0u;
+    bool right_negative=SIGNED!=0u&&(right[n-1u]&sign_bit())!=0u;
+    bool minimum=left[n-1u]==sign_bit()&&(n==1u||left[0]==0u);
+    bool minus_one=right[n-1u]==mask()&&(n==1u||right[0]==0xffffffffu);
+    if(SIGNED!=0u&&minimum&&minus_one)return 5u;
+    uint numerator[2],denominator[2];for(uint i=0u;i<2u;i++){numerator[i]=left[i];denominator[i]=right[i];}
+    if(left_negative)negate(left,numerator);if(right_negative)negate(right,denominator);
+    // Admission bounds widths8..64. Bit indices0..63 have limb0/1 and shift0..31.
+    // Remainder before each step is <denominator. An explicit carry represents its
+    // possible65th bit; modulo subtraction then leaves an exact result <denominator.
+    for(uint remaining=ELEMENT_BYTES*8u;remaining>0u;remaining--){uint bit=remaining-1u;uint carry=remainder[1]>>31u;remainder[1]=(remainder[1]<<1u)|(remainder[0]>>31u);remainder[0]=(remainder[0]<<1u)|((numerator[bit/32u]>>(bit%32u))&1u);
+        bool at_least=carry!=0u||remainder[1]>denominator[1]||(remainder[1]==denominator[1]&&remainder[0]>=denominator[0]);
+        if(at_least){uint borrow=uint(remainder[0]<denominator[0]);remainder[0]-=denominator[0];remainder[1]=remainder[1]-denominator[1]-borrow;quotient[bit/32u]|=1u<<(bit%32u);}
+    }
+    uint magnitude[2];if(left_negative!=right_negative){for(uint i=0u;i<2u;i++)magnitude[i]=quotient[i];negate(magnitude,quotient);}if(left_negative){for(uint i=0u;i<2u;i++)magnitude[i]=remainder[i];negate(magnitude,remainder);}return 0u;
+}
+void main(){uint pack=ELEMENT_BYTES<4u?4u/ELEMENT_BYTES:1u;uint word=gl_GlobalInvocationID.x;if(word>=EXTENT/pack+uint(EXTENT%pack!=0u))return;uint packed_q=0u,packed_r=0u;
+    for(uint sublane=0u;sublane<pack;sublane++){uint lane=word*pack+sublane;if(lane>=EXTENT)break;uint q[2],r[2];status_data.codes[lane]=evaluate(lane,q,r);if(ELEMENT_BYTES<4u){packed_q|=q[0]<<(sublane*ELEMENT_BYTES*8u);packed_r|=r[0]<<(sublane*ELEMENT_BYTES*8u);}else for(uint limb=0u;limb<width();limb++){quotient_data.words[lane*width()+limb]=q[limb];remainder_data.words[lane*width()+limb]=r[limb];}}
+    // One invocation owns both entire packed U32 words, including odd logical tails.
+    if(ELEMENT_BYTES<4u){quotient_data.words[word]=packed_q;remainder_data.words[word]=packed_r;}
+}

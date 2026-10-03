@@ -320,6 +320,7 @@ pub(super) fn consuming_binary_kernel(
     let (name, base_id, bindings, ops, type_caps) =
         consuming_binary_profile(scalar_type, operation, donor_operand);
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(base_id),
         entry: PcuDispatchEntryPoint {
             name,
@@ -497,6 +498,7 @@ pub(super) fn consuming_relu_kernel(
         _ => panic!("checked integer tensors cannot use consuming ReLU profiles"),
     };
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(id),
         entry: PcuDispatchEntryPoint {
             name,
@@ -792,6 +794,7 @@ pub(super) fn kernel(
     };
 
     Ok(PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(id),
         entry: PcuDispatchEntryPoint {
             name,

@@ -75,7 +75,7 @@ fn generated_calls_follow_automatic_and_explicit_rocm_policy_transitions() {
         dual_provider_transform(&input, &mut output),
         Err(PcuExecutionError::NoBackendEnabled
             | PcuExecutionError::BackendFailure(_)
-            | PcuExecutionError::NoCompatibleDevice(_))
+            | PcuExecutionError::NoCompatibleDevice { .. })
     ));
     assert_output(&output, &[91.0; 3]);
 

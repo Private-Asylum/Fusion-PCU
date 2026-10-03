@@ -82,13 +82,8 @@ mod tests {
         graph
             .set_value_numerical_mode(output, PcuNumericalMode::Strict)
             .unwrap();
-        assert_eq!(
-            assess_matmul_numerical_options(graph.node(output).unwrap(), &environment),
-            Err(TensorUnsupportedReason::NumericalPolicy {
-                requirement: PcuNumericalRequirement::CompoundArithmetic,
-                options: native_options(PcuPrecisionPolicy::BackendOptimized),
-            })
-        );
+        // Strict selects ordered scalar checks; native/precision flags are permissions.
+        assert!(assess_matmul_numerical_options(graph.node(output).unwrap(), &environment).is_ok());
         graph
             .set_value_numerical_options(output, PcuNumericalOptions::default())
             .unwrap();

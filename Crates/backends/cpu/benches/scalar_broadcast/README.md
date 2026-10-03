@@ -1,0 +1,3 @@
+# CPU scalar broadcast peers
+
+All 22 sealed host carriers, direct and canonical grid-stride source, N1/N65, four matched routes: prepared genuine #[pcu], ordinary genuine #[pcu], explicit graph diagnostic, native slice fill. There are 352 semantic peers and 352 separate 64-changing-input heap censuses. Warm caller scopes require zero Rust allocations/reallocations/frees and no ordinary source rescoring. Output storage and three tail elements are prepared cold. Raw carrier bits are compared through canonical bytes, including floating NaN payloads. This target uses Criterion --test for semantic qualification; no statistical timing claim follows from it.

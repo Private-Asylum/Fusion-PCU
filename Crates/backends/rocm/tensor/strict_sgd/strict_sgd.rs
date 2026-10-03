@@ -7,14 +7,14 @@ use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,
     PcuBindingType,
-    PcuCompoundArithmeticPolicy,
     PcuExecutionFault,
     PcuExecutionFaultKind,
     PcuFloatUnderflowPolicy,
+    PcuImplementationRequirements,
+    PcuRangePolicy,
     PcuInvocationShape,
     PcuNumericalMode,
     PcuOwnedBindingRequirement,
-    PcuPrecisionPolicy,
     PcuReproducibility,
     PcuScalarType,
     PcuValueType,
@@ -39,10 +39,24 @@ pub(crate) struct StrictSgdSpec {
     count: u32,
     scalar: PcuScalarType,
     policy: PcuFloatUnderflowPolicy,
+    numerical_requirements: PcuImplementationRequirements,
     rate_bits: u32,
 }
 
 impl StrictSgdSpec {
+    // Private factory admission establishes positive dimensions and packed event bounds.
+    pub(crate) fn fault_domain(self) -> fusion_pcu::dialect::tensor::TensorStrictFaultDomain {
+        fusion_pcu::dialect::tensor::TensorStrictFaultDomain::sgd(
+            self.scalar,
+            u64::from(self.count),
+            self.policy,
+        )
+        .expect("verified checked compound dimensions and format")
+    }
+    pub(crate) fn fault_extent(self) -> u64 {
+        self.fault_domain().event_extent()
+    }
+
     pub(super) fn from_node(graph: &Graph, node: NodeDescriptor<'_>) -> Option<Self> {
         let OpDescriptor::SgdUpdate {
             weights,
@@ -53,8 +67,6 @@ impl StrictSgdSpec {
             return None;
         };
         if node.numerical_mode != Some(PcuNumericalMode::Strict)
-            || node.numerical_options.compound_arithmetic != PcuCompoundArithmeticPolicy::Checked
-            || node.numerical_options.precision != PcuPrecisionPolicy::Preserve
             || node.numerical_options.reproducibility != PcuReproducibility::Unspecified
             || !matches!(node.scalar_type, PcuScalarType::F32 | PcuScalarType::F64)
             || !learning_rate.is_finite()
@@ -86,6 +98,14 @@ impl StrictSgdSpec {
         let spec = Self {
             count: u32::try_from(count).ok().filter(|n| *n != 0)?,
             scalar: node.scalar_type,
+            // Permissions may use this stronger ordered checker; retain the requested tuple.
+            numerical_requirements: PcuImplementationRequirements {
+                numerical_mode: PcuNumericalMode::Strict,
+                numerical_options: node.numerical_options,
+                float_underflow: node.float_underflow_policy.unwrap_or_default(),
+                // Tensor nodes currently represent only Reject range.
+                range_policy: PcuRangePolicy::Reject,
+            },
             policy: node.float_underflow_policy?,
             rate_bits: learning_rate.to_bits(),
         };
@@ -132,7 +152,7 @@ impl StrictSgdSpec {
                 "unsigned long long",
                 "f64",
                 "FusionF64CheckedResult",
-                f64::from(f32::from_bits(self.rate_bits)).to_bits(),
+                fusion_pcu::f32_bits_to_f64_bits(self.rate_bits),
             ),
             _ => unreachable!("private F32/F64 profile"),
         };
@@ -240,6 +260,8 @@ impl RocmTensorAssessor<'_> {
         left: &RocmMemoryResource,
         right: &RocmMemoryResource,
         output: &RocmMemoryResource,
+
+        mut status: Option<&mut super::owned_scratch::Status>,
     ) -> Result<(), RocmTensorExecutionError> {
         self.ensure_strict_sgd_cached(spec)?;
         let key = TensorDispatchCacheKey::StrictSgd(spec);
@@ -263,13 +285,15 @@ impl RocmTensorAssessor<'_> {
             })
             .collect::<Result<SmallVec<[_; 3]>, _>>()
             .map_err(RocmTensorExecutionError::Backend)?;
-        let mut completion = prepared
-            .submit(&bindings)
-            .map_err(RocmTensorExecutionError::Backend)?;
-        match completion
+        let mut completion =
+            super::owned_scratch::submit(prepared, &bindings, status.as_deref_mut())?;
+        let outcome = completion
             .wait()
-            .map_err(RocmTensorExecutionError::Completion)?
-        {
+            .map_err(RocmTensorExecutionError::Completion)?;
+        if let Some(status) = status {
+            status.observe(outcome);
+        }
+        match outcome {
             PcuCompletionOutcome::Succeeded => Ok(()),
             PcuCompletionOutcome::Failed => Err(RocmTensorExecutionError::FailedCompletion),
             PcuCompletionOutcome::Fault(fault) => Err(spec.fault_error(value, fault)?.into()),

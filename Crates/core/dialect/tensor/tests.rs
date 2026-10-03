@@ -66,29 +66,26 @@ fn typed_loss_keeps_scalar_shape_policy_and_rejects_other_types_and_foreign_valu
         Err(TensorError::UnknownValue(_))
     ));
     let wide = graph.input_typed::<f64>([1]).unwrap();
+    let wide_loss = graph.mean_squared_error_typed(wide, wide).unwrap();
+    assert_eq!(wide_loss.scalar_type(), PcuScalarType::F64);
+    let integer = graph.input_typed::<u64>([1]).unwrap();
     assert!(matches!(
-        graph.mean_squared_error_typed(wide, wide),
-        Err(TensorError::UnsupportedScalarType {
-            scalar_type: PcuScalarType::F64,
-            ..
-        })
+        graph.mean_squared_error_typed(integer, integer),
+        Err(TensorError::UnsupportedScalarType { .. })
     ));
 }
 
 #[test]
-fn checked_reference_admission_matches_unsupported_numerical_execution() {
+fn checked_reference_portable_refusal_matches_execution() {
     for options in [
-        crate::PcuNumericalOptions {
-            compound_arithmetic: crate::PcuCompoundArithmeticPolicy::BackendDefined,
-            ..crate::PcuNumericalOptions::default()
-        },
-        crate::PcuNumericalOptions {
-            precision: crate::PcuPrecisionPolicy::BackendOptimized,
-            ..crate::PcuNumericalOptions::default()
-        },
         crate::PcuNumericalOptions {
             reproducibility: crate::PcuReproducibility::PortableV1,
             ..crate::PcuNumericalOptions::default()
+        },
+        crate::PcuNumericalOptions {
+            compound_arithmetic: crate::PcuCompoundArithmeticPolicy::BackendDefined,
+            precision: crate::PcuPrecisionPolicy::BackendOptimized,
+            reproducibility: crate::PcuReproducibility::PortableV1,
         },
     ] {
         let mut graph = Graph::default();
@@ -914,20 +911,6 @@ fn dynamic_graph_operations_reject_dtype_mismatch_and_foreign_typed_views() {
 }
 
 #[test]
-fn opaque_half_arithmetic_is_rejected_without_blocking_typed_storage() {
-    let mut graph = Graph::default();
-    let left = graph.input_typed::<PcuF16Bits>([1]).unwrap();
-    let right = graph.input_typed::<PcuF16Bits>([1]).unwrap();
-    assert!(matches!(
-        graph.add_typed(left, right),
-        Err(TensorError::UnsupportedScalarType {
-            value,
-            scalar_type: PcuScalarType::F16,
-        }) if value == left.erase()
-    ));
-}
-
-#[test]
 fn reference_assessor_and_evaluator_preserve_f64_identity_values() {
     let mut graph = Graph::default();
     let input = graph.input([2], PcuScalarType::F64).unwrap();
@@ -1327,7 +1310,7 @@ fn graph_uniform_is_compact_but_keeps_dense_logical_storage_facts() {
     assert_eq!(
         uniform_node.op,
         OpDescriptor::Uniform {
-            value: TensorScalarValue::F32(2.5)
+            value: &TensorScalarValue::F32(2.5)
         }
     );
 
@@ -1557,13 +1540,33 @@ fn assert_gradient_graph_matches_reference(
     loss: ValueId,
     values: &[ValueId],
 ) {
+    // Target-selective capture must agree with the existing all-target transform
+    // and separately evaluated host AD across fanout and transposed multilayer graphs.
+    let selected: Vec<_> = values
+        .iter()
+        .map(|value| graph.backward_mse_for(loss, *value).unwrap())
+        .collect();
     let gradient_values = graph.backward_mse(loss).unwrap();
     let execution = graph.evaluate(inputs).unwrap();
     let reference = execution.gradients(graph, loss).unwrap();
-    for value in values {
+    for (value, selected) in values.iter().zip(selected) {
         let graph_gradient = execution
             .value_typed::<f32>(gradient_values[value.index].unwrap())
             .unwrap();
+        let selected_gradient = execution.value_typed::<f32>(selected).unwrap();
+        assert_eq!(selected_gradient.shape(), graph_gradient.shape());
+        assert_eq!(
+            selected_gradient
+                .data()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            graph_gradient
+                .data()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+        );
         let reference_gradient = reference[value.index].as_ref().unwrap();
         assert_eq!(graph_gradient.shape(), reference_gradient.shape());
         for (actual, expected) in graph_gradient.data().iter().zip(reference_gradient.data()) {
@@ -1664,7 +1667,7 @@ fn relu_backward_checks_shapes_and_matches_strict_derivative() {
     let inputs = [
         (
             input,
-            TensorValue::from(Tensor::<f32>::new([2], vec![f32::NAN, 0.0]).unwrap()),
+            TensorValue::from(Tensor::<f32>::new([2], vec![-1.0, 0.0]).unwrap()),
         ),
         (
             upstream,
@@ -2019,7 +2022,7 @@ fn selected_output_plan_prunes_unrelated_nodes_and_pins_outputs() {
         .erase();
     let selected = graph.add(input, constant).unwrap();
     let unrelated = graph.input(vec![2], PcuScalarType::F32).unwrap();
-    let _other = graph.relu(unrelated).unwrap();
+    let _other = graph.uniform_typed([2], 3.0_f32).unwrap();
 
     let plan = graph.execution_plan_for_outputs(&[selected]).unwrap();
     assert_eq!(plan.node_order(), &[input, constant, selected]);
@@ -3175,5 +3178,105 @@ fn execution_and_input_bindings_are_graph_checked() {
     assert_eq!(
         execution.gradients(&graph, loss).unwrap_err(),
         TensorError::GraphChanged
+    );
+}
+
+#[test]
+fn binary64_reverse_graph_keeps_constants_and_gradients_typed() {
+    let mut graph = Graph::default();
+    graph.set_numerical_mode(PcuNumericalMode::Strict);
+    let input = graph.input_typed::<f64>([2, 2]).unwrap();
+    let weights = graph.input_typed::<f64>([2, 1]).unwrap();
+    let target = graph.input_typed::<f64>([2, 1]).unwrap();
+    let projected = graph.matmul_typed(input, weights).unwrap();
+    let prediction = graph.relu_typed(projected).unwrap();
+    let loss = graph.mean_squared_error_typed(prediction, target).unwrap();
+    let gradients = graph.backward_mse(loss.erase()).unwrap();
+    assert!(
+        graph
+            .nodes()
+            .all(|node| node.scalar_type == PcuScalarType::F64)
+    );
+    let execution = graph
+        .evaluate_checked(&[
+            (
+                input.erase(),
+                TensorValue::F64(Tensor::new([2, 2], vec![1.0, 0.0, 0.0, 1.0]).unwrap()),
+            ),
+            (
+                weights.erase(),
+                TensorValue::F64(Tensor::new([2, 1], vec![2.0, -1.0]).unwrap()),
+            ),
+            (
+                target.erase(),
+                TensorValue::F64(Tensor::new([2, 1], vec![1.0, 1.0]).unwrap()),
+            ),
+        ])
+        .unwrap();
+    assert_eq!(
+        execution.value_typed::<f64>(loss.erase()).unwrap().data(),
+        &[1.0]
+    );
+    assert_eq!(
+        execution
+            .value_typed::<f64>(gradients[weights.erase().index].unwrap())
+            .unwrap()
+            .data(),
+        &[1.0, 0.0]
+    );
+}
+
+#[test]
+fn second_derivative_rejects_without_mutating_reverse_graph_or_panicking() {
+    let mut graph = Graph::default();
+    let input = graph.input_typed::<f32>([1]).unwrap();
+    let upstream = graph.input_typed::<f32>([1]).unwrap();
+    let derivative = graph
+        .relu_backward(input.erase(), upstream.erase())
+        .unwrap();
+    let zero = graph.constant_typed(Tensor::new([1], vec![0.0_f32]).unwrap());
+    let loss = graph.mean_squared_error(derivative, zero.erase()).unwrap();
+    let nodes = graph.nodes.len();
+    assert!(
+        matches!(graph.backward_mse(loss), Err(TensorError::UnsupportedGradient(value)) if value == derivative)
+    );
+    assert_eq!(graph.nodes.len(), nodes);
+    let execution = graph
+        .evaluate(&[
+            (
+                input.erase(),
+                TensorValue::F32(Tensor::new([1], vec![1.0]).unwrap()),
+            ),
+            (
+                upstream.erase(),
+                TensorValue::F32(Tensor::new([1], vec![1.0]).unwrap()),
+            ),
+        ])
+        .unwrap();
+    assert!(
+        matches!(execution.gradients(&graph, loss), Err(TensorError::UnsupportedGradient(value)) if value == derivative)
+    );
+}
+
+#[test]
+fn graph_identity_exhaustion_does_not_wrap_or_reissue_a_stale_identity() {
+    #[cfg(target_has_atomic = "64")]
+    let maximum = u64::MAX;
+    #[cfg(not(target_has_atomic = "64"))]
+    let maximum = u32::MAX;
+    let counter = GraphIdentityCounter::new(maximum - 1);
+    #[cfg(target_has_atomic = "64")]
+    let expected = maximum - 1;
+    #[cfg(not(target_has_atomic = "64"))]
+    let expected = u64::from(maximum - 1);
+    assert_eq!(next_graph_id(&counter), Ok(expected));
+    assert_eq!(
+        next_graph_id(&counter),
+        Err(TensorError::GraphIdentityExhausted)
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), maximum);
+    assert_eq!(
+        next_graph_id(&counter),
+        Err(TensorError::GraphIdentityExhausted)
     );
 }

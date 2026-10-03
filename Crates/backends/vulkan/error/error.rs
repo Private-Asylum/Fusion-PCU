@@ -40,6 +40,18 @@ pub enum PcuVulkanError {
     UnsupportedBindingProfile,
     UnsupportedPreparedProfile,
     InvalidArguments,
+    /// A completed shader emitted a malformed raw or operation-incompatible fault record.
+    InvalidStatus {
+        code: u32,
+        invocation_id: u64,
+    },
+    /// A completed ordered compound emitted an invalid physical kind or semantic location.
+    InvalidCompoundStatus {
+        code: u32,
+        element_index: u64,
+        reduction_index: u32,
+        step: u32,
+    },
     InvalidOfferShape,
     InvalidOfferBinding(PcuBindingRef),
     InvalidOfferValueFlow(PcuTypedDispatchValidationError),
@@ -93,6 +105,22 @@ impl fmt::Display for PcuVulkanError {
                 formatter.write_str("unsupported Vulkan prepared bit-map profile")
             }
             Self::InvalidArguments => formatter.write_str("invalid Vulkan prepared host arguments"),
+            Self::InvalidStatus {
+                code,
+                invocation_id,
+            } => write!(
+                formatter,
+                "invalid Vulkan shader status {code} at logical invocation {invocation_id}",
+            ),
+            Self::InvalidCompoundStatus {
+                code,
+                element_index,
+                reduction_index,
+                step,
+            } => write!(
+                formatter,
+                "invalid Vulkan compound status {code} at output {element_index}, reduction {reduction_index}, step {step}"
+            ),
             Self::InvalidOfferShape => formatter.write_str("invalid Vulkan offer logical shape"),
             Self::InvalidOfferBinding(binding) => {
                 write!(formatter, "invalid Vulkan offer binding: {binding:?}")

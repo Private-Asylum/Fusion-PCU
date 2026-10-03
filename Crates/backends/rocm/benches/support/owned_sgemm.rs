@@ -140,6 +140,7 @@ impl SgemmGraph {
         b.copy_from(&expected_bytes)?;
 
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(0xD1_0052),
             entry: PcuDispatchEntryPoint {
                 name: "owned_dispatch_sgemm_copy",

@@ -1,7 +1,43 @@
 //! Typed Objective-C ownership and all foreign/shared-memory operations live here.
 
+#[cfg(feature = "api-census")]
+#[path = "rust/census/census.rs"]
+mod census;
+#[cfg(feature = "api-census")]
+#[rustfmt::skip]
+pub use census::{MetalApiCallCensus,api_call_census,reset_api_call_census};
+
+#[cfg(any(target_os = "macos", test))]
+fn dispatch_group_width(maximum_threads: usize) -> Option<usize> {
+    let limit = maximum_threads.min(256);
+    (limit != 0).then(|| 1_usize << limit.ilog2())
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    #[test]
+    fn uniform_grid_never_wraps_u32_index_for_any_admitted_pipeline_limit() {
+        assert_eq!(super::dispatch_group_width(0), None);
+        for maximum in 1..=1024 {
+            let width = super::dispatch_group_width(maximum).unwrap();
+            assert!(width.is_power_of_two() && width <= maximum && width <= 256);
+            for count in [1, 255, 256, 257, u32::MAX - 256, u32::MAX - 1, u32::MAX] {
+                let count = usize::try_from(count).unwrap();
+                let group = width.min(count);
+                let submitted =
+                    u64::try_from(count.div_ceil(group)).unwrap() * u64::try_from(group).unwrap();
+                assert!(submitted >= u64::try_from(count).unwrap());
+                assert!(submitted <= 1_u64 << 32);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod native {
+    #[cfg(feature = "api-census")]
+    #[rustfmt::skip]
+    use super::census::{record,Call};
     #[rustfmt::skip]
     use std::{
         cell::Cell,
@@ -105,7 +141,7 @@ mod native {
     }
     pub struct Pipeline {
         object: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        maximum_threads: usize,
+        group_width: usize,
         _thread: PhantomData<Rc<()>>,
     }
 
@@ -122,6 +158,8 @@ mod native {
 
         pub fn open(index: usize) -> Result<(Self, MetalDeviceFacts), MetalError> {
             autoreleasepool(|_| {
+                #[cfg(feature = "api-census")]
+                record(Call::Session);
                 let devices = MTLCopyAllDevices();
                 let device = devices
                     .iter()
@@ -146,6 +184,8 @@ mod native {
         pub fn allocate(&self, bytes: usize) -> Result<Buffer, MetalError> {
             self.ensure_quiescent()?;
             autoreleasepool(|_| {
+                #[cfg(feature = "api-census")]
+                record(Call::Buffer);
                 let object = self
                     .device
                     .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
@@ -180,6 +220,8 @@ mod native {
                     reason = "Preserve admitted fast-math-disabled compilation on the existing deployment range."
                 )]
                 options.setFastMathEnabled(false);
+                #[cfg(feature = "api-census")]
+                record(Call::Compile);
                 let library = self
                     .device
                     .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
@@ -191,49 +233,56 @@ mod native {
                     .device
                     .newComputePipelineStateWithFunction_error(&function)
                     .map_err(|failure| error(&failure, "Metal pipeline"))?;
-                let maximum_threads = object.maxTotalThreadsPerThreadgroup();
-                if maximum_threads == 0 {
-                    return Err(MetalError::Runtime(
-                        "Metal pipeline reports no thread capacity".into(),
-                    ));
-                }
+                let group_width =
+                    super::dispatch_group_width(object.maxTotalThreadsPerThreadgroup())
+                        .ok_or_else(|| {
+                            MetalError::Runtime("Metal pipeline reports no thread capacity".into())
+                        })?;
                 Ok(Pipeline {
                     object,
-                    maximum_threads,
+                    group_width,
                     _thread: PhantomData,
                 })
             })
         }
 
-        pub fn execute(
+        pub fn execute<const BUFFER_COUNT: usize>(
             &self,
             pipeline: &Pipeline,
-            buffers: [&Buffer; 4],
+            buffers: [&Buffer; BUFFER_COUNT],
             config: [u32; 2],
             count: usize,
         ) -> Result<(), MetalError> {
             self.ensure_quiescent()?;
+            if count == 0 || u32::try_from(count).is_err() || BUFFER_COUNT == 0 || BUFFER_COUNT > 8
+            {
+                return Err(MetalError::InvalidExtent);
+            }
+            let group_threads = pipeline.group_width.min(count);
             autoreleasepool(|_| {
-                // Four buffer leases include repeated unary operands, plus device/queue/pipeline.
-                // Typed ARC owners survive terminal wait even if the safe outer owners vanish.
-                let leases: [Retained<AnyObject>; 7] = [
-                    buffers[0].object.clone().into(),
-                    buffers[1].object.clone().into(),
-                    buffers[2].object.clone().into(),
-                    buffers[3].object.clone().into(),
+                // Exact stack leases include each admitted buffer plus device/queue/pipeline.
+                // The legacy ABI retains four buffers; composed status banks may add slots.
+                // No vector/boxing or reconstructed native owner enters this warm protocol.
+                let buffer_leases: [Retained<AnyObject>; BUFFER_COUNT] =
+                    buffers.map(|buffer| buffer.object.clone().into());
+                let object_leases: [Retained<AnyObject>; 3] = [
                     self.device.clone().into(),
                     self.queue.clone().into(),
                     pipeline.object.clone().into(),
                 ];
+                #[cfg(feature = "api-census")]
+                record(Call::Command);
                 let command = self
                     .queue
                     .commandBuffer()
                     .ok_or_else(|| nil("Metal command buffer"))?;
+                #[cfg(feature = "api-census")]
+                record(Call::Encoder);
                 let encoder = command
                     .computeCommandEncoder()
                     .ok_or_else(|| nil("Metal encoder"))?;
                 encoder.setComputePipelineState(&pipeline.object);
-                // SAFETY: admitted MSL uses this four-buffer ABI and validated extents. setBytes
+                // SAFETY: admitted MSL uses this exact bounded buffer ABI and validated extents. setBytes
                 // copies the complete initialized config now; all +1 owners survive completion.
                 unsafe {
                     for (index, buffer) in buffers.iter().enumerate() {
@@ -242,23 +291,31 @@ mod native {
                     encoder.setBytes_length_atIndex(
                         NonNull::from(&config).cast(),
                         mem::size_of_val(&config),
-                        4,
+                        BUFFER_COUNT,
                     );
                 }
-                encoder.dispatchThreads_threadsPerThreadgroup(
+                // Baseline uniform dispatch avoids an unproved nonuniform-threadgroup feature.
+                // Every fixed entry guards its logical count before touching payload/status.
+                // A retained power-of-two width keeps padded global indices within U32 even
+                // at U32::MAX; smaller counts use one exact group without padding.
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: count,
+                        width: count.div_ceil(group_threads),
                         height: 1,
                         depth: 1,
                     },
                     MTLSize {
-                        width: pipeline.maximum_threads.min(256).min(count),
+                        width: group_threads,
                         height: 1,
                         depth: 1,
                     },
                 );
                 encoder.endEncoding();
+                #[cfg(feature = "api-census")]
+                record(Call::Commit);
                 command.commit();
+                #[cfg(feature = "api-census")]
+                record(Call::Wait);
                 command.waitUntilCompleted();
                 match command.status() {
                     MTLCommandBufferStatus::Completed => Ok(()),
@@ -266,12 +323,12 @@ mod native {
                         || MetalError::Runtime("Metal completion failed without NSError".into()),
                         |failure| error(&failure, "Metal completion"),
                     )),
-                    // Unknown completion must keep command+encoder, all four buffers, device,
+                    // Unknown completion must keep command+encoder, all admitted buffers, device,
                     // queue and pipeline alive. No ARC owner is released until quiescence is
                     // proved; this permanent quarantine intentionally retains uncertain work.
                     _ => {
                         self.quarantined.set(true);
-                        mem::forget(leases);
+                        mem::forget((buffer_leases, object_leases));
                         mem::forget(command);
                         mem::forget(encoder);
                         Err(MetalError::Runtime(
@@ -302,7 +359,35 @@ mod native {
             }
             Ok(())
         }
+        pub fn read_pair_bytes(
+            &self,
+            first: &mut [u8],
+            second: &mut [u8],
+        ) -> Result<(), MetalError> {
+            if first.len() != second.len()
+                || first
+                    .len()
+                    .checked_add(second.len())
+                    .is_none_or(|bytes| bytes > self.bytes)
+            {
+                return Err(MetalError::InvalidExtent);
+            }
+            // SAFETY: terminal initialized shared private buffer, both disjoint exclusive host
+            // destinations and the full packed span are proved before either infallible copy.
+            unsafe {
+                let source = self.object.contents().as_ptr().cast::<u8>();
+                ptr::copy_nonoverlapping(source, first.as_mut_ptr(), first.len());
+                ptr::copy_nonoverlapping(
+                    source.add(first.len()),
+                    second.as_mut_ptr(),
+                    second.len(),
+                );
+            }
+            Ok(())
+        }
         pub fn read_bytes(&self, offset: usize, bytes: &mut [u8]) -> Result<(), MetalError> {
+            #[cfg(feature = "api-census")]
+            record(Call::Read);
             if offset
                 .checked_add(bytes.len())
                 .is_none_or(|end| end > self.bytes)
@@ -339,6 +424,8 @@ mod native {
             count: usize,
             inspect: impl FnOnce(&[u32]) -> Result<(), MetalError>,
         ) -> Result<(), MetalError> {
+            #[cfg(feature = "api-census")]
+            record(Call::Status);
             if count.checked_mul(4) != Some(self.bytes) {
                 return Err(MetalError::InvalidExtent);
             }
@@ -497,10 +584,10 @@ mod unavailable {
         pub fn compile(&self, _: &str, _: &str) -> Result<Pipeline, MetalError> {
             Err(MetalError::Unsupported)
         }
-        pub fn execute(
+        pub fn execute<const BUFFER_COUNT: usize>(
             &self,
             _: &Pipeline,
-            _: [&Buffer; 4],
+            _: [&Buffer; BUFFER_COUNT],
             _: [u32; 2],
             _: usize,
         ) -> Result<(), MetalError> {
@@ -509,6 +596,10 @@ mod unavailable {
     }
     impl Buffer {
         pub fn write_bytes(&self, _: usize, _: &[u8]) -> Result<(), MetalError> {
+            Err(MetalError::Unsupported)
+        }
+        #[allow(clippy::unused_self)] // Keep the same unavailable-platform native buffer protocol.
+        pub fn read_pair_bytes(&self, _: &mut [u8], _: &mut [u8]) -> Result<(), MetalError> {
             Err(MetalError::Unsupported)
         }
         pub fn read_bytes(&self, _: usize, _: &mut [u8]) -> Result<(), MetalError> {

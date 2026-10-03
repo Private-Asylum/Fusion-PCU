@@ -1,0 +1,24 @@
+#version 450
+// Representation transport only: every sealed carrier bit pattern is preserved, with no
+// floating classification, rounding, arithmetic permission or Portable promise.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint ELEMENT_BYTES=4u;
+layout(constant_id=1) const uint EXTENT=1u;
+layout(constant_id=2) const uint BROADCAST=0u;
+layout(set=0,binding=0,std430) readonly buffer Input {uint data[];} source;
+layout(set=0,binding=1,std430) writeonly buffer Output {uint data[];} destination;
+void main() {
+    // Cold admission proves ELEMENT_BYTES in {1,2,4,8,16,32,64}, EXTENT>0 and
+    // ELEMENT_BYTES*EXTENT<=UINT_MAX. The ceiling uses division before addition.
+    uint bytes=ELEMENT_BYTES*EXTENT;
+    uint words=bytes/4u+uint(bytes%4u!=0u);
+    uint word=gl_GlobalInvocationID.x;
+    if(word>=words)return;
+    // Each invocation owns one full destination word. Cold input/output padding is
+    // initialized; terminal host publication copies only logical bytes, never padding.
+    if(BROADCAST==0u)destination.data[word]=source.data[word];
+    else if(ELEMENT_BYTES>=4u)destination.data[word]=source.data[word%(ELEMENT_BYTES/4u)];
+    else if(ELEMENT_BYTES==2u)destination.data[word]=(source.data[0]&0xffffu)*0x00010001u;
+    else destination.data[word]=(source.data[0]&0xffu)*0x01010101u;
+    // The low-format multiplications have exact maxima UINT_MAX, so never overflow.
+}

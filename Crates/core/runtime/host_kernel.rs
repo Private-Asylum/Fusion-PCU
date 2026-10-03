@@ -47,7 +47,7 @@ impl<'a> PcuHostArgument<'a> {
     #[must_use]
     #[allow(unsafe_code)] // Sealed PcuScalar implementations are padding-free and fully initialized.
     pub const fn read<T: PcuScalar>(target: PcuBindingRef, values: &'a [T]) -> Self {
-        // SAFETY: All sealed scalars are primitives or transparent u16 wrappers, with no padding.
+        // SAFETY: Every sealed scalar has a padding-free primitive, encoded-bit or limb representation.
         // The byte view covers precisely the initialized slice and cannot outlive its shared borrow.
         let bytes = unsafe {
             core::slice::from_raw_parts(
@@ -143,9 +143,21 @@ pub trait PcuPreparedHostKernel {
     /// flight after return, including errors. Pending device owners must survive completion or
     /// quarantine. Changed input contents must never be mistaken for cached results.
     ///
+    /// Publication is a transaction across all supplied host outputs. Complete all fallible
+    /// transfers, status validation and sibling preflight before changing caller bytes. A backend
+    /// whose readback can fail after writing must use retained private host storage; a backend
+    /// with fully validated mapped output may commit with infallible copies directly. Do not
+    /// impose an additional copy where the existing mechanism already proves this contract.
+    /// Preserve unwritten tails. This host transaction does not authorize restoring possibly
+    /// written resident storage: escaped device owners retain their separate discard/quarantine
+    /// law, and are not the host borrows described by this trait.
+    ///
     /// # Errors
-    /// Returns admission, allocation, transfer, execution, or checked-operation errors. Outputs
-    /// may be partially changed by a failed readback, as with other fallible mutable operations.
+    /// Returns admission, allocation, transfer, execution or checked-operation errors. A fatal
+    /// error preserves every supplied host output's pre-call bytes, including errors in later
+    /// sibling readbacks. A completed, explicitly requested Clamp may instead publish all useful
+    /// outputs and return its observable recovered range error. Failure to finish that publication
+    /// is fatal; a recovered arithmetic notice never excuses a partial host commit.
     fn call(&mut self, arguments: &mut [PcuHostArgument<'_>]) -> Result<(), Self::Error>;
 }
 

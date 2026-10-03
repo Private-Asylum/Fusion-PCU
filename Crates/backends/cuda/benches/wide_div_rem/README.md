@@ -1,0 +1,9 @@
+# CUDA joint wide division
+
+Every measured map performs genuine `#[pcu]` joint quotient/remainder. The same exact requested mode and submitted geometry feed an explicit prepared IR control and a native control launching the same lowered kernel. Six 128/256/512-bit types, Boundary/Strict, direct/canonical three-invocation grid and 65/4096 logical elements produce 240 source/IR/native boundary groups. Reject and unspecified reproducibility are the admitted division contract; Clamp and Portable division remain refused.
+
+Full host calls stage both complete inputs and publish both output prefixes after terminal status. Resident source calls borrow both selected resident inputs and mutate both existing output owners; the native peer retains the same input banks, outputs and status. Readback verifies complete results after the timed resident submission boundary. Native resident readback includes its two initialized device tail guards; full-host publication preserves caller tail guards.
+
+Changing full-bit banks include minimum/maximum, independent high limbs, equal magnitudes, divisor one and small/full-width divisors. Independent base-256 division and the copied 573 arbitrary-precision golden rows prove bits and status separately. Failure fixtures check earliest divide-by-zero/signed overflow, dual host rollback, resident discard and fresh-owner retry. The native faultword is reset after every non-success and retained after proved terminal success.
+
+`allocation-census` reports a separate 64-changing-call caller-thread Rust census for each route. Cold module preparation and device allocations remain outside warm scopes. No performance or zero-allocation result is claimed until the matching actual GPU cohort is qualified. Statistical runs retain the activity guard; `--test` is untimed semantic proof.

@@ -1,0 +1,777 @@
+#version 450
+// Cold rewriting replaces direct native function call targets and freezes constants.
+// No operation interpreter, instruction buffer or native floating arithmetic.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint EXTENT=1;
+layout(constant_id=1) const uint FORMAT=0;
+const uint WIDTH = FORMAT < 2 ? 16u : 8u;
+const uint FRACTION = FORMAT == 0 ? 10u : FORMAT == 1 ? 7u : FORMAT == 2 ? 3u : 2u;
+const int BIAS = FORMAT == 1 ? 127 : FORMAT == 2 ? 7 : 15;
+const uint SIGN = 1u << (WIDTH-1);
+const uint MAXIMUM = FORMAT == 0 ? 0x7bffu : FORMAT == 1 ? 0x7f7fu : FORMAT == 2 ? 0x7eu : 0x7bu;
+const uint FRACTION_MASK = (1u << FRACTION)-1u;
+const int MIN_EXPONENT = 1-BIAS;
+const int MAX_EXPONENT = int(MAXIMUM >> FRACTION)-BIAS;
+const uint LANES = 32u/WIDTH;
+
+layout(set=0,binding=0,std430) buffer Bank0 { uint words[]; } bank0;
+layout(set=0,binding=1,std430) buffer Bank1 { uint words[]; } bank1;
+layout(set=0,binding=2,std430) buffer Bank2 { uint words[]; } bank2;
+layout(set=0,binding=3,std430) buffer Bank3 { uint words[]; } bank3;
+layout(set=0,binding=4,std430) writeonly buffer Status { uint words[]; } status_data;
+layout(constant_id=2) const uint READ_WORDS_0=0;
+layout(constant_id=6) const uint WRITE_0=0;
+layout(constant_id=3) const uint READ_WORDS_1=0;
+layout(constant_id=7) const uint WRITE_1=0;
+layout(constant_id=4) const uint READ_WORDS_2=0;
+layout(constant_id=8) const uint WRITE_2=0;
+layout(constant_id=5) const uint READ_WORDS_3=0;
+layout(constant_id=9) const uint WRITE_3=0;
+layout(constant_id=10) const uint S0_0=0;
+layout(constant_id=11) const uint S0_1=0;
+layout(constant_id=12) const uint S0_2=0;
+layout(constant_id=13) const uint S0_3=0;
+layout(constant_id=14) const uint S0_4=0;
+layout(constant_id=15) const uint S0_5=0;
+layout(constant_id=16) const uint S0_6=0;
+layout(constant_id=17) const uint S0_7=0;
+layout(constant_id=18) const uint S1_0=0;
+layout(constant_id=19) const uint S1_1=0;
+layout(constant_id=20) const uint S1_2=0;
+layout(constant_id=21) const uint S1_3=0;
+layout(constant_id=22) const uint S1_4=0;
+layout(constant_id=23) const uint S1_5=0;
+layout(constant_id=24) const uint S1_6=0;
+layout(constant_id=25) const uint S1_7=1;
+layout(constant_id=26) const uint S2_0=0;
+layout(constant_id=27) const uint S2_1=0;
+layout(constant_id=28) const uint S2_2=0;
+layout(constant_id=29) const uint S2_3=0;
+layout(constant_id=30) const uint S2_4=0;
+layout(constant_id=31) const uint S2_5=0;
+layout(constant_id=32) const uint S2_6=0;
+layout(constant_id=33) const uint S2_7=2;
+layout(constant_id=34) const uint S3_0=0;
+layout(constant_id=35) const uint S3_1=0;
+layout(constant_id=36) const uint S3_2=0;
+layout(constant_id=37) const uint S3_3=0;
+layout(constant_id=38) const uint S3_4=0;
+layout(constant_id=39) const uint S3_5=0;
+layout(constant_id=40) const uint S3_6=0;
+layout(constant_id=41) const uint S3_7=3;
+layout(constant_id=42) const uint S4_0=0;
+layout(constant_id=43) const uint S4_1=0;
+layout(constant_id=44) const uint S4_2=0;
+layout(constant_id=45) const uint S4_3=0;
+layout(constant_id=46) const uint S4_4=0;
+layout(constant_id=47) const uint S4_5=0;
+layout(constant_id=48) const uint S4_6=0;
+layout(constant_id=49) const uint S4_7=4;
+layout(constant_id=50) const uint S5_0=0;
+layout(constant_id=51) const uint S5_1=0;
+layout(constant_id=52) const uint S5_2=0;
+layout(constant_id=53) const uint S5_3=0;
+layout(constant_id=54) const uint S5_4=0;
+layout(constant_id=55) const uint S5_5=0;
+layout(constant_id=56) const uint S5_6=0;
+layout(constant_id=57) const uint S5_7=5;
+layout(constant_id=58) const uint S6_0=0;
+layout(constant_id=59) const uint S6_1=0;
+layout(constant_id=60) const uint S6_2=0;
+layout(constant_id=61) const uint S6_3=0;
+layout(constant_id=62) const uint S6_4=0;
+layout(constant_id=63) const uint S6_5=0;
+layout(constant_id=64) const uint S6_6=0;
+layout(constant_id=65) const uint S6_7=6;
+layout(constant_id=66) const uint S7_0=0;
+layout(constant_id=67) const uint S7_1=0;
+layout(constant_id=68) const uint S7_2=0;
+layout(constant_id=69) const uint S7_3=0;
+layout(constant_id=70) const uint S7_4=0;
+layout(constant_id=71) const uint S7_5=0;
+layout(constant_id=72) const uint S7_6=0;
+layout(constant_id=73) const uint S7_7=7;
+layout(constant_id=74) const uint S8_0=0;
+layout(constant_id=75) const uint S8_1=0;
+layout(constant_id=76) const uint S8_2=0;
+layout(constant_id=77) const uint S8_3=0;
+layout(constant_id=78) const uint S8_4=0;
+layout(constant_id=79) const uint S8_5=0;
+layout(constant_id=80) const uint S8_6=0;
+layout(constant_id=81) const uint S8_7=8;
+layout(constant_id=82) const uint S9_0=0;
+layout(constant_id=83) const uint S9_1=0;
+layout(constant_id=84) const uint S9_2=0;
+layout(constant_id=85) const uint S9_3=0;
+layout(constant_id=86) const uint S9_4=0;
+layout(constant_id=87) const uint S9_5=0;
+layout(constant_id=88) const uint S9_6=0;
+layout(constant_id=89) const uint S9_7=9;
+layout(constant_id=90) const uint S10_0=0;
+layout(constant_id=91) const uint S10_1=0;
+layout(constant_id=92) const uint S10_2=0;
+layout(constant_id=93) const uint S10_3=0;
+layout(constant_id=94) const uint S10_4=0;
+layout(constant_id=95) const uint S10_5=0;
+layout(constant_id=96) const uint S10_6=0;
+layout(constant_id=97) const uint S10_7=10;
+layout(constant_id=98) const uint S11_0=0;
+layout(constant_id=99) const uint S11_1=0;
+layout(constant_id=100) const uint S11_2=0;
+layout(constant_id=101) const uint S11_3=0;
+layout(constant_id=102) const uint S11_4=0;
+layout(constant_id=103) const uint S11_5=0;
+layout(constant_id=104) const uint S11_6=0;
+layout(constant_id=105) const uint S11_7=11;
+layout(constant_id=106) const uint S12_0=0;
+layout(constant_id=107) const uint S12_1=0;
+layout(constant_id=108) const uint S12_2=0;
+layout(constant_id=109) const uint S12_3=0;
+layout(constant_id=110) const uint S12_4=0;
+layout(constant_id=111) const uint S12_5=0;
+layout(constant_id=112) const uint S12_6=0;
+layout(constant_id=113) const uint S12_7=12;
+layout(constant_id=114) const uint S13_0=0;
+layout(constant_id=115) const uint S13_1=0;
+layout(constant_id=116) const uint S13_2=0;
+layout(constant_id=117) const uint S13_3=0;
+layout(constant_id=118) const uint S13_4=0;
+layout(constant_id=119) const uint S13_5=0;
+layout(constant_id=120) const uint S13_6=0;
+layout(constant_id=121) const uint S13_7=13;
+layout(constant_id=122) const uint S14_0=0;
+layout(constant_id=123) const uint S14_1=0;
+layout(constant_id=124) const uint S14_2=0;
+layout(constant_id=125) const uint S14_3=0;
+layout(constant_id=126) const uint S14_4=0;
+layout(constant_id=127) const uint S14_5=0;
+layout(constant_id=128) const uint S14_6=0;
+layout(constant_id=129) const uint S14_7=14;
+layout(constant_id=130) const uint S15_0=0;
+layout(constant_id=131) const uint S15_1=0;
+layout(constant_id=132) const uint S15_2=0;
+layout(constant_id=133) const uint S15_3=0;
+layout(constant_id=134) const uint S15_4=0;
+layout(constant_id=135) const uint S15_5=0;
+layout(constant_id=136) const uint S15_6=0;
+layout(constant_id=137) const uint S15_7=15;
+layout(constant_id=138) const uint S16_0=0;
+layout(constant_id=139) const uint S16_1=0;
+layout(constant_id=140) const uint S16_2=0;
+layout(constant_id=141) const uint S16_3=0;
+layout(constant_id=142) const uint S16_4=0;
+layout(constant_id=143) const uint S16_5=0;
+layout(constant_id=144) const uint S16_6=0;
+layout(constant_id=145) const uint S16_7=16;
+layout(constant_id=146) const uint S17_0=0;
+layout(constant_id=147) const uint S17_1=0;
+layout(constant_id=148) const uint S17_2=0;
+layout(constant_id=149) const uint S17_3=0;
+layout(constant_id=150) const uint S17_4=0;
+layout(constant_id=151) const uint S17_5=0;
+layout(constant_id=152) const uint S17_6=0;
+layout(constant_id=153) const uint S17_7=17;
+layout(constant_id=154) const uint S18_0=0;
+layout(constant_id=155) const uint S18_1=0;
+layout(constant_id=156) const uint S18_2=0;
+layout(constant_id=157) const uint S18_3=0;
+layout(constant_id=158) const uint S18_4=0;
+layout(constant_id=159) const uint S18_5=0;
+layout(constant_id=160) const uint S18_6=0;
+layout(constant_id=161) const uint S18_7=18;
+layout(constant_id=162) const uint S19_0=0;
+layout(constant_id=163) const uint S19_1=0;
+layout(constant_id=164) const uint S19_2=0;
+layout(constant_id=165) const uint S19_3=0;
+layout(constant_id=166) const uint S19_4=0;
+layout(constant_id=167) const uint S19_5=0;
+layout(constant_id=168) const uint S19_6=0;
+layout(constant_id=169) const uint S19_7=19;
+layout(constant_id=170) const uint S20_0=0;
+layout(constant_id=171) const uint S20_1=0;
+layout(constant_id=172) const uint S20_2=0;
+layout(constant_id=173) const uint S20_3=0;
+layout(constant_id=174) const uint S20_4=0;
+layout(constant_id=175) const uint S20_5=0;
+layout(constant_id=176) const uint S20_6=0;
+layout(constant_id=177) const uint S20_7=20;
+layout(constant_id=178) const uint S21_0=0;
+layout(constant_id=179) const uint S21_1=0;
+layout(constant_id=180) const uint S21_2=0;
+layout(constant_id=181) const uint S21_3=0;
+layout(constant_id=182) const uint S21_4=0;
+layout(constant_id=183) const uint S21_5=0;
+layout(constant_id=184) const uint S21_6=0;
+layout(constant_id=185) const uint S21_7=21;
+layout(constant_id=186) const uint S22_0=0;
+layout(constant_id=187) const uint S22_1=0;
+layout(constant_id=188) const uint S22_2=0;
+layout(constant_id=189) const uint S22_3=0;
+layout(constant_id=190) const uint S22_4=0;
+layout(constant_id=191) const uint S22_5=0;
+layout(constant_id=192) const uint S22_6=0;
+layout(constant_id=193) const uint S22_7=22;
+layout(constant_id=194) const uint S23_0=0;
+layout(constant_id=195) const uint S23_1=0;
+layout(constant_id=196) const uint S23_2=0;
+layout(constant_id=197) const uint S23_3=0;
+layout(constant_id=198) const uint S23_4=0;
+layout(constant_id=199) const uint S23_5=0;
+layout(constant_id=200) const uint S23_6=0;
+layout(constant_id=201) const uint S23_7=23;
+layout(constant_id=202) const uint S24_0=0;
+layout(constant_id=203) const uint S24_1=0;
+layout(constant_id=204) const uint S24_2=0;
+layout(constant_id=205) const uint S24_3=0;
+layout(constant_id=206) const uint S24_4=0;
+layout(constant_id=207) const uint S24_5=0;
+layout(constant_id=208) const uint S24_6=0;
+layout(constant_id=209) const uint S24_7=24;
+layout(constant_id=210) const uint S25_0=0;
+layout(constant_id=211) const uint S25_1=0;
+layout(constant_id=212) const uint S25_2=0;
+layout(constant_id=213) const uint S25_3=0;
+layout(constant_id=214) const uint S25_4=0;
+layout(constant_id=215) const uint S25_5=0;
+layout(constant_id=216) const uint S25_6=0;
+layout(constant_id=217) const uint S25_7=25;
+layout(constant_id=218) const uint S26_0=0;
+layout(constant_id=219) const uint S26_1=0;
+layout(constant_id=220) const uint S26_2=0;
+layout(constant_id=221) const uint S26_3=0;
+layout(constant_id=222) const uint S26_4=0;
+layout(constant_id=223) const uint S26_5=0;
+layout(constant_id=224) const uint S26_6=0;
+layout(constant_id=225) const uint S26_7=26;
+layout(constant_id=226) const uint S27_0=0;
+layout(constant_id=227) const uint S27_1=0;
+layout(constant_id=228) const uint S27_2=0;
+layout(constant_id=229) const uint S27_3=0;
+layout(constant_id=230) const uint S27_4=0;
+layout(constant_id=231) const uint S27_5=0;
+layout(constant_id=232) const uint S27_6=0;
+layout(constant_id=233) const uint S27_7=27;
+layout(constant_id=234) const uint S28_0=0;
+layout(constant_id=235) const uint S28_1=0;
+layout(constant_id=236) const uint S28_2=0;
+layout(constant_id=237) const uint S28_3=0;
+layout(constant_id=238) const uint S28_4=0;
+layout(constant_id=239) const uint S28_5=0;
+layout(constant_id=240) const uint S28_6=0;
+layout(constant_id=241) const uint S28_7=28;
+layout(constant_id=242) const uint S29_0=0;
+layout(constant_id=243) const uint S29_1=0;
+layout(constant_id=244) const uint S29_2=0;
+layout(constant_id=245) const uint S29_3=0;
+layout(constant_id=246) const uint S29_4=0;
+layout(constant_id=247) const uint S29_5=0;
+layout(constant_id=248) const uint S29_6=0;
+layout(constant_id=249) const uint S29_7=29;
+layout(constant_id=250) const uint S30_0=0;
+layout(constant_id=251) const uint S30_1=0;
+layout(constant_id=252) const uint S30_2=0;
+layout(constant_id=253) const uint S30_3=0;
+layout(constant_id=254) const uint S30_4=0;
+layout(constant_id=255) const uint S30_5=0;
+layout(constant_id=256) const uint S30_6=0;
+layout(constant_id=257) const uint S30_7=30;
+layout(constant_id=258) const uint S31_0=0;
+layout(constant_id=259) const uint S31_1=0;
+layout(constant_id=260) const uint S31_2=0;
+layout(constant_id=261) const uint S31_3=0;
+layout(constant_id=262) const uint S31_4=0;
+layout(constant_id=263) const uint S31_5=0;
+layout(constant_id=264) const uint S31_6=0;
+layout(constant_id=265) const uint S31_7=31;
+layout(constant_id=266) const uint S32_0=0;
+layout(constant_id=267) const uint S32_1=0;
+layout(constant_id=268) const uint S32_2=0;
+layout(constant_id=269) const uint S32_3=0;
+layout(constant_id=270) const uint S32_4=0;
+layout(constant_id=271) const uint S32_5=0;
+layout(constant_id=272) const uint S32_6=0;
+layout(constant_id=273) const uint S32_7=32;
+layout(constant_id=274) const uint S33_0=0;
+layout(constant_id=275) const uint S33_1=0;
+layout(constant_id=276) const uint S33_2=0;
+layout(constant_id=277) const uint S33_3=0;
+layout(constant_id=278) const uint S33_4=0;
+layout(constant_id=279) const uint S33_5=0;
+layout(constant_id=280) const uint S33_6=0;
+layout(constant_id=281) const uint S33_7=33;
+layout(constant_id=282) const uint S34_0=0;
+layout(constant_id=283) const uint S34_1=0;
+layout(constant_id=284) const uint S34_2=0;
+layout(constant_id=285) const uint S34_3=0;
+layout(constant_id=286) const uint S34_4=0;
+layout(constant_id=287) const uint S34_5=0;
+layout(constant_id=288) const uint S34_6=0;
+layout(constant_id=289) const uint S34_7=34;
+layout(constant_id=290) const uint S35_0=0;
+layout(constant_id=291) const uint S35_1=0;
+layout(constant_id=292) const uint S35_2=0;
+layout(constant_id=293) const uint S35_3=0;
+layout(constant_id=294) const uint S35_4=0;
+layout(constant_id=295) const uint S35_5=0;
+layout(constant_id=296) const uint S35_6=0;
+layout(constant_id=297) const uint S35_7=35;
+layout(constant_id=298) const uint S36_0=0;
+layout(constant_id=299) const uint S36_1=0;
+layout(constant_id=300) const uint S36_2=0;
+layout(constant_id=301) const uint S36_3=0;
+layout(constant_id=302) const uint S36_4=0;
+layout(constant_id=303) const uint S36_5=0;
+layout(constant_id=304) const uint S36_6=0;
+layout(constant_id=305) const uint S36_7=36;
+layout(constant_id=306) const uint S37_0=0;
+layout(constant_id=307) const uint S37_1=0;
+layout(constant_id=308) const uint S37_2=0;
+layout(constant_id=309) const uint S37_3=0;
+layout(constant_id=310) const uint S37_4=0;
+layout(constant_id=311) const uint S37_5=0;
+layout(constant_id=312) const uint S37_6=0;
+layout(constant_id=313) const uint S37_7=37;
+layout(constant_id=314) const uint S38_0=0;
+layout(constant_id=315) const uint S38_1=0;
+layout(constant_id=316) const uint S38_2=0;
+layout(constant_id=317) const uint S38_3=0;
+layout(constant_id=318) const uint S38_4=0;
+layout(constant_id=319) const uint S38_5=0;
+layout(constant_id=320) const uint S38_6=0;
+layout(constant_id=321) const uint S38_7=38;
+layout(constant_id=322) const uint S39_0=0;
+layout(constant_id=323) const uint S39_1=0;
+layout(constant_id=324) const uint S39_2=0;
+layout(constant_id=325) const uint S39_3=0;
+layout(constant_id=326) const uint S39_4=0;
+layout(constant_id=327) const uint S39_5=0;
+layout(constant_id=328) const uint S39_6=0;
+layout(constant_id=329) const uint S39_7=39;
+layout(constant_id=330) const uint S40_0=0;
+layout(constant_id=331) const uint S40_1=0;
+layout(constant_id=332) const uint S40_2=0;
+layout(constant_id=333) const uint S40_3=0;
+layout(constant_id=334) const uint S40_4=0;
+layout(constant_id=335) const uint S40_5=0;
+layout(constant_id=336) const uint S40_6=0;
+layout(constant_id=337) const uint S40_7=40;
+layout(constant_id=338) const uint S41_0=0;
+layout(constant_id=339) const uint S41_1=0;
+layout(constant_id=340) const uint S41_2=0;
+layout(constant_id=341) const uint S41_3=0;
+layout(constant_id=342) const uint S41_4=0;
+layout(constant_id=343) const uint S41_5=0;
+layout(constant_id=344) const uint S41_6=0;
+layout(constant_id=345) const uint S41_7=41;
+layout(constant_id=346) const uint S42_0=0;
+layout(constant_id=347) const uint S42_1=0;
+layout(constant_id=348) const uint S42_2=0;
+layout(constant_id=349) const uint S42_3=0;
+layout(constant_id=350) const uint S42_4=0;
+layout(constant_id=351) const uint S42_5=0;
+layout(constant_id=352) const uint S42_6=0;
+layout(constant_id=353) const uint S42_7=42;
+layout(constant_id=354) const uint S43_0=0;
+layout(constant_id=355) const uint S43_1=0;
+layout(constant_id=356) const uint S43_2=0;
+layout(constant_id=357) const uint S43_3=0;
+layout(constant_id=358) const uint S43_4=0;
+layout(constant_id=359) const uint S43_5=0;
+layout(constant_id=360) const uint S43_6=0;
+layout(constant_id=361) const uint S43_7=43;
+layout(constant_id=362) const uint S44_0=0;
+layout(constant_id=363) const uint S44_1=0;
+layout(constant_id=364) const uint S44_2=0;
+layout(constant_id=365) const uint S44_3=0;
+layout(constant_id=366) const uint S44_4=0;
+layout(constant_id=367) const uint S44_5=0;
+layout(constant_id=368) const uint S44_6=0;
+layout(constant_id=369) const uint S44_7=44;
+layout(constant_id=370) const uint S45_0=0;
+layout(constant_id=371) const uint S45_1=0;
+layout(constant_id=372) const uint S45_2=0;
+layout(constant_id=373) const uint S45_3=0;
+layout(constant_id=374) const uint S45_4=0;
+layout(constant_id=375) const uint S45_5=0;
+layout(constant_id=376) const uint S45_6=0;
+layout(constant_id=377) const uint S45_7=45;
+layout(constant_id=378) const uint S46_0=0;
+layout(constant_id=379) const uint S46_1=0;
+layout(constant_id=380) const uint S46_2=0;
+layout(constant_id=381) const uint S46_3=0;
+layout(constant_id=382) const uint S46_4=0;
+layout(constant_id=383) const uint S46_5=0;
+layout(constant_id=384) const uint S46_6=0;
+layout(constant_id=385) const uint S46_7=46;
+layout(constant_id=386) const uint S47_0=0;
+layout(constant_id=387) const uint S47_1=0;
+layout(constant_id=388) const uint S47_2=0;
+layout(constant_id=389) const uint S47_3=0;
+layout(constant_id=390) const uint S47_4=0;
+layout(constant_id=391) const uint S47_5=0;
+layout(constant_id=392) const uint S47_6=0;
+layout(constant_id=393) const uint S47_7=47;
+layout(constant_id=394) const uint S48_0=0;
+layout(constant_id=395) const uint S48_1=0;
+layout(constant_id=396) const uint S48_2=0;
+layout(constant_id=397) const uint S48_3=0;
+layout(constant_id=398) const uint S48_4=0;
+layout(constant_id=399) const uint S48_5=0;
+layout(constant_id=400) const uint S48_6=0;
+layout(constant_id=401) const uint S48_7=48;
+layout(constant_id=402) const uint S49_0=0;
+layout(constant_id=403) const uint S49_1=0;
+layout(constant_id=404) const uint S49_2=0;
+layout(constant_id=405) const uint S49_3=0;
+layout(constant_id=406) const uint S49_4=0;
+layout(constant_id=407) const uint S49_5=0;
+layout(constant_id=408) const uint S49_6=0;
+layout(constant_id=409) const uint S49_7=49;
+layout(constant_id=410) const uint S50_0=0;
+layout(constant_id=411) const uint S50_1=0;
+layout(constant_id=412) const uint S50_2=0;
+layout(constant_id=413) const uint S50_3=0;
+layout(constant_id=414) const uint S50_4=0;
+layout(constant_id=415) const uint S50_5=0;
+layout(constant_id=416) const uint S50_6=0;
+layout(constant_id=417) const uint S50_7=50;
+layout(constant_id=418) const uint S51_0=0;
+layout(constant_id=419) const uint S51_1=0;
+layout(constant_id=420) const uint S51_2=0;
+layout(constant_id=421) const uint S51_3=0;
+layout(constant_id=422) const uint S51_4=0;
+layout(constant_id=423) const uint S51_5=0;
+layout(constant_id=424) const uint S51_6=0;
+layout(constant_id=425) const uint S51_7=51;
+layout(constant_id=426) const uint S52_0=0;
+layout(constant_id=427) const uint S52_1=0;
+layout(constant_id=428) const uint S52_2=0;
+layout(constant_id=429) const uint S52_3=0;
+layout(constant_id=430) const uint S52_4=0;
+layout(constant_id=431) const uint S52_5=0;
+layout(constant_id=432) const uint S52_6=0;
+layout(constant_id=433) const uint S52_7=52;
+layout(constant_id=434) const uint S53_0=0;
+layout(constant_id=435) const uint S53_1=0;
+layout(constant_id=436) const uint S53_2=0;
+layout(constant_id=437) const uint S53_3=0;
+layout(constant_id=438) const uint S53_4=0;
+layout(constant_id=439) const uint S53_5=0;
+layout(constant_id=440) const uint S53_6=0;
+layout(constant_id=441) const uint S53_7=53;
+layout(constant_id=442) const uint S54_0=0;
+layout(constant_id=443) const uint S54_1=0;
+layout(constant_id=444) const uint S54_2=0;
+layout(constant_id=445) const uint S54_3=0;
+layout(constant_id=446) const uint S54_4=0;
+layout(constant_id=447) const uint S54_5=0;
+layout(constant_id=448) const uint S54_6=0;
+layout(constant_id=449) const uint S54_7=54;
+layout(constant_id=450) const uint S55_0=0;
+layout(constant_id=451) const uint S55_1=0;
+layout(constant_id=452) const uint S55_2=0;
+layout(constant_id=453) const uint S55_3=0;
+layout(constant_id=454) const uint S55_4=0;
+layout(constant_id=455) const uint S55_5=0;
+layout(constant_id=456) const uint S55_6=0;
+layout(constant_id=457) const uint S55_7=55;
+layout(constant_id=458) const uint S56_0=0;
+layout(constant_id=459) const uint S56_1=0;
+layout(constant_id=460) const uint S56_2=0;
+layout(constant_id=461) const uint S56_3=0;
+layout(constant_id=462) const uint S56_4=0;
+layout(constant_id=463) const uint S56_5=0;
+layout(constant_id=464) const uint S56_6=0;
+layout(constant_id=465) const uint S56_7=56;
+layout(constant_id=466) const uint S57_0=0;
+layout(constant_id=467) const uint S57_1=0;
+layout(constant_id=468) const uint S57_2=0;
+layout(constant_id=469) const uint S57_3=0;
+layout(constant_id=470) const uint S57_4=0;
+layout(constant_id=471) const uint S57_5=0;
+layout(constant_id=472) const uint S57_6=0;
+layout(constant_id=473) const uint S57_7=57;
+layout(constant_id=474) const uint S58_0=0;
+layout(constant_id=475) const uint S58_1=0;
+layout(constant_id=476) const uint S58_2=0;
+layout(constant_id=477) const uint S58_3=0;
+layout(constant_id=478) const uint S58_4=0;
+layout(constant_id=479) const uint S58_5=0;
+layout(constant_id=480) const uint S58_6=0;
+layout(constant_id=481) const uint S58_7=58;
+layout(constant_id=482) const uint S59_0=0;
+layout(constant_id=483) const uint S59_1=0;
+layout(constant_id=484) const uint S59_2=0;
+layout(constant_id=485) const uint S59_3=0;
+layout(constant_id=486) const uint S59_4=0;
+layout(constant_id=487) const uint S59_5=0;
+layout(constant_id=488) const uint S59_6=0;
+layout(constant_id=489) const uint S59_7=59;
+layout(constant_id=490) const uint S60_0=0;
+layout(constant_id=491) const uint S60_1=0;
+layout(constant_id=492) const uint S60_2=0;
+layout(constant_id=493) const uint S60_3=0;
+layout(constant_id=494) const uint S60_4=0;
+layout(constant_id=495) const uint S60_5=0;
+layout(constant_id=496) const uint S60_6=0;
+layout(constant_id=497) const uint S60_7=60;
+layout(constant_id=498) const uint S61_0=0;
+layout(constant_id=499) const uint S61_1=0;
+layout(constant_id=500) const uint S61_2=0;
+layout(constant_id=501) const uint S61_3=0;
+layout(constant_id=502) const uint S61_4=0;
+layout(constant_id=503) const uint S61_5=0;
+layout(constant_id=504) const uint S61_6=0;
+layout(constant_id=505) const uint S61_7=61;
+layout(constant_id=506) const uint S62_0=0;
+layout(constant_id=507) const uint S62_1=0;
+layout(constant_id=508) const uint S62_2=0;
+layout(constant_id=509) const uint S62_3=0;
+layout(constant_id=510) const uint S62_4=0;
+layout(constant_id=511) const uint S62_5=0;
+layout(constant_id=512) const uint S62_6=0;
+layout(constant_id=513) const uint S62_7=62;
+layout(constant_id=514) const uint S63_0=0;
+layout(constant_id=515) const uint S63_1=0;
+layout(constant_id=516) const uint S63_2=0;
+layout(constant_id=517) const uint S63_3=0;
+layout(constant_id=518) const uint S63_4=0;
+layout(constant_id=519) const uint S63_5=0;
+layout(constant_id=520) const uint S63_6=0;
+layout(constant_id=521) const uint S63_7=63;
+uint policy;
+uint registers[64];
+uvec2 private_words[4];
+uint logical_index;
+uint packed_lane;
+uint notice;
+uint notice_step;
+bool fatal;
+uint read_word(uint bank,uint index) {
+ if(bank==0)return bank0.words[index]; if(bank==1)return bank1.words[index];
+ if(bank==2)return bank2.words[index]; return bank3.words[index];
+}
+void write_word(uint bank,uint index,uint bits) {
+ if(bank==0)bank0.words[index]=bits;else if(bank==1)bank1.words[index]=bits;
+ else if(bank==2)bank2.words[index]=bits;else bank3.words[index]=bits;
+}
+void record_fault(uint code,uint range,uint ordinal) {
+ if(code==0)return;
+ bool recovered=range==1&&(code==2||code==3);
+ if(!recovered){notice=code;notice_step=ordinal;fatal=true;}
+ else if(notice==0){notice=code|256u;notice_step=ordinal;}
+}
+struct Result { uint bits; uint status; };
+struct Parts { uint sign; uint significand; int exponent; };
+// Range faults retain exact useful payloads in private output. Reject never publishes them;
+// a completed Clamp map may publish only after the host has ruled out every fatal lane.
+// Diagnostic ABI: 0 success, 1 invalid operand, 2 underflow, 3 overflow, 4 zero divisor.
+Result ok(uint bits) { return Result(bits, 0); }
+Result fault(uint status) { return Result(0, status); }
+Parts decode(uint bits) {
+    uint exponent = (bits & (SIGN-1u)) >> FRACTION;
+    uint significand = bits & FRACTION_MASK;
+    if (exponent != 0) significand |= 1u << FRACTION;
+    return Parts(bits >> (WIDTH-1), significand, exponent == 0 ? MIN_EXPONENT : int(exponent)-BIAS);
+}
+// Every call guards distance before shifting. Zero and >=32 never execute a shift.
+// Extended inputs fit <=15 bits; >=32 therefore means zero+sticky in the exact wider oracle.
+uint jam(uint value, uint distance) {
+    if (distance == 0) return value;
+    if (distance >= 32) return uint(value != 0);
+    return (value >> distance) | uint((value & ((1u << distance)-1u)) != 0);
+}
+bool increment(uint significand, uint discarded) {
+    return discarded > 4u || (discarded == 4u && (significand & 1u) != 0);
+}
+Result passthrough(uint bits) {
+    uint magnitude = bits & (SIGN-1u);
+    if (policy == 1 && magnitude != 0 && magnitude < (1u << FRACTION)) return Result(bits, 2);
+    return ok(bits);
+}
+// Precondition ext!=0. With FRACTION<=10, Add supplies <2^15 and normalized
+// Mul/Div have top bit FRACTION+3<=13. No U32 carry/normalization overflow.
+// Exponents stay within [-298,277], a conservative bound also covering BF16.
+Result pack(uint sign, uint ext, int exponent) {
+    while (ext >= (1u << (FRACTION+4))) { ext = jam(ext, 1); exponent += 1; }
+    while (ext < (1u << (FRACTION+3))) { ext <<= 1; exponent -= 1; }
+    uint unbounded_sig = ext >> 3;
+    if (increment(unbounded_sig, ext & 7u)) unbounded_sig += 1;
+    int unbounded_exp = exponent + int(unbounded_sig == (1u << (FRACTION+1)));
+    bool tiny = unbounded_exp < MIN_EXPONENT;
+    if (exponent < MIN_EXPONENT) { ext = jam(ext, uint(MIN_EXPONENT-exponent)); exponent = MIN_EXPONENT; }
+    uint discarded = ext & 7u;
+    uint significand = ext >> 3;
+    bool inexact = discarded != 0;
+    if (increment(significand, discarded)) significand += 1;
+    bool subnormal = false;
+    uint bits;
+    if (exponent == MIN_EXPONENT && significand < (1u << FRACTION)) {
+        bits = (sign << (WIDTH-1)) | significand;
+        subnormal = significand != 0;
+    } else {
+        if (significand >= (1u << (FRACTION+1))) { significand >>= 1; exponent += 1; }
+        if (exponent > MAX_EXPONENT) return Result((sign << (WIDTH-1)) | MAXIMUM, 3);
+        bits = (sign << (WIDTH-1)) | (uint(exponent+BIAS) << FRACTION) | (significand & FRACTION_MASK);
+    }
+    // E4M3FN has finite final-exponent encodings through fraction110, then reserved NaN.
+    // Check the rounded destination fields explicitly, including the ties-even 464->448 case.
+    if ((bits & (SIGN-1u)) > MAXIMUM) return Result((sign << (WIDTH-1)) | MAXIMUM,3);
+    bool reject = policy == 0 ? (tiny && inexact) : policy == 1 ? (subnormal || (tiny && inexact)) : false;
+    return reject ? Result(bits, 2) : ok(bits);
+}
+Result add(uint left, uint right, bool subtract) {
+    Parts a = decode(left); Parts b = decode(right); b.sign ^= uint(subtract);
+    if (a.significand == 0) {
+        if (b.significand != 0) return passthrough((b.sign << (WIDTH-1)) | (right & (SIGN-1u)));
+        return ok(uint(a.sign == b.sign) * (a.sign << (WIDTH-1)));
+    }
+    if (b.significand == 0) return passthrough(left);
+    if (a.exponent < b.exponent) { Parts temporary = a; a = b; b = temporary; }
+    uint x = a.significand << 3; // Each extended input <2^14, maximum sum <2^15.
+    uint y = jam(b.significand << 3, uint(a.exponent-b.exponent));
+    uint sign; uint ext;
+    if (a.sign == b.sign) { sign = a.sign; ext = x+y; }
+    else if (x >= y) { sign = a.sign; ext = x-y; }
+    else { sign = b.sign; ext = y-x; }
+    return ext == 0 ? ok(0) : pack(sign, ext, a.exponent);
+}
+Result multiply(uint left, uint right) {
+    Parts a = decode(left); Parts b = decode(right);
+    uint sign = a.sign ^ b.sign;
+    if (a.significand == 0 || b.significand == 0) return ok(sign << (WIDTH-1));
+    // Each significand <2^11; umulExtended computes all <=22 product bits exactly.
+    uint high; uint low; umulExtended(a.significand, b.significand, high, low);
+    int top = high != 0 ? 32+findMSB(high) : findMSB(low); // Product nonzero: top in0..21, high always zero.
+    int exponent = a.exponent+b.exponent+top-int(2u*FRACTION);
+    uint ext;
+    if (top > int(FRACTION+3)) {
+        uint distance = uint(top-int(FRACTION+3)); // 1..8: both limb shifts strictly below32.
+        ext = (high << (32u-distance)) | (low >> distance);
+        ext |= uint((low & ((1u << distance)-1u)) != 0);
+    } else {
+        ext = low << uint(int(FRACTION+3)-top); // high=0 and resulting top<=13, no overflow.
+    }
+    return pack(sign, ext, exponent);
+}
+Result divide(uint left, uint right) {
+    Parts a = decode(left); Parts b = decode(right);
+    uint sign = (left ^ right) >> (WIDTH-1);
+    if (b.significand == 0) return fault(4);
+    if (a.significand == 0) return ok(sign << (WIDTH-1));
+    uint a_shift = uint(int(FRACTION)-findMSB(a.significand)); // Nonzero shifts0..10.
+    uint b_shift = uint(int(FRACTION)-findMSB(b.significand));
+    a.significand <<= a_shift; a.exponent -= int(a_shift);
+    b.significand <<= b_shift; b.exponent -= int(b_shift);
+    uint remainder = a.significand;
+    int exponent = a.exponent-b.exponent;
+    if (remainder < b.significand) { remainder <<= 1; exponent -= 1; }
+    // Exact FRACTION+4-bit quotient, <=14bits. Initial remainder in[d,2*d),
+    // d<2^11; after subtract remainder<d, every next shift keeps it<2^12.
+    // No integer division, U32 carry or zero-divisor UB participates.
+    uint quotient = 0;
+    for (uint bit=0; bit<FRACTION+4; bit++) {
+        quotient <<= 1;
+        if (remainder >= b.significand) { remainder -= b.significand; quotient |= 1; }
+        if (bit != FRACTION+3) remainder <<= 1;
+    }
+    quotient |= uint(remainder != 0);
+    return pack(sign, quotient, exponent);
+}
+bool finite_bits(uint bits){return (bits&(SIGN-1u))<=MAXIMUM;}
+Result unary_bits(uint bits,bool negate){
+ if(!finite_bits(bits))return fault(1);
+ if(negate)bits=bits^SIGN;
+ else if(!((bits&SIGN)==0&&(bits&(SIGN-1u))!=0))bits=0;
+ return policy==1&&((bits&(SIGN-1u))!=0&&(bits&(SIGN-1u))<(1u<<FRACTION))?Result(bits,2):ok(bits);
+}
+void finish_result(uint dst,Result result,uint range,uint ordinal){record_fault(result.status,range,ordinal);if(!fatal)registers[dst]=result.bits;}
+void native_nop(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){}
+void native_load(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;registers[dst]=b==0?(private_words[a].x>>(packed_lane*WIDTH))&((SIGN<<1)-1u):read_word(a,0)&((SIGN<<1)-1u);}
+void native_store(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;uint shift=packed_lane*WIDTH;uint mask=((SIGN<<1)-1u)<<shift;private_words[a].x=(private_words[a].x&~mask)|(registers[b]<<shift);}
+void native_constant(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;registers[dst]=lo;}
+void native_add(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;policy=uf;Result result;if(!finite_bits(registers[a])||!finite_bits(registers[b]))result=fault(1);else result=add(registers[a],registers[b],false);finish_result(dst,result,range,ordinal);}
+void native_sub(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;policy=uf;Result result;if(!finite_bits(registers[a])||!finite_bits(registers[b]))result=fault(1);else result=add(registers[a],registers[b],true);finish_result(dst,result,range,ordinal);}
+void native_mul(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;policy=uf;Result result;if(!finite_bits(registers[a])||!finite_bits(registers[b]))result=fault(1);else result=multiply(registers[a],registers[b]);finish_result(dst,result,range,ordinal);}
+void native_div(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;policy=uf;Result result;if(!finite_bits(registers[a])||!finite_bits(registers[b]))result=fault(1);else result=divide(registers[a],registers[b]);finish_result(dst,result,range,ordinal);}
+void native_neg(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;policy=uf;finish_result(dst,unary_bits(registers[a],true),range,ordinal);}
+void native_relu(uint dst,uint a,uint b,uint uf,uint range,uint lo,uint hi,uint ordinal){if(fatal)return;policy=uf;finish_result(dst,unary_bits(registers[a],false),range,ordinal);}
+void main(){
+ uint word=gl_GlobalInvocationID.x;
+ uint word_extent=EXTENT/LANES+uint(EXTENT%LANES!=0);
+ if(word>=word_extent)return;
+private_words[0]=uvec2(word<READ_WORDS_0?read_word(0,word):0,0);
+private_words[1]=uvec2(word<READ_WORDS_1?read_word(1,word):0,0);
+private_words[2]=uvec2(word<READ_WORDS_2?read_word(2,word):0,0);
+private_words[3]=uvec2(word<READ_WORDS_3?read_word(3,word):0,0);
+for(packed_lane=0;packed_lane<LANES;packed_lane++){logical_index=word*LANES+packed_lane;if(logical_index>=EXTENT)break;notice=0;notice_step=0;fatal=false;
+native_nop(S0_0,S0_1,S0_2,S0_3,S0_4,S0_5,S0_6,S0_7);
+native_load(S1_0,S1_1,S1_2,S1_3,S1_4,S1_5,S1_6,S1_7);
+native_store(S2_0,S2_1,S2_2,S2_3,S2_4,S2_5,S2_6,S2_7);
+native_constant(S3_0,S3_1,S3_2,S3_3,S3_4,S3_5,S3_6,S3_7);
+native_add(S4_0,S4_1,S4_2,S4_3,S4_4,S4_5,S4_6,S4_7);
+native_sub(S5_0,S5_1,S5_2,S5_3,S5_4,S5_5,S5_6,S5_7);
+native_mul(S6_0,S6_1,S6_2,S6_3,S6_4,S6_5,S6_6,S6_7);
+native_div(S7_0,S7_1,S7_2,S7_3,S7_4,S7_5,S7_6,S7_7);
+native_neg(S8_0,S8_1,S8_2,S8_3,S8_4,S8_5,S8_6,S8_7);
+native_relu(S9_0,S9_1,S9_2,S9_3,S9_4,S9_5,S9_6,S9_7);
+native_nop(S10_0,S10_1,S10_2,S10_3,S10_4,S10_5,S10_6,S10_7);
+native_load(S11_0,S11_1,S11_2,S11_3,S11_4,S11_5,S11_6,S11_7);
+native_store(S12_0,S12_1,S12_2,S12_3,S12_4,S12_5,S12_6,S12_7);
+native_constant(S13_0,S13_1,S13_2,S13_3,S13_4,S13_5,S13_6,S13_7);
+native_add(S14_0,S14_1,S14_2,S14_3,S14_4,S14_5,S14_6,S14_7);
+native_sub(S15_0,S15_1,S15_2,S15_3,S15_4,S15_5,S15_6,S15_7);
+native_mul(S16_0,S16_1,S16_2,S16_3,S16_4,S16_5,S16_6,S16_7);
+native_div(S17_0,S17_1,S17_2,S17_3,S17_4,S17_5,S17_6,S17_7);
+native_neg(S18_0,S18_1,S18_2,S18_3,S18_4,S18_5,S18_6,S18_7);
+native_relu(S19_0,S19_1,S19_2,S19_3,S19_4,S19_5,S19_6,S19_7);
+native_nop(S20_0,S20_1,S20_2,S20_3,S20_4,S20_5,S20_6,S20_7);
+native_load(S21_0,S21_1,S21_2,S21_3,S21_4,S21_5,S21_6,S21_7);
+native_store(S22_0,S22_1,S22_2,S22_3,S22_4,S22_5,S22_6,S22_7);
+native_constant(S23_0,S23_1,S23_2,S23_3,S23_4,S23_5,S23_6,S23_7);
+native_add(S24_0,S24_1,S24_2,S24_3,S24_4,S24_5,S24_6,S24_7);
+native_sub(S25_0,S25_1,S25_2,S25_3,S25_4,S25_5,S25_6,S25_7);
+native_mul(S26_0,S26_1,S26_2,S26_3,S26_4,S26_5,S26_6,S26_7);
+native_div(S27_0,S27_1,S27_2,S27_3,S27_4,S27_5,S27_6,S27_7);
+native_neg(S28_0,S28_1,S28_2,S28_3,S28_4,S28_5,S28_6,S28_7);
+native_relu(S29_0,S29_1,S29_2,S29_3,S29_4,S29_5,S29_6,S29_7);
+native_nop(S30_0,S30_1,S30_2,S30_3,S30_4,S30_5,S30_6,S30_7);
+native_load(S31_0,S31_1,S31_2,S31_3,S31_4,S31_5,S31_6,S31_7);
+native_store(S32_0,S32_1,S32_2,S32_3,S32_4,S32_5,S32_6,S32_7);
+native_constant(S33_0,S33_1,S33_2,S33_3,S33_4,S33_5,S33_6,S33_7);
+native_add(S34_0,S34_1,S34_2,S34_3,S34_4,S34_5,S34_6,S34_7);
+native_sub(S35_0,S35_1,S35_2,S35_3,S35_4,S35_5,S35_6,S35_7);
+native_mul(S36_0,S36_1,S36_2,S36_3,S36_4,S36_5,S36_6,S36_7);
+native_div(S37_0,S37_1,S37_2,S37_3,S37_4,S37_5,S37_6,S37_7);
+native_neg(S38_0,S38_1,S38_2,S38_3,S38_4,S38_5,S38_6,S38_7);
+native_relu(S39_0,S39_1,S39_2,S39_3,S39_4,S39_5,S39_6,S39_7);
+native_nop(S40_0,S40_1,S40_2,S40_3,S40_4,S40_5,S40_6,S40_7);
+native_load(S41_0,S41_1,S41_2,S41_3,S41_4,S41_5,S41_6,S41_7);
+native_store(S42_0,S42_1,S42_2,S42_3,S42_4,S42_5,S42_6,S42_7);
+native_constant(S43_0,S43_1,S43_2,S43_3,S43_4,S43_5,S43_6,S43_7);
+native_add(S44_0,S44_1,S44_2,S44_3,S44_4,S44_5,S44_6,S44_7);
+native_sub(S45_0,S45_1,S45_2,S45_3,S45_4,S45_5,S45_6,S45_7);
+native_mul(S46_0,S46_1,S46_2,S46_3,S46_4,S46_5,S46_6,S46_7);
+native_div(S47_0,S47_1,S47_2,S47_3,S47_4,S47_5,S47_6,S47_7);
+native_neg(S48_0,S48_1,S48_2,S48_3,S48_4,S48_5,S48_6,S48_7);
+native_relu(S49_0,S49_1,S49_2,S49_3,S49_4,S49_5,S49_6,S49_7);
+native_nop(S50_0,S50_1,S50_2,S50_3,S50_4,S50_5,S50_6,S50_7);
+native_load(S51_0,S51_1,S51_2,S51_3,S51_4,S51_5,S51_6,S51_7);
+native_store(S52_0,S52_1,S52_2,S52_3,S52_4,S52_5,S52_6,S52_7);
+native_constant(S53_0,S53_1,S53_2,S53_3,S53_4,S53_5,S53_6,S53_7);
+native_add(S54_0,S54_1,S54_2,S54_3,S54_4,S54_5,S54_6,S54_7);
+native_sub(S55_0,S55_1,S55_2,S55_3,S55_4,S55_5,S55_6,S55_7);
+native_mul(S56_0,S56_1,S56_2,S56_3,S56_4,S56_5,S56_6,S56_7);
+native_div(S57_0,S57_1,S57_2,S57_3,S57_4,S57_5,S57_6,S57_7);
+native_neg(S58_0,S58_1,S58_2,S58_3,S58_4,S58_5,S58_6,S58_7);
+native_relu(S59_0,S59_1,S59_2,S59_3,S59_4,S59_5,S59_6,S59_7);
+native_nop(S60_0,S60_1,S60_2,S60_3,S60_4,S60_5,S60_6,S60_7);
+native_load(S61_0,S61_1,S61_2,S61_3,S61_4,S61_5,S61_6,S61_7);
+native_store(S62_0,S62_1,S62_2,S62_3,S62_4,S62_5,S62_6,S62_7);
+native_constant(S63_0,S63_1,S63_2,S63_3,S63_4,S63_5,S63_6,S63_7);
+status_data.words[2u*logical_index]=notice;status_data.words[2u*logical_index+1u]=notice_step;}
+if(WRITE_0!=0){write_word(0,word,private_words[0].x);}
+if(WRITE_1!=0){write_word(1,word,private_words[1].x);}
+if(WRITE_2!=0){write_word(2,word,private_words[2].x);}
+if(WRITE_3!=0){write_word(3,word,private_words[3].x);}
+}

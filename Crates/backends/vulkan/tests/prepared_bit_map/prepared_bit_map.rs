@@ -194,9 +194,26 @@ fn detached_policy_grid_schema_and_short_call_admission_are_transactional() {
                 assert_eq!(output[9].to_bits(), 0x8000_0001);
                 assert_eq!(&output[257..], &[31.0; 3]);
             }
-            assert!(
-                support::prepare_graph(&backend, 257, policy, PcuRangePolicy::Clamp, grid).is_err()
-            );
+            let mut clamped =
+                support::prepare_graph(&backend, 257, policy, PcuRangePolicy::Clamp, grid).unwrap();
+            let result = clamped.call(&mut [
+                PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+                PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+            ]);
+            if policy == PcuFloatUnderflowPolicy::RejectSubnormalResult {
+                assert!(matches!(
+                    result,
+                    Err(PcuVulkanError::Fault(PcuExecutionFault {
+                        recovered: true,
+                        kind: PcuExecutionFaultKind::ArithmeticUnderflow,
+                        invocation_id: 9
+                    }))
+                ));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(output[9].to_bits(), 0x8000_0001);
+            assert_eq!(&output[257..], &[31.0; 3]);
         }
     }
     let mut call = negate_prepare::<8, _>(&backend).unwrap();
@@ -299,6 +316,9 @@ fn assert_offers(backend: &PcuVulkanBackend) {
             scalar,
             |kernel| {
                 for numerical_mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
+                    let mut kernel = *kernel;
+                    kernel.numerical_requirements.numerical_mode = numerical_mode;
+                    let kernel = &kernel;
                     let request = PcuImplementationRequest {
                         device: backend.device_identity().unwrap(),
                         executor: PcuExecutorId(0),
@@ -318,10 +338,14 @@ fn assert_offers(backend: &PcuVulkanBackend) {
                         1
                     );
                     let offer = output[0].unwrap();
-                    assert_eq!(offer.implementation.revision, 3);
+                    assert_eq!(offer.implementation.revision, 1);
                     assert_eq!(
                         offer.implementation.local_id,
-                        if scalar == PcuScalarType::F64 { 3 } else { 1 }
+                        if scalar == PcuScalarType::F64 {
+                            116
+                        } else {
+                            112
+                        }
                     );
                     assert_eq!(offer.workspace_bytes, None);
                     assert!(offer.cost.completion.is_none());
@@ -507,17 +531,22 @@ fn f64_direct_grid_all_underflow_policies_and_transport_are_exact() {
                 ])
                 .unwrap();
             assert_eq!(&output[..257], &[-1.0; 257]);
-            assert!(
-                support::with_typed_graph(
-                    257,
-                    policy,
-                    PcuRangePolicy::Clamp,
-                    grid,
-                    pcu_facade::PcuScalarType::F64,
-                    |kernel| backend.prepare_host_kernel(kernel)
-                )
-                .is_err()
-            );
+            let mut clamped = support::with_typed_graph(
+                257,
+                policy,
+                PcuRangePolicy::Clamp,
+                grid,
+                pcu_facade::PcuScalarType::F64,
+                |kernel| backend.prepare_host_kernel(kernel),
+            )
+            .unwrap();
+            clamped
+                .call(&mut [
+                    PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+                    PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                ])
+                .unwrap();
+            assert_eq!(&output[..257], &[-1.0; 257]);
         }
     }
     let mut call = transport_f64_prepare::<8, _>(&backend).unwrap();

@@ -15,6 +15,14 @@ use crate::{
     PcuFloatUnderflowPolicy,
 };
 
+#[path = "scalar_checked_conversion/integer/integer.rs"]
+mod integer;
+#[rustfmt::skip]
+pub use integer::{
+    u64_to_f32_nearest_even,
+    u64_to_f64_nearest_even,
+};
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for f64 {}

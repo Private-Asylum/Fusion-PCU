@@ -63,7 +63,7 @@ fn extreme_rate(
     pcu::sgd_update(weights, gradient, 3.402_823_5e38_f32)
 }
 #[pcu(flag(non_strict), flag(native_compound), flag(non_deterministic))]
-fn unsupported_width(
+fn admitted_f64(
     weights: &[f64; 1],
     gradient: &[f64; 1],
 ) -> Result<PcuTensor<f64>, PcuExecutionError> {
@@ -204,10 +204,13 @@ fn authored_cold_policy_dtype_and_resident_shape_rejections_preserve_owner_reads
         source::strict(&[1.0], &[1.0]).unwrap_err(),
         source::portable(&[1.0], &[1.0]).unwrap_err(),
         source::tight(&[1.0], &[1.0]).unwrap_err(),
-        unsupported_width(&[1.0], &[1.0]).unwrap_err(),
     ] {
         assert!(format!("{error:?}").contains("Unsupported"), "{error:?}");
     }
+    let widened = admitted_f64(&[1.0], &[1.0]).unwrap();
+    let mut widened_actual = [0.0_f64];
+    widened.read_into(&mut widened_actual).unwrap();
+    assert_eq!(widened_actual[0].to_bits(), 0.75_f64.to_bits());
     assert!(source::preserve::<0>(&[], &[]).is_err());
     let w = identity(&[1.0, 2.0]).unwrap();
     let g = identity(&[1.0, 2.0, 3.0]).unwrap();

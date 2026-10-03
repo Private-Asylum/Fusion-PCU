@@ -1,0 +1,9 @@
+# Mutable ordered float maps
+
+The actual annotated source spells the same ordered Add/store/load/Mul/store stream with initialized mutable locals and straight-line assignments. It reuses the original driver, independent dyadic oracle, prepared-IR route and both native controls. Two outputs, tails, first-fatal private rollback and retry remain observable. The original benchmark keeps its original group label and operations.
+
+The new target uses a distinct mutable group label. Six formats, Boundary/Strict, all three underflow policies, Reject/Clamp, direct/canonical grid and65/4096 extents produce1,152 semantic scopes and separate64-changing-call censuses. Normal statistical runs retain the existing activity guard; `--test` is semantic only. Original native matched work is a historical diagnostic, while minimal native omits overwritten stage initial upload.
+
+This target is a new unqualified candidate until its own actual source/semantic/census certificate is closed. Existing immutable and private-capacity certificates do not retrospectively qualify it. Cold source IR equivalence and the common native mutable-local/erased-fault source gate must also pass before publication claims.
+
+Host publication now retains private RAM per output. Every successful device read finishes before infallible copies publish either caller output; terminal arithmetic faults and SDK readback errors preserve all host outputs. Observable recovered Clamp keeps its separately specified publication+Err behavior. Both minimal and historical matched native controls stage readbacks privately too. These additional CPU copies are part of each whole host-call boundary; SDK/API counters alone do not count host memcpy bytes. Fixed-shape warm buffers are retained, and unknown completion retains the affected RAM destination alongside native allocation/runtime leases. Hardware qualification of this new implementation is separate from the frozen34c60 baseline.

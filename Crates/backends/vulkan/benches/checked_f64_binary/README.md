@@ -1,0 +1,9 @@
+# Checked F64 Vulkan binary pairs
+
+All four Add/Sub/Mul/Div workloads run genuine annotated source at N1/N4096, with Reject normal arithmetic and observable Clamp overflow payloads. Each pairs prepared annotated source, ordinary annotated source, an explicit graph diagnostic and an independent ash/compiler/lifecycle owner selected by the same physical UUID. The native owner compiles the audited U32-only shader independently; it shares arithmetic source and is not an independent arithmetic oracle. Separate core integer-significand tests validate exact bits/faults.
+
+Every route retains two coherent input mappings, private output/status, pipeline/descriptors/commands/fence. It stages changing input each call, waits terminal completion, scans logical status and publishes only a fatal-free output prefix. Clamp returns observable recovered Err with useful entire output; any fatal preserves caller output. Output/tails/retry and zero Rust alloc/realloc/free across64 changing-input warm calls perroute are asserted. Driver C allocations are outside this Rust census. Ordinary scoring stays unchanged after warmup.
+
+Shader arithmetic uses only U32/I32: two limbs for53-bit significands, four for exact106-bit products,56 quotient bits with bounded remainder, ties-even rounding and explicit tininess policy. No Float64/Int64 feature or native floating-control assumption. Existing F64 Copy/Neg still has its independent Float64 feature gate. Portable and low-format membership do not follow from this F64 implementation.
+
+Command: cargo bench -p fusion-pcu-vulkan --features hosted --bench checked_f64_binary -- --test. This collects64 semantic peers and no statistics. Statistical mode retains the existing GPU activity guard; 2026-10-01 user GPU activity19%before/30%after forbids an uncontested timing claim.

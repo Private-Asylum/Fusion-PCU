@@ -257,6 +257,11 @@ fn prepare_policy(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     backend.prepare_host_kernel(&PcuDispatchKernelIr {
+        numerical_requirements: pcu_facade::PcuImplementationRequirements {
+            float_underflow: underflow_policy,
+            range_policy,
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: PcuKernelId(70),
         entry: PcuDispatchEntryPoint {
             name: "policy_neg",
@@ -360,4 +365,16 @@ fn schema_rejects_duplicates_types_access_and_handles_reordered_arguments() {
         ])
         .unwrap();
     assert_eq!(output.map(f32::to_bits), [-1.0_f32; 17].map(f32::to_bits));
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[test]
+fn actual_neon_selection_executes_annotated_f32_source() {
+    let backend = PcuCpuCheckedNeg::new(PcuCpuProcessor::detect(), PcuCpuImplementation::Neon)
+        .expect("actual AArch64 host must admit NEON");
+    let bindings = negate_bindings();
+    let builder = negate_ir::<257>(&bindings).unwrap();
+    let prepared = backend.prepare_host_kernel(&builder.ir()).unwrap();
+    assert_eq!(prepared.implementation(), PcuCpuImplementation::Neon);
+    compare::<257>(backend);
 }

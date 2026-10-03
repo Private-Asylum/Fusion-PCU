@@ -269,9 +269,11 @@ impl Ownership {
             .segments
             .first()
             .is_some_and(|segment| segment.ident == "pcu")
-            && !["identity", "relu", "add", "sub", "mul", "matmul"]
-                .iter()
-                .any(|name| is_pcu_builtin(&path.path, name))
+            && ![
+                "identity", "relu", "add", "sub", "mul", "matmul", "gradient",
+            ]
+            .iter()
+            .any(|name| is_pcu_builtin(&path.path, name))
         {
             return Err(super::composition_body_error(&call.func));
         }

@@ -226,3 +226,15 @@ impl TensorOperationAssessor for MlxTensorAssessor {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[path = "checked_tensor/checked_tensor.rs"]
+mod checked_tensor;
+pub use checked_tensor::MlxCheckedTensorPlan;
+
+#[path = "binary_tensor/binary_tensor.rs"]
+mod binary_tensor;
+pub use binary_tensor::MlxCheckedTensorBinaryPlan;
+
+#[path = "integer_tensor/integer_tensor.rs"]
+mod integer_tensor;
+pub use integer_tensor::MlxCheckedTensorIntegerPlan;

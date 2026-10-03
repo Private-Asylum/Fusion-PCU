@@ -645,6 +645,16 @@ const fn scalar_index(scalar: crate::PcuScalarType) -> usize {
         crate::PcuScalarType::BF16 => 12,
         crate::PcuScalarType::F32 => 13,
         crate::PcuScalarType::F64 => 14,
+        crate::PcuScalarType::I128 => 15,
+        crate::PcuScalarType::U128 => 16,
+        crate::PcuScalarType::I256 => 17,
+        crate::PcuScalarType::U256 => 18,
+        crate::PcuScalarType::I512 => 19,
+        crate::PcuScalarType::U512 => 20,
+        crate::PcuScalarType::F128 => 21,
+        crate::PcuScalarType::F256 => 22,
+        crate::PcuScalarType::F8E4M3FN => 23,
+        crate::PcuScalarType::F8E5M2 => 24,
     }
 }
 
@@ -1075,6 +1085,7 @@ mod tests {
                 rhs: PcuDispatchValueId(2),
             })];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(8),
                 entry: PcuDispatchEntryPoint {
                     name: "typed-alu-capability",

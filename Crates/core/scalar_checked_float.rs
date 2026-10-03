@@ -1,4 +1,4 @@
-//! Checked binary32 and binary64 arithmetic implemented with integer significands.
+//! Checked binary16/BF16/OFP8/binary32/binary64 arithmetic with integer significands.
 //!
 //! Numerical rules reference IEEE Std 754-2019: clauses 4.3.1/4.3.3 for nearest,
 //! ties-to-even rounding, 7.4 for overflow, and 7.5(a) for tininess after rounding.
@@ -9,6 +9,8 @@
 //! and status flags are PCU policies. In particular, this finite-input profile is stricter
 //! than IEEE invalid-operation handling (clauses 6.2 and 7.2). These bounded operations do
 //! not establish conformance for the full standard or for backend library reductions.
+//! OFP8 is not an IEEE basic format; its named encodings use the declared PCU
+//! rounding/exception contract, including E4M3FN's finite final exponent.
 
 #[rustfmt::skip]
 use crate::{
@@ -24,15 +26,34 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for f32 {}
     impl Sealed for f64 {}
+    impl Sealed for crate::PcuF16Bits {}
+    impl Sealed for crate::PcuBf16Bits {}
+    impl Sealed for crate::PcuF8E4M3FnBits {}
+    impl Sealed for crate::PcuF8E5M2Bits {}
 }
 
 mod f64;
 
-/// Checked scalar Add/Sub/Mul/Div operations for IEEE binary32 and binary64 values.
+/// Checked scalar Add/Sub/Mul/Div for binary16/32/64 and named BF16/OFP8 formats.
 ///
 /// This host-side arithmetic contract does not imply backend execution support.
 #[allow(private_bounds)] // Prevents downstream checked-float implementations from bypassing the contract.
 pub trait PcuCheckedFloat: PcuScalar + sealed::Sealed + Sized + Copy {
+    /// Selects the upstream derivative when this finite input is strictly positive.
+    ///
+    /// Both operands must be finite even when the gradient would be masked out.
+    /// Nonpositive inputs, including either signed zero, produce positive zero.
+    /// Selection is a PCU differentiation rule, not IEEE arithmetic. An unchanged
+    /// subnormal is exact under IEEE 754-2019 clause 7.5; the selected policy may
+    /// deliberately reject it. No multiply or rounding is introduced.
+    ///
+    /// # Errors
+    /// Returns invalid operand or policy-rejected selected subnormal output.
+    fn pcu_checked_relu_backward_with_policy(
+        self,
+        upstream: Self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuExecutionFaultKind>;
     /// Adds finite operands, rejecting invalid inputs and overflow by default.
     ///
     /// # Errors
@@ -124,11 +145,11 @@ pub trait PcuCheckedFloat: PcuScalar + sealed::Sealed + Sized + Copy {
     ) -> Result<Self, PcuExecutionFaultKind>;
 }
 
-/// Checked binary32/binary64 arithmetic that retains range-fault payloads.
+/// Checked binary16/BF16/binary32/binary64 arithmetic retaining range-fault payloads.
 ///
 /// Unlike saturation, a range violation remains an error. Its payload is the nearest finite
 /// endpoint for overflow or the rounded result for policy-rejected underflow.
-#[allow(private_bounds)] // The sealed set limits this behavior to the two implemented binary formats.
+#[allow(private_bounds)] // The sealed set limits this behavior to explicitly implemented binary formats.
 pub trait PcuClampedFloat: PcuCheckedFloat + sealed::Sealed {
     /// Adds, retaining the signed maximum finite endpoint on overflow.
     ///
@@ -561,6 +582,9 @@ fn multiply<const CLAMP: bool>(
     }
 }
 
+// The denominator is already proved nonzero; retain the quotient/remainder pair
+// that classifies rounding inexactness rather than adding a separate divisibility API.
+#[allow(clippy::manual_is_multiple_of)]
 fn divide<const CLAMP: bool>(
     left: f32,
     right: f32,
@@ -611,6 +635,25 @@ fn divide<const CLAMP: bool>(
 }
 
 impl PcuCheckedFloat for f32 {
+    fn pcu_checked_relu_backward_with_policy(
+        self,
+        upstream: Self,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Self, PcuExecutionFaultKind> {
+        if !self.is_finite() || !upstream.is_finite() {
+            return Err(PcuExecutionFaultKind::InvalidFloatingOperand);
+        }
+        // IEEE 754 binary32 selection is exact: positive finite subnormals
+        // remain positive even when the caller's hardware mode flushes inputs.
+        // Inspect the encoding rather than inheriting that ambient mode.
+        let bits = self.to_bits();
+        let positive = bits & 0x8000_0000 == 0 && bits & 0x7fff_ffff != 0;
+        let result = if positive { upstream } else { 0.0 };
+        // Two exact sign inversions validate the selected representation without rounding it.
+        result
+            .pcu_checked_neg_with_policy(policy)?
+            .pcu_checked_neg()
+    }
     fn pcu_checked_neg(self) -> Result<Self, PcuExecutionFaultKind> {
         self.pcu_checked_neg_with_policy(PcuFloatUnderflowPolicy::default())
     }

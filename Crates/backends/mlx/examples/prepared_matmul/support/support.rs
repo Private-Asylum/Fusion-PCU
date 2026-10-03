@@ -1,5 +1,9 @@
 use super::source;
-use fusion_pcu_mlx::MlxRuntime;
+#[rustfmt::skip]
+use fusion_pcu_mlx::{
+    MlxRuntime,
+    MlxProgramInput,
+};
 use std::sync::Arc;
 
 pub fn run() {
@@ -16,10 +20,11 @@ pub fn run() {
     for phase in [0.0_f32, 1.0] {
         let left = [1.0 + phase, 2.0, 3.0, 4.0];
         let right = [5.0, 6.0, 7.0, 8.0];
-        let lhs = session.upload_f32([2, 2], &left).unwrap();
-        let rhs = session.upload_f32([2, 2], &right).unwrap();
-        let output = session
-            .execute_program(&prepared, &[(a, &lhs), (b, &rhs)])
+        let output = prepared
+            .execute_mixed(&[
+                (a, MlxProgramInput::Host(&left)),
+                (b, MlxProgramInput::Host(&right)),
+            ])
             .unwrap();
         let mut host = [-73.0_f32; 5];
         output.read_into_f32(&mut host).unwrap();

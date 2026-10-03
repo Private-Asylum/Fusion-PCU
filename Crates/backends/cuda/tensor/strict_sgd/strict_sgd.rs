@@ -10,13 +10,13 @@ use fusion_pcu::{
     PcuBindingAccess,
     PcuBindingRef,
     PcuBindingType,
-    PcuCompoundArithmeticPolicy,
     PcuExecutionFault,
     PcuFloatUnderflowPolicy,
+    PcuImplementationRequirements,
+    PcuRangePolicy,
     PcuNumericalMode,
     PcuNumericalRequirement,
     PcuOwnedBindingRequirement,
-    PcuPrecisionPolicy,
     PcuReproducibility,
     PcuScalarType,
     PcuValueType,
@@ -38,6 +38,7 @@ use super::CudaTensorExecutionError;
 pub struct Profile {
     scalar: PcuScalarType,
     policy: PcuFloatUnderflowPolicy,
+    numerical_requirements: PcuImplementationRequirements,
     count: u32,
     rate_bits: u32,
 }
@@ -53,13 +54,8 @@ pub(super) fn assess(
     if node.numerical_options.reproducibility != PcuReproducibility::Unspecified {
         return Err(unsupported(PcuNumericalRequirement::Reproducibility));
     }
-    if node.numerical_mode != Some(PcuNumericalMode::Strict)
-        || node.numerical_options.compound_arithmetic != PcuCompoundArithmeticPolicy::Checked
-    {
+    if node.numerical_mode != Some(PcuNumericalMode::Strict) {
         return Err(unsupported(PcuNumericalRequirement::CompoundArithmetic));
-    }
-    if node.numerical_options.precision != PcuPrecisionPolicy::Preserve {
-        return Err(unsupported(PcuNumericalRequirement::Precision));
     }
     if !matches!(node.scalar_type, PcuScalarType::F32 | PcuScalarType::F64) {
         return Err(TensorUnsupportedReason::ElementType);
@@ -109,6 +105,14 @@ pub(super) fn assess(
         .ok_or(TensorUnsupportedReason::Shape)?;
     Ok(Profile {
         scalar: node.scalar_type,
+        // Permissions may use this stronger ordered checker; retain the requested tuple.
+        numerical_requirements: PcuImplementationRequirements {
+            numerical_mode: PcuNumericalMode::Strict,
+            numerical_options: node.numerical_options,
+            float_underflow: node.float_underflow_policy.unwrap_or_default(),
+            // Tensor nodes currently represent only Reject range.
+            range_policy: PcuRangePolicy::Reject,
+        },
         policy: node.float_underflow_policy.unwrap_or_default(),
         count,
         rate_bits: learning_rate.to_bits(),
@@ -116,6 +120,19 @@ pub(super) fn assess(
 }
 
 impl Profile {
+    // Private factory admission establishes positive dimensions and packed event bounds.
+    pub(crate) fn fault_domain(self) -> fusion_pcu::dialect::tensor::TensorStrictFaultDomain {
+        fusion_pcu::dialect::tensor::TensorStrictFaultDomain::sgd(
+            self.scalar,
+            u64::from(self.count),
+            self.policy,
+        )
+        .expect("verified checked compound dimensions and format")
+    }
+    pub(crate) fn fault_extent(self) -> u64 {
+        self.fault_domain().event_extent()
+    }
+
     pub(crate) const fn count(self) -> u32 {
         self.count
     }
@@ -156,7 +173,7 @@ impl Profile {
                 "unsigned long long",
                 "f64",
                 "FusionF64CheckedResult",
-                f64::from(f32::from_bits(self.rate_bits)).to_bits(),
+                fusion_pcu::f32_bits_to_f64_bits(self.rate_bits),
             ),
             _ => unreachable!("cold profile admits F32/F64 only"),
         };
@@ -221,6 +238,8 @@ impl super::CudaTensorAssessor<'_> {
         weights: &crate::CudaMemoryResource,
         gradient: &crate::CudaMemoryResource,
         output: &crate::CudaMemoryResource,
+
+        mut status: Option<&mut super::owned_scratch::Status>,
     ) -> Result<(), CudaTensorExecutionError> {
         use fusion_pcu::PcuOwnedDispatchMemorySession;
         use fusion_pcu::PcuOwnedCompletion;
@@ -249,14 +268,15 @@ impl super::CudaTensorAssessor<'_> {
                 .find(|(key, _)| *key == super::TensorDispatchCacheKey::StrictSgd(profile))
                 .map(|(_, prepared)| prepared)
                 .ok_or(CudaTensorExecutionError::InvalidPlan(value))?;
-            prepared
-                .submit(&bindings)
-                .map_err(CudaTensorExecutionError::Backend)?
+            super::owned_scratch::submit(prepared, &bindings, status.as_deref_mut())?
         };
-        match completion
+        let outcome = completion
             .wait()
-            .map_err(CudaTensorExecutionError::Completion)?
-        {
+            .map_err(CudaTensorExecutionError::Completion)?;
+        if let Some(status) = status {
+            status.observe(outcome);
+        }
+        match outcome {
             fusion_pcu::PcuCompletionOutcome::Succeeded => Ok(()),
             fusion_pcu::PcuCompletionOutcome::Failed => {
                 Err(CudaTensorExecutionError::FailedCompletion)

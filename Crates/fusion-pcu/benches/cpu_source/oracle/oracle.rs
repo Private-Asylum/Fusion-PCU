@@ -2,6 +2,9 @@
 use super::{native, setup};
 use native::Error;
 
+#[path = "helper_integer/helper_integer.rs"]
+pub mod helper_integer;
+
 pub fn negate<const N: usize>(mut call: impl FnMut(&[f32; N], &mut [f32]) -> Result<(), Error>) {
     let mut input = setup::array::<f32, N>(0.0);
     for (index, value) in input.iter_mut().enumerate() {
@@ -93,4 +96,51 @@ pub fn integer<const N: usize, const MUL: bool>(
     assert_eq!(actual, expected);
     assert_eq!(call(&lhs, &rhs, &mut actual[..N - 1]), Err(Error::Schema));
     assert_eq!(actual, expected);
+}
+
+pub fn composition<const N: usize, const ORDERED: bool>(
+    mut call: impl FnMut(&[f32; N], &mut [f32], &mut [f32]) -> Result<(), Error>,
+) {
+    let mut input = setup::array::<f32, N>(1.0);
+    let mut stage = vec![42.0; N + 2];
+    let mut output = vec![42.0; N + 2];
+    for value in [1.0, 2.0, 4.0] {
+        input.fill(value);
+        call(&input, &mut stage, &mut output).unwrap();
+        assert_eq!(&output[..N], &vec![(value + value) * value; N]);
+        assert_eq!(&output[N..], &[42.0; 2]);
+        if ORDERED {
+            assert_eq!(&stage[..N], &vec![value + value; N]);
+        } else {
+            assert_eq!(stage, vec![42.0; N + 2]);
+        }
+        assert_eq!(&stage[N..], &[42.0; 2]);
+    }
+    let before_stage = stage.clone();
+    let before_output = output.clone();
+    input[N / 2] = f32::INFINITY;
+    let fault = call(&input, &mut stage, &mut output).unwrap_err();
+    assert!(matches!(fault, Error::Fault(fault)
+        if fault.kind == fusion_pcu::PcuExecutionFaultKind::InvalidFloatingOperand
+        && fault.invocation_id == u64::try_from(N / 2).unwrap() && !fault.recovered));
+    assert_eq!(stage, before_stage);
+    assert_eq!(output, before_output);
+    input[N / 2] = 1.0;
+    call(&input, &mut stage, &mut output).unwrap();
+    let before_stage = stage.clone();
+    let before_output = output.clone();
+    assert_eq!(
+        call(&input, &mut stage, &mut output[..N - 1]),
+        Err(Error::Schema)
+    );
+    assert_eq!(stage, before_stage);
+    assert_eq!(output, before_output);
+    if ORDERED {
+        assert_eq!(
+            call(&input, &mut stage[..N - 1], &mut output),
+            Err(Error::Schema)
+        );
+        assert_eq!(stage, before_stage);
+        assert_eq!(output, before_output);
+    }
 }

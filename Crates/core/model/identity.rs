@@ -30,6 +30,15 @@ const GRID_STRIDE_BODY: [crate::PcuDispatchOp<'static>; 2] = [
     }),
 ];
 
+const GRID_STRIDE_BROADCAST_BODY: [crate::PcuDispatchOp<'static>; 2] = [
+    crate::PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+        result: PcuDispatchValueId(1),
+        binding: crate::PcuBindingRef::new(0, 0),
+        index: PcuDispatchIndex::BindingElementZero,
+    }),
+    GRID_STRIDE_BODY[1],
+];
+
 /// Why a typed scalar identity kernel could not be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuScalarIdentityBuildError {
@@ -101,6 +110,37 @@ impl<T: PcuScalar> PcuScalarIdentityBuilder<T> {
         invocations: u32,
         bindings: &'a [PcuBinding<'a>],
     ) -> Result<PcuDispatchKernelBuilder<'a, 3>, PcuScalarIdentityBuildError> {
+        Self::build_direct(
+            kernel_id,
+            invocations,
+            bindings,
+            PcuDispatchIndex::InvocationId,
+        )
+    }
+
+    /// Broadcasts one immutable scalar to each direct invocation's output element.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid shape, scalar layout or binding schema.
+    pub fn build_broadcast<'a>(
+        kernel_id: u32,
+        invocations: u32,
+        bindings: &'a [PcuBinding<'a>],
+    ) -> Result<PcuDispatchKernelBuilder<'a, 3>, PcuScalarIdentityBuildError> {
+        Self::build_direct(
+            kernel_id,
+            invocations,
+            bindings,
+            PcuDispatchIndex::BindingElementZero,
+        )
+    }
+
+    fn build_direct<'a>(
+        kernel_id: u32,
+        invocations: u32,
+        bindings: &'a [PcuBinding<'a>],
+        source_index: PcuDispatchIndex,
+    ) -> Result<PcuDispatchKernelBuilder<'a, 3>, PcuScalarIdentityBuildError> {
         let builder = Self::validate(kernel_id, invocations, bindings)?;
         let source = crate::PcuBindingRef::new(0, 0);
         let destination = crate::PcuBindingRef::new(0, 1);
@@ -108,7 +148,7 @@ impl<T: PcuScalar> PcuScalarIdentityBuilder<T> {
             .with_data_op(PcuDispatchDataOp::BindingLoad {
                 result: PcuDispatchValueId(1),
                 binding: source,
-                index: PcuDispatchIndex::InvocationId,
+                index: source_index,
             })
             .and_then(|builder| {
                 builder.with_data_op(PcuDispatchDataOp::BindingStore {
@@ -136,15 +176,41 @@ impl<T: PcuScalar> PcuScalarIdentityBuilder<T> {
         extent: u32,
         bindings: &'a [PcuBinding<'a>],
     ) -> Result<PcuDispatchKernelBuilder<'a, 3>, PcuScalarIdentityBuildError> {
+        Self::build_grid(kernel_id, invocations, extent, bindings, &GRID_STRIDE_BODY)
+    }
+
+    /// Broadcasts one immutable scalar across the canonical grid-stride output extent.
+    ///
+    /// # Errors
+    /// Returns an error for an empty bound, invalid layout or invalid binding schema.
+    pub fn build_grid_stride_broadcast<'a>(
+        kernel_id: u32,
+        invocations: u32,
+        extent: u32,
+        bindings: &'a [PcuBinding<'a>],
+    ) -> Result<PcuDispatchKernelBuilder<'a, 3>, PcuScalarIdentityBuildError> {
+        Self::build_grid(
+            kernel_id,
+            invocations,
+            extent,
+            bindings,
+            &GRID_STRIDE_BROADCAST_BODY,
+        )
+    }
+
+    fn build_grid<'a>(
+        kernel_id: u32,
+        invocations: u32,
+        extent: u32,
+        bindings: &'a [PcuBinding<'a>],
+        body: &'static [crate::PcuDispatchOp<'static>],
+    ) -> Result<PcuDispatchKernelBuilder<'a, 3>, PcuScalarIdentityBuildError> {
         if extent == 0 {
             return Err(PcuScalarIdentityBuildError::EmptyShape);
         }
         let builder = Self::validate(kernel_id, invocations, bindings)?;
         builder
-            .with_op(crate::PcuDispatchOp::GridStrideLoop {
-                extent,
-                body: &GRID_STRIDE_BODY,
-            })
+            .with_op(crate::PcuDispatchOp::GridStrideLoop { extent, body })
             .and_then(|builder| builder.with_control_op(PcuDispatchControlOp::Return))
             .map_err(PcuScalarIdentityBuildError::Builder)
     }
@@ -237,6 +303,40 @@ mod tests {
                 PcuBindingAccess::ReadWrite,
             ),
         ]
+    }
+
+    #[test]
+    fn broadcast_builder_keeps_single_element_input_and_indexed_output_distinct() {
+        let bindings = bindings::<crate::PcuU512>();
+        let direct =
+            PcuScalarIdentityBuilder::<crate::PcuU512>::build_broadcast(7, 9, &bindings).unwrap();
+        let grid = PcuScalarIdentityBuilder::<crate::PcuU512>::build_grid_stride_broadcast(
+            7, 3, 17, &bindings,
+        )
+        .unwrap();
+        for kernel in [direct.ir(), grid.ir()] {
+            crate::validate_scalar_broadcast_kernel(&kernel, crate::PcuScalarType::U512).unwrap();
+            assert!(
+                crate::validate_scalar_identity_kernel(&kernel, crate::PcuScalarType::U512)
+                    .is_err()
+            );
+            crate::validate_typed_dispatch_value_flow(&kernel).unwrap();
+            assert_eq!(
+                kernel.minimum_binding_elements_for(crate::PcuBindingRef::new(0, 0), 9),
+                1
+            );
+            assert_eq!(
+                kernel.minimum_binding_elements_for(crate::PcuBindingRef::new(0, 1), 9),
+                if matches!(
+                    kernel.ops.first(),
+                    Some(PcuDispatchOp::GridStrideLoop { .. })
+                ) {
+                    17
+                } else {
+                    9
+                }
+            );
+        }
     }
 
     #[test]

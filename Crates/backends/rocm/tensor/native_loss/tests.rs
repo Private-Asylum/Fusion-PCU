@@ -110,3 +110,41 @@ fn loss_rejects_unrepresentable_native_reduction_count() {
         }
     );
 }
+
+#[test]
+fn native_f64_loss_proves_width_workspace_and_negative_profiles() {
+    let mut graph = Graph::default();
+    graph.set_numerical_options(PcuNumericalOptions {
+        compound_arithmetic: PcuCompoundArithmeticPolicy::BackendDefined,
+        ..PcuNumericalOptions::default()
+    });
+    let p = graph.input([65], PcuScalarType::F64).unwrap();
+    let t = graph.input([65], PcuScalarType::F64).unwrap();
+    let loss = graph.mean_squared_error(p, t).unwrap();
+    assert_eq!(
+        assess(&graph, graph.node(loss).unwrap()),
+        TensorOperationSupport::Supported {
+            route: TensorExecutionRoute::Library,
+            workspace_bytes: Some(520)
+        }
+    );
+    let source = super::lower_native_mse_to_hip_source(&graph, loss).unwrap();
+    assert!(source.contains("const double *prediction"));
+    assert!(source.contains("volatile double difference"));
+    assert!(!source.contains("*status"));
+    assert!(super::super::mse_scratch_length_fits_scalar(65, PcuScalarType::F64, 520).unwrap());
+    assert!(!super::super::mse_scratch_length_fits_scalar(65, PcuScalarType::F64, 519).unwrap());
+    assert!(
+        super::super::mse_scratch_length_fits_scalar(usize::MAX, PcuScalarType::F64, usize::MAX)
+            .is_err()
+    );
+    assert_eq!(
+        super::super::mse_scale_f64(65).unwrap().to_bits(),
+        0x3f8f_81f8_1f81_f820
+    );
+    assert!(super::super::mse_scale_f64(0).is_err());
+    graph
+        .set_value_numerical_options(loss, PcuNumericalOptions::default())
+        .unwrap();
+    assert!(super::lower_native_mse_to_hip_source(&graph, loss).is_err());
+}

@@ -12,6 +12,7 @@ fn kernel<'a>(
     bindings: &'a [PcuBinding<'a>],
 ) -> PcuDispatchKernelIr<'a> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(1),
         entry: PcuDispatchEntryPoint {
             name: "checked_integer_test",
@@ -53,6 +54,14 @@ fn lowers_checked_integer_binary_with_width_safe_guards_for_all_integer_widths()
 }
 
 fn lower_checked_map(scalar: fusion_pcu::PcuScalarType, op: PcuDispatchIntegerBinaryOp) -> String {
+    lower_checked_map_with_range(scalar, op, fusion_pcu::PcuRangePolicy::Reject)
+}
+
+fn lower_checked_map_with_range(
+    scalar: fusion_pcu::PcuScalarType,
+    op: PcuDispatchIntegerBinaryOp,
+    range_policy: fusion_pcu::PcuRangePolicy,
+) -> String {
     let ty = PcuValueType::Scalar(scalar);
     let bindings = [
         PcuBinding::value(
@@ -92,6 +101,7 @@ fn lower_checked_map(scalar: fusion_pcu::PcuScalarType, op: PcuDispatchIntegerBi
             index: PcuDispatchIndex::InvocationId,
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            range_policy,
             value_type: ty,
             op,
             result: PcuDispatchValueId(3),
@@ -105,8 +115,22 @@ fn lower_checked_map(scalar: fusion_pcu::PcuScalarType, op: PcuDispatchIntegerBi
         }),
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
-    let source = lower_dispatch_to_cuda_source(&kernel(&ops, &bindings))
+    let mut ir = kernel(&ops, &bindings);
+    ir.numerical_requirements.range_policy = range_policy;
+    let source = lower_dispatch_to_cuda_source(&ir)
         .unwrap_or_else(|error| panic!("{scalar:?} checked {op:?} rejected: {error:?}"));
+    let mut portable = ir;
+    portable
+        .numerical_requirements
+        .numerical_options
+        .reproducibility = fusion_pcu::PcuReproducibility::PortableV1;
+    assert!(fusion_pcu::describe_portable_v1_integer_map(&portable).is_ok());
+    assert!(crate::admission::checked_numeric_contract(&portable));
+    let portable_source = lower_dispatch_to_cuda_source(&portable).unwrap();
+    assert_eq!(
+        source.split_once('\n').unwrap().1,
+        portable_source.split_once('\n').unwrap().1
+    );
     assert!(source.contains("unsigned long long* fusion_fault_word"));
     assert!(source.contains("return;"));
     assert!(source.contains("binding_0_2[fusion_gid] = v3;"));
@@ -212,6 +236,7 @@ fn checked_integer_binary_rejects_type_and_binding_mismatches() {
             index: PcuDispatchIndex::InvocationId,
         }),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            range_policy: fusion_pcu::PcuRangePolicy::Reject,
             value_type: PcuValueType::Scalar(PcuScalarType::U32),
             op: PcuDispatchIntegerBinaryOp::Add,
             result: PcuDispatchValueId(3),
@@ -320,6 +345,68 @@ fn guarded_i64_and_u64_classification_matches_checked_arithmetic_at_boundaries()
                     _ => unreachable!(),
                 });
                 assert_eq!(u64_tag(lhs, rhs, op), expected, "u64 {lhs} {op:?} {rhs}");
+            }
+        }
+    }
+}
+
+#[test]
+fn wide_integer_guards_use_explicit_limbs_without_native128_or_float_fallback() {
+    for scalar in [
+        fusion_pcu::PcuScalarType::I128,
+        fusion_pcu::PcuScalarType::U128,
+        fusion_pcu::PcuScalarType::I256,
+        fusion_pcu::PcuScalarType::U256,
+        fusion_pcu::PcuScalarType::I512,
+        fusion_pcu::PcuScalarType::U512,
+    ] {
+        for op in [
+            PcuDispatchIntegerBinaryOp::Add,
+            PcuDispatchIntegerBinaryOp::Sub,
+            PcuDispatchIntegerBinaryOp::Mul,
+        ] {
+            let source = lower_checked_map(scalar, op);
+            assert!(source.contains("fusion_checked_wide_binary(v1, v2"));
+            assert!(source.contains("product[D*2u]"));
+            assert!(source.contains("fusion_checked_wide_3.fault"));
+            assert!(!source.contains("__int128"));
+            assert!(!source.contains("float v3"));
+        }
+    }
+}
+
+#[test]
+fn integer_clamp_emits_saturated_endpoint_and_first_recovered_status_for_all_widths() {
+    use fusion_pcu::{PcuRangePolicy, PcuScalarType};
+    for scalar in [
+        PcuScalarType::I8,
+        PcuScalarType::U8,
+        PcuScalarType::I16,
+        PcuScalarType::U16,
+        PcuScalarType::I32,
+        PcuScalarType::U32,
+        PcuScalarType::I64,
+        PcuScalarType::U64,
+        PcuScalarType::I128,
+        PcuScalarType::U128,
+        PcuScalarType::I256,
+        PcuScalarType::U256,
+        PcuScalarType::I512,
+        PcuScalarType::U512,
+    ] {
+        for op in [
+            PcuDispatchIntegerBinaryOp::Add,
+            PcuDispatchIntegerBinaryOp::Sub,
+            PcuDispatchIntegerBinaryOp::Mul,
+        ] {
+            let source = lower_checked_map_with_range(scalar, op, PcuRangePolicy::Clamp);
+            assert!(source.contains("bool fusion_range_fault_recorded = false;"));
+            assert!(source.contains("0x8000000000000000ull"));
+            assert!(source.contains("!fusion_range_fault_recorded"));
+            if scalar.bit_width() >= 128 {
+                assert!(source.contains("fusion_wide_saturate<FusionBits"));
+            } else {
+                assert!(source.contains("fusion_integer_fault_3 == 0u ? static_cast"));
             }
         }
     }

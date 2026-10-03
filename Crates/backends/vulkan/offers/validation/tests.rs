@@ -48,6 +48,7 @@ fn fixture(run: impl FnOnce(PcuDispatchKernelIr<'_>)) {
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     run(PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(1),
         entry: PcuDispatchEntryPoint {
             name: "offer",

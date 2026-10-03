@@ -317,6 +317,7 @@ fn with_kernel<T: PcuCheckedInteger, R>(
         load(0),
         load(1),
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+            range_policy: pcu_facade::PcuRangePolicy::Reject,
             value_type: PcuValueType::Scalar(T::TYPE),
             op: profile.op,
             result: PcuDispatchValueId(3),
@@ -344,6 +345,7 @@ fn with_kernel<T: PcuCheckedInteger, R>(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     callback(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(80),
         entry: PcuDispatchEntryPoint {
             name: "integer",
@@ -726,6 +728,14 @@ fn check_offers<T: PcuCheckedInteger>(ids: &mut std::vec::Vec<u32>) {
             };
             for mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
                 request.requirements.numerical_mode = mode;
+                let kernel = PcuDispatchKernelIr {
+                    numerical_requirements: request.requirements,
+                    ..*request.operation
+                };
+                let request = PcuImplementationRequest {
+                    operation: &kernel,
+                    ..request
+                };
                 let mut output = [None; 2];
                 assert_eq!(offers.implementation_offers(&request, &mut output), Ok(1));
                 let offer = output[0].unwrap();
@@ -740,6 +750,7 @@ fn check_offers<T: PcuCheckedInteger>(ids: &mut std::vec::Vec<u32>) {
                     ids.push(offer.implementation.local_id);
                 }
             }
+            request.requirements.numerical_mode = PcuNumericalMode::Boundary;
             assert_eq!(offers.implementation_offers(&request, &mut []), Ok(1));
             let mut output = [None];
             request.boundary = PcuCostBoundary::Resident;

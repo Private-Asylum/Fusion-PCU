@@ -33,3 +33,51 @@ path = "tests/checked_float_rejection/checked_float_rejection.rs"
 [[test]]
 name = "bit_map"
 path = "tests/bit_map/bit_map.rs"
+
+[[test]]
+name = "checked_binary"
+path = "tests/checked_binary/checked_binary.rs"
+
+[[test]]
+name="checked_unary"
+path="tests/checked_unary/checked_unary.rs"
+
+[[test]]
+name="scalar_transport"
+path="tests/scalar_transport/scalar_transport.rs"
+
+[[test]]
+name="checked_integer"
+path="tests/checked_integer/checked_integer.rs"
+
+[[test]]
+name="checked_div_rem"
+path="tests/checked_div_rem/checked_div_rem.rs"
+
+[[test]]
+name="operand_schema"
+path="tests/operand_schema/operand_schema.rs"
+
+[[test]]
+name="checked_conversion"
+path="tests/checked_conversion/checked_conversion.rs"
+
+[[test]]
+name="cold_constants"
+path="tests/cold_constants/cold_constants.rs"
+
+[[test]]
+name="integer_operands"
+path="tests/integer_operands/integer_operands.rs"
+
+[[test]]
+name="div_rem_roles"
+path="tests/div_rem_roles/div_rem_roles.rs"
+
+[[test]]
+name="portable_div_rem"
+path="tests/portable_div_rem/portable_div_rem.rs"
+
+[[test]]
+name = "ordered_transport"
+path = "tests/ordered_transport/ordered_transport.rs"

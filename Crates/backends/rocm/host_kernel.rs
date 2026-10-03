@@ -162,6 +162,8 @@ impl From<RocmOwnedDispatchError> for RocmHostKernelError {
 struct HostBindingSlot {
     resource: Option<RocmMemoryResource>,
     fully_written_prefix: Option<usize>,
+    // Private RAM is retained across calls; no caller output is a native copy destination.
+    readback: Option<crate::OwnedHostReadback>,
 }
 
 /// A single heterogeneous host or resident argument for the synchronous mixed-call adapter.
@@ -268,6 +270,8 @@ impl HostKernelCallArgument for RocmMixedHostArgument<'_> {
 /// Reusable `ROCm` executable and owned staging resources for typed host calls.
 pub struct RocmPreparedHostKernel {
     dispatch: RocmPreparedDispatch,
+    // Original source declarations, including cold-proved unread zero-byte inputs.
+    argument_requirements: Vec<PcuOwnedBindingRequirement>,
     memory: RocmMemoryProvider,
     pool: PcuMemoryPoolId,
     fault_word: Option<DeviceBuffer>,
@@ -276,6 +280,39 @@ pub struct RocmPreparedHostKernel {
     bindings: Vec<PcuOwnedBinding<DeviceBuffer>>,
     poisoned: bool,
     last_call_completion_uncertain: bool,
+    last_call_may_have_written: bool,
+    #[cfg(test)]
+    fail_readback_at: Option<usize>,
+}
+
+// Called only after backend structural admission. Original source type/access metadata
+// survives device-ABI projection; zero extent comes exclusively from the detached schema.
+fn host_declaration_requirements(
+    kernel: &PcuDispatchKernelIr<'_>,
+    shape: PcuInvocationShape,
+) -> Result<Vec<PcuOwnedBindingRequirement>, RocmOwnedDispatchError> {
+    let operands = crate::codegen::lower::map_binding_projection(kernel);
+    kernel
+        .bindings
+        .iter()
+        .map(|binding| {
+            let mut requirement = PcuOwnedBindingRequirement::from_verified_binding(
+                kernel,
+                binding.reference(),
+                shape,
+            )?;
+            // The generic minimum helper is conservative for an unread declaration.
+            // Caller-provided empty bytes never prove that a binding is unread.
+            if operands.is_some_and(|schema| {
+                !schema.contains_output(binding.reference())
+                    && !schema.input_bindings().contains(&binding.reference())
+            }) {
+                requirement.min_required_bytes = 0;
+            }
+            Ok(requirement)
+        })
+        .collect::<Result<Vec<_>, fusion_pcu::PcuOwnedDispatchBindingError>>()
+        .map_err(RocmOwnedDispatchError::Binding)
 }
 
 impl PcuHostKernelBackend for RocmOwnedDispatchBackend {
@@ -296,6 +333,7 @@ impl PcuHostKernelBackend for RocmOwnedDispatchBackend {
         let shape = PcuInvocationShape::invocations(invocations);
         let dispatch =
             self.prepare_dispatch(fusion_pcu::PcuDispatchSubmission { kernel, shape })?;
+        let argument_requirements = host_declaration_requirements(kernel, shape)?;
         let binding_count = dispatch.binding_schema().len();
         // This follows backend SSA/type/geometry admission. Each staging slot has independent
         // backing, so a different binding cannot alias a proven output behind the analysis.
@@ -314,6 +352,7 @@ impl PcuHostKernelBackend for RocmOwnedDispatchBackend {
                 Ok(HostBindingSlot {
                     resource: None,
                     fully_written_prefix,
+                    readback: None,
                 })
             })
             .collect::<Result<Vec<_>, RocmHostKernelError>>()?;
@@ -331,6 +370,7 @@ impl PcuHostKernelBackend for RocmOwnedDispatchBackend {
         };
         Ok(RocmPreparedHostKernel {
             dispatch,
+            argument_requirements,
             memory: self.memory_provider(pool),
             pool,
             fault_word,
@@ -339,6 +379,9 @@ impl PcuHostKernelBackend for RocmOwnedDispatchBackend {
             bindings: Vec::with_capacity(binding_count),
             poisoned: false,
             last_call_completion_uncertain: false,
+            last_call_may_have_written: false,
+            #[cfg(test)]
+            fail_readback_at: None,
         })
     }
 }
@@ -369,24 +412,38 @@ impl RocmPreparedHostKernel {
         self.last_call_completion_uncertain
     }
 
+    /// Whether the most recent call reached submission that could modify a device output.
+    ///
+    /// Argument validation and staging failures leave this false. A launch or completion
+    /// failure is conservatively true unless it was classified as certainly prelaunch.
+    /// Terminal arithmetic faults remain true even when completion is certain; callers must
+    /// discard mutable resident results separately from uncertain-completion quarantine.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn last_call_may_have_written(&self) -> bool {
+        self.last_call_may_have_written
+    }
+
     #[allow(clippy::too_many_lines)]
     fn call_arguments<A: HostKernelCallArgument>(
         &mut self,
         arguments: &mut [A],
     ) -> Result<(), RocmHostKernelError> {
         self.last_call_completion_uncertain = false;
+        self.last_call_may_have_written = false;
         if self.poisoned {
             return Err(RocmHostKernelError::PoisonedAfterUncertainCompletion);
         }
         // A non-poisoned executable must not retain borrows/resources from an earlier call. The
         // uncertain path is poisoned above and deliberately keeps its submission leases alive.
         self.bindings.clear();
+        readback::clear(&mut self.slots);
         if cfg!(target_endian = "big") {
             return Err(RocmHostKernelError::BigEndianHostUnsupported);
         }
 
         let requirements = self.dispatch.binding_schema();
-        validate_call_arguments(requirements, arguments, Some(&self.memory))?;
+        validate_call_arguments(&self.argument_requirements, arguments, Some(&self.memory))?;
 
         // Grow every host slot before any transfer. Resident resources are borrowed directly and
         // do not consume a staging allocation.
@@ -399,7 +456,12 @@ impl RocmPreparedHostKernel {
             let Some(bytes) = argument.host_bytes() else {
                 continue;
             };
-            let required_size = u64::try_from(bytes.len())
+            // Caller coverage was checked against its full view above. A cold-proved complete
+            // writer needs only its initialized prefix in private staging: no device operation
+            // reads the caller's tail, and successful readback preserves that tail in place.
+            // Resident resources keep their original capacities and do not enter this branch.
+            let staging_bytes = self.slots[slot].fully_written_prefix.unwrap_or(bytes.len());
+            let required_size = u64::try_from(staging_bytes)
                 .map_err(|_| RocmHostKernelError::BufferSizeOverflow(requirement.target))?;
             let needs_growth = self.slots[slot]
                 .resource
@@ -453,6 +515,15 @@ impl RocmPreparedHostKernel {
                 // If the synchronous copy could not prove quiescence, dropping this owner leaves
                 // the existing allocation lease quarantined. A later call allocates a fresh
                 // staging slot instead of repeatedly hitting that quarantined gate.
+                if self.slots[slot].resource.as_ref().is_some_and(|resource| {
+                    resource
+                        .device_buffer()
+                        .validate_access_available()
+                        .is_err()
+                }) {
+                    self.poisoned = true;
+                    self.last_call_completion_uncertain = true;
+                }
                 self.slots[slot].resource = None;
                 return Err(RocmHostKernelError::Memory(error));
             }
@@ -482,6 +553,9 @@ impl RocmPreparedHostKernel {
             ));
         }
 
+        // Staging writes only private host-slot storage. This is the first operation that may
+        // write a borrowed resident destination; retain that fact through terminal fault/error.
+        self.last_call_may_have_written = true;
         let submission = if let Some(fault_word) = self.fault_word.as_mut() {
             let reset_fault_word = self.fault_word_state.begin_submission();
             self.dispatch
@@ -493,6 +567,7 @@ impl RocmPreparedHostKernel {
             Ok(completion) => completion,
             Err(error) => {
                 if is_certain_prelaunch_error(&error) {
+                    self.last_call_may_have_written = false;
                     self.bindings.clear();
                     return Err(error.into());
                 }
@@ -524,34 +599,44 @@ impl RocmPreparedHostKernel {
             }
         };
 
-        for (slot, requirement) in requirements.iter().enumerate() {
-            let Some(argument) = arguments
-                .iter_mut()
-                .find(|argument| argument.target() == requirement.target)
-            else {
-                unreachable!("coverage validated above")
-            };
-            let Some(bytes) = argument.host_bytes_mut() else {
-                continue;
-            };
-            let bytes = if let Some(prefix) = self.slots[slot].fully_written_prefix {
-                &mut bytes[..prefix]
-            } else {
-                bytes
-            };
-            let transfer = self.memory.transfer_from(
-                self.slots[slot]
-                    .resource
-                    .as_ref()
-                    .expect("host slot allocated above"),
-                0,
-                bytes,
-            );
-            if let Err(error) = transfer {
-                self.slots[slot].resource = None;
-                return Err(RocmHostKernelError::Memory(error));
-            }
-        }
+        readback::stage_and_publish(
+            &mut self.slots,
+            requirements,
+            arguments,
+            |slot_index, slot, span| {
+                #[cfg(not(test))]
+                let _ = slot_index;
+                #[cfg(test)]
+                if self.fail_readback_at == Some(slot_index) {
+                    // Deterministic test-only refusal after earlier real private readbacks.
+                    // No driver failure or unknown completion is injected.
+                    return Err(RocmHostKernelError::Memory(
+                        fusion_pcu::PcuMemoryProviderError {
+                            pool: self.pool,
+                            operation: PcuMemoryProviderOperation::TransferFrom,
+                            disposition: fusion_pcu::PcuMemoryDisposition::Reject,
+                            failure: fusion_pcu::PcuMemoryProviderFailure::BackendFailure,
+                        },
+                    ));
+                }
+                let transfer = self.memory.readback_owned(
+                    slot.resource.as_ref().expect("host slot allocated above"),
+                    0,
+                    span,
+                );
+                match transfer {
+                    Ok(ticket) => slot.readback = Some(ticket),
+                    Err(error) => {
+                        if readback::retire_after_transfer_failure(slot) {
+                            self.poisoned = true;
+                            self.last_call_completion_uncertain = true;
+                        }
+                        return Err(RocmHostKernelError::Memory(error));
+                    }
+                }
+                Ok(())
+            },
+        )?;
         if let Some(fault) = recovered_fault {
             return Err(RocmHostKernelError::CheckedExecutionFault(fault));
         }
@@ -598,6 +683,11 @@ fn validate_call_arguments<A: HostKernelCallArgument>(
         }
         if !access_satisfies(argument.access(), requirement.access) {
             return Err(RocmHostKernelError::AccessMismatch(target));
+        }
+        // Zero extent is verified from unused readonly IR, not inferred from caller bytes.
+        // Do not borrow/probe foreign, discarded or uncertain resident owners for unread input.
+        if requirement.min_required_bytes == 0 && requirement.access == PcuBindingAccess::ReadOnly {
+            continue;
         }
         let actual_bytes = if let Some(bytes) = argument.host_bytes() {
             bytes.len()
@@ -651,11 +741,31 @@ fn validate_call_arguments<A: HostKernelCallArgument>(
             return Err(RocmHostKernelError::MissingArgument(required.target));
         }
     }
+    validate_resident_overlap(requirements, arguments)
+}
+
+fn validate_resident_overlap<A: HostKernelCallArgument>(
+    requirements: &[PcuOwnedBindingRequirement],
+    arguments: &[A],
+) -> Result<(), RocmHostKernelError> {
     for (index, argument) in arguments.iter().enumerate() {
+        let unread = |target| {
+            requirements.iter().any(|requirement| {
+                requirement.target == target
+                    && requirement.min_required_bytes == 0
+                    && requirement.access == PcuBindingAccess::ReadOnly
+            })
+        };
+        if unread(argument.target()) {
+            continue;
+        }
         let Some(resource) = argument.resident_resource() else {
             continue;
         };
         for other in &arguments[index + 1..] {
+            if unread(other.target()) {
+                continue;
+            }
             let Some(other_resource) = other.resident_resource() else {
                 continue;
             };
@@ -851,3 +961,22 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "tensor"))]
+#[path = "host_kernel/operand_tests.rs"]
+mod operand_tests;
+
+#[cfg(all(test, feature = "tensor"))]
+#[path = "host_kernel/staging_tests.rs"]
+mod staging_tests;
+
+#[cfg(all(test, feature = "tensor"))]
+#[path = "host_kernel/mutable_tests.rs"]
+mod mutable_tests;
+
+#[cfg(all(test, feature = "tensor"))]
+#[path = "host_kernel/transport_tests.rs"]
+mod transport_tests;
+
+#[path = "host_kernel/readback/readback.rs"]
+mod readback;

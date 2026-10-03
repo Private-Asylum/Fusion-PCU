@@ -75,6 +75,39 @@ const BINARY_BINDINGS: &[PcuBinding<'static>] = &[
     ),
 ];
 
+const MSE_OPS: &[PcuDispatchOp<'static>] = &[
+    PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+        result: LEFT,
+        binding: LEFT_REF,
+        index: PcuDispatchIndex::InvocationId,
+    }),
+    PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+        result: RIGHT,
+        binding: RIGHT_REF,
+        index: PcuDispatchIndex::InvocationId,
+    }),
+    PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+        value_type: fusion_pcu::PcuValueType::f64(),
+        result: RESULT,
+        op: fusion_pcu::PcuDispatchAluOp::Sub,
+        lhs: LEFT,
+        rhs: RIGHT,
+    }),
+    PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
+        value_type: fusion_pcu::PcuValueType::f64(),
+        result: EPILOGUE_RESULT,
+        op: fusion_pcu::PcuDispatchAluOp::Mul,
+        lhs: RESULT,
+        rhs: RESULT,
+    }),
+    PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore {
+        binding: OUTPUT_REF,
+        index: PcuDispatchIndex::InvocationId,
+        value: EPILOGUE_RESULT,
+    }),
+    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+];
+
 const RELU_BINDINGS: &[PcuBinding<'static>] = &[
     PcuBinding::value(
         Some("input"),
@@ -320,6 +353,7 @@ pub(super) fn consuming_binary_kernel(
     let (name, base_id, bindings, ops, type_caps) =
         consuming_binary_profile(scalar_type, operation, donor_operand);
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(base_id),
         entry: PcuDispatchEntryPoint {
             name,
@@ -497,6 +531,7 @@ pub(super) fn consuming_relu_kernel(
         _ => panic!("checked integer tensors cannot use consuming ReLU profiles"),
     };
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(id),
         entry: PcuDispatchEntryPoint {
             name,
@@ -753,12 +788,14 @@ pub(super) fn kernel(
             ("tensor_relu_f64", 0x4644_0040, RELU_BINDINGS, RELU_OPS)
         }
         TensorDispatchKind::Relu => return Err(CudaTensorExecutionError::InvalidPointwiseProfile),
-        TensorDispatchKind::SquaredDifference => {
-            return Err(CudaTensorExecutionError::UnsupportedScalarType(
-                fusion_pcu::PcuScalarType::F64,
-            ));
-        }
-        TensorDispatchKind::CheckedIntegerAdd
+        TensorDispatchKind::SquaredDifference if scalar_mask == 0 => (
+            "tensor_native_mse_squared_difference_f64",
+            0x464d_5345,
+            BINARY_BINDINGS,
+            MSE_OPS,
+        ),
+        TensorDispatchKind::SquaredDifference
+        | TensorDispatchKind::CheckedIntegerAdd
         | TensorDispatchKind::CheckedIntegerSub
         | TensorDispatchKind::CheckedIntegerMul
         | TensorDispatchKind::CheckedFloatAdd
@@ -770,6 +807,7 @@ pub(super) fn kernel(
     };
 
     Ok(PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(id),
         entry: PcuDispatchEntryPoint {
             name,
@@ -1140,6 +1178,7 @@ mod tests {
             fusion_pcu::PcuDispatchOp::Control(fusion_pcu::PcuDispatchControlOp::Return),
         ];
         let kernel = fusion_pcu::PcuDispatchKernelIr {
+            numerical_requirements: fusion_pcu::PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: fusion_pcu::PcuKernelId(0x4644_0050),
             entry: fusion_pcu::PcuDispatchEntryPoint {
                 name: "tensor_min_f64_hardware_test",

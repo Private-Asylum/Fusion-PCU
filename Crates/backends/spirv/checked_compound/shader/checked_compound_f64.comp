@@ -1,0 +1,239 @@
+#version 450
+// Ordered PCU Strict compounds. Scalar integer synthesis is copied exactly from
+// the qualified F64 checked binary body; no floating type or native 64-bit integer.
+// Each constituent rounds/classifies before the next; no FMA or reassociation.
+// First fault is output row-major, then increasing reduction, then named step.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint OP = 0;
+layout(constant_id=1) const uint POLICY = 0;
+layout(constant_id=2) const uint ROWS = 1;
+layout(constant_id=3) const uint INNER = 1;
+layout(constant_id=4) const uint COLUMNS = 1;
+layout(constant_id=5) const uint TRANSPOSE_LEFT = 0;
+layout(constant_id=6) const uint TRANSPOSE_RIGHT = 0;
+layout(constant_id=7) const uint FACTOR_LOW = 0;
+layout(constant_id=8) const uint FACTOR_HIGH = 0;
+layout(set=0,binding=0,std430) readonly buffer Source0 { uvec2 values[]; } source0;
+layout(set=0,binding=1,std430) readonly buffer Source1 { uvec2 values[]; } source1;
+layout(set=0,binding=2,std430) writeonly buffer Output { uvec2 values[]; } output_data;
+layout(set=0,binding=3,std430) writeonly buffer Status { uint values[]; } status_data;
+struct Result { uvec2 bits; uint status; };
+struct Parts { uint sign; uvec2 significand; int exponent; };
+bool zero(uvec2 value) { return (value.x | value.y) == 0; }
+bool ge(uvec2 a, uvec2 b) { return a.y > b.y || (a.y == b.y && a.x >= b.x); }
+uvec2 plus(uvec2 a, uvec2 b) {
+    uint low = a.x+b.x;
+    return uvec2(low,a.y+b.y+uint(low<a.x));
+}
+// Caller orders operands, so the mathematical difference is nonnegative.
+uvec2 minus(uvec2 a, uvec2 b) { return uvec2(a.x-b.x,a.y-b.y-uint(a.x<b.x)); }
+// Branches exclude U32 shift distances >=32, including every zero-distance case.
+uvec2 left(uvec2 value, uint distance) {
+    if (distance == 0) return value;
+    if (distance >= 64) return uvec2(0);
+    if (distance >= 32) return uvec2(0,value.x << (distance-32));
+    return uvec2(value.x << distance,(value.y << distance)|(value.x >> (32-distance)));
+}
+uvec2 right(uvec2 value, uint distance) {
+    if (distance == 0) return value;
+    if (distance >= 64) return uvec2(0);
+    if (distance >= 32) return uvec2(value.y >> (distance-32),0);
+    return uvec2((value.x >> distance)|(value.y << (32-distance)),value.y >> distance);
+}
+uvec2 jam(uvec2 value, uint distance) {
+    if (distance == 0) return value;
+    if (distance >= 64) return uvec2(uint(!zero(value)),0);
+    uvec2 result = right(value,distance);
+    bool discarded;
+    if (distance >= 32) {
+        uint upper = distance-32; // 0..31; zero must not shift by32 below.
+        discarded = value.x != 0 || (upper != 0 && (value.y & ((1u << upper)-1u)) != 0);
+    } else discarded = (value.x & ((1u << distance)-1u)) != 0;
+    result.x |= uint(discarded);
+    return result;
+}
+int top(uvec2 value) { return value.y != 0 ? 32+findMSB(value.y) : findMSB(value.x); }
+Result ok(uvec2 bits) { return Result(bits,0); }
+Result fault(uint status) { return Result(uvec2(0),status); }
+Parts decode(uvec2 bits) {
+    uint exponent = (bits.y >> 20)&2047u;
+    uvec2 significand = uvec2(bits.x,bits.y&0xfffffu);
+    if (exponent != 0) significand.y |= 0x100000u;
+    return Parts(bits.y>>31,significand,exponent == 0 ? -1022 : int(exponent)-1023);
+}
+bool increment(uvec2 significand,uint discarded) {
+    return discarded > 4u || (discarded == 4u && (significand.x&1u) != 0);
+}
+Result passthrough(uvec2 bits) {
+    uvec2 magnitude = uvec2(bits.x,bits.y&0x7fffffffu);
+    if (POLICY == 1 && !zero(magnitude) && magnitude.y < 0x100000u) return Result(bits,2);
+    return ok(bits);
+}
+// ext is nonzero and <2^57. Normalized ext has its top bit at55; rounding can
+// produce only bit53 in a significand. No add/shift approaches the 64-bit bound.
+// Exponents stay within [-2200,2100], safely inside I32, including subnormal inputs.
+Result pack(uint sign,uvec2 ext,int exponent) {
+    while (ext.y >= 0x1000000u) { ext = jam(ext,1); exponent += 1; }
+    while (ext.y < 0x800000u) { ext = left(ext,1); exponent -= 1; }
+    uvec2 unbounded_sig = right(ext,3);
+    if (increment(unbounded_sig,ext.x&7u)) unbounded_sig = plus(unbounded_sig,uvec2(1,0));
+    int unbounded_exp = exponent+int(unbounded_sig.y == 0x200000u);
+    bool tiny = unbounded_exp < -1022;
+    if (exponent < -1022) { ext = jam(ext,uint(-1022-exponent)); exponent = -1022; }
+    uint discarded = ext.x&7u;
+    uvec2 significand = right(ext,3);
+    bool inexact = discarded != 0;
+    if (increment(significand,discarded)) significand = plus(significand,uvec2(1,0));
+    bool subnormal = false;
+    uvec2 bits;
+    if (exponent == -1022 && significand.y < 0x100000u) {
+        bits = uvec2(significand.x,(sign << 31)|significand.y);
+        subnormal = !zero(significand);
+    } else {
+        if (significand.y >= 0x200000u) { significand = right(significand,1); exponent += 1; }
+        if (exponent > 1023) return Result(uvec2(0xffffffffu,(sign << 31)|0x7fefffffu),3);
+        bits = uvec2(significand.x,(sign << 31)|(uint(exponent+1023) << 20)|(significand.y&0xfffffu));
+    }
+    bool reject = POLICY == 0 ? (tiny && inexact) : POLICY == 1 ? (subnormal || (tiny && inexact)) : false;
+    return reject ? Result(bits,2) : ok(bits);
+}
+Result add(uvec2 a_bits,uvec2 b_bits,bool subtract) {
+    Parts a = decode(a_bits); Parts b = decode(b_bits); b.sign ^= uint(subtract);
+    if (zero(a.significand)) {
+        if (!zero(b.significand)) return passthrough(uvec2(b_bits.x,(b.sign << 31)|(b_bits.y&0x7fffffffu)));
+        return ok(uvec2(0,uint(a.sign == b.sign)*(a.sign << 31)));
+    }
+    if (zero(b.significand)) return passthrough(a_bits);
+    if (a.exponent < b.exponent) { Parts temporary = a; a = b; b = temporary; }
+    // Each extended operand <2^56; their sum <2^57, no 64-bit carry is lost.
+    uvec2 x = left(a.significand,3);
+    uvec2 y = jam(left(b.significand,3),uint(a.exponent-b.exponent));
+    uint sign; uvec2 ext;
+    if (a.sign == b.sign) { sign = a.sign; ext = plus(x,y); }
+    else if (ge(x,y)) { sign = a.sign; ext = minus(x,y); }
+    else { sign = b.sign; ext = minus(y,x); }
+    return zero(ext) ? ok(uvec2(0)) : pack(sign,ext,a.exponent);
+}
+// Exact sum of four U32 products, all nonnegative partial sums <= the final
+// 53x53-bit product (<2^106). Carry can never leave the four-limb accumulator.
+uvec4 add_word(uvec4 value,uint index,uint word) {
+    for (uint cursor=index; cursor<4 && word!=0; cursor++) {
+        uint original = value[cursor]; value[cursor] += word;
+        word = uint(value[cursor]<original);
+    }
+    return value;
+}
+uvec4 product(uvec2 a,uvec2 b) {
+    uvec4 value = uvec4(0);
+    for (uint i=0; i<2; i++) for (uint j=0; j<2; j++) {
+        uint high; uint low; umulExtended(a[i],b[j],high,low);
+        value = add_word(value,i+j,low);
+        value = add_word(value,i+j+1,high); // greatest index3, always in bounds.
+    }
+    return value;
+}
+int wide_top(uvec4 value) {
+    for (int index=3; index>=0; index--) if (value[index] != 0) return index*32+findMSB(value[index]);
+    return -1;
+}
+// Used only for distance1..50: word0..1, residual0..31; indices <=3.
+// Result has top bit55. Every discarded lower word/bit contributes sticky.
+uvec2 wide_jam(uvec4 value,uint distance) {
+    uint word = distance/32; uint residual = distance%32;
+    uvec2 result = uvec2(value[word],value[word+1]);
+    bool discarded = word != 0 && value[0] != 0;
+    if (residual != 0) {
+        result = uvec2((value[word] >> residual)|(value[word+1] << (32-residual)),
+                       (value[word+1] >> residual)|(value[word+2] << (32-residual)));
+        discarded = discarded || (value[word]&((1u << residual)-1u)) != 0;
+    }
+    result.x |= uint(discarded);
+    return result;
+}
+Result multiply(uvec2 a_bits,uvec2 b_bits) {
+    Parts a = decode(a_bits); Parts b = decode(b_bits); uint sign = a.sign^b.sign;
+    if (zero(a.significand) || zero(b.significand)) return ok(uvec2(0,sign << 31));
+    uvec4 value = product(a.significand,b.significand);
+    int highest = wide_top(value); // nonzero product: 0..105.
+    int exponent = a.exponent+b.exponent+highest-104;
+    uvec2 ext = highest > 55 ? wide_jam(value,uint(highest-55)) : left(value.xy,uint(55-highest));
+    return pack(sign,ext,exponent);
+}
+Result divide(uvec2 a_bits,uvec2 b_bits) {
+    Parts a = decode(a_bits); Parts b = decode(b_bits); uint sign = a.sign^b.sign;
+    if (zero(b.significand)) return fault(4);
+    if (zero(a.significand)) return ok(uvec2(0,sign << 31));
+    uint a_shift = uint(52-top(a.significand)); uint b_shift = uint(52-top(b.significand));
+    a.significand = left(a.significand,a_shift); a.exponent -= int(a_shift);
+    b.significand = left(b.significand,b_shift); b.exponent -= int(b_shift);
+    uvec2 remainder = a.significand; int exponent = a.exponent-b.exponent;
+    if (!ge(remainder,b.significand)) { remainder = left(remainder,1); exponent -= 1; }
+    // Divisor in[2^52,2^53), initial remainder in[d,2*d). After subtracting,
+    // remainder<d; every next shift keeps remainder<2^54. Quotient has56 bits.
+    // No integer division instruction or shift-overflow participates.
+    uvec2 quotient = uvec2(0);
+    for (uint bit=0; bit<56; bit++) {
+        quotient = left(quotient,1);
+        if (ge(remainder,b.significand)) { remainder = minus(remainder,b.significand); quotient.x |= 1; }
+        if (bit != 55) remainder = left(remainder,1);
+    }
+    quotient.x |= uint(!zero(remainder));
+    return pack(sign,quotient,exponent);
+}
+
+bool finite(uvec2 a) { return ((a.y >> 20)&2047u) != 2047u; }
+Result checked(uvec2 a,uvec2 b,uint operation) {
+ if (!finite(a)||!finite(b)) return fault(1);
+ if (operation==0) return add(a,b,false);
+ if (operation==1) return add(a,b,true);
+ if (operation==2) return multiply(a,b);
+ return divide(a,b);
+}
+bool publish_fault(uint lane,uint reduction,uint step,Result result) {
+ if (result.status==0) return false;
+ // Cold output_count*12 fits the U32 storage bound. lane*3+2 is therefore safe.
+ status_data.values[lane*3]=result.status;
+ status_data.values[lane*3+1]=reduction;
+ status_data.values[lane*3+2]=step;
+ return true;
+}
+void main() {
+ uint lane=gl_GlobalInvocationID.x;
+ if (lane>=uint(output_data.values.length())) return;
+ status_data.values[lane*3]=0; status_data.values[lane*3+1]=0; status_data.values[lane*3+2]=0;
+ uvec2 total=uvec2(0);
+ if(OP==0) {
+  Result product=checked(uvec2(FACTOR_LOW,FACTOR_HIGH),source1.values[lane],2);
+  if(publish_fault(lane,0,0,product))return;
+  Result updated=checked(source0.values[lane],product.bits,1);
+  if(publish_fault(lane,0,2,updated))return;
+  output_data.values[lane]=updated.bits; return;
+ }
+ for(uint reduction=0;reduction<INNER;reduction++) {
+  uint left_index=reduction; uint right_index=reduction;
+  if(OP==1) {
+   // Cold rows*inner,inner*columns and rows*columns fit U32 bytes. All indices
+   // below their exact native input extents; transposition changes strides only.
+   uint row=lane/COLUMNS; uint column=lane%COLUMNS;
+   left_index=TRANSPOSE_LEFT!=0?reduction*ROWS+row:row*INNER+reduction;
+   right_index=TRANSPOSE_RIGHT!=0?column*INNER+reduction:reduction*COLUMNS+column;
+  }
+  uvec2 a=source0.values[left_index]; uvec2 b=source1.values[right_index];
+  if(OP==2) {
+   Result difference=checked(a,b,1);
+   if(publish_fault(lane,reduction,2,difference))return;
+   a=difference.bits; b=difference.bits;
+  }
+  Result product=checked(a,b,2);
+  if(publish_fault(lane,reduction,0,product))return;
+  Result accumulated=checked(total,product.bits,0);
+  if(publish_fault(lane,reduction,1,accumulated))return;
+  total=accumulated.bits;
+ }
+ if(OP==2) {
+  Result mean=checked(total,uvec2(FACTOR_LOW,FACTOR_HIGH),3);
+  if(publish_fault(lane,INNER,3,mean))return;
+  total=mean.bits;
+ }
+ output_data.values[lane]=total;
+}

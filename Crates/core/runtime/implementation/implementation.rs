@@ -32,6 +32,20 @@ pub struct PcuImplementationRequirements {
     pub range_policy: PcuRangePolicy,
 }
 
+impl PcuImplementationRequirements {
+    /// Canonical checked boundary requirements, also usable in constant IR declarations.
+    pub const DEFAULT: Self = Self {
+        numerical_mode: PcuNumericalMode::Boundary,
+        numerical_options: PcuNumericalOptions {
+            compound_arithmetic: crate::PcuCompoundArithmeticPolicy::Checked,
+            precision: crate::PcuPrecisionPolicy::Preserve,
+            reproducibility: crate::PcuReproducibility::Unspecified,
+        },
+        float_underflow: PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        range_policy: PcuRangePolicy::Reject,
+    };
+}
+
 /// Concrete identity of an implementation within a discovered device snapshot.
 ///
 /// `local_id` names a provider-defined kernel, library algorithm or delegated implementation.
@@ -81,6 +95,19 @@ pub enum PcuCostBoundary {
     Resident,
     /// Ordinary host inputs through terminal host output publication, including staging.
     Host,
+    /// All selected inputs begin in host memory; the terminal output remains resident.
+    ///
+    /// Includes required input staging, execution, completion and publication of the escaped
+    /// resident owner. It excludes later explicit host readback and owner destruction. This
+    /// differs from both a fully resident operation and a full host-output boundary.
+    HostInputsResidentOutput,
+    /// Selected inputs mix host memory and already-resident resources; output remains resident.
+    ///
+    /// Includes the required host-input staging, execution, completion and escaped-owner
+    /// publication. Resident inputs retain their required leases/affinity; this boundary is
+    /// not permission to import or migrate them. Later readback/destruction is excluded.
+    /// Cost evidence must additionally identify which inputs were staged and their extents.
+    MixedInputsResidentOutput,
 }
 
 /// Cold cost facts for one concrete admitted operation and resource boundary.
@@ -124,6 +151,27 @@ pub struct PcuImplementationRequest<'a, O: ?Sized> {
     pub requirements: PcuImplementationRequirements,
     pub boundary: PcuCostBoundary,
     pub operation: &'a O,
+}
+
+impl<'a, 'ir> PcuImplementationRequest<'a, crate::PcuDispatchKernelIr<'ir>> {
+    /// Borrows the complete dispatch contract without reconstructing its numerical tuple.
+    ///
+    /// This is a cold descriptive request, not device admission or an executable handle.
+    #[must_use]
+    pub const fn for_dispatch(
+        device: PcuDeviceIdentity,
+        executor: PcuExecutorId,
+        boundary: PcuCostBoundary,
+        operation: &'a crate::PcuDispatchKernelIr<'ir>,
+    ) -> Self {
+        Self {
+            device,
+            executor,
+            requirements: operation.numerical_requirements,
+            boundary,
+            operation,
+        }
+    }
 }
 
 /// An implementation admitted for the entire concrete request supplied to its query.

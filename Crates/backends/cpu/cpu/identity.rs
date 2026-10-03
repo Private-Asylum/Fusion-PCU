@@ -5,8 +5,10 @@ use fusion_pcu::{
     validate_host_scalar_bindings,
     validate_parameters,
     validate_scalar_identity_kernel,
+    validate_scalar_broadcast_kernel,
     PcuBindingRef,
     PcuDispatchDataOp,
+    PcuDispatchIndex,
     PcuDispatchOp,
     PcuDispatchSubmission,
     PcuHostScalarBinding,
@@ -21,6 +23,7 @@ use fusion_pcu::{
 /// Failure to execute a typed scalar identity copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuScalarIdentityReferenceError {
+    UnsupportedNumericalRequirements,
     InvalidSubmission,
     InvalidKernel(PcuScalarIdentityValidationError),
     MissingBinding(PcuBindingRef),
@@ -42,17 +45,38 @@ unsafe impl<T: PcuScalar> PcuSynchronousHostDispatchBackend<T> for PcuScalarIden
         bindings: &mut [PcuHostScalarBinding<'_, T>],
         parameters: PcuInvocationParameters<'_>,
     ) -> Result<(), Self::Error> {
+        if submission
+            .kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            == fusion_pcu::PcuReproducibility::PortableV1
+        {
+            return Err(PcuScalarIdentityReferenceError::UnsupportedNumericalRequirements);
+        }
         validate_host_scalar_bindings::<T, ()>(submission, bindings)
             .map_err(|_| PcuScalarIdentityReferenceError::InvalidSubmission)?;
         validate_parameters(submission.kernel.signature(), parameters)
             .map_err(|_| PcuScalarIdentityReferenceError::InvalidSubmission)?;
-        validate_scalar_identity_kernel(submission.kernel, T::TYPE)
-            .map_err(PcuScalarIdentityReferenceError::InvalidKernel)?;
+
         let width = submission.shape.invocation_count().get() as usize;
         let (body, extent) = match submission.kernel.ops {
             [PcuDispatchOp::GridStrideLoop { extent, body }, _] => (*body, *extent as usize),
             ops => (ops, width),
         };
+        let broadcast = matches!(
+            body.first(),
+            Some(PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad {
+                index: PcuDispatchIndex::BindingElementZero,
+                ..
+            }))
+        );
+        let validation = if broadcast {
+            validate_scalar_broadcast_kernel(submission.kernel, T::TYPE)
+        } else {
+            validate_scalar_identity_kernel(submission.kernel, T::TYPE)
+        };
+        validation.map_err(PcuScalarIdentityReferenceError::InvalidKernel)?;
         let PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { binding: input, .. }) = body[0]
         else {
             unreachable!("validated identity begins with one load")
@@ -71,14 +95,14 @@ unsafe impl<T: PcuScalar> PcuSynchronousHostDispatchBackend<T> for PcuScalarIden
             .iter()
             .position(|binding| binding.target == output)
             .ok_or(PcuScalarIdentityReferenceError::MissingBinding(output))?;
-        // The admitted profile has no effects beyond the dense copy. A nonzero grid stride
+        // The admitted profile only repeats or copies representation bits. A nonzero grid stride
         // covers exactly the same prefix once; it needs no per-invocation interpreter loop.
         if input_index < output_index {
             let (before, after) = bindings.split_at_mut(output_index);
-            copy_prefix(&before[input_index], &mut after[0], extent)?;
+            copy_prefix(&before[input_index], &mut after[0], extent, broadcast)?;
         } else {
             let (before, after) = bindings.split_at_mut(input_index);
-            copy_prefix(&after[0], &mut before[output_index], extent)?;
+            copy_prefix(&after[0], &mut before[output_index], extent, broadcast)?;
         }
         Ok(())
     }
@@ -88,6 +112,7 @@ fn copy_prefix<T: PcuScalar>(
     source: &PcuHostScalarBinding<'_, T>,
     destination: &mut PcuHostScalarBinding<'_, T>,
     extent: usize,
+    broadcast: bool,
 ) -> Result<(), PcuScalarIdentityReferenceError> {
     let source = match &source.slice {
         PcuHostScalarSlice::Read(slice) => *slice,
@@ -98,7 +123,11 @@ fn copy_prefix<T: PcuScalar>(
             destination.target,
         ));
     };
-    output[..extent].copy_from_slice(&source[..extent]);
+    if broadcast {
+        output[..extent].fill(source[0]);
+    } else {
+        output[..extent].copy_from_slice(&source[..extent]);
+    }
     Ok(())
 }
 
@@ -183,6 +212,7 @@ mod tests {
                 PcuDispatchOp::Control(PcuDispatchControlOp::Return),
             ];
             let kernel = PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId(1),
                 entry: PcuDispatchEntryPoint {
                     name: "identity",

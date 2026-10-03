@@ -1,4 +1,4 @@
-//! Bounded admission for checked binary32 and binary64 maps.
+//! Bounded structural admission for checked scalar floating-point maps.
 
 #[rustfmt::skip]
 use crate::{
@@ -33,18 +33,19 @@ pub enum CheckedFloatBinaryMapValidationError {
     MissingReturn,
 }
 
-/// Validates a checked binary32 or binary64 Add/Sub/Mul indexed map and its frozen underflow policy.
+/// Validates a checked Add/Sub/Mul/Div indexed map and its frozen underflow policy.
 ///
 /// Two read-only value bindings feed one writable value binding. The body consists of two
 /// homogeneous scalar loads, exactly one checked binary operation and one matching store, followed by Return.
 /// It may execute directly using `InvocationId` or inside one `GridStrideLoop` using
 /// `GridStrideId`. Input loads may use `BindingElementZero` for broadcast. `scalar_caps` is the backend's
-/// direct value-type floor; this profile never admits half, vector, or matrix arithmetic.
+/// direct value-type floor. Binary16/32/64 and named BF16/OFP8 formats have a checked
+/// scalar contract; vector/matrix and wide-float arithmetic are outside this profile.
+/// Structural validation does not establish an executable backend implementation.
 ///
 /// # Errors
 ///
 /// Returns the first interface, capability, binding, operation, indexing, or SSA failure.
-#[allow(clippy::too_many_lines)]
 pub fn validate_checked_float_binary_kernel(
     kernel: &PcuDispatchKernelIr<'_>,
     value_type: PcuValueType,
@@ -52,14 +53,35 @@ pub fn validate_checked_float_binary_kernel(
     underflow_policy: PcuFloatUnderflowPolicy,
     scalar_caps: PcuValueTypeCaps,
 ) -> Result<(), CheckedFloatBinaryMapValidationError> {
-    let required_scalar_cap = if value_type == PcuValueType::f32() {
-        PcuValueTypeCaps::FLOAT32
-    } else if value_type == PcuValueType::f64() {
-        PcuValueTypeCaps::FLOAT64
-    } else {
-        return Err(CheckedFloatBinaryMapValidationError::UnsupportedRequirements);
+    validate_canonical_binary_kernel(kernel, value_type, op, underflow_policy, scalar_caps, false)
+}
+
+// The legacy distinct-input profile stays narrow until providers explicitly adopt the
+// detached operand schema. Broadening structural admission alone is not executable proof.
+#[allow(clippy::too_many_lines)] // One cold profile validates the complete interface, body and SSA.
+fn validate_canonical_binary_kernel(
+    kernel: &PcuDispatchKernelIr<'_>,
+    value_type: PcuValueType,
+    op: PcuDispatchFloatBinaryOp,
+    underflow_policy: PcuFloatUnderflowPolicy,
+    scalar_caps: PcuValueTypeCaps,
+    repeated_loads: bool,
+) -> Result<(), CheckedFloatBinaryMapValidationError> {
+    let required_scalar_cap = match value_type {
+        PcuValueType::Scalar(
+            scalar @ (crate::PcuScalarType::F16
+            | crate::PcuScalarType::BF16
+            | crate::PcuScalarType::F32
+            | crate::PcuScalarType::F64
+            | crate::PcuScalarType::F8E4M3FN
+            | crate::PcuScalarType::F8E5M2),
+        ) => PcuValueTypeCaps::for_scalar(scalar),
+        _ => return Err(CheckedFloatBinaryMapValidationError::UnsupportedRequirements),
     };
-    if !kernel.ports.is_empty() || !kernel.parameters.is_empty() || kernel.bindings.len() != 3 {
+    if !kernel.ports.is_empty()
+        || !kernel.parameters.is_empty()
+        || !(kernel.bindings.len() == 3 || repeated_loads && kernel.bindings.len() == 2)
+    {
         return Err(CheckedFloatBinaryMapValidationError::UnsupportedInterface);
     }
     let allowed_types = scalar_caps | PcuValueTypeCaps::SCALAR_VALUES;
@@ -93,12 +115,12 @@ pub fn validate_checked_float_binary_kernel(
     }
     let refs = [
         kernel.bindings[0].reference(),
-        kernel.bindings[1].reference(),
-        kernel.bindings[2].reference(),
+        kernel.bindings[kernel.bindings.len() - 2].reference(),
+        kernel.bindings[kernel.bindings.len() - 1].reference(),
     ];
     if kernel.bindings[0].access != PcuBindingAccess::ReadOnly
-        || kernel.bindings[1].access != PcuBindingAccess::ReadOnly
-        || kernel.bindings[2].access == PcuBindingAccess::ReadOnly
+        || kernel.bindings[kernel.bindings.len() - 2].access != PcuBindingAccess::ReadOnly
+        || kernel.bindings[kernel.bindings.len() - 1].access == PcuBindingAccess::ReadOnly
     {
         let bad = kernel
             .bindings
@@ -161,7 +183,7 @@ pub fn validate_checked_float_binary_kernel(
                 binding,
             ));
         };
-        if loaded[input] {
+        if loaded[input] && !repeated_loads {
             return Err(CheckedFloatBinaryMapValidationError::UnsupportedOperation(
                 position,
             ));
@@ -206,7 +228,7 @@ pub fn validate_checked_float_binary_kernel(
     if value != result {
         return Err(CheckedFloatBinaryMapValidationError::InvalidValue(value));
     }
-    if !loaded.into_iter().all(core::convert::identity) {
+    if !repeated_loads && !loaded.into_iter().all(core::convert::identity) {
         return Err(CheckedFloatBinaryMapValidationError::UnsupportedOperation(
             2,
         ));
@@ -215,6 +237,9 @@ pub fn validate_checked_float_binary_kernel(
         .map_err(|_| CheckedFloatBinaryMapValidationError::InvalidSsa)?;
     Ok(())
 }
+
+mod operand_schema;
+pub use operand_schema::*;
 
 #[cfg(test)]
 mod tests;

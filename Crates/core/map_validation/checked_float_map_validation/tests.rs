@@ -21,12 +21,14 @@ use crate::{
     PcuFloatUnderflowPolicy as Policy,
     PcuKernelId,
     PcuParameterValue,
+    PcuScalarType,
     PcuValueType,
     PcuValueTypeCaps,
 };
 
 fn fixture<'a>(bindings: &'a [PcuBinding], ops: &'a [Op<'a>]) -> PcuDispatchKernelIr<'a> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(3),
         entry: PcuDispatchEntryPoint {
             name: "checked_float_map",
@@ -148,10 +150,26 @@ fn admits_multiple_checked_nodes_constants_and_per_node_policies_for_both_widths
 }
 
 #[test]
-fn admits_checked_relu_for_direct_and_grid_stride_maps_at_both_widths() {
+fn admits_checked_relu_for_direct_and_grid_stride_maps_at_all_six_formats() {
     for (value_type, caps) in [
         (PcuValueType::f32(), PcuValueTypeCaps::FLOAT32),
         (PcuValueType::f64(), PcuValueTypeCaps::FLOAT64),
+        (
+            PcuValueType::Scalar(PcuScalarType::F16),
+            PcuValueTypeCaps::for_scalar(PcuScalarType::F16),
+        ),
+        (
+            PcuValueType::Scalar(PcuScalarType::BF16),
+            PcuValueTypeCaps::for_scalar(PcuScalarType::BF16),
+        ),
+        (
+            PcuValueType::Scalar(PcuScalarType::F8E4M3FN),
+            PcuValueTypeCaps::for_scalar(PcuScalarType::F8E4M3FN),
+        ),
+        (
+            PcuValueType::Scalar(PcuScalarType::F8E5M2),
+            PcuValueTypeCaps::for_scalar(PcuScalarType::F8E5M2),
+        ),
     ] {
         let bindings = bindings(value_type);
         let direct = [
@@ -211,6 +229,50 @@ fn admits_checked_relu_for_direct_and_grid_stride_maps_at_both_widths() {
             validate_checked_float_map_kernel(&fixture(&bindings, &grid), value_type, caps),
             Ok(())
         );
+    }
+}
+
+#[test]
+fn low_formats_require_exact_caps_and_do_not_invent_narrow_constants() {
+    for scalar in [
+        PcuScalarType::F16,
+        PcuScalarType::BF16,
+        PcuScalarType::F8E4M3FN,
+        PcuScalarType::F8E5M2,
+    ] {
+        let value_type = PcuValueType::Scalar(scalar);
+        let bindings = bindings(value_type);
+        // Existing F32/F64 parameter constants cannot stand in for a low format.
+        let body = accepted_body(value_type, PcuDispatchIndex::InvocationId);
+        let mut ops = body.to_vec();
+        ops.push(Op::Control(PcuDispatchControlOp::Return));
+        let kernel = fixture(&bindings, &ops);
+        assert_eq!(
+            validate_checked_float_map_kernel(&kernel, value_type, PcuValueTypeCaps::empty()),
+            Err(Error::UnsupportedRequirements)
+        );
+        assert_eq!(
+            validate_checked_float_map_kernel(
+                &kernel,
+                value_type,
+                PcuValueTypeCaps::for_scalar(scalar) | PcuValueTypeCaps::FLOAT64
+            ),
+            Err(Error::UnsupportedOperation(2))
+        );
+        for unsupported in [
+            PcuScalarType::F128,
+            PcuScalarType::F256,
+            PcuScalarType::I128,
+        ] {
+            assert_eq!(
+                validate_checked_float_map_kernel(
+                    &kernel,
+                    PcuValueType::Scalar(unsupported),
+                    PcuValueTypeCaps::for_scalar(unsupported)
+                ),
+                Err(Error::UnsupportedType)
+            );
+        }
     }
 }
 

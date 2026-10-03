@@ -92,12 +92,13 @@ pub enum CublasError {
 /// Host-side phase durations for one explicitly profiled SGEMM call.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CublasSgemmHostTiming {
-    /// Validation, leases, device selection, and symbol lookup.
+    /// Validation, leases, device selection, and retained function-pointer access.
     pub preflight: std::time::Duration,
     /// Time spent in the `cublasSgemm_v2` C function.
     pub cublas_call: std::time::Duration,
-    /// Time spent in `cudaDeviceSynchronize`.
-    pub device_synchronize: std::time::Duration,
+    /// Successful calls wait on the exact observed handle stream. Failed cuBLAS calls
+    /// conservatively establish device-wide quiescence. This records either completion wait.
+    pub completion_wait: std::time::Duration,
     /// Lease release or quarantine disposition after synchronization.
     pub cleanup: std::time::Duration,
 }
@@ -106,7 +107,7 @@ pub struct CublasSgemmHostTiming {
 enum SgemmPhase {
     Preflight,
     CublasCall,
-    DeviceSynchronize,
+    StreamSynchronize,
     Cleanup,
 }
 
@@ -143,7 +144,7 @@ impl SgemmTimingSink for CollectSgemmTiming<'_> {
         match phase {
             SgemmPhase::Preflight => self.0.preflight = elapsed,
             SgemmPhase::CublasCall => self.0.cublas_call = elapsed,
-            SgemmPhase::DeviceSynchronize => self.0.device_synchronize = elapsed,
+            SgemmPhase::StreamSynchronize => self.0.completion_wait = elapsed,
             SgemmPhase::Cleanup => self.0.cleanup = elapsed,
         }
     }
@@ -226,6 +227,9 @@ struct CublasHandleOwner {
     runtime: CudaRuntime,
     library: Arc<Library>,
     handle: CublasHandle,
+    vectors: crate::ffi::VectorFunctions,
+    functions: crate::ffi::BlasHandleFunctions,
+    get_stream: crate::ffi::cublas::GetStream,
     poisoned: Cell<bool>,
     sgemm: Sgemm,
     dgemm: OnceCell<Result<Dgemm, CublasError>>,
@@ -468,6 +472,17 @@ impl Cublas {
         self.dgemm_function().map(|_| ())
     }
 
+    // Error-only quarantine owns the exact queue as well as the vendor handle, library and
+    // runtime/context. Allocation leases retain data separately. A later cache/session drop
+    // cannot destroy the bound stream or code roots while completion remains unknown.
+    fn retain_unknown_completion(&self) {
+        self.owner.poisoned.set(true);
+        std::mem::forget(Rc::clone(&self.owner));
+        if let Some(stream) = &self.bound_stream {
+            std::mem::forget(stream.clone());
+        }
+    }
+
     /// Whether this handle may safely admit another operation after prior completion results.
     #[must_use]
     pub fn is_usable(&self) -> bool {
@@ -581,33 +596,28 @@ impl Cublas {
                     detail: e.to_string(),
                 }
             })?;
-            for (symbol, result) in [
-                (
-                    "cublasSdot_v2",
-                    crate::ffi::resolve_cublas_sdot_v2(&library).map(|_| ()),
-                ),
-                (
-                    "cublasSasum_v2",
-                    crate::ffi::resolve_cublas_sasum_v2(&library).map(|_| ()),
-                ),
-                (
-                    "cublasSscal_v2",
-                    crate::ffi::resolve_cublas_sscal_v2(&library).map(|_| ()),
-                ),
-                (
-                    "cublasGetPointerMode_v2",
-                    crate::ffi::resolve_cublas_get_pointer_mode_v2(&library).map(|_| ()),
-                ),
-                (
-                    "cublasSetPointerMode_v2",
-                    crate::ffi::resolve_cublas_set_pointer_mode_v2(&library).map(|_| ()),
-                ),
-            ] {
-                result.map_err(|e| CublasError::MissingSymbol {
+            // SAFETY: typed SDK declarations are paired with exact symbol names. The
+            // handle owner stores this immutable table beside its retained library owner.
+            let vectors = unsafe { crate::ffi::retain_blas_vector_functions(&library) }.map_err(
+                |(symbol, error)| CublasError::MissingSymbol {
                     symbol,
-                    detail: e.to_string(),
+                    detail: error.to_string(),
+                },
+            )?;
+            let functions =
+                crate::ffi::retain_blas_handle_functions(&library).map_err(|(symbol, error)| {
+                    CublasError::MissingSymbol {
+                        symbol,
+                        detail: error.to_string(),
+                    }
                 })?;
-            }
+            let get_stream =
+                *crate::ffi::resolve_cublas_get_stream_v2(&library).map_err(|error| {
+                    CublasError::MissingSymbol {
+                        symbol: "cublasGetStream_v2",
+                        detail: error.to_string(),
+                    }
+                })?;
             let status = unsafe { crate::ffi::call_cublas_CreateHandle(*create, &raw mut handle) };
             if status != CUBLAS_SUCCESS {
                 return Err(CublasError::Status {
@@ -615,6 +625,9 @@ impl Cublas {
                     code: status,
                 });
             }
+            // These cold configuration helpers destroy an unescaped handle on error. Transfer
+            // ownership only after successful configuration, then retain it through stream
+            // observation so each failure boundary has exactly one destruction owner.
             let configured_modes = if let Some(config) = &numerical_config {
                 Some(crate::ffi::configure_native_math_modes(
                     &library,
@@ -625,24 +638,70 @@ impl Cublas {
                 crate::ffi::configure_math_modes(&library, handle)?;
                 None
             };
-            return Ok(Self {
-                owner: Rc::new(CublasHandleOwner {
-                    runtime: runtime.clone(),
-                    library,
-                    handle,
-                    poisoned: Cell::new(false),
-                    sgemm,
-                    dgemm: OnceCell::new(),
-                    numerical_config: numerical_config.zip(configured_modes),
-                }),
+            let owner = CublasHandleOwner {
+                runtime: runtime.clone(),
+                library,
+                handle,
+                vectors,
+                functions,
+                get_stream,
+                poisoned: Cell::new(false),
+                sgemm,
+                dgemm: OnceCell::new(),
+                numerical_config: numerical_config.zip(configured_modes),
+            };
+            let result = Self {
+                owner: Rc::new(owner),
                 in_flight: Rc::new(Cell::new(0)),
                 queue_marker: Rc::new(()) as Rc<dyn Any>,
                 bound_stream: None,
-            });
+            };
+            result.verify_stream(ptr::null_mut())?;
+            return Ok(result);
         }
         Err(CublasError::LibraryUnavailable(
             last_error.unwrap_or_else(|| "no library candidates".into()),
         ))
+    }
+
+    fn verify_stream(&self, expected: *mut std::ffi::c_void) -> Result<(), CublasError> {
+        let mut actual = ptr::null_mut();
+        // SAFETY: private live handle, retained exact ABI, and writable exact host output.
+        let status = unsafe {
+            crate::ffi::call_cublas_GetStream(
+                self.owner.get_stream,
+                self.owner.handle,
+                &raw mut actual,
+            )
+        };
+        if status != CUBLAS_SUCCESS {
+            return Err(CublasError::Status {
+                operation: "cublasGetStream_v2",
+                code: status,
+            });
+        }
+        if actual != expected {
+            return Err(CublasError::DifferentStream);
+        }
+        Ok(())
+    }
+
+    fn synchronize_operation(&self, all_calls_succeeded: bool) -> Result<(), CudaError> {
+        // Successful library work uses the cold-observed handle stream. Its event waits include
+        // producers, and access leases reject unrelated outstanding users. The documentation
+        // does not guarantee that partially launched internal work after a cuBLAS status error
+        // rejoins that stream, so errors retain conservative device-wide quiescence.
+        // https://docs.nvidia.com/cuda/cublas/index.html#cublassetstream
+        // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html
+        if !all_calls_succeeded {
+            return crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
+        }
+        let stream = self
+            .bound_stream
+            .as_ref()
+            .map_or(ptr::null_mut(), |stream| stream.inner.raw);
+        // SAFETY: retained stream owner or the documented NULL stream, on this runtime's device.
+        unsafe { crate::ffi::invoke_cudaStreamSynchronize(&self.owner.runtime, stream) }
     }
 
     /// Binds this handle to a selected CUDA stream before graph operations are submitted.
@@ -664,24 +723,22 @@ impl Cublas {
         self.owner
             .runtime
             .cuda_set_device(self.owner.runtime.0.ordinal)?;
-        // SAFETY: cublasSetStream_v2 has the documented C ABI in cublas-auxiliary.h.
-        let set_stream =
-            crate::ffi::resolve_cublas_set_stream_v2(&self.owner.library).map_err(|error| {
-                CublasError::MissingSymbol {
-                    symbol: "cublasSetStream_v2",
-                    detail: error.to_string(),
-                }
-            })?;
+        let set_stream = self.owner.functions.set_stream;
         let status = unsafe {
-            crate::ffi::call_cublas_SetStream(*set_stream, self.owner.handle, stream.inner.raw)
+            crate::ffi::call_cublas_SetStream(set_stream, self.owner.handle, stream.inner.raw)
         };
         if status != CUBLAS_SUCCESS {
+            self.owner.poisoned.set(true);
             return Err(CublasError::Status {
                 operation: "cublasSetStream_v2",
                 code: status,
             });
         }
         self.bound_stream = Some(stream.clone());
+        if let Err(error) = self.verify_stream(stream.inner.raw) {
+            self.owner.poisoned.set(true);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -811,6 +868,10 @@ impl Cublas {
             )
         };
         if status != CUBLAS_SUCCESS {
+            if let Err(error) = batch.fail_external_submission() {
+                self.owner.poisoned.set(true);
+                return Err(error.into());
+            }
             return Err(CublasError::Status {
                 operation: "cublasSgemm_v2",
                 code: status,
@@ -926,6 +987,10 @@ impl Cublas {
             )
         };
         if status != CUBLAS_SUCCESS {
+            if let Err(error) = batch.fail_external_submission() {
+                self.owner.poisoned.set(true);
+                return Err(error.into());
+            }
             return Err(CublasError::Status {
                 operation: "cublasDgemm_v2",
                 code: status,
@@ -1094,7 +1159,7 @@ impl Cublas {
         let dgemm = self.dgemm_function()?;
         // SAFETY: f64 extents, leading dimensions, runtime/device, and non-aliasing were checked;
         // all buffers are leased and alpha/beta remain stable until the synchronous call and
-        // terminal device wait have both returned.
+        // terminal handle-stream wait have both returned.
         let status = unsafe {
             crate::ffi::call_cublas_Dgemm(
                 dgemm,
@@ -1122,9 +1187,9 @@ impl Cublas {
                 ldc,
             )
         };
-        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
+        let sync = self.synchronize_operation(status == CUBLAS_SUCCESS);
         if let Err(error) = sync {
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(a_lease);
             std::mem::forget(b_lease);
             std::mem::forget(c_lease);
@@ -1251,17 +1316,16 @@ impl Cublas {
             )
         };
         timing.finish(SgemmPhase::CublasCall, call_mark);
-        // cuBLAS enqueues on its default stream. Device synchronization makes this API explicitly
-        // synchronous and ensures all borrowed buffer owners remain valid until completion. Even a
-        // cuBLAS error is followed by synchronization because the call may have partially queued.
-        let sync_mark = timing.begin(SgemmPhase::DeviceSynchronize);
-        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
-        timing.finish(SgemmPhase::DeviceSynchronize, sync_mark);
+        // Successful calls wait on the observed handle stream before publication/lease release.
+        // A cuBLAS status error retains device-wide quiescence for undocumented partial work.
+        let sync_mark = timing.begin(SgemmPhase::StreamSynchronize);
+        let sync = self.synchronize_operation(status == CUBLAS_SUCCESS);
+        timing.finish(SgemmPhase::StreamSynchronize, sync_mark);
         let cleanup_mark = timing.begin(SgemmPhase::Cleanup);
         if let Err(error) = sync {
             // Completion is now unknown. Retain every allocation and the library/handle forever;
             // freeing any of them could race device work that CUDA failed to confirm had stopped.
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(a_lease);
             std::mem::forget(b_lease);
             std::mem::forget(c_lease);
@@ -1355,37 +1419,15 @@ impl Cublas {
         self.owner
             .runtime
             .cuda_set_device(self.owner.runtime.0.ordinal)?;
-        // SAFETY: symbols match cuBLAS public declarations; live validated device allocations
-        // remain leased until synchronization confirms completion.
-        let get_mode = crate::ffi::resolve_cublas_get_pointer_mode_v2(&self.owner.library)
-            .map_err(|e| CublasError::MissingSymbol {
-                symbol: "cublasGetPointerMode_v2",
-                detail: e.to_string(),
-            })?;
-        let set_mode = crate::ffi::resolve_cublas_set_pointer_mode_v2(&self.owner.library)
-            .map_err(|e| CublasError::MissingSymbol {
-                symbol: "cublasSetPointerMode_v2",
-                detail: e.to_string(),
-            })?;
-        let sdot = crate::ffi::resolve_cublas_sdot_v2(&self.owner.library).map_err(|e| {
-            CublasError::MissingSymbol {
-                symbol: "cublasSdot_v2",
-                detail: e.to_string(),
-            }
-        })?;
-        let sscal = crate::ffi::resolve_cublas_sscal_v2(&self.owner.library).map_err(|e| {
-            CublasError::MissingSymbol {
-                symbol: "cublasSscal_v2",
-                detail: e.to_string(),
-            }
-        })?;
+        // Exact entries were validated cold; leases and the library remain retained through
+        // successful handle-stream completion or conservative error quiescence/quarantine.
+        let get_mode = self.owner.vectors.get_pointer_mode;
+        let set_mode = self.owner.vectors.set_pointer_mode;
+        let sdot = self.owner.functions.sdot;
+        let sscal = self.owner.vectors.sscal;
         let mut prior_mode = CUBLAS_POINTER_MODE_HOST;
         let get_status = unsafe {
-            crate::ffi::call_cublas_GetPointerMode(
-                *get_mode,
-                self.owner.handle,
-                &raw mut prior_mode,
-            )
+            crate::ffi::call_cublas_GetPointerMode(get_mode, self.owner.handle, &raw mut prior_mode)
         };
         if get_status != CUBLAS_SUCCESS {
             return Err(CublasError::Status {
@@ -1395,12 +1437,14 @@ impl Cublas {
         }
         let set_status = unsafe {
             crate::ffi::call_cublas_SetPointerMode(
-                *set_mode,
+                set_mode,
                 self.owner.handle,
                 CUBLAS_POINTER_MODE_DEVICE,
             )
         };
         if set_status != CUBLAS_SUCCESS {
+            // A failed mode mutation has no documented unchanged-state guarantee.
+            self.owner.poisoned.set(true);
             return Err(CublasError::Status {
                 operation: "cublasSetPointerMode_v2",
                 code: set_status,
@@ -1408,7 +1452,7 @@ impl Cublas {
         }
         let dot_status = unsafe {
             crate::ffi::call_cublas_Sdot(
-                *sdot,
+                sdot,
                 self.owner.handle,
                 n,
                 x.allocation.pointer.cast(),
@@ -1423,7 +1467,7 @@ impl Cublas {
             // restore the mode observed on entry after it has captured alpha.
             let host_status = unsafe {
                 crate::ffi::call_cublas_SetPointerMode(
-                    *set_mode,
+                    set_mode,
                     self.owner.handle,
                     CUBLAS_POINTER_MODE_HOST,
                 )
@@ -1431,7 +1475,7 @@ impl Cublas {
             if host_status == CUBLAS_SUCCESS {
                 unsafe {
                     crate::ffi::call_cublas_Sscal(
-                        *sscal,
+                        sscal,
                         self.owner.handle,
                         1,
                         std::ptr::from_ref(&scale),
@@ -1446,11 +1490,15 @@ impl Cublas {
             CUBLAS_SUCCESS
         };
         let restore_status = unsafe {
-            crate::ffi::call_cublas_SetPointerMode(*set_mode, self.owner.handle, prior_mode)
+            crate::ffi::call_cublas_SetPointerMode(set_mode, self.owner.handle, prior_mode)
         };
-        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
+        let sync = self.synchronize_operation(
+            dot_status == CUBLAS_SUCCESS
+                && scale_status == CUBLAS_SUCCESS
+                && restore_status == CUBLAS_SUCCESS,
+        );
         if let Err(error) = sync {
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(x_lease);
             std::mem::forget(y_lease);
             std::mem::forget(result_lease);
@@ -1541,28 +1589,11 @@ impl Cublas {
             .cuda_set_device(self.owner.runtime.0.ordinal)?;
         // SAFETY: symbols match cuBLAS public declarations; leased allocations remain alive
         // until synchronization confirms the operation has completed.
-        let get_mode = crate::ffi::resolve_cublas_get_pointer_mode_v2(&self.owner.library)
-            .map_err(|e| CublasError::MissingSymbol {
-                symbol: "cublasGetPointerMode_v2",
-                detail: e.to_string(),
-            })?;
-        let set_mode = crate::ffi::resolve_cublas_set_pointer_mode_v2(&self.owner.library)
-            .map_err(|e| CublasError::MissingSymbol {
-                symbol: "cublasSetPointerMode_v2",
-                detail: e.to_string(),
-            })?;
-        let sasum = crate::ffi::resolve_cublas_sasum_v2(&self.owner.library).map_err(|e| {
-            CublasError::MissingSymbol {
-                symbol: "cublasSasum_v2",
-                detail: e.to_string(),
-            }
-        })?;
-        let sscal = crate::ffi::resolve_cublas_sscal_v2(&self.owner.library).map_err(|e| {
-            CublasError::MissingSymbol {
-                symbol: "cublasSscal_v2",
-                detail: e.to_string(),
-            }
-        })?;
+        // No warm symbol lookup: cold handle admission owns all four exact entrypoints.
+        let get_mode = &self.owner.vectors.get_pointer_mode;
+        let set_mode = &self.owner.vectors.set_pointer_mode;
+        let sasum = &self.owner.vectors.sasum;
+        let sscal = &self.owner.vectors.sscal;
         let mut prior_mode = CUBLAS_POINTER_MODE_HOST;
         let get_status = unsafe {
             crate::ffi::call_cublas_GetPointerMode(
@@ -1585,6 +1616,8 @@ impl Cublas {
             )
         };
         if set_status != CUBLAS_SUCCESS {
+            // A failed mode mutation has no documented unchanged-state guarantee.
+            self.owner.poisoned.set(true);
             return Err(CublasError::Status {
                 operation: "cublasSetPointerMode_v2",
                 code: set_status,
@@ -1628,9 +1661,13 @@ impl Cublas {
         let restore_status = unsafe {
             crate::ffi::call_cublas_SetPointerMode(*set_mode, self.owner.handle, prior_mode)
         };
-        let sync = crate::ffi::invoke_cudaDeviceSynchronize(&self.owner.runtime);
+        let sync = self.synchronize_operation(
+            reduction_status == CUBLAS_SUCCESS
+                && scale_status == CUBLAS_SUCCESS
+                && restore_status == CUBLAS_SUCCESS,
+        );
         if let Err(error) = sync {
-            self.owner.poisoned.set(true);
+            self.retain_unknown_completion();
             std::mem::forget(x_lease);
             std::mem::forget(result_lease);
             return Err(error.into());
@@ -1656,6 +1693,171 @@ impl Cublas {
         }
         Ok(())
     }
+
+    /// Reduce F64 magnitudes into a device scalar, then scale in F64.
+    ///
+    /// Typed double ASUM/SCAL preserve F64 storage and arithmetic. Reduction order and
+    /// special-value propagation remain native library behavior, independently of strict
+    /// checking or portable reproducibility. The selected handle configuration is retained.
+    ///
+    /// # Errors
+    /// Rejects invalid extents, strides, aliases, conflicting access and different runtimes.
+    /// Library errors restore pointer mode after terminal completion; uncertain completion
+    /// quarantines leases and poisons the handle exactly as [`Self::sasum_scaled`].
+    #[allow(clippy::too_many_lines)]
+    pub fn dasum_scaled(
+        &self,
+        n: usize,
+        x: &DeviceBuffer,
+        incx: usize,
+        scale: f64,
+        result: &DeviceBuffer,
+    ) -> Result<(), CublasError> {
+        self.ensure_idle()?;
+        if n == 0 || incx == 0 {
+            return Err(CublasError::InvalidVector(
+                "length and strides must be positive",
+            ));
+        }
+        let x_required = vector_bytes_for_size(n, incx, size_of::<f64>())?;
+        if x_required > x.len() {
+            return Err(CublasError::BufferTooSmall {
+                matrix: "x",
+                allocation: x.len(),
+                required: x_required,
+            });
+        }
+        if result.len() < size_of::<f64>() {
+            return Err(CublasError::BufferTooSmall {
+                matrix: "result",
+                allocation: result.len(),
+                required: size_of::<f64>(),
+            });
+        }
+        for buffer in [x, result] {
+            self.owner
+                .runtime
+                .ensure_same_runtime(&buffer.allocation.runtime)
+                .map_err(|_| CublasError::DifferentRuntime)?;
+        }
+        if Rc::ptr_eq(&x.allocation, &result.allocation) {
+            return Err(CublasError::AliasedBuffers);
+        }
+        let x_lease = x.acquire_access().map_err(|_| CublasError::Busy)?;
+        let result_lease = result.acquire_access().map_err(|_| CublasError::Busy)?;
+        let (n, incx) = (
+            c_int::try_from(n).map_err(|_| CublasError::DimensionOverflow)?,
+            c_int::try_from(incx).map_err(|_| CublasError::DimensionOverflow)?,
+        );
+        self.owner
+            .runtime
+            .cuda_set_device(self.owner.runtime.0.ordinal)?;
+        // SAFETY: symbols match cuBLAS public declarations; leased allocations remain alive
+        // until synchronization confirms the operation has completed.
+        // No warm symbol lookup: cold handle admission owns all four exact entrypoints.
+        let get_mode = &self.owner.vectors.get_pointer_mode;
+        let set_mode = &self.owner.vectors.set_pointer_mode;
+        let dasum = &self.owner.vectors.dasum;
+        let dscal = &self.owner.vectors.dscal;
+        let mut prior_mode = CUBLAS_POINTER_MODE_HOST;
+        let get_status = unsafe {
+            crate::ffi::call_cublas_GetPointerMode(
+                *get_mode,
+                self.owner.handle,
+                &raw mut prior_mode,
+            )
+        };
+        if get_status != CUBLAS_SUCCESS {
+            return Err(CublasError::Status {
+                operation: "cublasGetPointerMode_v2",
+                code: get_status,
+            });
+        }
+        let set_status = unsafe {
+            crate::ffi::call_cublas_SetPointerMode(
+                *set_mode,
+                self.owner.handle,
+                CUBLAS_POINTER_MODE_DEVICE,
+            )
+        };
+        if set_status != CUBLAS_SUCCESS {
+            // A failed mode mutation has no documented unchanged-state guarantee.
+            self.owner.poisoned.set(true);
+            return Err(CublasError::Status {
+                operation: "cublasSetPointerMode_v2",
+                code: set_status,
+            });
+        }
+        let reduction_status = unsafe {
+            crate::ffi::call_cublas_Dasum(
+                *dasum,
+                self.owner.handle,
+                n,
+                x.allocation.pointer.cast(),
+                incx,
+                result.allocation.pointer.cast(),
+            )
+        };
+        let scale_status = if reduction_status == CUBLAS_SUCCESS {
+            let host_status = unsafe {
+                crate::ffi::call_cublas_SetPointerMode(
+                    *set_mode,
+                    self.owner.handle,
+                    CUBLAS_POINTER_MODE_HOST,
+                )
+            };
+            if host_status == CUBLAS_SUCCESS {
+                unsafe {
+                    crate::ffi::call_cublas_Dscal(
+                        *dscal,
+                        self.owner.handle,
+                        1,
+                        std::ptr::from_ref(&scale),
+                        result.allocation.pointer.cast(),
+                        1,
+                    )
+                }
+            } else {
+                host_status
+            }
+        } else {
+            CUBLAS_SUCCESS
+        };
+        let restore_status = unsafe {
+            crate::ffi::call_cublas_SetPointerMode(*set_mode, self.owner.handle, prior_mode)
+        };
+        let sync = self.synchronize_operation(
+            reduction_status == CUBLAS_SUCCESS
+                && scale_status == CUBLAS_SUCCESS
+                && restore_status == CUBLAS_SUCCESS,
+        );
+        if let Err(error) = sync {
+            self.retain_unknown_completion();
+            std::mem::forget(x_lease);
+            std::mem::forget(result_lease);
+            return Err(error.into());
+        }
+        if restore_status != CUBLAS_SUCCESS {
+            self.owner.poisoned.set(true);
+            return Err(CublasError::Status {
+                operation: "cublasSetPointerMode_v2(restore)",
+                code: restore_status,
+            });
+        }
+        if reduction_status != CUBLAS_SUCCESS {
+            return Err(CublasError::Status {
+                operation: "cublasDasum_v2",
+                code: reduction_status,
+            });
+        }
+        if scale_status != CUBLAS_SUCCESS {
+            return Err(CublasError::Status {
+                operation: "cublasDscal_v2",
+                code: scale_status,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CublasHandleOwner {
@@ -1672,10 +1874,13 @@ impl Drop for CublasHandleOwner {
             std::mem::forget(self.library.clone());
             return;
         }
+        // Vendor cublasDestroy implicitly performs cudaDeviceSynchronize to release its internal
+        // resources. This cold destruction boundary remains device-wide by NVIDIA's contract;
+        // successful per-operation publication above requires only the exact handle stream.
+        // https://docs.nvidia.com/cuda/cublas/index.html#cublasdestroy
         // SAFETY: handle came from cublasCreate_v2 and library is retained until this drop.
-        if let Ok(destroy) = crate::ffi::resolve_cublas_destroy_v2(&self.library) {
-            let _ = unsafe { crate::ffi::call_cublas_DestroyHandle(*destroy, self.handle) };
-        }
+        let _ =
+            unsafe { crate::ffi::call_cublas_DestroyHandle(self.functions.destroy, self.handle) };
     }
 }
 
@@ -1742,6 +1947,14 @@ fn matrix_bytes_f64(
 }
 
 fn vector_bytes(n: usize, stride: usize) -> Result<usize, CublasError> {
+    vector_bytes_for_size(n, stride, size_of::<f32>())
+}
+
+fn vector_bytes_for_size(
+    n: usize,
+    stride: usize,
+    element_size: usize,
+) -> Result<usize, CublasError> {
     if n == 0 || stride == 0 {
         return Err(CublasError::InvalidVector(
             "length and strides must be positive",
@@ -1752,13 +1965,21 @@ fn vector_bytes(n: usize, stride: usize) -> Result<usize, CublasError> {
         .and_then(|v| v.checked_add(1))
         .ok_or(CublasError::DimensionOverflow)?;
     elements
-        .checked_mul(size_of::<f32>())
+        .checked_mul(element_size)
         .ok_or(CublasError::DimensionOverflow)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_vector_extents_include_stride_and_detect_overflow() {
+        assert_eq!(vector_bytes_for_size(1, 8, size_of::<f64>()).unwrap(), 8);
+        assert_eq!(vector_bytes_for_size(4, 2, size_of::<f64>()).unwrap(), 56);
+        assert!(vector_bytes_for_size(0, 1, size_of::<f64>()).is_err());
+        assert!(vector_bytes_for_size(usize::MAX / 8 + 1, 1, size_of::<f64>()).is_err());
+    }
 
     #[test]
     fn matrix_extent_checks_leading_dimension_and_overflow() {
@@ -1902,6 +2123,113 @@ mod tests {
         drop(cublas);
         completion.wait().expect("wait for DGEMM completion");
         verify(&read_output(&batch_c), 1.5, -0.25);
+    }
+
+    #[test]
+    #[cfg(feature = "allocation-census")]
+    #[ignore = "requires authorized CUDA device and native BLAS library"]
+    fn retained_sgemm_dot_stream_and_destroy_have_no_warm_symbol_resolution() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let mut blas = Cublas::new(&runtime).unwrap();
+        let mut left = runtime.allocate(16).unwrap();
+        let mut right = runtime.allocate(16).unwrap();
+        let output = runtime.allocate(16).unwrap();
+        let dot = runtime.allocate(4).unwrap();
+        let encode = |values: [f32; 4]| {
+            values
+                .into_iter()
+                .flat_map(f32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        };
+        right.copy_from(&encode([1.0, 0.0, 0.0, 1.0])).unwrap();
+        crate::reset_cuda_api_census();
+        blas.bind_stream(&stream).unwrap();
+        for iteration in 0..8 {
+            let values = if iteration % 2 == 0 {
+                [1.0, 2.0, 3.0, 4.0]
+            } else {
+                [5.0, 6.0, 7.0, 8.0]
+            };
+            let bytes = encode(values);
+            left.copy_from(&bytes).unwrap();
+            blas.sgemm(
+                false, false, 2, 2, 2, 1.0, &left, 2, &right, 2, 0.0, &output, 2,
+            )
+            .unwrap();
+            let mut actual = [0; 16];
+            output.copy_to(&mut actual).unwrap();
+            assert_eq!(actual.as_slice(), bytes);
+            blas.sdot_scaled(4, &left, 1, &right, 1, 0.5, &dot).unwrap();
+            let mut actual_dot = [0; 4];
+            dot.copy_to(&mut actual_dot).unwrap();
+            assert_eq!(
+                f32::from_ne_bytes(actual_dot).to_bits(),
+                if iteration % 2 == 0 {
+                    2.5_f32.to_bits()
+                } else {
+                    6.5_f32.to_bits()
+                }
+            );
+        }
+        drop(blas);
+        let api = crate::cuda_api_census();
+        assert_eq!(api.symbol_resolutions, 0);
+        assert_eq!(api.module_loads, 0);
+    }
+
+    #[test]
+    #[ignore = "requires native BLAS/device; deterministic error-only owner-retention witness"]
+    fn synchronous_unknown_completion_retains_exact_handle_stream_roots() {
+        for bound in [false, true] {
+            let runtime = CudaRuntime::new(0).unwrap();
+            let stream = runtime.create_stream().unwrap();
+            let mut blas = Cublas::new(&runtime).unwrap();
+            if bound {
+                blas.bind_stream(&stream).unwrap();
+            }
+            let mut left = runtime.allocate(4).unwrap();
+            let mut right = runtime.allocate(4).unwrap();
+            let output = runtime.allocate(4).unwrap();
+            left.copy_from(&2.0_f32.to_ne_bytes()).unwrap();
+            right.copy_from(&3.0_f32.to_ne_bytes()).unwrap();
+            let owner_count = Rc::strong_count(&blas.owner);
+            let stream_count = Rc::strong_count(&stream.inner);
+            blas.sgemm(
+                false, false, 1, 1, 1, 1.0, &left, 1, &right, 1, 0.0, &output, 1,
+            )
+            .unwrap();
+            let mut actual = [0; 4];
+            output.copy_to(&mut actual).unwrap();
+            assert_eq!(f32::from_ne_bytes(actual).to_bits(), 6.0_f32.to_bits());
+            assert_eq!(Rc::strong_count(&blas.owner), owner_count);
+            assert_eq!(Rc::strong_count(&stream.inner), stream_count);
+            let owner = Rc::downgrade(&blas.owner);
+            let library = Arc::downgrade(&blas.owner.library);
+            let context = Arc::downgrade(&runtime.0);
+            let queue = Rc::downgrade(&stream.inner);
+            // Real SGEMM has already completed. Exercise the actual private unknown-result
+            // retention helper deterministically; this is not an injected driver-loss test.
+            blas.retain_unknown_completion();
+            assert!(!blas.is_usable());
+            assert!(matches!(
+                blas.sgemm(
+                    false, false, 1, 1, 1, 1.0, &left, 1, &right, 1, 0.0, &output, 1
+                ),
+                Err(CublasError::CompletionUnknown)
+            ));
+            drop(blas);
+            drop(left);
+            drop(right);
+            drop(output);
+            drop(stream);
+            drop(runtime);
+            assert!(owner.upgrade().is_some());
+            assert!(library.upgrade().is_some());
+            assert!(context.upgrade().is_some());
+            // NULL has no separate Rust stream owner; an unrelated created stream must drop.
+            assert_eq!(queue.upgrade().is_some(), bound);
+        }
     }
 
     #[test]
@@ -2115,5 +2443,214 @@ mod tests {
             .map(|chunk| f32::from_ne_bytes(*chunk))
             .collect::<Vec<_>>();
         assert_eq!(actual, a_values);
+    }
+
+    #[cfg(feature = "allocation-census")]
+    #[test]
+    #[ignore = "requires authorized CUDA device; controlled unrelated stream correctness"]
+    fn synchronous_gemm_waits_only_on_observed_handle_stream() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let image = crate::compile_cuda_source_for_device(&runtime,
+            "extern \"C\" __global__ void delay() { const unsigned long long start=clock64(); while (clock64()-start<500000000ULL) { asm volatile(\"\"); } }").unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"delay").unwrap();
+        let foreign = runtime
+            .create_stream_with_options(crate::CudaStreamOptions {
+                mode: crate::CudaStreamMode::NonBlocking,
+                priority: 0,
+            })
+            .unwrap();
+        let encode = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let mut a = runtime.allocate(16).unwrap();
+        let mut b = runtime.allocate(16).unwrap();
+        let c = runtime.allocate(16).unwrap();
+        a.copy_from(&encode(&[1., 2., 3., 4.])).unwrap();
+        b.copy_from(&encode(&[1., 0., 0., 1.])).unwrap();
+        for bound in [false, true] {
+            let mut blas = Cublas::new(&runtime).unwrap();
+            let own = runtime.create_stream().unwrap();
+            if bound {
+                blas.bind_stream(&own).unwrap();
+            }
+            let run = || {
+                blas.sgemm(false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2)
+                    .unwrap();
+            };
+            run(); // Resolve library/workspace cold costs before scheduling unrelated work.
+            // SAFETY: no-argument delay ABI; module/stream/completion own every resource.
+            let mut delayed =
+                unsafe { kernel.launch(&foreign, [1, 1, 1], [1, 1, 1], 0, &[]) }.unwrap();
+            assert_eq!(foreign.query().unwrap(), crate::CudaReadiness::Pending);
+            crate::reset_cuda_api_census();
+            run();
+            let api = crate::cuda_api_census();
+            assert_eq!(api.device_synchronizations, 0);
+            assert_eq!(api.stream_synchronizations, 1);
+            assert_eq!(api.symbol_resolutions, 0);
+            assert_eq!(
+                foreign.query().unwrap(),
+                crate::CudaReadiness::Pending,
+                "unrelated nonblocking work must remain pending after GEMM publication"
+            );
+            eprintln!("exact handle stream bound={bound}: {api:?}");
+            delayed.wait().unwrap();
+            let mut actual = [0_u8; 16];
+            c.copy_to(&mut actual).unwrap();
+            assert_eq!(actual.as_slice(), encode(&[1., 2., 3., 4.]));
+        }
+    }
+    #[cfg(feature = "allocation-census")]
+    #[test]
+    #[ignore = "requires authorized CUDA device; controlled unrelated stream correctness"]
+    fn failed_gemm_establishes_device_quiescence_before_releasing_leases() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let image = crate::compile_cuda_source_for_device(&runtime,
+            "extern \"C\" __global__ void delay() { const unsigned long long start=clock64(); while (clock64()-start<500000000ULL) { asm volatile(\"\"); } }").unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"delay").unwrap();
+        let foreign = runtime
+            .create_stream_with_options(crate::CudaStreamOptions {
+                mode: crate::CudaStreamMode::NonBlocking,
+                priority: 0,
+            })
+            .unwrap();
+        let encode = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let mut a = runtime.allocate(16).unwrap();
+        let mut b = runtime.allocate(16).unwrap();
+        let c = runtime.allocate(16).unwrap();
+        a.copy_from(&encode(&[1., 2., 3., 4.])).unwrap();
+        b.copy_from(&encode(&[1., 0., 0., 1.])).unwrap();
+        for bound in [false, true] {
+            let mut blas = Cublas::new(&runtime).unwrap();
+            let own = runtime.create_stream().unwrap();
+            if bound {
+                blas.bind_stream(&own).unwrap();
+            }
+            blas.sgemm(false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2)
+                .unwrap();
+            let original = blas.owner.sgemm;
+            Rc::get_mut(&mut blas.owner).unwrap().sgemm =
+                crate::ffi::cublas::fixture_sgemm_failure();
+            // SAFETY: exact no-argument ABI; live module and completion retain all resources.
+            let mut delayed =
+                unsafe { kernel.launch(&foreign, [1, 1, 1], [1, 1, 1], 0, &[]) }.unwrap();
+            assert_eq!(foreign.query().unwrap(), crate::CudaReadiness::Pending);
+            crate::reset_cuda_api_census();
+            assert!(matches!(
+                blas.sgemm(false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2),
+                Err(CublasError::Status {
+                    operation: "cublasSgemm_v2",
+                    code: 13
+                })
+            ));
+            let api = crate::cuda_api_census();
+            assert_eq!(api.device_synchronizations, 1);
+            assert_eq!(api.stream_synchronizations, 0);
+            assert_eq!(api.symbol_resolutions, 0);
+            assert_eq!(foreign.query().unwrap(), crate::CudaReadiness::Ready);
+            eprintln!("failed GEMM conservative quiescence bound={bound}: {api:?}");
+            Rc::get_mut(&mut blas.owner).unwrap().sgemm = original;
+            crate::reset_cuda_api_census();
+            blas.sgemm(false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2)
+                .unwrap();
+            let api = crate::cuda_api_census();
+            assert_eq!(api.device_synchronizations, 0);
+            assert_eq!(api.stream_synchronizations, 1);
+            delayed.wait().unwrap();
+            let mut actual = [0_u8; 16];
+            c.copy_to(&mut actual).unwrap();
+            assert_eq!(actual.as_slice(), encode(&[1., 2., 3., 4.]));
+        }
+    }
+    #[cfg(feature = "allocation-census")]
+    #[test]
+    #[ignore = "requires authorized CUDA device; controlled unrelated stream correctness"]
+    fn failed_batch_gemm_quiesces_device_and_rejects_further_submission() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let image = crate::compile_cuda_source_for_device(&runtime,
+            "extern \"C\" __global__ void delay() { const unsigned long long start=clock64(); while (clock64()-start<500000000ULL) { asm volatile(\"\"); } }").unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"delay").unwrap();
+        let foreign = runtime
+            .create_stream_with_options(crate::CudaStreamOptions {
+                mode: crate::CudaStreamMode::NonBlocking,
+                priority: 0,
+            })
+            .unwrap();
+        let encode = |values: &[f32]| {
+            values
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let mut a = runtime.allocate(16).unwrap();
+        let mut b = runtime.allocate(16).unwrap();
+        let c = runtime.allocate(16).unwrap();
+        a.copy_from(&encode(&[1., 2., 3., 4.])).unwrap();
+        b.copy_from(&encode(&[1., 0., 0., 1.])).unwrap();
+        {
+            let bound = true;
+            let mut blas = Cublas::new(&runtime).unwrap();
+            let own = runtime.create_stream().unwrap();
+            if bound {
+                blas.bind_stream(&own).unwrap();
+            }
+            blas.sgemm(false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2)
+                .unwrap();
+            let original = blas.owner.sgemm;
+            Rc::get_mut(&mut blas.owner).unwrap().sgemm =
+                crate::ffi::cublas::fixture_sgemm_failure();
+            // SAFETY: exact no-argument ABI; live module and completion retain all resources.
+            let mut delayed =
+                unsafe { kernel.launch(&foreign, [1, 1, 1], [1, 1, 1], 0, &[]) }.unwrap();
+            assert_eq!(foreign.query().unwrap(), crate::CudaReadiness::Pending);
+            crate::reset_cuda_api_census();
+            let mut batch = CudaCompletionBatch::new(&own);
+            assert!(matches!(
+                blas.sgemm_into_batch(
+                    &mut batch, false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2
+                ),
+                Err(CublasError::Status {
+                    operation: "cublasSgemm_v2",
+                    code: 13
+                })
+            ));
+            let api = crate::cuda_api_census();
+            assert_eq!(api.device_synchronizations, 1);
+            assert_eq!(api.stream_synchronizations, 0);
+            assert_eq!(api.symbol_resolutions, 0);
+            assert_eq!(foreign.query().unwrap(), crate::CudaReadiness::Ready);
+            eprintln!("failed GEMM conservative quiescence bound={bound}: {api:?}");
+            assert!(matches!(batch.finish(), Err(CudaError::BatchPoisoned)));
+            assert!(matches!(
+                blas.sgemm_into_batch(
+                    &mut batch, false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2
+                ),
+                Err(CublasError::Cuda(CudaError::BatchPoisoned))
+            ));
+            assert!(matches!(c.copy_to(&mut [0_u8; 16]), Err(CudaError::Busy)));
+            drop(batch);
+            Rc::get_mut(&mut blas.owner).unwrap().sgemm = original;
+            crate::reset_cuda_api_census();
+            blas.sgemm(false, false, 2, 2, 2, 1., &a, 2, &b, 2, 0., &c, 2)
+                .unwrap();
+            let api = crate::cuda_api_census();
+            assert_eq!(api.device_synchronizations, 0);
+            assert_eq!(api.stream_synchronizations, 1);
+            delayed.wait().unwrap();
+            let mut actual = [0_u8; 16];
+            c.copy_to(&mut actual).unwrap();
+            assert_eq!(actual.as_slice(), encode(&[1., 2., 3., 4.]));
+        }
     }
 }

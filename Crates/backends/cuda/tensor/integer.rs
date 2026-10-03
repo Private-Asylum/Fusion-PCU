@@ -84,6 +84,7 @@ macro_rules! integer_profile {
                 PcuDispatchIntegerBinaryOp::Mul => 3,
             };
             PcuDispatchKernelIr {
+                numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
                 id: PcuKernelId($kernel_id + op_tag),
                 entry: PcuDispatchEntryPoint {
                     name: "tensor_checked_integer_binary",
@@ -114,6 +115,7 @@ macro_rules! binary_ops {
                 index: PcuDispatchIndex::InvocationId,
             }),
             PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
+                range_policy: fusion_pcu::PcuRangePolicy::Reject,
                 value_type: $value_type,
                 op: $op,
                 result: RESULT,
@@ -211,6 +213,66 @@ integer_profile!(
     0x494e_5700
 );
 
+integer_profile!(
+    i128_kernel,
+    I128_BINDINGS,
+    I128_ADD,
+    I128_SUB,
+    I128_MUL,
+    PcuValueType::Scalar(fusion_pcu::PcuScalarType::I128),
+    PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::I128),
+    0x494e_5800
+);
+integer_profile!(
+    u128_kernel,
+    U128_BINDINGS,
+    U128_ADD,
+    U128_SUB,
+    U128_MUL,
+    PcuValueType::Scalar(fusion_pcu::PcuScalarType::U128),
+    PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::U128),
+    0x494e_5900
+);
+integer_profile!(
+    i256_kernel,
+    I256_BINDINGS,
+    I256_ADD,
+    I256_SUB,
+    I256_MUL,
+    PcuValueType::Scalar(fusion_pcu::PcuScalarType::I256),
+    PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::I256),
+    0x494e_5a00
+);
+integer_profile!(
+    u256_kernel,
+    U256_BINDINGS,
+    U256_ADD,
+    U256_SUB,
+    U256_MUL,
+    PcuValueType::Scalar(fusion_pcu::PcuScalarType::U256),
+    PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::U256),
+    0x494e_5b00
+);
+integer_profile!(
+    i512_kernel,
+    I512_BINDINGS,
+    I512_ADD,
+    I512_SUB,
+    I512_MUL,
+    PcuValueType::Scalar(fusion_pcu::PcuScalarType::I512),
+    PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::I512),
+    0x494e_5c00
+);
+integer_profile!(
+    u512_kernel,
+    U512_BINDINGS,
+    U512_ADD,
+    U512_SUB,
+    U512_MUL,
+    PcuValueType::Scalar(fusion_pcu::PcuScalarType::U512),
+    PcuValueTypeCaps::for_scalar(fusion_pcu::PcuScalarType::U512),
+    0x494e_5d00
+);
 pub(super) fn kernel(
     scalar_type: TensorPointwiseScalarType,
     op: PcuDispatchIntegerBinaryOp,
@@ -225,9 +287,79 @@ pub(super) fn kernel(
         TensorPointwiseScalarType::U32 => u32_kernel,
         TensorPointwiseScalarType::I64 => i64_kernel,
         TensorPointwiseScalarType::U64 => u64_kernel,
-        TensorPointwiseScalarType::F32 | TensorPointwiseScalarType::F64 => {
+        TensorPointwiseScalarType::I128 => i128_kernel,
+        TensorPointwiseScalarType::U128 => u128_kernel,
+        TensorPointwiseScalarType::I256 => i256_kernel,
+        TensorPointwiseScalarType::U256 => u256_kernel,
+        TensorPointwiseScalarType::I512 => i512_kernel,
+        TensorPointwiseScalarType::U512 => u512_kernel,
+
+        TensorPointwiseScalarType::F16
+        | TensorPointwiseScalarType::BF16
+        | TensorPointwiseScalarType::F8E4M3FN
+        | TensorPointwiseScalarType::F8E5M2
+        | TensorPointwiseScalarType::F32
+        | TensorPointwiseScalarType::F64 => {
             return Err(CudaTensorExecutionError::InvalidPointwiseProfile);
         }
     };
     Ok(build(op, logical_count))
+}
+
+/// Lowers one validated dense checked integer `Add`/`Sub`/`Mul` node to its executor kernel.
+///
+/// The header-free runtime-compiler source uses the same fixed kernel body.
+/// The four-pointer ABI is left, right, fresh output, and a u64 fault word initialized
+/// to `u64::MAX`. Wait for completion and inspect status before publishing useful output.
+/// This is exact rejecting scalar arithmetic; it offers no tensor Clamp or `PortableV1` profile.
+///
+/// # Errors
+/// Returns invalid graph, dtype, operation, shape or unproved reproducibility errors.
+pub fn lower_checked_integer_tensor_to_cuda_source(
+    graph: &fusion_pcu::dialect::tensor::Graph,
+    value: fusion_pcu::dialect::tensor::ValueId,
+) -> Result<String, CudaTensorExecutionError> {
+    use fusion_pcu::dialect::tensor::{OpDescriptor, TensorOperationSupport, TensorUnsupportedReason};
+    let node = graph.node(value)?;
+    if node.numerical_options.reproducibility != fusion_pcu::PcuReproducibility::Unspecified {
+        return Err(CudaTensorExecutionError::Unsupported {
+            value,
+            reason: TensorUnsupportedReason::NumericalPolicy {
+                requirement: fusion_pcu::PcuNumericalRequirement::Reproducibility,
+                options: node.numerical_options,
+            },
+        });
+    }
+    let op = match node.op {
+        OpDescriptor::Add { .. } => PcuDispatchIntegerBinaryOp::Add,
+        OpDescriptor::Sub { .. } => PcuDispatchIntegerBinaryOp::Sub,
+        OpDescriptor::Mul { .. } => PcuDispatchIntegerBinaryOp::Mul,
+        _ => return Err(CudaTensorExecutionError::InvalidPointwiseProfile),
+    };
+    if !super::is_checked_integer_scalar(node.scalar_type) {
+        return Err(CudaTensorExecutionError::UnsupportedScalarType(
+            node.scalar_type,
+        ));
+    }
+    if let TensorOperationSupport::Unsupported { reason } =
+        super::assess_checked_integer_node(graph, node)
+    {
+        return Err(CudaTensorExecutionError::Unsupported { value, reason });
+    }
+    let scalar = TensorPointwiseScalarType::try_from(node.scalar_type)?;
+    let count = node
+        .shape
+        .iter()
+        .try_fold(1u32, |count, &dim| {
+            u32::try_from(dim)
+                .ok()
+                .and_then(|dim| count.checked_mul(dim))
+        })
+        .ok_or(CudaTensorExecutionError::SizeOverflow)?;
+    let ir = PcuDispatchKernelIr {
+        numerical_requirements: super::fixed_numerical_requirements(node),
+        ..kernel(scalar, op, count)?
+    };
+    crate::lower_dispatch_to_cuda_rtc_source(&ir)
+        .map_err(|error| CudaTensorExecutionError::Backend(error.into()))
 }

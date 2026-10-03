@@ -8,6 +8,14 @@ use alloc::vec::Vec;
 #[rustfmt::skip]
 use crate::{
     PcuBf16Bits,
+    PcuF8E4M3FnBits,
+    PcuF8E5M2Bits,
+    PcuU256,
+    PcuI256,
+    PcuU512,
+    PcuI512,
+    PcuF128Bits,
+    PcuF256Bits,
     PcuF16Bits,
     PcuScalar,
     PcuScalarType,
@@ -30,6 +38,16 @@ mod sealed {
     impl Sealed for i64 {}
     impl Sealed for super::PcuF16Bits {}
     impl Sealed for super::PcuBf16Bits {}
+    impl Sealed for super::PcuF8E4M3FnBits {}
+    impl Sealed for super::PcuF8E5M2Bits {}
+    impl Sealed for u128 {}
+    impl Sealed for i128 {}
+    impl Sealed for super::PcuU256 {}
+    impl Sealed for super::PcuI256 {}
+    impl Sealed for super::PcuU512 {}
+    impl Sealed for super::PcuI512 {}
+    impl Sealed for super::PcuF128Bits {}
+    impl Sealed for super::PcuF256Bits {}
 }
 
 /// Closed scalar set that can be stored in a heterogeneous tensor value.
@@ -55,10 +73,12 @@ pub trait TensorElement: PcuScalar + sealed::Sealed {
     fn splat(shape: Vec<usize>, value: Self) -> Result<TensorValue, super::TensorError>;
 }
 
-/// Owned tensor storage for every scalar with a defined dense host representation.
+/// Owned heterogeneous storage for the admitted host-reference scalar set.
 ///
 /// `Bool`, `I4`, and `U4` have scalar identities but no `PcuScalar` host type in this crate, so
-/// they intentionally have no variant here. F16/BF16 variants preserve their storage bits and
+/// they intentionally have no variant here. Every sealed scalar representation otherwise has
+/// exact host storage, including wide integer and floating carriers and named FP8 formats.
+/// These variants preserve their storage bits and
 /// do not imply arithmetic conversion. This is host/reference storage, not a device owner or a
 /// promise that a backend supports every scalar or operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +95,16 @@ pub enum TensorValue {
     I16(Tensor<i16>),
     I32(Tensor<i32>),
     I64(Tensor<i64>),
+    F8E4M3Fn(Tensor<PcuF8E4M3FnBits>),
+    F8E5M2(Tensor<PcuF8E5M2Bits>),
+    U128(Tensor<u128>),
+    I128(Tensor<i128>),
+    U256(Tensor<PcuU256>),
+    I256(Tensor<PcuI256>),
+    U512(Tensor<PcuU512>),
+    I512(Tensor<PcuI512>),
+    F128(Tensor<PcuF128Bits>),
+    F256(Tensor<PcuF256Bits>),
 }
 
 /// One typed scalar value suitable for a heterogeneous graph uniform node.
@@ -95,6 +125,16 @@ pub enum TensorScalarValue {
     I16(i16),
     I32(i32),
     I64(i64),
+    F8E4M3Fn(PcuF8E4M3FnBits),
+    F8E5M2(PcuF8E5M2Bits),
+    U128(u128),
+    I128(i128),
+    U256(PcuU256),
+    I256(PcuI256),
+    U512(PcuU512),
+    I512(PcuI512),
+    F128(PcuF128Bits),
+    F256(PcuF256Bits),
 }
 
 impl TensorScalarValue {
@@ -103,6 +143,16 @@ impl TensorScalarValue {
     pub const fn scalar_type(self) -> PcuScalarType {
         match self {
             Self::F16(_) => PcuScalarType::F16,
+            Self::F8E4M3Fn(_) => PcuScalarType::F8E4M3FN,
+            Self::F8E5M2(_) => PcuScalarType::F8E5M2,
+            Self::U128(_) => PcuScalarType::U128,
+            Self::I128(_) => PcuScalarType::I128,
+            Self::U256(_) => PcuScalarType::U256,
+            Self::I256(_) => PcuScalarType::I256,
+            Self::U512(_) => PcuScalarType::U512,
+            Self::I512(_) => PcuScalarType::I512,
+            Self::F128(_) => PcuScalarType::F128,
+            Self::F256(_) => PcuScalarType::F256,
             Self::Bf16(_) => PcuScalarType::BF16,
             Self::F32(_) => PcuScalarType::F32,
             Self::F64(_) => PcuScalarType::F64,
@@ -141,6 +191,16 @@ impl TensorScalarValue {
         let shape = shape.into();
         match self {
             Self::F16(value) => PcuF16Bits::splat(shape, value),
+            Self::F8E4M3Fn(value) => PcuF8E4M3FnBits::splat(shape, value),
+            Self::F8E5M2(value) => PcuF8E5M2Bits::splat(shape, value),
+            Self::U128(value) => u128::splat(shape, value),
+            Self::I128(value) => i128::splat(shape, value),
+            Self::U256(value) => PcuU256::splat(shape, value),
+            Self::I256(value) => PcuI256::splat(shape, value),
+            Self::U512(value) => PcuU512::splat(shape, value),
+            Self::I512(value) => PcuI512::splat(shape, value),
+            Self::F128(value) => PcuF128Bits::splat(shape, value),
+            Self::F256(value) => PcuF256Bits::splat(shape, value),
             Self::Bf16(value) => PcuBf16Bits::splat(shape, value),
             Self::F32(value) => f32::splat(shape, value),
             Self::F64(value) => f64::splat(shape, value),
@@ -189,6 +249,16 @@ impl TensorValue {
     pub const fn scalar_type(&self) -> PcuScalarType {
         match self {
             Self::F16(_) => PcuScalarType::F16,
+            Self::F8E4M3Fn(_) => PcuScalarType::F8E4M3FN,
+            Self::F8E5M2(_) => PcuScalarType::F8E5M2,
+            Self::U128(_) => PcuScalarType::U128,
+            Self::I128(_) => PcuScalarType::I128,
+            Self::U256(_) => PcuScalarType::U256,
+            Self::I256(_) => PcuScalarType::I256,
+            Self::U512(_) => PcuScalarType::U512,
+            Self::I512(_) => PcuScalarType::I512,
+            Self::F128(_) => PcuScalarType::F128,
+            Self::F256(_) => PcuScalarType::F256,
             Self::Bf16(_) => PcuScalarType::BF16,
             Self::F32(_) => PcuScalarType::F32,
             Self::F64(_) => PcuScalarType::F64,
@@ -208,6 +278,16 @@ impl TensorValue {
     pub fn shape(&self) -> &[usize] {
         match self {
             Self::F16(tensor) => tensor.shape(),
+            Self::F8E4M3Fn(tensor) => tensor.shape(),
+            Self::F8E5M2(tensor) => tensor.shape(),
+            Self::U128(tensor) => tensor.shape(),
+            Self::I128(tensor) => tensor.shape(),
+            Self::U256(tensor) => tensor.shape(),
+            Self::I256(tensor) => tensor.shape(),
+            Self::U512(tensor) => tensor.shape(),
+            Self::I512(tensor) => tensor.shape(),
+            Self::F128(tensor) => tensor.shape(),
+            Self::F256(tensor) => tensor.shape(),
             Self::Bf16(tensor) => tensor.shape(),
             Self::F32(tensor) => tensor.shape(),
             Self::F64(tensor) => tensor.shape(),
@@ -227,6 +307,16 @@ impl TensorValue {
     pub const fn len(&self) -> usize {
         match self {
             Self::F16(tensor) => tensor.len(),
+            Self::F8E4M3Fn(tensor) => tensor.len(),
+            Self::F8E5M2(tensor) => tensor.len(),
+            Self::U128(tensor) => tensor.len(),
+            Self::I128(tensor) => tensor.len(),
+            Self::U256(tensor) => tensor.len(),
+            Self::I256(tensor) => tensor.len(),
+            Self::U512(tensor) => tensor.len(),
+            Self::I512(tensor) => tensor.len(),
+            Self::F128(tensor) => tensor.len(),
+            Self::F256(tensor) => tensor.len(),
             Self::Bf16(tensor) => tensor.len(),
             Self::F32(tensor) => tensor.len(),
             Self::F64(tensor) => tensor.len(),
@@ -306,6 +396,16 @@ macro_rules! tensor_element {
 
 tensor_element!(PcuF16Bits, F16);
 tensor_element!(PcuBf16Bits, Bf16);
+tensor_element!(PcuF8E4M3FnBits, F8E4M3Fn);
+tensor_element!(PcuF8E5M2Bits, F8E5M2);
+tensor_element!(u128, U128);
+tensor_element!(i128, I128);
+tensor_element!(PcuU256, U256);
+tensor_element!(PcuI256, I256);
+tensor_element!(PcuU512, U512);
+tensor_element!(PcuI512, I512);
+tensor_element!(PcuF128Bits, F128);
+tensor_element!(PcuF256Bits, F256);
 tensor_element!(f32, F32);
 tensor_element!(f64, F64);
 tensor_element!(u8, U8);

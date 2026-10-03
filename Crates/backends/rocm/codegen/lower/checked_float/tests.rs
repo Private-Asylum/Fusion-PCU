@@ -47,6 +47,7 @@ fn checked_relu_lowers_direct_dispatch_to_policy_aware_bit_classification() {
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let source = lower_dispatch_to_hip_source(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(91),
         entry: PcuDispatchEntryPoint {
             name: "checked_relu_test",
@@ -96,6 +97,7 @@ fn checked_relu_lowers_grid_stride_dispatch_with_logical_fault_indices() {
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let grid_source = lower_dispatch_to_hip_source(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(92),
         entry: PcuDispatchEntryPoint {
             name: "checked_relu_grid_test",
@@ -211,6 +213,7 @@ fn checked_kernel_for_type_with_range_policy(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     lower_dispatch_to_hip_source(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(91),
         entry: PcuDispatchEntryPoint {
             name: "checked_f32_test",
@@ -434,6 +437,7 @@ fn checked_f64_to_f32_kernel_with_range_policy(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     lower_dispatch_to_hip_source(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(92),
         entry: PcuDispatchEntryPoint {
             name: "checked_f64_to_f32_test",
@@ -540,6 +544,7 @@ fn checked_f32_to_f64_kernel(grid: bool) -> String {
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     lower_dispatch_to_hip_source(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(94),
         entry: PcuDispatchEntryPoint {
             name: "checked_f32_to_f64_test",
@@ -662,6 +667,7 @@ fn checked_conversion_composes_with_checked_math_on_both_widths() {
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let source = lower_dispatch_to_hip_source(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(93),
         entry: PcuDispatchEntryPoint {
             name: "mixed_checked_float_test",

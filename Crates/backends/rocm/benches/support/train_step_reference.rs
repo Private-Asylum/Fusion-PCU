@@ -7,11 +7,11 @@ use fusion_pcu::dialect::tensor::Tensor;
 #[rustfmt::skip]
 use super::{
     Program,
-    StrictProgram,
+    SeparatedUpdateProgram,
 };
 
-pub fn cpu_strict_two_steps(
-    program: &StrictProgram,
+pub fn cpu_separated_update_two_steps(
+    program: &SeparatedUpdateProgram,
     samples: &Tensor,
     target: &Tensor,
     initial: &Tensor,

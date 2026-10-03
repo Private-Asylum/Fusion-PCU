@@ -19,6 +19,7 @@ path = "vulkan.rs"
 [features]
 default = []
 hosted = ["dep:ash", "dep:fusion-pcu-spirv"]
+tensor = ["hosted", "fusion-pcu-core/tensor"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
@@ -28,10 +29,31 @@ ash = { workspace = true, optional = true }
 [lints]
 workspace = true
 
+[[test]]
+name = "composed_float_maps"
+path = "tests/composed_float_maps/composed_float_maps.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "resident_div_rem_roles"
+path = "tests/resident_div_rem_roles/resident_div_rem_roles.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "resident_div_rem_roles"
+path = "benches/resident_div_rem_roles/resident_div_rem_roles.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "resident-div-rem-roles"
+path = "examples/resident_div_rem_roles/resident_div_rem_roles.rs"
+required-features = ["tensor"]
+
 [dev-dependencies]
 # Test-only path dependencies stay out of the published dependency graph.
 fusion-pcu-macros = { path = "../../macros" }
-pcu-facade = { workspace = true, features = ["vulkan"] }
+pcu-facade = { workspace = true, features = ["vulkan", "tensor", "cpu"] }
 criterion.workspace = true
 winit.workspace = true
 
@@ -53,5 +75,388 @@ required-features = ["hosted"]
 [[bench]]
 name = "checked_neg"
 path = "benches/checked_neg/checked_neg.rs"
+harness = false
+required-features = ["hosted"]
+
+[[test]]
+name = "checked_binary"
+path = "tests/checked_binary/checked_binary.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "checked_binary"
+path = "benches/checked_binary/checked_binary.rs"
+harness = false
+required-features = ["hosted"]
+
+[[example]]
+name = "checked-binary"
+path = "examples/checked_binary/checked_binary.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "clamped_binary"
+path = "tests/clamped_binary/clamped_binary.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "clamped_binary"
+path = "benches/clamped_binary/clamped_binary.rs"
+harness = false
+required-features = ["hosted"]
+
+[[example]]
+name = "clamped-binary"
+path = "examples/clamped_binary/clamped_binary.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "checked_f64_binary"
+path = "tests/checked_f64_binary/checked_f64_binary.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "checked_f64_binary"
+path = "benches/checked_f64_binary/checked_f64_binary.rs"
+harness = false
+required-features = ["hosted"]
+
+[[example]]
+name = "checked-f64-binary"
+path = "examples/checked_f64_binary/checked_f64_binary.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "low_binary"
+path = "tests/low_binary/low_binary.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "low_binary"
+path = "benches/low_binary/low_binary.rs"
+harness = false
+required-features = ["hosted"]
+
+[[example]]
+name = "low-binary"
+path = "examples/low_binary/low_binary.rs"
+required-features = ["hosted"]
+
+[[test]]
+name="portable_binary"
+path="tests/portable_binary/portable_binary.rs"
+required-features=["hosted"]
+
+[[bench]]
+name = "owned_leaf"
+path = "benches/owned_leaf/owned_leaf.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "owned_source"
+path = "tests/owned_source/owned_source.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "owned-leaf"
+path = "examples/owned_leaf/owned_leaf.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name="portable_binary"
+path="benches/portable_binary/portable_binary.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="portable-binary"
+path="examples/portable_binary/portable_binary.rs"
+required-features=["hosted"]
+
+[[test]]
+name="checked_unary"
+path="tests/checked_unary/checked_unary.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="checked_unary"
+path="benches/checked_unary/checked_unary.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="checked-unary"
+path="examples/checked_unary/checked_unary.rs"
+required-features=["hosted"]
+
+[[test]]
+name="scalar_transport"
+path="tests/scalar_transport/scalar_transport.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="scalar_transport"
+path="benches/scalar_transport/scalar_transport.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="scalar-transport"
+path="examples/scalar_transport/scalar_transport.rs"
+required-features=["hosted"]
+
+[[test]]
+name="checked_integer"
+path="tests/checked_integer/checked_integer.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="checked_integer"
+path="benches/checked_integer/checked_integer.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="checked-integer"
+path="examples/checked_integer/checked_integer.rs"
+required-features=["hosted"]
+
+[[test]]
+name="checked_div_rem"
+path="tests/checked_div_rem/checked_div_rem.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="checked_div_rem"
+path="benches/checked_div_rem/checked_div_rem.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="checked-div-rem"
+path="examples/checked_div_rem/checked_div_rem.rs"
+required-features=["hosted"]
+
+[[test]]
+name="operand_schema"
+path="tests/operand_schema/operand_schema.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="operand_schema"
+path="benches/operand_schema/operand_schema.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="operand-schema"
+path="examples/operand_schema/operand_schema.rs"
+required-features=["hosted"]
+
+[[test]]
+name="checked_conversion"
+path="tests/checked_conversion/checked_conversion.rs"
+required-features=["hosted"]
+
+[[test]]
+name = "owned_buffer"
+path = "tests/owned_buffer/owned_buffer.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "scalar_tensor"
+path = "tests/scalar_tensor/scalar_tensor.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_tensor"
+path = "tests/checked_tensor/checked_tensor.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_tensor"
+path = "benches/checked_tensor/checked_tensor.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name="checked_conversion"
+path="benches/checked_conversion/checked_conversion.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="checked-conversion"
+path="examples/checked_conversion/checked_conversion.rs"
+required-features=["hosted"]
+
+[[example]]
+name="checked-tensor"
+path="examples/checked_tensor/checked_tensor.rs"
+required-features=["tensor"]
+
+[[test]]
+name="checked_backward"
+path="tests/checked_backward/checked_backward.rs"
+required-features=["tensor"]
+
+[[test]]
+name="checked_compound"
+path="tests/checked_compound/checked_compound.rs"
+required-features=["tensor"]
+
+[[bench]]
+name="checked_compound"
+path="benches/checked_compound/checked_compound.rs"
+harness=false
+required-features=["tensor"]
+
+[[example]]
+name="checked-compound"
+path="examples/checked_compound/checked_compound.rs"
+required-features=["tensor"]
+
+[[example]]
+name="gradient"
+path="examples/gradient/gradient.rs"
+required-features=["tensor"]
+
+[[bench]]
+name="checked_backward"
+path="benches/checked_backward/checked_backward.rs"
+harness=false
+required-features=["tensor"]
+
+[[example]]
+name="checked-backward"
+path="examples/checked_backward/checked_backward.rs"
+required-features=["tensor"]
+
+[[bench]]
+name="gradient"
+path="benches/gradient/gradient.rs"
+harness=false
+required-features=["tensor"]
+
+[[test]]
+name = "resident_arguments"
+path = "tests/resident_arguments/resident_arguments.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "resident_arguments"
+path = "benches/resident_arguments/resident_arguments.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "resident-arguments"
+path = "examples/resident_arguments/resident_arguments.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name="integer_operands"
+path="benches/integer_operands/integer_operands.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="integer-operands"
+path="examples/integer_operands/integer_operands.rs"
+required-features=["hosted"]
+
+[[test]]
+name="integer_operands"
+path="tests/integer_operands/integer_operands.rs"
+required-features=["tensor"]
+
+[[test]]
+name="wide_div_rem"
+path="tests/wide_div_rem/wide_div_rem.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="wide_div_rem"
+path="benches/wide_div_rem/wide_div_rem.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="wide-div-rem"
+path="examples/wide_div_rem/wide_div_rem.rs"
+required-features=["hosted"]
+
+[[test]]
+name="div_rem_roles"
+path="tests/div_rem_roles/div_rem_roles.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="div_rem_roles"
+path="benches/div_rem_roles/div_rem_roles.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="div-rem-roles"
+path="examples/div_rem_roles/div_rem_roles.rs"
+required-features=["hosted"]
+
+[[test]]
+name="portable_div_rem"
+path="tests/portable_div_rem/portable_div_rem.rs"
+required-features=["hosted"]
+
+[[bench]]
+name="portable_div_rem"
+path="benches/portable_div_rem/portable_div_rem.rs"
+harness=false
+required-features=["hosted"]
+
+[[example]]
+name="portable-div-rem"
+path="examples/portable_div_rem/portable_div_rem.rs"
+required-features=["hosted"]
+
+[[bench]]
+name = "portable_unary"
+path = "benches/portable_unary/portable_unary.rs"
+harness = false
+
+[[example]]
+name = "portable-unary"
+path = "examples/portable_unary/portable_unary.rs"
+
+[[bench]]
+name = "composed_float_maps"
+path = "benches/composed_float_maps/composed_float_maps.rs"
+harness = false
+required-features = ["hosted"]
+
+[[test]]
+name = "composed_control_compiler"
+path = "tests/composed_control_compiler/composed_control_compiler.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "unary_roles"
+path = "benches/unary_roles/unary_roles.rs"
+harness = false
+required-features = ["hosted"]
+
+[[test]]
+name = "unary_roles"
+path = "tests/unary_roles/unary_roles.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "ordered_transport"
+path = "tests/ordered_transport/ordered_transport.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "ordered_transport"
+path = "benches/ordered_transport/ordered_transport.rs"
 harness = false
 required-features = ["hosted"]

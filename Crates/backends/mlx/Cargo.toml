@@ -1,6 +1,6 @@
 [package]
 name = "fusion-pcu-mlx"
-description = "Explicit delegated MLX GPU tensor runtime for Fusion PCU"
+description = "Explicit MLX-owned checked dispatch and delegated GPU tensors for Fusion PCU"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -21,7 +21,18 @@ path = "mlx.rs"
 default = []
 tensor = ["fusion-pcu-core/tensor"]
 benchmark-control = ["tensor"]
+# Caller-thread view API attempts only; ordinary benchmark controls have no counter work.
+view-census = ["benchmark-control"]
+# No adapter counter work is compiled into ordinary benchmark controls.
+division-census = ["benchmark-control"]
+# Untimed carrier adapter attempts; no counter work in ordinary controls.
+carrier-census = ["benchmark-control", "allocation-census"]
+binary-census = ["benchmark-control", "allocation-census"]
+integer-census = ["benchmark-control", "allocation-census"]
 allocation-census = []
+# Requested-header joint Portable source controls; no instrumentation in ordinary controls.
+portable-joint-control = ["benchmark-control"]
+portable-unary-control = ["benchmark-control"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
@@ -32,8 +43,12 @@ sha2.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
-pcu-facade = { workspace = true, features = ["tensor"] }
+pcu-facade = { workspace = true, features = ["std", "tensor", "mlx"] }
 criterion.workspace = true
+
+[[test]]
+name = "checked_unary"
+path = "tests/checked_unary/checked_unary.rs"
 
 [[test]]
 name = "native_prepare"
@@ -55,5 +70,247 @@ name = "prepared_matmul"
 path = "examples/prepared_matmul/prepared_matmul.rs"
 required-features = ["tensor"]
 
+[[bench]]
+name = "checked_unary"
+path = "benches/checked_unary/checked_unary.rs"
+harness = false
+
+[[example]]
+name = "checked_unary"
+path = "examples/checked_unary/checked_unary.rs"
+
 [lints]
 workspace = true
+
+[[test]]
+name = "checked_encoded"
+path = "tests/checked_encoded/checked_encoded.rs"
+
+[[test]]
+name = "checked_graph"
+path = "tests/checked_graph/checked_graph.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "encoded_unary"
+path = "benches/encoded_unary/encoded_unary.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "encoded_prefix"
+path = "tests/encoded_prefix/encoded_prefix.rs"
+
+[[test]]
+name = "checked_binary"
+path = "tests/checked_binary/checked_binary.rs"
+
+[[bench]]
+name = "checked_binary"
+path = "benches/checked_binary/checked_binary.rs"
+harness = false
+
+[[example]]
+name = "checked_binary"
+path = "examples/checked_binary/checked_binary.rs"
+
+[[test]]
+name = "encoded_carrier"
+path = "tests/encoded_carrier/encoded_carrier.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "encoded_carrier"
+path = "benches/encoded_carrier/encoded_carrier.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "encoded_carrier"
+path = "examples/encoded_carrier/encoded_carrier.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "carrier_map"
+path = "tests/carrier_map/carrier_map.rs"
+
+[[bench]]
+name = "carrier_map"
+path = "benches/carrier_map/carrier_map.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "carrier_map"
+path = "examples/carrier_map/carrier_map.rs"
+
+[[test]]
+name = "tensor_binary"
+path = "tests/tensor_binary/tensor_binary.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_binary"
+path = "benches/tensor_binary/tensor_binary.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[example]]
+name = "tensor_binary"
+path = "examples/tensor_binary/tensor_binary.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "tensor_relu"
+path = "benches/tensor_relu/tensor_relu.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[example]]
+name = "tensor_relu"
+path = "examples/tensor_relu/tensor_relu.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_integer"
+path = "tests/checked_integer/checked_integer.rs"
+
+[[bench]]
+name = "checked_integer"
+path = "benches/checked_integer/checked_integer.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "checked_integer"
+path = "examples/checked_integer/checked_integer.rs"
+
+[[test]]
+name="tensor_integer"
+path="tests/tensor_integer/tensor_integer.rs"
+required-features=["tensor"]
+
+[[bench]]
+name = "tensor_integer"
+path = "benches/tensor_integer/tensor_integer.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[example]]
+name = "tensor_integer"
+path = "examples/tensor_integer/tensor_integer.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_div_rem"
+path = "tests/checked_div_rem/checked_div_rem.rs"
+
+[[bench]]
+name = "checked_div_rem"
+path = "benches/checked_div_rem/checked_div_rem.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "checked_div_rem"
+path = "examples/checked_div_rem/checked_div_rem.rs"
+
+[[bench]]
+name = "checked_div_rem_roles"
+path = "benches/checked_div_rem_roles/checked_div_rem_roles.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[example]]
+name = "checked_div_rem_roles"
+path = "examples/checked_div_rem_roles/checked_div_rem_roles.rs"
+
+[[example]]
+name = "portable_div_rem"
+path = "examples/portable_div_rem/portable_div_rem.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "carrier_prefix"
+path = "benches/carrier_prefix/carrier_prefix.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[bench]]
+name = "unary_prefix"
+path = "benches/unary_prefix/unary_prefix.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[example]]
+name = "unary_prefix"
+path = "examples/unary_prefix/unary_prefix.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "binary_prefix"
+path = "benches/binary_prefix/binary_prefix.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[example]]
+name = "binary_prefix"
+path = "examples/binary_prefix/binary_prefix.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "integer_prefix"
+path = "benches/integer_prefix/integer_prefix.rs"
+harness = false
+required-features = ["tensor", "benchmark-control"]
+
+[[example]]
+name = "integer_prefix"
+path = "examples/integer_prefix/integer_prefix.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "portable_unary"
+path = "benches/portable_unary/portable_unary.rs"
+harness = false
+required-features = ["portable-unary-control"]
+
+[[example]]
+name = "portable_unary"
+path = "examples/portable_unary/portable_unary.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "normal_unary_roles"
+path = "benches/normal_unary_roles/normal_unary_roles.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "normal_unary_roles"
+path = "examples/normal_unary_roles/normal_unary_roles.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "transport"
+path = "tests/transport/transport.rs"
+
+[[bench]]
+name = "transport"
+path = "benches/transport/transport.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "transport"
+path = "examples/transport/transport.rs"
+
+[[bench]]
+name = "transport_resident"
+path = "benches/transport_resident/transport_resident.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "transport_resident"
+path = "examples/transport_resident/transport_resident.rs"

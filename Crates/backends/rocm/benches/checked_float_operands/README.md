@@ -1,0 +1,7 @@
+# Checked floating operand projection
+
+This canonical Criterion benchmark performs ordinary generic `#[pcu]` self-multiply/self-divide, with matching explicit dispatch IR and the same generated native kernel. Four schemas cover a single readonly declaration, an unread empty declaration, a canonical 17-invocation grid, and repeated scalar broadcast. Six exact encodings, both modes, all three underflow policies, and extents65/65536 produce864 peers per provider.
+
+All routes upload one actually used input, complete one checked kernel, inspect retained status, and read the output prefix into the same host tail-preserving destination. The native ABI has exactly output/input/status pointers; it allocates no placeholder for the unread declaration. Cold compilation/storage setup is outside warm measurements. Independent dyadic raw-bit answers and alternating banks guard the workload. The allocation-census build measures64 changing calls and verifies no new resolution, module load, device allocation/free or provider scoring. `--test` runs correctness only; statistics retain the GPU activity guard.
+
+The source integration fixture separately covers all eight mode/compound/precision tuples, all underflow policies, Reject/Clamp, fatal versus recovered priority, host rollback, resident discard/retry, and unused discarded/foreign owners. Repeated operand Portable admission remains unsupported.

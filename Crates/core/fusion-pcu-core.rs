@@ -26,6 +26,8 @@ pub mod dialect;
 mod insight_macros;
 pub use dialect::builder as dialect_builder;
 pub mod dispatch;
+#[path = "fault_domain/fault_domain.rs"]
+pub mod fault_domain;
 pub mod function;
 #[path = "hardware/hardware.rs"]
 pub mod hardware;
@@ -85,6 +87,7 @@ pub use borrowed::*;
 pub use builder::*;
 pub use dispatch::*;
 pub use function::*;
+pub use fault_domain::*;
 pub use map_validation::*;
 pub use numerical::*;
 pub use dialect::*;

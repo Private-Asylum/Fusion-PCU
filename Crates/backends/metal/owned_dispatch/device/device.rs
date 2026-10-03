@@ -70,74 +70,38 @@ impl PcuPreparedDeviceKernel for MetalPreparedDeviceKernel {
         &mut self,
         arguments: &mut [PcuDeviceArgument<'_, MetalMemoryResource>],
     ) -> Result<(), Self::Error> {
-        let bindings = arguments
-            .iter()
-            .enumerate()
-            .map(|(index, argument)| {
-                if arguments[..index]
-                    .iter()
-                    .any(|other| other.target() == argument.target())
-                {
-                    return Err(MetalOwnedDispatchError::Binding(
-                        PcuOwnedDispatchBindingError::Duplicate(argument.target()),
-                    ));
-                }
-                let bytes = u64::try_from(argument.elements())
-                    .ok()
-                    .and_then(|count| count.checked_mul(4))
-                    .ok_or(MetalError::InvalidExtent)?;
-                let requirement = self
-                    .dispatch
-                    .requirements
-                    .iter()
-                    .find(|required| required.target == argument.target())
-                    .ok_or_else(|| {
-                        MetalOwnedDispatchError::Binding(PcuOwnedDispatchBindingError::Unexpected(
-                            argument.target(),
-                        ))
-                    })?;
-                if bytes < requirement.min_required_bytes {
-                    return Err(MetalOwnedDispatchError::Binding(
-                        PcuOwnedDispatchBindingError::BufferTooSmall {
-                            binding: argument.target(),
-                            required: requirement.min_required_bytes,
-                            available: bytes,
-                        },
-                    ));
-                }
-                let value = match argument.scalar() {
-                    fusion_pcu::PcuScalarType::U32 => PcuValueType::u32(),
-                    fusion_pcu::PcuScalarType::F32 => PcuValueType::f32(),
-                    _ => {
-                        return Err(MetalOwnedDispatchError::Binding(
-                            PcuOwnedDispatchBindingError::TypeMismatch(argument.target()),
-                        ));
-                    }
-                };
-                // Reuse the same physical affinity, real size and resource-access validation as bind.
-                let backend = MetalOwnedDispatchBackend::new(
-                    self.dispatch.session.clone(),
-                    self.dispatch.device,
-                );
-                let binding = backend.bind(
-                    argument.target(),
-                    argument.access(),
-                    PcuBindingType::Value(value),
-                    argument.resource(),
-                )?;
-                if bytes > binding.byte_len {
-                    return Err(MetalOwnedDispatchError::Binding(
-                        PcuOwnedDispatchBindingError::BufferTooSmall {
-                            binding: argument.target(),
-                            required: bytes,
-                            available: binding.byte_len,
-                        },
-                    ));
-                }
-                Ok(binding)
-            })
-            .collect::<Result<Vec<_>, Self::Error>>()?;
+        let bindings = self.bind_device_arguments(arguments)?;
         self.dispatch.validate_resources(&bindings)?;
+        if let super::Program::DivRem(kernel) = &self.dispatch.program {
+            return match MetalPreparedDispatch::execute_div_rem(kernel, &bindings)? {
+                fusion_pcu::PcuCompletionOutcome::Succeeded => Ok(()),
+                fusion_pcu::PcuCompletionOutcome::Fault(fault) => {
+                    Err(MetalError::Arithmetic(fault).into())
+                }
+                fusion_pcu::PcuCompletionOutcome::Failed => Err(MetalError::Unsupported.into()),
+            };
+        }
+        if let super::Program::DivRemRoles(kernel) = &self.dispatch.program {
+            return match MetalPreparedDispatch::execute_div_rem_roles(kernel, &bindings)? {
+                fusion_pcu::PcuCompletionOutcome::Succeeded => Ok(()),
+                fusion_pcu::PcuCompletionOutcome::Fault(fault) => {
+                    Err(MetalError::Arithmetic(fault).into())
+                }
+                fusion_pcu::PcuCompletionOutcome::Failed => Err(MetalError::Unsupported.into()),
+            };
+        }
+        if let super::Program::Composed(kernel) = &self.dispatch.program {
+            return match MetalPreparedDispatch::execute_composed(kernel, &bindings)? {
+                fusion_pcu::PcuCompletionOutcome::Succeeded => Ok(()),
+                fusion_pcu::PcuCompletionOutcome::Fault(fault) => {
+                    Err(MetalError::Arithmetic(fault).into())
+                }
+                fusion_pcu::PcuCompletionOutcome::Failed => Err(MetalError::Unsupported.into()),
+            };
+        }
+        if let super::Program::Transport(kernel) = &self.dispatch.program {
+            return MetalPreparedDispatch::execute_transport(kernel, &bindings).map(|_| ());
+        }
         let find = |target| {
             bindings
                 .iter()
@@ -146,10 +110,19 @@ impl PcuPreparedDeviceKernel for MetalPreparedDeviceKernel {
                     PcuOwnedDispatchBindingError::Missing(target),
                 ))
         };
-        let inputs = self.dispatch.program.inputs();
+        let inputs = self
+            .dispatch
+            .program
+            .inputs()
+            .ok_or(MetalError::Unsupported)?;
         let left = find(inputs[0])?;
         let right = find(inputs[1])?;
-        let output = find(self.dispatch.program.output())?;
+        let output = find(
+            self.dispatch
+                .program
+                .output()
+                .ok_or(MetalError::Unsupported)?,
+        )?;
         // Avoid a RefCell conflict and prevent accidental aliasing through advanced resource owners.
         if std::rc::Rc::ptr_eq(&output.resource.buffer, &left.resource.buffer)
             || std::rc::Rc::ptr_eq(&output.resource.buffer, &right.resource.buffer)
@@ -172,7 +145,7 @@ impl PcuPreparedDeviceKernel for MetalPreparedDeviceKernel {
 }
 
 impl MetalOwnedDispatchBackend {
-    /// Uploads an explicitly transferred U32/F32 typed buffer through shared memory services.
+    /// Uploads an explicitly transferred22 byte-addressed sealed scalar buffer through shared memory services.
     ///
     /// # Errors
     /// Rejects unsupported types, zero extents, byte order, allocation or transfer failures.
@@ -182,12 +155,7 @@ impl MetalOwnedDispatchBackend {
         values: &[T],
     ) -> Result<fusion_pcu::PcuDeviceBuffer<T, MetalMemoryResource>, MetalOwnedDispatchError> {
         use fusion_pcu::PcuMemoryProvider;
-        if cfg!(target_endian = "big")
-            || !matches!(
-                T::TYPE,
-                fusion_pcu::PcuScalarType::U32 | fusion_pcu::PcuScalarType::F32
-            )
-        {
+        if cfg!(target_endian = "big") || T::TYPE.bit_width() < 8 {
             return Err(MetalError::Unsupported.into());
         }
         if values.is_empty() {
@@ -234,5 +202,100 @@ impl MetalOwnedDispatchBackend {
                 host.bytes_mut().ok_or(MetalError::Unsupported)?,
             )
             .map_err(MetalOwnedDispatchError::Memory)
+    }
+}
+
+const fn scalar_value_type(scalar: fusion_pcu::PcuScalarType) -> Option<PcuValueType> {
+    if scalar.bit_width() >= 8 {
+        Some(PcuValueType::Scalar(scalar))
+    } else {
+        None
+    }
+}
+
+impl MetalPreparedDeviceKernel {
+    fn bind_device_arguments(
+        &self,
+        arguments: &[PcuDeviceArgument<'_, MetalMemoryResource>],
+    ) -> Result<Vec<fusion_pcu::PcuOwnedBinding<super::MetalOwnedResource>>, MetalOwnedDispatchError>
+    {
+        if let super::Program::Composed(kernel) = &self.dispatch.program {
+            super::composed::validate_declarations(&kernel.borrow(), arguments)?;
+        }
+        if let super::Program::Transport(kernel) = &self.dispatch.program {
+            super::transport::validate_declarations(kernel, arguments)?;
+        }
+        let bindings = arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| {
+                !self
+                    .dispatch
+                    .program
+                    .is_unread_declaration(argument.target())
+            })
+            .map(|(index, argument)| {
+                if arguments[..index]
+                    .iter()
+                    .any(|other| other.target() == argument.target())
+                {
+                    return Err(MetalOwnedDispatchError::Binding(
+                        PcuOwnedDispatchBindingError::Duplicate(argument.target()),
+                    ));
+                }
+                let bytes = u64::try_from(argument.elements())
+                    .ok()
+                    .and_then(|count| {
+                        count.checked_mul(u64::from(argument.scalar().bit_width()) / 8)
+                    })
+                    .ok_or(MetalError::InvalidExtent)?;
+                let requirement = self
+                    .dispatch
+                    .requirements
+                    .iter()
+                    .find(|required| required.target == argument.target())
+                    .ok_or_else(|| {
+                        MetalOwnedDispatchError::Binding(PcuOwnedDispatchBindingError::Unexpected(
+                            argument.target(),
+                        ))
+                    })?;
+                if bytes < requirement.min_required_bytes {
+                    return Err(MetalOwnedDispatchError::Binding(
+                        PcuOwnedDispatchBindingError::BufferTooSmall {
+                            binding: argument.target(),
+                            required: requirement.min_required_bytes,
+                            available: bytes,
+                        },
+                    ));
+                }
+                let value = scalar_value_type(argument.scalar()).ok_or_else(|| {
+                    MetalOwnedDispatchError::Binding(PcuOwnedDispatchBindingError::TypeMismatch(
+                        argument.target(),
+                    ))
+                })?;
+                // Reuse the same physical affinity, real size and resource-access validation as bind.
+                let backend = MetalOwnedDispatchBackend::new(
+                    self.dispatch.session.clone(),
+                    self.dispatch.device,
+                );
+                let binding = backend.bind(
+                    argument.target(),
+                    argument.access(),
+                    PcuBindingType::Value(value),
+                    argument.resource(),
+                )?;
+                if bytes > binding.byte_len {
+                    return Err(MetalOwnedDispatchError::Binding(
+                        PcuOwnedDispatchBindingError::BufferTooSmall {
+                            binding: argument.target(),
+                            required: bytes,
+                            available: binding.byte_len,
+                        },
+                    ));
+                }
+                Ok(binding)
+            })
+            .collect::<Result<Vec<_>, MetalOwnedDispatchError>>()?;
+        Ok(bindings)
     }
 }

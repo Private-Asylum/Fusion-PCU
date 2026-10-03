@@ -170,7 +170,7 @@ fn generic_owned_sources_support_f32_f64_and_helpers() {
     assert!(
         matches!(
             &error,
-            PcuExecutionError::NoCompatibleDevice(rejections)
+            PcuExecutionError::NoCompatibleDevice { rejected: rejections, .. }
                 if rejections.iter().any(|(_, error)| matches!(
                     error,
                     PcuExecutionError::TensorExecution(

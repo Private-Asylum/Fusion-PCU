@@ -20,6 +20,13 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
     let ident = input.function_ident;
     let vis = input.visibility;
     let attributes = &function.attrs;
+    // Generated argument adapters must mention typed, deliberately unread parameters.
+    // The author's underscore convention remains valid; only generated wrappers need this allow.
+    let unread_underscore_allow = input
+        .arguments
+        .iter()
+        .any(|arg| !arg.access.used() && arg.ident.to_string().starts_with('_'))
+        .then(|| quote! { #[allow(clippy::used_underscore_binding)] });
     let generics = &function.sig.generics;
     let where_clause = &generics.where_clause;
     let fresh_ident = |base: &str| {
@@ -46,9 +53,9 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
     let bindings_call = &input.bindings_call;
     let policy_builder_ident = &input.policy_builder_ident;
     let policy_builder_call = if generic_args.is_empty() {
-        quote! { #policy_builder_ident(&#bindings_ident, #policy_ident, #range_policy_ident) }
+        quote! { #policy_builder_ident(&#bindings_ident, #policy_ident, #range_policy_ident, #context_ident.numerical_requirements()) }
     } else {
-        quote! { #policy_builder_ident::<#(#generic_args),*>(&#bindings_ident, #policy_ident, #range_policy_ident) }
+        quote! { #policy_builder_ident::<#(#generic_args),*>(&#bindings_ident, #policy_ident, #range_policy_ident, #context_ident.numerical_requirements()) }
     };
     let underflow_policy = input.explicit_policy.as_ref().map_or_else(
         || quote! { #context_ident.float_underflow_policy() },
@@ -58,7 +65,7 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
         || quote! { #context_ident.range_policy() },
         |policy| quote! { #policy },
     );
-    let range_profile_guard = if input.supports_float_range {
+    let range_profile_guard = if input.supports_range_policy {
         quote! {}
     } else {
         quote! {
@@ -88,7 +95,7 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
         let name = &pattern.ident;
         let scalar = &arg.scalar;
         let shape = source_shape(pcu, &arg.ty, arg.scalar_reference);
-        let trait_name = if arg.read_write {
+        let trait_name = if arg.access.writable() {
             quote! { PcuWriteStorage }
         } else {
             quote! { PcuReadStorage }
@@ -99,10 +106,24 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
         *reference.elem = syn::parse_quote!((impl #pcu::#trait_name<#scalar, #shape> + ?Sized));
         let slot = arg.binding;
         let target = quote! { #pcu::PcuBindingRef::new(0, #slot) };
-        conversions.push(quote! {
-            #pcu::#trait_name::as_pcu_call_argument(#name, #target)
-                .map_err(#pcu::global::argument_error)?
-        });
+        if arg.access.used() {
+            conversions.push(quote! {
+                #pcu::#trait_name::as_pcu_call_argument(#name, #target)
+                    .map_err(#pcu::global::argument_error)?
+            });
+        } else {
+            // Validated lowering emitted no access. Preserve the source declaration,
+            // without probing an irrelevant owner's storage or session.
+            let metadata = if arg.access.writable() {
+                quote! { unused_read_write }
+            } else {
+                quote! { unused_read }
+            };
+            conversions.push(quote! {{
+                let _ = #name;
+                #pcu::PcuCallArgument::#metadata::<#scalar>(#target)
+            }});
+        }
     }
     let count = input.arguments.len();
     let generic_params = generics
@@ -126,6 +147,7 @@ pub fn generate(input: &Input<'_>) -> TokenStream {
     quote! {
         #(#attributes)*
         #[allow(dead_code)]
+        #unread_underscore_allow
         #vis fn #ident #generics (#direct_inputs) -> ::core::result::Result<(), #pcu::global::PcuExecutionError> #where_clause {
             #marker_definition
             static #site_ident: #pcu::global::PcuHostCallSite = #pcu::global::PcuHostCallSite::new();
@@ -169,3 +191,7 @@ fn source_shape(pcu: &syn::Path, ty: &Type, scalar_reference: bool) -> TokenStre
         _ => unreachable!("validated PCU argument shape"),
     }
 }
+
+#[cfg(test)]
+#[path = "hosted/tests/tests.rs"]
+mod tests;

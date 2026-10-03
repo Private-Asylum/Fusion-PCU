@@ -38,14 +38,27 @@ pub fn validate_integer_checked_binary_kernel(
     op: crate::model::PcuDispatchIntegerBinaryOp,
     scalar_caps: PcuValueTypeCaps,
 ) -> Result<(), IntegerMapValidationError> {
-    let refs = validate_checked_binary_interface(kernel, value_type, scalar_caps)?;
-    validate_checked_binary_body(kernel, value_type, op, refs)
+    validate_binary_kernel(kernel, value_type, op, scalar_caps, false)
+}
+
+// Existing providers keep distinct-load admission until they explicitly adopt the detached
+// operand schema. The opt-in path changes resource roles, not arithmetic or range policy.
+fn validate_binary_kernel(
+    kernel: &PcuDispatchKernelIr<'_>,
+    value_type: PcuValueType,
+    op: crate::model::PcuDispatchIntegerBinaryOp,
+    scalar_caps: PcuValueTypeCaps,
+    repeated_loads: bool,
+) -> Result<(), IntegerMapValidationError> {
+    let refs = validate_checked_binary_interface(kernel, value_type, scalar_caps, repeated_loads)?;
+    validate_checked_binary_body(kernel, value_type, op, refs, repeated_loads)
 }
 
 fn validate_checked_binary_interface(
     kernel: &PcuDispatchKernelIr<'_>,
     value_type: PcuValueType,
     scalar_caps: PcuValueTypeCaps,
+    repeated_loads: bool,
 ) -> Result<[PcuBindingRef; 3], IntegerMapValidationError> {
     if !matches!(
         value_type,
@@ -58,16 +71,26 @@ fn validate_checked_binary_interface(
                 | crate::PcuScalarType::U32
                 | crate::PcuScalarType::I64
                 | crate::PcuScalarType::U64
+                | crate::PcuScalarType::I128
+                | crate::PcuScalarType::U128
+                | crate::PcuScalarType::I256
+                | crate::PcuScalarType::U256
+                | crate::PcuScalarType::I512
+                | crate::PcuScalarType::U512
         )
     ) {
         return Err(IntegerMapValidationError::UnsupportedInterface);
     }
-    if !kernel.ports.is_empty() || !kernel.parameters.is_empty() || kernel.bindings.len() != 3 {
+    if !kernel.ports.is_empty()
+        || !kernel.parameters.is_empty()
+        || !(kernel.bindings.len() == 3 || repeated_loads && kernel.bindings.len() == 2)
+    {
         return Err(IntegerMapValidationError::UnsupportedInterface);
     }
     let allowed_types = scalar_caps | PcuValueTypeCaps::SCALAR_VALUES;
-    let allowed_features =
-        PcuDispatchFeatureCaps::MUTABLE_RESOURCES | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES;
+    let allowed_features = PcuDispatchFeatureCaps::MUTABLE_RESOURCES
+        | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES
+        | PcuDispatchFeatureCaps::RANGE_CLAMP;
     if kernel.required_type_support().bits() & !allowed_types.bits() != 0
         || kernel.required_feature_support().bits() & !allowed_features.bits() != 0
     {
@@ -88,25 +111,29 @@ fn validate_checked_binary_interface(
             return Err(IntegerMapValidationError::InvalidBinding(reference));
         }
     }
-    let refs = [
-        kernel.bindings[0].reference(),
-        kernel.bindings[1].reference(),
-        kernel.bindings[2].reference(),
-    ];
-    if kernel.bindings[0].access != PcuBindingAccess::ReadOnly
-        || kernel.bindings[1].access != PcuBindingAccess::ReadOnly
-        || kernel.bindings[2].access == PcuBindingAccess::ReadOnly
-    {
-        let bad = kernel
-            .bindings
-            .iter()
-            .find(|binding| {
-                (binding.reference() == refs[0] || binding.reference() == refs[1])
-                    != (binding.access == PcuBindingAccess::ReadOnly)
-            })
-            .map_or(refs[2], |binding| binding.reference());
-        return Err(IntegerMapValidationError::InvalidBinding(bad));
-    }
+    // Binding declaration order is source parameter order, not an execution role. Freeze the
+    // two read-only resources and writable result by schema; SSA validation below checks the
+    // actual load/store references independently. This permits ordinary output-first functions.
+    let mut inputs = kernel
+        .bindings
+        .iter()
+        .filter(|binding| binding.access == PcuBindingAccess::ReadOnly);
+    let first = inputs
+        .next()
+        .ok_or(IntegerMapValidationError::UnsupportedInterface)?
+        .reference();
+    let second = match inputs.next() {
+        Some(binding) => binding.reference(),
+        None if repeated_loads => first,
+        None => return Err(IntegerMapValidationError::UnsupportedInterface),
+    };
+    let output = kernel
+        .bindings
+        .iter()
+        .find(|binding| binding.access != PcuBindingAccess::ReadOnly)
+        .ok_or(IntegerMapValidationError::UnsupportedInterface)?
+        .reference();
+    let refs = [first, second, output];
     Ok(refs)
 }
 
@@ -115,6 +142,7 @@ fn validate_checked_binary_body(
     value_type: PcuValueType,
     op: crate::model::PcuDispatchIntegerBinaryOp,
     refs: [PcuBindingRef; 3],
+    repeated_loads: bool,
 ) -> Result<(), IntegerMapValidationError> {
     let (body, index) = match kernel.ops {
         [
@@ -159,7 +187,7 @@ fn validate_checked_binary_body(
         } else {
             return Err(IntegerMapValidationError::InvalidBinding(binding));
         };
-        if loaded[input] {
+        if loaded[input] && !repeated_loads {
             return Err(IntegerMapValidationError::UnsupportedOperation(slot));
         }
         define_integer_div_value(&mut values, result)?;
@@ -168,6 +196,7 @@ fn validate_checked_binary_body(
     let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary {
         value_type: actual,
         op: actual_op,
+        range_policy,
         result,
         lhs,
         rhs,
@@ -177,6 +206,9 @@ fn validate_checked_binary_body(
     };
     if actual != value_type || actual_op != op {
         return Err(IntegerMapValidationError::UnsupportedOperation(2));
+    }
+    if range_policy != kernel.numerical_requirements.range_policy {
+        return Err(IntegerMapValidationError::RangePolicyMismatch);
     }
     require_integer_div_value(&values, lhs)?;
     require_integer_div_value(&values, rhs)?;
@@ -199,11 +231,19 @@ fn validate_checked_binary_body(
         return Err(IntegerMapValidationError::InvalidValue(value));
     }
     require_integer_div_value(&values, value)?;
-    if !loaded.into_iter().all(core::convert::identity) {
+    if !repeated_loads && !loaded.into_iter().all(core::convert::identity) {
         return Err(IntegerMapValidationError::UnsupportedOperation(2));
     }
     Ok(())
 }
+
+#[path = "checked_binary/operand_schema/operand_schema.rs"]
+mod operand_schema;
+#[rustfmt::skip]
+pub use operand_schema::{
+    assess_checked_integer_binary_operands,
+    CheckedIntegerBinaryOperandSchema,
+};
 
 #[cfg(test)]
 mod tests;

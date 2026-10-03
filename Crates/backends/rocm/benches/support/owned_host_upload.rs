@@ -110,6 +110,7 @@ impl UploadGraph {
         let output = backend.allocate(expected.len())?;
         let upload_stream = backend.create_stream()?;
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(0xD1_0053),
             entry: PcuDispatchEntryPoint {
                 name: "owned_host_upload_graph_copy",

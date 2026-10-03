@@ -457,7 +457,7 @@ const fn scalar_width(scalar: PcuScalarType) -> usize {
         PcuScalarType::I16 | PcuScalarType::U16 | PcuScalarType::F16 | PcuScalarType::BF16 => 2,
         PcuScalarType::I32 | PcuScalarType::U32 | PcuScalarType::F32 => 4,
         PcuScalarType::I64 | PcuScalarType::U64 | PcuScalarType::F64 => 8,
-        PcuScalarType::Bool | PcuScalarType::I4 | PcuScalarType::U4 => 0,
+        _ => 0, // Exact admission rejects unimplemented packed/wide storage and arithmetic.
     }
 }
 

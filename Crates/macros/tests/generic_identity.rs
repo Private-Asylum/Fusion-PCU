@@ -35,6 +35,68 @@ fn copy_grid<T: PcuScalar, const N: usize>(input: &[T], output: &mut [T]) {
     }
 }
 
+#[pcu(invocations = N, crate_path = ::pcu_alias)]
+fn broadcast<T: PcuScalar, const N: usize>(seed: &T, output: &mut [T]) {
+    let id = context.global_invocation_id;
+    output[id] = *seed;
+}
+
+#[pcu(invocations = 3, crate_path = ::pcu_alias)]
+fn broadcast_grid<T: PcuScalar, const N: usize>(seed: &T, output: &mut [T]) {
+    let mut id = context.global_invocation_id;
+    let stride = context.invocation_count;
+    while id < N {
+        output[id] = *seed;
+        id += stride;
+    }
+}
+
+fn assert_broadcast<T: PcuScalar>() {
+    let bindings = broadcast_bindings::<T>();
+    let direct = broadcast_ir::<T, 17>(&bindings).unwrap();
+    let bindings = broadcast_grid_bindings::<T>();
+    let grid = broadcast_grid_ir::<T, 17>(&bindings).unwrap();
+    for kernel in [direct.ir(), grid.ir()] {
+        pcu_alias::validate_scalar_broadcast_kernel(&kernel, T::TYPE).unwrap();
+        pcu_alias::validate_typed_dispatch_value_flow(&kernel).unwrap();
+        assert!(pcu_alias::validate_scalar_identity_kernel(&kernel, T::TYPE).is_err());
+        assert_eq!(
+            kernel.minimum_binding_elements_for(PcuBindingRef::new(0, 0), 3),
+            1
+        );
+        assert_eq!(
+            kernel.minimum_binding_elements_for(PcuBindingRef::new(0, 1), 17),
+            17
+        );
+    }
+}
+
+#[test]
+fn all_twenty_two_carriers_lower_readonly_scalar_broadcast_without_arithmetic_bounds() {
+    assert_broadcast::<u8>();
+    assert_broadcast::<i8>();
+    assert_broadcast::<u16>();
+    assert_broadcast::<i16>();
+    assert_broadcast::<u32>();
+    assert_broadcast::<i32>();
+    assert_broadcast::<u64>();
+    assert_broadcast::<i64>();
+    assert_broadcast::<u128>();
+    assert_broadcast::<i128>();
+    assert_broadcast::<pcu_alias::PcuU256>();
+    assert_broadcast::<pcu_alias::PcuI256>();
+    assert_broadcast::<pcu_alias::PcuU512>();
+    assert_broadcast::<pcu_alias::PcuI512>();
+    assert_broadcast::<pcu_alias::PcuF16Bits>();
+    assert_broadcast::<pcu_alias::PcuBf16Bits>();
+    assert_broadcast::<pcu_alias::PcuF8E4M3FnBits>();
+    assert_broadcast::<pcu_alias::PcuF8E5M2Bits>();
+    assert_broadcast::<f32>();
+    assert_broadcast::<f64>();
+    assert_broadcast::<pcu_alias::PcuF128Bits>();
+    assert_broadcast::<pcu_alias::PcuF256Bits>();
+}
+
 #[test]
 fn generic_scalar_copy_specializes_binding_type_and_executes_on_cpu() {
     let bindings = copy_bindings::<f32>();

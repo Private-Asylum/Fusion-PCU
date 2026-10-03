@@ -23,6 +23,8 @@ use crate::{
     PcuValueTypeCaps,
 };
 
+mod operand_schema;
+
 fn validate(
     kernel: &PcuDispatchKernelIr<'_>,
     op: BinaryOp,
@@ -38,6 +40,7 @@ fn fixture<'a>(
     parameters: &'a [crate::PcuParameter],
 ) -> PcuDispatchKernelIr<'a> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(7),
         entry: PcuDispatchEntryPoint {
             name: "checked_f32",
@@ -399,6 +402,104 @@ fn accepts_binary64_profiles_and_requires_matching_type_floor() {
                     ),
                     Err(Error::UnsupportedRequirements)
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn named_low_precision_contracts_require_exact_format_and_capabilities() {
+    for scalar in [
+        crate::PcuScalarType::F16,
+        crate::PcuScalarType::BF16,
+        crate::PcuScalarType::F8E4M3FN,
+        crate::PcuScalarType::F8E5M2,
+    ] {
+        let value_type = PcuValueType::Scalar(scalar);
+        let bindings = make_bindings(value_type);
+        for policy in [
+            PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+            PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        ] {
+            for op in [BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div] {
+                for index in [
+                    PcuDispatchIndex::InvocationId,
+                    PcuDispatchIndex::GridStrideId,
+                ] {
+                    let mut body = body(index, Id(3), policy);
+                    body[2] = Op::Data(Data::CheckedFloatBinary {
+                        value_type,
+                        op,
+                        underflow_policy: policy,
+                        range_policy: crate::PcuRangePolicy::Reject,
+                        result: Id(3),
+                        lhs: Id(1),
+                        rhs: Id(2),
+                    });
+                    let direct = [
+                        body[0],
+                        body[1],
+                        body[2],
+                        body[3],
+                        Op::Control(PcuDispatchControlOp::Return),
+                    ];
+                    let grid = [
+                        Op::GridStrideLoop {
+                            extent: 17,
+                            body: &body,
+                        },
+                        Op::Control(PcuDispatchControlOp::Return),
+                    ];
+                    let ops: &[Op<'_>] = if index == PcuDispatchIndex::InvocationId {
+                        &direct
+                    } else {
+                        &grid
+                    };
+                    let kernel = fixture(&bindings, ops, &[]);
+                    assert_eq!(
+                        validate_checked_float_binary_kernel(
+                            &kernel,
+                            value_type,
+                            op,
+                            policy,
+                            PcuValueTypeCaps::for_scalar(scalar)
+                        ),
+                        Ok(())
+                    );
+                    assert_eq!(
+                        validate_checked_float_binary_kernel(
+                            &kernel,
+                            value_type,
+                            op,
+                            policy,
+                            PcuValueTypeCaps::FLOAT32
+                        ),
+                        Err(Error::UnsupportedRequirements)
+                    );
+                    assert!(
+                        validate_checked_float_binary_kernel(
+                            &kernel,
+                            PcuValueType::f32(),
+                            op,
+                            policy,
+                            PcuValueTypeCaps::FLOAT32 | PcuValueTypeCaps::for_scalar(scalar)
+                        )
+                        .is_err()
+                    );
+                    for wide in [crate::PcuScalarType::F128, crate::PcuScalarType::F256] {
+                        assert_eq!(
+                            validate_checked_float_binary_kernel(
+                                &kernel,
+                                PcuValueType::Scalar(wide),
+                                op,
+                                policy,
+                                PcuValueTypeCaps::for_scalar(wide)
+                            ),
+                            Err(Error::UnsupportedRequirements)
+                        );
+                    }
+                }
             }
         }
     }

@@ -78,9 +78,7 @@ fn matrix_admits_only_implemented_independent_policy_combinations() {
                                     workspace_bytes: None,
                                 }
                             );
-                        } else if mode == PcuNumericalMode::Strict
-                            && compound == PcuCompoundArithmeticPolicy::Checked
-                        {
+                        } else if mode == PcuNumericalMode::Strict {
                             assert_eq!(
                                 support,
                                 TensorOperationSupport::Supported {

@@ -1,0 +1,61 @@
+#version 450
+// Exact PCU ReLU derivative: select the upstream representation for positive input,
+// otherwise positive zero. Every nonfinite input/upstream rejects even if inactive;
+// this finite-input policy departs from IEEE default propagation/selection behavior.
+// No arithmetic rounding occurs; only RejectSubnormalResult can reject a finite
+// selected subnormal. IEEE-after-rounding and gradual underflow preserve exact bits.
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint FORMAT=0u; // F16/BF16/E4M3FN/E5M2/F32/F64.
+layout(constant_id=1) const uint POLICY=0u;
+layout(constant_id=2) const uint EXTENT=1u;
+layout(set=0,binding=0,std430) readonly buffer Input {uint data[];} source;
+layout(set=0,binding=1,std430) readonly buffer Upstream {uint data[];} upstream;
+layout(set=0,binding=2,std430) writeonly buffer Output {uint data[];} destination;
+layout(set=0,binding=3,std430) writeonly buffer Status {uint data[];} status;
+uvec3 backward(uint x,uint xhi,uint dy,uint dyhi) {
+    if(FORMAT==5u) {
+        uint magnitude=xhi&0x7fffffffu; uint gradmag=dyhi&0x7fffffffu;
+        if(magnitude>0x7fefffffu || gradmag>0x7fefffffu)return uvec3(0u,0u,1u);
+        if((xhi&0x80000000u)!=0u || (magnitude==0u && x==0u)) {dy=0u;dyhi=0u;}
+        gradmag=dyhi&0x7fffffffu;
+        uint code=POLICY==1u && gradmag<0x00100000u && (gradmag!=0u || dy!=0u)?2u:0u;
+        return uvec3(dy,dyhi,code);
+    }
+    uint sign=FORMAT<2u?0x8000u:FORMAT<4u?0x80u:0x80000000u;
+    uint maximum=FORMAT==0u?0x7bffu:FORMAT==1u?0x7f7fu:FORMAT==2u?0x7eu:FORMAT==3u?0x7bu:0x7f7fffffu;
+    uint minimum=FORMAT==0u?0x400u:FORMAT==1u?0x80u:FORMAT==2u?0x8u:FORMAT==3u?0x4u:0x00800000u;
+    uint magnitude=x&(sign-1u);
+    if(magnitude>maximum || (dy&(sign-1u))>maximum)return uvec3(0u,0u,1u);
+    if((x&sign)!=0u || magnitude==0u)dy=0u;
+    magnitude=dy&(sign-1u);
+    uint code=POLICY==1u && magnitude!=0u && magnitude<minimum?2u:0u;
+    return uvec3(dy,0u,code);
+}
+void main() {
+    uint word=gl_GlobalInvocationID.x;
+    if(FORMAT==5u) {
+        if(word>=EXTENT)return;
+        // The cold extent*8 byte bound guarantees word*2+1 cannot wrap or leave storage.
+        uint base=word*2u;
+        uvec3 result=backward(source.data[base],source.data[base+1u],upstream.data[base],upstream.data[base+1u]);
+        destination.data[base]=result.x;destination.data[base+1u]=result.y;status.data[word]=result.z;
+        return;
+    }
+    uint width=FORMAT<2u?16u:FORMAT<4u?8u:32u;
+    uint lanes=32u/width;
+    uint words=EXTENT/lanes+uint(EXTENT%lanes!=0u);
+    if(word>=words)return;
+    uint base=word*lanes;uint packed=0u;
+    // One invocation owns the entire output word, including odd logical tails. Both
+    // inputs use the same dense index; the cold extent*max(4,bytes) bound proves all
+    // lane/base products and additions below. Every shift is0..31, never a U32-width shift.
+    for(uint lane=0u;lane<lanes && lane<EXTENT-base;++lane) {
+        uint logical=base+lane;uint shift=lane*width;
+        uint mask=0xffffffffu>>(32u-width);
+        uint x=(source.data[word]>>shift)&mask;
+        uint dy=(upstream.data[word]>>shift)&mask;
+        uvec3 result=backward(x,0u,dy,0u);packed|=result.x<<shift;
+        status.data[logical]=result.z;
+    }
+    destination.data[word]=packed;
+}

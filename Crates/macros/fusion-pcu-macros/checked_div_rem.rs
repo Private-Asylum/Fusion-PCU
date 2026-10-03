@@ -11,7 +11,11 @@ use super::{
     validate_invocation_index,
 };
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+#[rustfmt::skip]
+use quote::{
+    format_ident,
+    quote,
+};
 use syn::spanned::Spanned;
 #[rustfmt::skip]
 use syn::{
@@ -28,6 +32,10 @@ use syn::{
 
 type Lowered<'a> = (Option<&'a Expr>, Vec<TokenStream2>);
 
+#[cfg(test)]
+#[path = "checked_div_rem/tests/tests.rs"]
+mod tests;
+
 struct CheckedDivRemBody<'a> {
     invocation: Ident,
     lhs: &'a Expr,
@@ -39,6 +47,41 @@ struct CheckedDivRemBody<'a> {
     extent: Option<&'a Expr>,
 }
 
+/// An associated const specializes the typed body without allocation or an
+/// invalid function-local const capturing the outer generic parameter.
+pub fn generic_grid_operations(
+    data_ops: &[TokenStream2],
+    extent: &TokenStream2,
+    function: &Ident,
+    scalar: &Ident,
+    pcu: &Path,
+) -> (TokenStream2, usize, TokenStream2) {
+    let body_ident = format_ident!("__{}_PcuDivRemBody", function);
+    let body_len = data_ops.len();
+    let body_ops = data_ops
+        .iter()
+        .map(|op| quote! { #pcu::PcuDispatchOp::Data(#op) });
+    let body_item = quote! {
+        #[allow(non_camel_case_types)]
+        struct #body_ident<#scalar: #pcu::PcuCheckedIntegerDivision>(::core::marker::PhantomData<#scalar>);
+        impl<#scalar: #pcu::PcuCheckedIntegerDivision> #body_ident<#scalar> {
+            const BODY: [#pcu::PcuDispatchOp<'static>; #body_len] = [#(#body_ops),*];
+        }
+    };
+    let operation = quote! {
+        let builder = builder.with_op(#pcu::PcuDispatchOp::GridStrideLoop {
+            extent: const {
+                let extent: usize = #extent;
+                assert!(extent != 0, "PCU grid-stride extent must be nonzero");
+                assert!(extent <= u32::MAX as usize, "PCU grid-stride extent exceeds u32");
+                extent as u32
+            },
+            body: &#body_ident::<#scalar>::BODY,
+        })?;
+    };
+    (operation, 2, body_item)
+}
+
 pub fn lower<'a>(
     function: &'a ItemFn,
     bindings: &[BindingSpec],
@@ -47,7 +90,7 @@ pub fn lower<'a>(
     let Some(body) = parse_checked_div_rem_body(function)? else {
         return Ok(None);
     };
-    let lowered = lower_checked_div_rem_body(&body, bindings, pcu)?;
+    let lowered = lower_checked_div_rem_body(function, &body, bindings, pcu)?;
     Ok(Some(lowered))
 }
 
@@ -314,28 +357,28 @@ fn checked_div_rem_local(statement: &Stmt) -> Result<(Ident, Ident, &Expr, &Expr
 }
 
 fn lower_checked_div_rem_body<'a>(
+    function: &ItemFn,
     body: &CheckedDivRemBody<'a>,
     bindings: &[BindingSpec],
     pcu: &Path,
 ) -> Result<(Option<&'a Expr>, Vec<TokenStream2>), Error> {
-    if bindings.len() != 4
-        || bindings
-            .iter()
-            .any(|binding| binding.scalar != ScalarKind::U32)
-    {
+    if !(3..=4).contains(&bindings.len()) {
         return Err(Error::new(
             body.lhs.span(),
-            "checked u32 DivRem requires exactly four u32 bindings",
+            "checked DivRem requires one or two read-only inputs and two matching integer outputs",
         ));
     }
-    if bindings[0].access != BindingAccess::ReadOnly
-        || bindings[1].access != BindingAccess::ReadOnly
-        || bindings[2].access != BindingAccess::ReadWrite
-        || bindings[3].access != BindingAccess::ReadWrite
+    let scalar = bindings[0].scalar;
+    let scalar_ty = division_scalar(function, bindings, body.lhs)?;
+    if bindings
+        .iter()
+        .filter(|binding| binding.access == BindingAccess::ReadWrite)
+        .count()
+        != 2
     {
         return Err(Error::new(
             body.lhs.span(),
-            "checked u32 DivRem requires two read-only inputs followed by two writable outputs",
+            "checked DivRem requires exactly two writable outputs, independent of declaration order",
         ));
     }
     let mut emitter = ExprEmitter::new(
@@ -345,12 +388,18 @@ fn lower_checked_div_rem_body<'a>(
         body.extent.is_some(),
         ScalarKind::Generic,
     );
-    let (lhs, lhs_type) = emitter.emit_expr(body.lhs)?;
-    let (rhs, rhs_type) = emitter.emit_expr(body.rhs)?;
-    if lhs_type != ScalarKind::U32 || rhs_type != ScalarKind::U32 {
+    let (lhs, lhs_type) = emit_operand(&mut emitter, body.lhs)?;
+    let (rhs, rhs_type) = emit_operand(&mut emitter, body.rhs)?;
+    if lhs_type != scalar || rhs_type != scalar {
         return Err(Error::new(
             body.lhs.span(),
-            "checked DivRem requires matching u32 operands",
+            "checked DivRem requires matching fixed-width integer operands",
+        ));
+    }
+    if emitter.ops.len() != 2 {
+        return Err(Error::new(
+            body.lhs.span(),
+            "checked DivRem operands must each be one read-only resource load",
         ));
     }
     let q_value = emitter.alloc_value(body.quotient.span())?;
@@ -358,7 +407,7 @@ fn lower_checked_div_rem_body<'a>(
     let pcu_ref = pcu;
     emitter.ops.push(quote! {
         #pcu_ref::PcuDispatchDataOp::CheckedDivRem {
-            value_type: #pcu_ref::PcuValueType::u32(),
+            value_type: #pcu_ref::PcuValueType::Scalar(<#scalar_ty as #pcu_ref::PcuScalar>::TYPE),
             flags: #pcu_ref::model::PcuIntegerDivFlags::CHECKED,
             quotient: #pcu_ref::PcuDispatchValueId(#q_value),
             remainder: #pcu_ref::PcuDispatchValueId(#r_value),
@@ -366,18 +415,18 @@ fn lower_checked_div_rem_body<'a>(
             rhs: #pcu_ref::PcuDispatchValueId(#rhs),
         }
     });
-    let q_binding = validate_div_rem_store(
-        body.quotient_store,
-        &body.quotient,
-        &body.invocation,
-        bindings,
-    )?;
-    let r_binding = validate_div_rem_store(
-        body.remainder_store,
-        &body.remainder,
-        &body.invocation,
-        bindings,
-    )?;
+    let (quotient_store, remainder_store) =
+        if is_ident_expr(&body.quotient_store.right, &body.remainder)
+            && is_ident_expr(&body.remainder_store.right, &body.quotient)
+        {
+            (body.remainder_store, body.quotient_store)
+        } else {
+            (body.quotient_store, body.remainder_store)
+        };
+    let q_binding =
+        validate_div_rem_store(quotient_store, &body.quotient, &body.invocation, bindings)?;
+    let r_binding =
+        validate_div_rem_store(remainder_store, &body.remainder, &body.invocation, bindings)?;
     if q_binding.binding == r_binding.binding {
         return Err(Error::new(
             body.remainder_store.left.span(),
@@ -394,6 +443,114 @@ fn lower_checked_div_rem_body<'a>(
     emitter.ops.push(quote! { #pcu_ref::PcuDispatchDataOp::BindingStore { binding: #pcu_ref::PcuBindingRef::new(0, #q_output_slot), index: #pcu_ref::PcuDispatchIndex::#store_index, value: #pcu_ref::PcuDispatchValueId(#q_value) } });
     emitter.ops.push(quote! { #pcu_ref::PcuDispatchDataOp::BindingStore { binding: #pcu_ref::PcuBindingRef::new(0, #r_output_slot), index: #pcu_ref::PcuDispatchIndex::#store_index, value: #pcu_ref::PcuDispatchValueId(#r_value) } });
     Ok((body.extent, emitter.ops))
+}
+
+/// Division's stronger type bound permits scalar reads without broadening ordinary expressions.
+fn emit_operand(
+    emitter: &mut ExprEmitter<'_>,
+    expression: &Expr,
+) -> Result<(u16, ScalarKind), Error> {
+    match expression {
+        Expr::Paren(paren) => return emit_operand(emitter, &paren.expr),
+        Expr::Group(group) => return emit_operand(emitter, &group.expr),
+        Expr::Index(index) => {
+            let ident = expr_ident(&index.expr).ok_or_else(|| {
+                Error::new(
+                    index.expr.span(),
+                    "checked DivRem indexed operand must name a binding",
+                )
+            })?;
+            if emitter.binding(ident, BindingAccess::ReadOnly)?.access != BindingAccess::ReadOnly {
+                return Err(Error::new(
+                    expression.span(),
+                    "checked DivRem operands require read-only bindings",
+                ));
+            }
+            return emitter.emit_expr(expression);
+        }
+        _ => {}
+    }
+    let scalar = match expression {
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => unary.expr.as_ref(),
+        Expr::Path(_) => expression,
+        _ => {
+            return Err(Error::new(
+                expression.span(),
+                "checked DivRem operands must be read-only resource loads",
+            ));
+        }
+    };
+    let ident = expr_ident(scalar).ok_or_else(|| {
+        Error::new(
+            scalar.span(),
+            "checked DivRem scalar operand must name a binding",
+        )
+    })?;
+    let (slot, scalar) = {
+        let binding = emitter.binding(ident, BindingAccess::ReadOnly)?;
+        if !binding.scalar_reference || binding.access != BindingAccess::ReadOnly {
+            return Err(Error::new(
+                expression.span(),
+                "checked DivRem bare operands require read-only scalar bindings",
+            ));
+        }
+        (binding.binding, binding.scalar)
+    };
+    let result = emitter.alloc_value(expression.span())?;
+    let pcu = emitter.crate_path;
+    // Each authored operand retains its own SSA load even when both name the same scalar.
+    emitter.ops.push(quote! {
+        #pcu::PcuDispatchDataOp::BindingLoad {
+            result: #pcu::PcuDispatchValueId(#result),
+            binding: #pcu::PcuBindingRef::new(0, #slot),
+            index: #pcu::PcuDispatchIndex::BindingElementZero,
+        }
+    });
+    Ok((result, scalar))
+}
+
+/// The source vocabulary is broader than any provider's admitted execution ABI.
+/// Generic division requires the stronger sealed bound; `PcuScalar` alone does not
+/// establish integer semantics. No wrapping, total, or Clamp division is introduced.
+fn division_scalar(
+    function: &ItemFn,
+    bindings: &[BindingSpec],
+    operand: &Expr,
+) -> Result<TokenStream2, Error> {
+    let first = &bindings[0];
+    let scalar = first.scalar;
+    let concrete_integer = matches!(
+        scalar,
+        ScalarKind::U8
+            | ScalarKind::U16
+            | ScalarKind::U32
+            | ScalarKind::U64
+            | ScalarKind::U128
+            | ScalarKind::I8
+            | ScalarKind::I16
+            | ScalarKind::I32
+            | ScalarKind::I64
+            | ScalarKind::I128
+    );
+    let generic_integer =
+        scalar == ScalarKind::Generic && super::generic_integer::has_division_bound(function);
+    if !(concrete_integer || generic_integer)
+        || bindings.iter().any(|binding| {
+            binding.scalar != scalar
+                || binding.generic_scalar != first.generic_scalar
+                || binding.scalar_reference && binding.access != BindingAccess::ReadOnly
+                || binding.matrix.is_some()
+        })
+    {
+        return Err(Error::new_spanned(
+            operand,
+            "checked DivRem requires matching integer slice/array outputs and read-only slice/array/scalar inputs; generic resources require `T: PcuCheckedIntegerDivision`",
+        ));
+    }
+    Ok(first
+        .generic_scalar
+        .as_ref()
+        .map_or_else(|| scalar.rust_type(), |generic| quote! { #generic }))
 }
 
 fn validate_div_rem_store<'a>(
@@ -419,10 +576,10 @@ fn validate_div_rem_store<'a>(
         .iter()
         .find(|binding| binding.ident == *ident)
         .ok_or_else(|| Error::new(ident.span(), "unknown PCU binding"))?;
-    if output.access != BindingAccess::ReadWrite || output.scalar != ScalarKind::U32 {
+    if output.access != BindingAccess::ReadWrite || output.scalar != bindings[0].scalar {
         return Err(Error::new(
             index.span(),
-            "checked DivRem output must be a writable u32 binding",
+            "checked DivRem output must be a writable binding with the input integer type",
         ));
     }
     if expr_ident(&assignment.right).is_none_or(|ident| ident != expected_value) {
@@ -431,5 +588,6 @@ fn validate_div_rem_store<'a>(
             "each checked DivRem output must be stored exactly once to its matching binding",
         ));
     }
+    output.written.set(true);
     Ok(output)
 }

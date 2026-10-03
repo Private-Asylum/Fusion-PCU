@@ -1,13 +1,11 @@
 //! Cold policy/provenance bounds and hardware fault/retry checks for ordered SGD.
 #[rustfmt::skip]
 use fusion_pcu::{
-    PcuCompoundArithmeticPolicy,
     PcuExecutionFault,
     PcuExecutionFaultKind,
     PcuFloatUnderflowPolicy,
     PcuNumericalMode,
     PcuNumericalOptions,
-    PcuPrecisionPolicy,
     PcuReproducibility,
     PcuScalarType,
 };
@@ -46,6 +44,7 @@ fn strict_sgd_source_freezes_rate_bits_width_policy_and_order() {
             };
             assert!(source.contains(&format!("({expected}ull)")));
             assert_eq!(profile.count(), 17);
+            assert_eq!(profile.fault_extent(), 2 * 17);
             let requirements = profile.requirements();
             assert_eq!(requirements.len(), 3);
             assert!(
@@ -68,20 +67,11 @@ fn strict_sgd_rejects_unproved_options_absent_mode_and_forged_signed_rate() {
             Err(TensorUnsupportedReason::NumericalPolicy { .. })
         ));
     }
-    for options in [
-        PcuNumericalOptions {
-            compound_arithmetic: PcuCompoundArithmeticPolicy::BackendDefined,
-            ..Default::default()
-        },
-        PcuNumericalOptions {
-            precision: PcuPrecisionPolicy::BackendOptimized,
-            ..Default::default()
-        },
-        PcuNumericalOptions {
+    {
+        let options = PcuNumericalOptions {
             reproducibility: PcuReproducibility::PortableV1,
             ..Default::default()
-        },
-    ] {
+        };
         let mut node = original;
         node.numerical_options = options;
         assert!(matches!(
@@ -214,4 +204,72 @@ fn tensor_execution_error_exposes_structured_compound_source_and_leaf_absence() 
             .source()
             .is_none()
     );
+}
+
+#[test]
+fn stronger_strict_permissions_keep_distinct_frozen_cache_tuples() {
+    for scalar in [
+        fusion_pcu::PcuScalarType::F32,
+        fusion_pcu::PcuScalarType::F64,
+    ] {
+        let mut profiles = Vec::new();
+        for underflow in [
+            fusion_pcu::PcuFloatUnderflowPolicy::IeeeAfterRounding,
+            fusion_pcu::PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+            fusion_pcu::PcuFloatUnderflowPolicy::RejectSubnormalResult,
+        ] {
+            let mut same_arithmetic = None;
+            for compound in [
+                fusion_pcu::PcuCompoundArithmeticPolicy::Checked,
+                fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined,
+            ] {
+                for precision in [
+                    fusion_pcu::PcuPrecisionPolicy::Preserve,
+                    fusion_pcu::PcuPrecisionPolicy::BackendOptimized,
+                ] {
+                    let mut graph = fusion_pcu::dialect::tensor::Graph::default();
+                    graph.set_numerical_mode(fusion_pcu::PcuNumericalMode::Strict);
+                    let options = fusion_pcu::PcuNumericalOptions {
+                        compound_arithmetic: compound,
+                        precision,
+                        ..Default::default()
+                    };
+                    graph.set_numerical_options(options);
+                    let left = graph.input([2, 2], scalar).unwrap();
+                    let right = graph.input([2, 2], scalar).unwrap();
+                    let output = graph.sgd_update(left, right, 0.5).unwrap();
+                    graph
+                        .set_value_float_underflow_policy(output, underflow)
+                        .unwrap();
+                    graph
+                        .set_value_float_underflow_policy(output, underflow)
+                        .unwrap();
+                    let profile = super::assess(&graph, graph.node(output).unwrap()).unwrap();
+                    let requirements = fusion_pcu::PcuImplementationRequirements {
+                        numerical_mode: fusion_pcu::PcuNumericalMode::Strict,
+                        numerical_options: options,
+                        float_underflow: underflow,
+                        range_policy: fusion_pcu::PcuRangePolicy::Reject,
+                    };
+                    assert_eq!(profile.numerical_requirements, requirements);
+                    assert!(
+                        !profiles.contains(&profile),
+                        "requested permissions must retain distinct cache identities"
+                    );
+                    let source = profile.source();
+                    if let Some(previous) = &same_arithmetic {
+                        assert_eq!(previous, &source);
+                    } else {
+                        same_arithmetic = Some(source);
+                    }
+                    // Later mutable Graph defaults cannot replace the captured invocation tuple.
+                    graph.set_numerical_mode(fusion_pcu::PcuNumericalMode::Boundary);
+                    graph.set_numerical_options(fusion_pcu::PcuNumericalOptions::default());
+                    assert_eq!(profile.numerical_requirements, requirements);
+                    profiles.push(profile);
+                }
+            }
+        }
+        assert_eq!(profiles.len(), 12);
+    }
 }

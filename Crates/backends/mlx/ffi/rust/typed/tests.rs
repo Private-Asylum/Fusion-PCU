@@ -52,5 +52,5 @@ fn exact_f32_borrows_preserve_pointer_bits_extent_and_exclusive_writes() {
     assert_eq!(view.as_mut_ptr(), pointer);
     view[0] = f32::from_bits(0x8000_0000);
     assert_eq!(storage[0].to_bits(), 0x8000_0000);
-    assert_eq!(as_f32::<f32>(&[]).unwrap(), []);
+    assert!(as_f32::<f32>(&[]).unwrap().is_empty());
 }

@@ -69,7 +69,10 @@ impl PcuCapturedTensorProgram {
 /// Function/helper flags are resolved by the generated companion against these base policies.
 ///
 /// # Errors
-/// Returns empty/overflowing shapes, capture or selected-program construction failures.
+/// Returns empty executable input shapes, overflowing declared shapes, capture or
+/// selected-program construction failures. Unused zero extents remain truthful
+/// declarations and require no physical resource. Checked discarded effects still
+/// contribute their actual executable inputs.
 #[doc(hidden)]
 pub fn __pcu_capture_tensor_program<T: PcuScalar, const N: usize, F>(
     shapes: [PcuSourceShape; N],
@@ -86,18 +89,6 @@ where
 {
     if N == 0 {
         return Err(PcuExecutionError::EmptyTensorInput);
-    }
-    for shape in shapes {
-        let elements = match shape {
-            PcuSourceShape::Scalar => 1,
-            PcuSourceShape::Slice { length } | PcuSourceShape::FixedArray { length } => length,
-            PcuSourceShape::FixedMatrix { rows, columns } => rows
-                .checked_mul(columns)
-                .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?,
-        };
-        if elements == 0 {
-            return Err(PcuExecutionError::EmptyTensorInput);
-        }
     }
     build(
         shapes.map(PcuTensorShapeWitness::Static),
@@ -121,6 +112,10 @@ where
         [PcuTensorGraphValue<T>; N],
     ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>,
 {
+    let mut declared_elements = [0_usize; N];
+    for (index, shape) in shapes.iter().copied().enumerate() {
+        declared_elements[index] = element_count(shape)?;
+    }
     let (mut capture, input_values) =
         PcuTensorGraphCapture::new_with_witnesses_and_policy::<T, N>(shapes, float_underflow)?;
     capture.numerical_mode.set(numerical_mode);
@@ -145,6 +140,9 @@ where
             .iter()
             .position(|captured_id| *captured_id == selected_id)
             .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?;
+        if declared_elements[argument_index] == 0 {
+            return Err(PcuExecutionError::EmptyTensorInput);
+        }
         input_ids.push(selected_id);
         input_indices.push(argument_index);
     }
@@ -156,6 +154,22 @@ where
         input_ids,
         input_indices,
     })
+}
+
+pub(super) fn element_count(shape: PcuTensorShapeWitness<'_>) -> Result<usize, PcuExecutionError> {
+    let count = match shape {
+        PcuTensorShapeWitness::Static(PcuSourceShape::Scalar) => Some(1),
+        PcuTensorShapeWitness::Static(
+            PcuSourceShape::Slice { length } | PcuSourceShape::FixedArray { length },
+        ) => Some(length),
+        PcuTensorShapeWitness::Static(PcuSourceShape::FixedMatrix { rows, columns }) => {
+            rows.checked_mul(columns)
+        }
+        PcuTensorShapeWitness::Dynamic(dimensions) => dimensions
+            .iter()
+            .try_fold(1_usize, |count, dimension| count.checked_mul(*dimension)),
+    };
+    count.ok_or(PcuExecutionError::InvalidTensorSourcePlan)
 }
 
 #[cfg(test)]

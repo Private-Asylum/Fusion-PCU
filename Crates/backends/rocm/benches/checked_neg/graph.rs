@@ -64,6 +64,7 @@ pub fn with_ir<T: Scalar, const N: usize, R>(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     call(&PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(
             0xc0de_0000 ^ u32::try_from(N).unwrap() ^ u32::try_from(size_of::<T>()).unwrap(),
         ),

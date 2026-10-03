@@ -20,6 +20,7 @@ use super::{
 use crate::core::PcuScalarType;
 #[rustfmt::skip]
 use crate::{
+    PcuCheckedFloatWidening,
     PcuFloatUnderflowPolicy,
     PcuNumericalMode,
 };
@@ -33,6 +34,14 @@ use strict_matmul::checked_matmul;
 #[path = "reference/strict_sgd/strict_sgd.rs"]
 mod strict_sgd;
 use strict_sgd::checked_sgd;
+
+#[path = "reference/strict_mse/strict_mse.rs"]
+mod strict_mse;
+use strict_mse::checked_mse;
+
+#[cfg(test)]
+#[path = "reference/numerical_permissions/numerical_permissions.rs"]
+mod numerical_permissions;
 
 pub(super) const fn unsupported_value(
     graph_id: u64,
@@ -53,6 +62,39 @@ pub(super) fn binary_value(
     float_underflow_policy: Option<PcuFloatUnderflowPolicy>,
 ) -> Result<TensorValue, TensorError> {
     match (left, right) {
+        (TensorValue::F8E4M3Fn(left), TensorValue::F8E4M3Fn(right)) => checked_float_value(
+            left,
+            right,
+            output,
+            operation,
+            float_underflow_policy.unwrap_or_default(),
+        )
+        .map(TensorValue::F8E4M3Fn),
+        (TensorValue::F8E5M2(left), TensorValue::F8E5M2(right)) => checked_float_value(
+            left,
+            right,
+            output,
+            operation,
+            float_underflow_policy.unwrap_or_default(),
+        )
+        .map(TensorValue::F8E5M2),
+        (TensorValue::F16(left), TensorValue::F16(right)) => checked_float_value(
+            left,
+            right,
+            output,
+            operation,
+            float_underflow_policy.unwrap_or_default(),
+        )
+        .map(TensorValue::F16),
+        (TensorValue::Bf16(left), TensorValue::Bf16(right)) => checked_float_value(
+            left,
+            right,
+            output,
+            operation,
+            float_underflow_policy.unwrap_or_default(),
+        )
+        .map(TensorValue::Bf16),
+
         (TensorValue::F32(left), TensorValue::F32(right)) => checked_float_value(
             left,
             right,
@@ -69,6 +111,42 @@ pub(super) fn binary_value(
             float_underflow_policy.unwrap_or_default(),
         )
         .map(TensorValue::F64),
+        (left, right) if left.scalar_type() != right.scalar_type() => {
+            Err(TensorError::ScalarTypeMismatch {
+                value: output,
+                expected: left.scalar_type(),
+                actual: right.scalar_type(),
+            })
+        }
+        (left, right) => checked_integer_binary_value(left, right, output, operation),
+    }
+}
+
+fn checked_integer_binary_value(
+    left: &TensorValue,
+    right: &TensorValue,
+    output: ValueId,
+    operation: BinaryOp,
+) -> Result<TensorValue, TensorError> {
+    match (left, right) {
+        (TensorValue::U128(left), TensorValue::U128(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::U128)
+        }
+        (TensorValue::I128(left), TensorValue::I128(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::I128)
+        }
+        (TensorValue::U256(left), TensorValue::U256(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::U256)
+        }
+        (TensorValue::I256(left), TensorValue::I256(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::I256)
+        }
+        (TensorValue::U512(left), TensorValue::U512(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::U512)
+        }
+        (TensorValue::I512(left), TensorValue::I512(right)) => {
+            checked_integer_value(left, right, output, operation).map(TensorValue::I512)
+        }
         (TensorValue::U8(left), TensorValue::U8(right)) => {
             checked_integer_value(left, right, output, operation).map(TensorValue::U8)
         }
@@ -92,13 +170,6 @@ pub(super) fn binary_value(
         }
         (TensorValue::I64(left), TensorValue::I64(right)) => {
             checked_integer_value(left, right, output, operation).map(TensorValue::I64)
-        }
-        (left, right) if left.scalar_type() != right.scalar_type() => {
-            Err(TensorError::ScalarTypeMismatch {
-                value: output,
-                expected: left.scalar_type(),
-                actual: right.scalar_type(),
-            })
         }
         (left, _) => Err(unsupported_value(
             output.graph_id,
@@ -175,41 +246,51 @@ fn checked_integer_value<T: PcuCheckedInteger>(
     })
 }
 
-pub(super) fn relu_value(input: &TensorValue, output: ValueId) -> Result<TensorValue, TensorError> {
+fn checked_relu_value<T: PcuCheckedFloat + TensorElement>(
+    input: &Tensor<T>,
+    output: ValueId,
+    policy: PcuFloatUnderflowPolicy,
+) -> Result<Tensor<T>, TensorError> {
+    let data = input
+        .data
+        .iter()
+        .enumerate()
+        .map(|(element_index, value)| {
+            value.pcu_checked_relu_with_policy(policy).map_err(|kind| {
+                TensorError::ArithmeticFault {
+                    value: output,
+                    element_index,
+                    kind,
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Tensor::new(input.shape.clone(), data)
+}
+
+pub(super) fn relu_value(
+    input: &TensorValue,
+    output: ValueId,
+    policy: PcuFloatUnderflowPolicy,
+) -> Result<TensorValue, TensorError> {
     match input {
+        TensorValue::F8E4M3Fn(tensor) => {
+            checked_relu_value(tensor, output, policy).map(TensorValue::F8E4M3Fn)
+        }
+        TensorValue::F8E5M2(tensor) => {
+            checked_relu_value(tensor, output, policy).map(TensorValue::F8E5M2)
+        }
+        TensorValue::F16(tensor) => {
+            checked_relu_value(tensor, output, policy).map(TensorValue::F16)
+        }
+        TensorValue::Bf16(tensor) => {
+            checked_relu_value(tensor, output, policy).map(TensorValue::Bf16)
+        }
         TensorValue::F32(tensor) => {
-            let data = tensor
-                .data
-                .iter()
-                .enumerate()
-                .map(|(element_index, value)| {
-                    value
-                        .pcu_checked_relu()
-                        .map_err(|kind| TensorError::ArithmeticFault {
-                            value: output,
-                            element_index,
-                            kind,
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(TensorValue::F32(Tensor::new(tensor.shape.clone(), data)?))
+            checked_relu_value(tensor, output, policy).map(TensorValue::F32)
         }
         TensorValue::F64(tensor) => {
-            let data = tensor
-                .data
-                .iter()
-                .enumerate()
-                .map(|(element_index, value)| {
-                    value
-                        .pcu_checked_relu()
-                        .map_err(|kind| TensorError::ArithmeticFault {
-                            value: output,
-                            element_index,
-                            kind,
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(TensorValue::F64(Tensor::new(tensor.shape.clone(), data)?))
+            checked_relu_value(tensor, output, policy).map(TensorValue::F64)
         }
         other => Err(unsupported_value(
             output.graph_id,
@@ -223,17 +304,50 @@ pub(super) fn relu_backward_value(
     input: &TensorValue,
     upstream: &TensorValue,
     output: ValueId,
+    policy: PcuFloatUnderflowPolicy,
 ) -> Result<TensorValue, TensorError> {
+    fn checked<T: PcuCheckedFloat + TensorElement>(
+        input: &Tensor<T>,
+        upstream: &Tensor<T>,
+        output: ValueId,
+        policy: PcuFloatUnderflowPolicy,
+    ) -> Result<Tensor<T>, TensorError> {
+        let data = input
+            .data
+            .iter()
+            .zip(&upstream.data)
+            .enumerate()
+            .map(|(element_index, (&value, &gradient))| {
+                value
+                    .pcu_checked_relu_backward_with_policy(gradient, policy)
+                    .map_err(|kind| TensorError::ArithmeticFault {
+                        value: output,
+                        element_index,
+                        kind,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Tensor::new(input.shape.clone(), data)
+    }
     match (input, upstream) {
-        (TensorValue::F32(input), TensorValue::F32(upstream)) => Ok(TensorValue::F32(Tensor::new(
-            input.shape.clone(),
-            input
-                .data
-                .iter()
-                .zip(&upstream.data)
-                .map(|(value, gradient)| if *value > 0.0 { *gradient } else { 0.0 })
-                .collect(),
-        )?)),
+        (TensorValue::F8E4M3Fn(input), TensorValue::F8E4M3Fn(upstream)) => {
+            checked(input, upstream, output, policy).map(TensorValue::F8E4M3Fn)
+        }
+        (TensorValue::F8E5M2(input), TensorValue::F8E5M2(upstream)) => {
+            checked(input, upstream, output, policy).map(TensorValue::F8E5M2)
+        }
+        (TensorValue::F16(input), TensorValue::F16(upstream)) => {
+            checked(input, upstream, output, policy).map(TensorValue::F16)
+        }
+        (TensorValue::Bf16(input), TensorValue::Bf16(upstream)) => {
+            checked(input, upstream, output, policy).map(TensorValue::Bf16)
+        }
+        (TensorValue::F32(input), TensorValue::F32(upstream)) => {
+            checked(input, upstream, output, policy).map(TensorValue::F32)
+        }
+        (TensorValue::F64(input), TensorValue::F64(upstream)) => {
+            checked(input, upstream, output, policy).map(TensorValue::F64)
+        }
         (input, upstream) if input.scalar_type() != upstream.scalar_type() => {
             Err(TensorError::ScalarTypeMismatch {
                 value: output,
@@ -308,10 +422,23 @@ pub(super) fn mean_squared_error_value(
     prediction: &TensorValue,
     target: &TensorValue,
     output: ValueId,
+    mode: PcuNumericalMode,
+    policy: PcuFloatUnderflowPolicy,
 ) -> Result<TensorValue, TensorError> {
     match (prediction, target) {
         (TensorValue::F32(prediction), TensorValue::F32(target)) => {
-            let divisor = mean_denominator(prediction.data.len());
+            if mode == PcuNumericalMode::Strict {
+                return checked_mse(
+                    prediction,
+                    target,
+                    output,
+                    policy,
+                    0.0,
+                    super::constants::count_f32(prediction.data.len()),
+                )
+                .map(TensorValue::F32);
+            }
+            let divisor = super::constants::count_f32(prediction.data.len());
             Ok(TensorValue::F32(Tensor::scalar(
                 prediction
                     .data
@@ -321,6 +448,25 @@ pub(super) fn mean_squared_error_value(
                     .sum::<f32>()
                     / divisor,
             )))
+        }
+        (TensorValue::F64(prediction), TensorValue::F64(target)) => {
+            // The named compound rounds its count nearest-even independently of
+            // the calling thread's floating-point control state.
+            let denominator = super::constants::count_f64(prediction.data.len());
+            if mode == PcuNumericalMode::Strict {
+                checked_mse(prediction, target, output, policy, 0.0, denominator)
+                    .map(TensorValue::F64)
+            } else {
+                Ok(TensorValue::F64(Tensor::scalar(
+                    prediction
+                        .data
+                        .iter()
+                        .zip(&target.data)
+                        .map(|(left, right)| (left - right) * (left - right))
+                        .sum::<f64>()
+                        / denominator,
+                )))
+            }
         }
         (prediction, target) if prediction.scalar_type() != target.scalar_type() => {
             Err(TensorError::ScalarTypeMismatch {
@@ -359,7 +505,13 @@ pub(super) fn sgd_value(
             }
         },
         (TensorValue::F64(weights), TensorValue::F64(gradient)) => {
-            let rate = f64::from(learning_rate);
+            let rate = learning_rate.pcu_checked_to_f64().map_err(|kind| {
+                TensorError::ArithmeticFault {
+                    value: output,
+                    element_index: 0,
+                    kind,
+                }
+            })?;
             match mode {
                 PcuNumericalMode::Strict => {
                     checked_sgd(weights, gradient, rate, output, policy).map(TensorValue::F64)
@@ -498,13 +650,6 @@ pub(super) fn matmul_f64(
         data: output,
         known_uniform_value: None,
     }
-}
-
-// Tensor storage must already fit in memory; f32 precision is sufficient for a
-// practically allocatable element count used as a mean divisor.
-#[allow(clippy::cast_precision_loss)]
-pub(super) const fn mean_denominator(element_count: usize) -> f32 {
-    element_count as f32
 }
 
 #[cfg(test)]

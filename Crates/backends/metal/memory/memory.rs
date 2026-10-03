@@ -1,4 +1,4 @@
-//! Word-aligned shared Metal resources under the neutral memory contract.
+//! Exact-byte shared Metal resources under the neutral memory contract.
 
 #[rustfmt::skip]
 use std::{
@@ -106,7 +106,7 @@ impl PcuMemoryResource for MetalMemoryResource {
         self.pool
     }
     fn size_bytes(&self) -> u64 {
-        self.buffer.borrow().len() as u64 * 4
+        self.buffer.borrow().byte_len() as u64
     }
     fn alignment_bytes(&self) -> u64 {
         self.alignment
@@ -231,14 +231,12 @@ impl PcuMemoryProvider for MetalMemoryProvider {
         if request.host_access == PcuMemoryHostAccess::Mapping {
             return Err(self.error(operation, PcuMemoryProviderFailure::MappingUnavailable));
         }
-        if !request.size_bytes.is_multiple_of(4) || request.alignment_bytes > 4 {
+        if request.alignment_bytes > 4 {
             return Err(self.error(operation, PcuMemoryProviderFailure::Unsupported));
         }
-        let words = usize::try_from(request.size_bytes / 4)
+        let bytes = usize::try_from(request.size_bytes)
             .map_err(|_| self.error(operation, PcuMemoryProviderFailure::RangeOutOfBounds))?;
-        if request.size_bytes > self.session.facts().max_buffer_bytes
-            || u32::try_from(words).is_err()
-        {
+        if request.size_bytes > self.session.facts().max_buffer_bytes {
             return Err(self.error(operation, PcuMemoryProviderFailure::RangeOutOfBounds));
         }
         self.session
@@ -250,7 +248,7 @@ impl PcuMemoryProvider for MetalMemoryProvider {
         // The generic PcuDeviceBufferAllocator contract itself permits uninitialized storage.
         let buffer = self
             .session
-            .allocate_zeroed(words)
+            .allocate_zeroed_bytes(bytes)
             .map_err(|error| self.error(operation, failure(&error)))?;
         Ok(MetalMemoryResource {
             pool: self.pool,
@@ -328,6 +326,26 @@ const fn failure(error: &MetalError) -> PcuMemoryProviderFailure {
         MetalError::Unsupported => PcuMemoryProviderFailure::Unsupported,
         MetalError::InvalidExtent => PcuMemoryProviderFailure::RangeOutOfBounds,
         _ => PcuMemoryProviderFailure::BackendFailure,
+    }
+}
+
+#[cfg(feature = "tensor")]
+impl MetalSession {
+    pub(crate) fn initialized_tensor_resource(
+        &self,
+        pool: PcuMemoryPoolId,
+        buffer: MetalBuffer,
+    ) -> Result<MetalMemoryResource, MetalError> {
+        self.ensure_quiescent()?;
+        if !self.same_session(buffer.session()) {
+            return Err(MetalError::ForeignSession);
+        }
+        Ok(MetalMemoryResource {
+            pool,
+            buffer: Rc::new(RefCell::new(buffer)),
+            alignment: 1,
+            access: PcuMemoryAccess::ReadWrite,
+        })
     }
 }
 
@@ -462,17 +480,17 @@ mod tests {
                 .failure,
             PcuMemoryProviderFailure::AccessDenied
         );
-        assert_eq!(
-            provider
-                .allocate(PcuMemoryAllocationRequest {
-                    size_bytes: 6,
-                    ..request
-                })
-                .err()
-                .unwrap()
-                .failure,
-            PcuMemoryProviderFailure::Unsupported
-        );
+        let mut odd = provider
+            .allocate(PcuMemoryAllocationRequest {
+                size_bytes: 6,
+                ..request
+            })
+            .unwrap();
+        assert_eq!(odd.size_bytes(), 6);
+        provider.transfer_to(&mut odd, 1, &[1, 2, 3, 4, 5]).unwrap();
+        let mut odd_bytes = [0; 6];
+        provider.transfer_from(&odd, 0, &mut odd_bytes).unwrap();
+        assert_eq!(odd_bytes, [0, 1, 2, 3, 4, 5]);
         assert_eq!(
             provider
                 .allocate(PcuMemoryAllocationRequest {

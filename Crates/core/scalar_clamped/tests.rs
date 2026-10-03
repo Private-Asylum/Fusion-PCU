@@ -22,6 +22,7 @@ fn assert_fault<T: core::fmt::Debug + PartialEq + Copy>(
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)] // Each macro expansion exercises both range directions at the exact scalar width.
 fn all_integer_widths_report_faults_and_return_the_saturated_endpoint() {
     macro_rules! unsigned_boundaries {
         ($ty:ty) => {{
@@ -87,10 +88,12 @@ fn all_integer_widths_report_faults_and_return_the_saturated_endpoint() {
     unsigned_boundaries!(u16);
     unsigned_boundaries!(u32);
     unsigned_boundaries!(u64);
+    unsigned_boundaries!(u128);
     signed_boundaries!(i8);
     signed_boundaries!(i16);
     signed_boundaries!(i32);
     signed_boundaries!(i64);
+    signed_boundaries!(i128);
 }
 
 #[test]

@@ -47,11 +47,35 @@ use super::{
 
 #[allow(clippy::too_many_lines)] // One pass keeps the supported IR subset's validation rules together.
 pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), RocmLowerError> {
+    // Only independently qualified synthesized low-float and exact integer maps opt in.
+    // The neutral descriptor supplies structural eligibility, never broad backend conformance.
+    if kernel
+        .numerical_requirements
+        .numerical_options
+        .reproducibility
+        == fusion_pcu::PcuReproducibility::PortableV1
+        && fusion_pcu::describe_portable_v1_map(kernel).is_err()
+        && fusion_pcu::describe_portable_v1_integer_map(kernel).is_err()
+        && fusion_pcu::describe_portable_v1_integer_div_rem_map(kernel).is_err()
+        && fusion_pcu::describe_portable_v1_unary_map(kernel).is_err()
+    {
+        return Err(RocmLowerError::UnsupportedRequirements);
+    }
+    // Checked division has only fatal zero/overflow domains; no quotient/remainder Clamp law.
+    // Reject incompatible headers before compilation without changing valid emitter bytes/IDs.
+    if kernel_uses_checked_div_rem(kernel)
+        && kernel.numerical_requirements.range_policy != fusion_pcu::PcuRangePolicy::Reject
+    {
+        return Err(RocmLowerError::UnsupportedRequirements);
+    }
     if kernel.entry.logical_shape[0] == 0
         || kernel.entry.logical_shape[1] != 1
         || kernel.entry.logical_shape[2] != 1
     {
         return Err(RocmLowerError::InvalidKernelShape);
+    }
+    if super::composed::has_broadcast_write_hazard(kernel) {
+        return Err(RocmLowerError::UnsupportedRequirements);
     }
     if !kernel.ports.is_empty() || !kernel.parameters.is_empty() {
         return Err(RocmLowerError::UnsupportedKernelInterface);
@@ -80,7 +104,32 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         )
         .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
+    // Independent operand-schema admission preserves actual loaded bindings and SSA roles.
+    // Existing multi-operation F32/F64 profiles keep their established validator below.
+    if super::map_binding_projection(kernel).is_some() {
+        return Ok(());
+    }
     if let Some(value_type) = checked_float_binary_profile(kernel) {
+        if matches!(
+            value_type,
+            PcuValueType::Scalar(
+                fusion_pcu::PcuScalarType::F16
+                    | fusion_pcu::PcuScalarType::BF16
+                    | fusion_pcu::PcuScalarType::F8E4M3FN
+                    | fusion_pcu::PcuScalarType::F8E5M2
+            )
+        ) {
+            let (op, underflow) =
+                low_binary_profile(kernel.ops).ok_or(RocmLowerError::UnsupportedKernelInterface)?;
+            return fusion_pcu::validate_checked_float_binary_kernel(
+                kernel,
+                value_type,
+                op,
+                underflow,
+                PcuValueTypeCaps::for_scalar(value_type.scalar_type()),
+            )
+            .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
+        }
         let scalar_caps = if value_type == PcuValueType::f32() {
             PcuValueTypeCaps::FLOAT32
         } else if value_type == PcuValueType::f64() {
@@ -92,7 +141,18 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
             .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
     if let Some(value_type) = checked_float_unary_profile(kernel) {
-        let scalar_caps = if value_type == PcuValueType::f32() {
+        let scalar_caps = if matches!(
+            value_type,
+            PcuValueType::Scalar(
+                fusion_pcu::PcuScalarType::F16
+                    | fusion_pcu::PcuScalarType::BF16
+                    | fusion_pcu::PcuScalarType::F8E4M3FN
+                    | fusion_pcu::PcuScalarType::F8E5M2
+            )
+        ) && low_unary_profile(kernel.ops)
+        {
+            PcuValueTypeCaps::for_scalar(value_type.scalar_type())
+        } else if value_type == PcuValueType::f32() {
             PcuValueTypeCaps::FLOAT32
         } else if value_type == PcuValueType::f64() {
             PcuValueTypeCaps::FLOAT64
@@ -112,6 +172,26 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         )
         .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
     }
+    if kernel_uses_checked_div_rem(kernel)
+        && let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
+            kernel.bindings.first().map(|binding| binding.binding_type)
+        && matches!(
+            scalar,
+            fusion_pcu::PcuScalarType::I128
+                | fusion_pcu::PcuScalarType::U128
+                | fusion_pcu::PcuScalarType::I256
+                | fusion_pcu::PcuScalarType::U256
+                | fusion_pcu::PcuScalarType::I512
+                | fusion_pcu::PcuScalarType::U512
+        )
+    {
+        return fusion_pcu::validate_integer_checked_div_rem_kernel(
+            kernel,
+            PcuValueType::Scalar(scalar),
+            PcuValueTypeCaps::for_scalar(scalar),
+        )
+        .map_err(|_| RocmLowerError::UnsupportedKernelInterface);
+    }
     if let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
         kernel.bindings.first().map(|binding| binding.binding_type)
         && matches!(
@@ -126,10 +206,21 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
                 | fusion_pcu::PcuScalarType::U64
                 | fusion_pcu::PcuScalarType::F16
                 | fusion_pcu::PcuScalarType::BF16
+                | fusion_pcu::PcuScalarType::F8E4M3FN
+                | fusion_pcu::PcuScalarType::F8E5M2
                 | fusion_pcu::PcuScalarType::F32
                 | fusion_pcu::PcuScalarType::F64
+                | fusion_pcu::PcuScalarType::I128
+                | fusion_pcu::PcuScalarType::U128
+                | fusion_pcu::PcuScalarType::I256
+                | fusion_pcu::PcuScalarType::U256
+                | fusion_pcu::PcuScalarType::I512
+                | fusion_pcu::PcuScalarType::U512
+                | fusion_pcu::PcuScalarType::F128
+                | fusion_pcu::PcuScalarType::F256
         )
-        && fusion_pcu::validate_scalar_identity_kernel(kernel, scalar).is_ok()
+        && (fusion_pcu::validate_scalar_identity_kernel(kernel, scalar).is_ok()
+            || fusion_pcu::validate_scalar_broadcast_kernel(kernel, scalar).is_ok())
     {
         return Ok(());
     }
@@ -420,7 +511,9 @@ fn has_checked_float_conversion(kernel: &PcuDispatchKernelIr<'_>) -> bool {
     contains(kernel.ops)
 }
 
-fn checked_float_binary_profile(kernel: &PcuDispatchKernelIr<'_>) -> Option<PcuValueType> {
+pub(super) fn checked_float_binary_profile(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Option<PcuValueType> {
     kernel.ops.iter().find_map(|op| match op {
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary { value_type, .. }) => {
             Some(*value_type)
@@ -437,7 +530,9 @@ fn checked_float_binary_profile(kernel: &PcuDispatchKernelIr<'_>) -> Option<PcuV
     })
 }
 
-fn checked_float_unary_profile(kernel: &PcuDispatchKernelIr<'_>) -> Option<PcuValueType> {
+pub(super) fn checked_float_unary_profile(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Option<PcuValueType> {
     kernel.ops.iter().find_map(|op| match op {
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
             value_type,
@@ -471,7 +566,24 @@ fn kernel_uses_checked_div_rem(kernel: &PcuDispatchKernelIr<'_>) -> bool {
     })
 }
 
-fn checked_integer_binary_profile(
+pub(super) fn checked_integer_div_rem_profile(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Option<PcuValueType> {
+    kernel.ops.iter().find_map(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { value_type, .. }) => {
+            Some(*value_type)
+        }
+        PcuDispatchOp::GridStrideLoop { body, .. } => body.iter().find_map(|op| match op {
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { value_type, .. }) => {
+                Some(*value_type)
+            }
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+pub(super) fn checked_integer_binary_profile(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Option<(PcuValueType, PcuDispatchIntegerBinaryOp)> {
     kernel.ops.iter().find_map(|op| match op {
@@ -637,4 +749,41 @@ fn require_binding(
     } else {
         Err(RocmLowerError::InvalidBindingAccess(reference))
     }
+}
+
+pub(super) fn low_binary_profile(
+    ops: &[PcuDispatchOp<'_>],
+) -> Option<(
+    fusion_pcu::PcuDispatchFloatBinaryOp,
+    fusion_pcu::PcuFloatUnderflowPolicy,
+)> {
+    ops.iter().find_map(|op| match op {
+        PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
+            op,
+            underflow_policy,
+            ..
+        }) => Some((*op, *underflow_policy)),
+        PcuDispatchOp::GridStrideLoop { body, .. } => low_binary_profile(body),
+        _ => None,
+    })
+}
+
+fn low_unary_profile(ops: &[PcuDispatchOp<'_>]) -> bool {
+    fn count(ops: &[PcuDispatchOp<'_>], unary: &mut usize, other: &mut bool) {
+        for op in ops {
+            match op {
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary { .. }) => *unary += 1,
+                PcuDispatchOp::Data(
+                    PcuDispatchDataOp::CheckedFloatBinary { .. }
+                    | PcuDispatchDataOp::CheckedFloatConvert { .. },
+                ) => *other = true,
+                PcuDispatchOp::GridStrideLoop { body, .. } => count(body, unary, other),
+                _ => (),
+            }
+        }
+    }
+    let mut unary = 0;
+    let mut other = false;
+    count(ops, &mut unary, &mut other);
+    unary == 1 && !other
 }

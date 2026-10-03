@@ -13,6 +13,8 @@ use fusion_pcu::{
     PcuBindingType,
     PcuExecutionFault,
     PcuFloatUnderflowPolicy,
+    PcuImplementationRequirements,
+    PcuRangePolicy,
     PcuNumericalMode,
     PcuOwnedBindingRequirement,
     PcuScalarType,
@@ -34,6 +36,7 @@ use super::CudaTensorExecutionError;
 pub struct Profile {
     scalar: PcuScalarType,
     policy: PcuFloatUnderflowPolicy,
+    numerical_requirements: PcuImplementationRequirements,
     rows: u32,
     inner: u32,
     columns: u32,
@@ -45,6 +48,20 @@ pub struct Profile {
 }
 
 impl Profile {
+    // Private factory admission establishes positive dimensions and packed event bounds.
+    pub(crate) fn fault_domain(self) -> fusion_pcu::dialect::tensor::TensorStrictFaultDomain {
+        fusion_pcu::dialect::tensor::TensorStrictFaultDomain::matmul(
+            self.scalar,
+            u64::from(self.output_count()),
+            u64::from(self.inner),
+            self.policy,
+        )
+        .expect("verified checked compound dimensions and format")
+    }
+    pub(crate) fn fault_extent(self) -> u64 {
+        self.fault_domain().event_extent()
+    }
+
     #[allow(clippy::too_many_lines)] // One cold pass establishes type, shape, ABI and fault-index bounds.
     pub(super) fn from_node(
         graph: &Graph,
@@ -59,7 +76,10 @@ impl Profile {
         else {
             return Err(CudaTensorExecutionError::InvalidPlan(node.value));
         };
-        if node.numerical_mode != Some(PcuNumericalMode::Strict) {
+        if graph.node(node.value).ok() != Some(node)
+            || node.numerical_mode != Some(PcuNumericalMode::Strict)
+            || node.numerical_options.reproducibility != fusion_pcu::PcuReproducibility::Unspecified
+        {
             return Err(CudaTensorExecutionError::InvalidPlan(node.value));
         }
         let width = match node.scalar_type {
@@ -119,6 +139,14 @@ impl Profile {
         }
         Ok(Self {
             scalar: node.scalar_type,
+            // Permissions may use this stronger ordered checker; retain the requested tuple.
+            numerical_requirements: PcuImplementationRequirements {
+                numerical_mode: PcuNumericalMode::Strict,
+                numerical_options: node.numerical_options,
+                float_underflow: node.float_underflow_policy.unwrap_or_default(),
+                // Tensor nodes currently represent only Reject range.
+                range_policy: PcuRangePolicy::Reject,
+            },
             policy: node
                 .float_underflow_policy
                 .unwrap_or(PcuFloatUnderflowPolicy::IeeeAfterRounding),
@@ -254,6 +282,8 @@ impl super::CudaTensorAssessor<'_> {
         left: &crate::CudaMemoryResource,
         right: &crate::CudaMemoryResource,
         output: &crate::CudaMemoryResource,
+
+        mut status: Option<&mut super::owned_scratch::Status>,
     ) -> Result<(), CudaTensorExecutionError> {
         use fusion_pcu::PcuOwnedDispatchMemorySession;
         use fusion_pcu::PcuOwnedCompletion;
@@ -282,14 +312,15 @@ impl super::CudaTensorAssessor<'_> {
                 .find(|(key, _)| *key == super::TensorDispatchCacheKey::StrictMatMul(profile))
                 .map(|(_, prepared)| prepared)
                 .ok_or(CudaTensorExecutionError::InvalidPlan(value))?;
-            prepared
-                .submit(&bindings)
-                .map_err(CudaTensorExecutionError::Backend)?
+            super::owned_scratch::submit(prepared, &bindings, status.as_deref_mut())?
         };
-        match completion
+        let outcome = completion
             .wait()
-            .map_err(CudaTensorExecutionError::Completion)?
-        {
+            .map_err(CudaTensorExecutionError::Completion)?;
+        if let Some(status) = status {
+            status.observe(outcome);
+        }
+        match outcome {
             fusion_pcu::PcuCompletionOutcome::Succeeded => Ok(()),
             fusion_pcu::PcuCompletionOutcome::Failed => {
                 Err(CudaTensorExecutionError::FailedCompletion)

@@ -5,6 +5,8 @@ mod activity;
 #[cfg(feature = "allocation-census")]
 #[allow(unsafe_code)] // Opt-in allocator forwards valid caller layouts to System.
 mod allocations;
+#[path = "../helper_ordered_float_maps/activity/activity.rs"]
+mod cohort_activity;
 mod correctness;
 mod driver;
 mod native;

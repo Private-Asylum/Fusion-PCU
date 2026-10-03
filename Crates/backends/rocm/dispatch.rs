@@ -11,6 +11,8 @@ use std::{
 use fusion_pcu::{
     PcuBindingRef,
     PcuDispatchKernelIr,
+    PcuOwnedBindingRequirement,
+    PcuOwnedDispatchBindingError,
 };
 
 #[rustfmt::skip]
@@ -34,6 +36,7 @@ pub struct RocmDispatchBinding<'a> {
 #[derive(Debug)]
 pub enum RocmDispatchError {
     Lower(RocmLowerError),
+    Binding(PcuOwnedDispatchBindingError),
     Compile(HipCompileError),
     HipRtc(crate::HipRtcError),
     Hip(HipError),
@@ -55,6 +58,7 @@ impl fmt::Display for RocmDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lower(error) => write!(f, "PCU Dispatch cannot lower to ROCm: {error}"),
+            Self::Binding(error) => write!(f, "PCU Dispatch binding is invalid: {error:?}"),
             Self::Compile(error) => write!(f, "ROCm code object compilation failed: {error}"),
             Self::HipRtc(error) => write!(f, "ROCm runtime compilation failed: {error}"),
             Self::Hip(error) => write!(f, "ROCm execution failed: {error}"),
@@ -119,6 +123,12 @@ pub fn execute_pcu_dispatch(
     bindings: &[RocmDispatchBinding<'_>],
 ) -> Result<(), RocmDispatchError> {
     let source = lower_dispatch_to_hip_source(kernel)?;
+    let fault_law = crate::owned_dispatch::checked_scalar_fault_law(kernel);
+    if operations_use_checked_fault(kernel.ops) && fault_law.is_none() {
+        return Err(RocmDispatchError::Lower(
+            RocmLowerError::UnsupportedKernelInterface,
+        ));
+    }
     if block_size == 0 {
         return Err(RocmDispatchError::InvalidBlockSize);
     }
@@ -136,18 +146,15 @@ pub fn execute_pcu_dispatch(
 
     let checked_fault = operations_use_checked_fault(kernel.ops);
     let mut ordered = Vec::with_capacity(kernel.bindings.len() + usize::from(checked_fault));
-    for declared in kernel.bindings {
-        let id = PcuBindingRef::new(declared.set, declared.binding);
+    for requirement in binding_requirements(kernel)? {
+        let id = requirement.target;
         let buffer = bindings
             .iter()
             .find(|candidate| candidate.id == id)
             .ok_or(RocmDispatchError::MissingBinding(id))?
             .buffer;
-        let element_size = scalar_byte_width(declared.binding_type)?;
-        let required = usize::try_from(invocations)
-            .ok()
-            .and_then(|count| count.checked_mul(element_size))
-            .ok_or(RocmDispatchError::GeometryOverflow)?;
+        let required = usize::try_from(requirement.min_required_bytes)
+            .map_err(|_| RocmDispatchError::GeometryOverflow)?;
         if buffer.len() < required {
             return Err(RocmDispatchError::BufferTooSmall {
                 binding: id,
@@ -173,8 +180,8 @@ pub fn execute_pcu_dispatch(
     let module = runtime.load_module(&image)?;
     let function = module.function(c"fusion_kernel")?;
     let stream = runtime.create_stream()?;
-    // SAFETY: the lowerer emits exactly one f32 pointer parameter per validated binding, in
-    // declaration order. We checked each device allocation's length for all indexed accesses.
+    // SAFETY: the lowerer emits typed pointers for the projected actual resources, in original
+    // declaration order. Core requirements checked complete direct/grid indexed spans.
     // The completion is waited before returning, so the buffers remain borrowed through use.
     let mut completion =
         unsafe { function.launch(&stream, [grid_x, 1, 1], [block_size, 1, 1], 0, &ordered)? };
@@ -182,42 +189,56 @@ pub fn execute_pcu_dispatch(
     if let Some(fault_word) = fault_word.take() {
         let mut bytes = [0_u8; size_of::<u64>()];
         fault_word.copy_to(&mut bytes)?;
-        if let Some(fault) = decode_fault_word(u64::from_ne_bytes(bytes))? {
+        if let Some(fault) = decode_fault_word_in_extent(
+            u64::from_ne_bytes(bytes),
+            crate::owned_dispatch::checked_fault_extent(kernel),
+        )? {
+            if fault_law.is_none_or(|law| !law.allows(fault.kind, fault.recovered)) {
+                return Err(RocmDispatchError::Hip(HipError::InvalidExecutionFaultWord(
+                    u64::from_ne_bytes(bytes),
+                )));
+            }
             return Err(RocmDispatchError::ExecutionFault(fault));
         }
     }
     Ok(())
 }
 
-const fn scalar_byte_width(
-    binding_type: fusion_pcu::PcuBindingType,
-) -> Result<usize, RocmDispatchError> {
-    let fusion_pcu::PcuBindingType::Value(fusion_pcu::PcuValueType::Scalar(scalar)) = binding_type
-    else {
-        return Err(RocmDispatchError::Lower(
-            RocmLowerError::UnsupportedKernelInterface,
-        ));
-    };
-    Ok(match scalar {
-        fusion_pcu::PcuScalarType::I8 | fusion_pcu::PcuScalarType::U8 => 1,
-        fusion_pcu::PcuScalarType::I16
-        | fusion_pcu::PcuScalarType::U16
-        | fusion_pcu::PcuScalarType::F16
-        | fusion_pcu::PcuScalarType::BF16 => 2,
-        fusion_pcu::PcuScalarType::I32
-        | fusion_pcu::PcuScalarType::U32
-        | fusion_pcu::PcuScalarType::F32 => 4,
-        fusion_pcu::PcuScalarType::I64
-        | fusion_pcu::PcuScalarType::U64
-        | fusion_pcu::PcuScalarType::F64 => 8,
-        fusion_pcu::PcuScalarType::Bool
-        | fusion_pcu::PcuScalarType::I4
-        | fusion_pcu::PcuScalarType::U4 => {
-            return Err(RocmDispatchError::Lower(
-                RocmLowerError::UnsupportedKernelInterface,
-            ));
-        }
-    })
+fn decode_fault_word_in_extent(
+    word: u64,
+    extent: u32,
+) -> Result<Option<fusion_pcu::PcuExecutionFault>, RocmDispatchError> {
+    match decode_fault_word(word) {
+        Ok(Some(fault)) if !fault.is_within_logical_extent(u64::from(extent)) => Err(
+            RocmDispatchError::Hip(HipError::InvalidExecutionFaultWord(word)),
+        ),
+        result => result,
+    }
+}
+
+// The legacy synchronous entry compiles on every call, so it freezes the same resource
+// projection and exact indexed spans as owned preparation before touching any buffer.
+fn binding_requirements(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Result<Vec<PcuOwnedBindingRequirement>, RocmDispatchError> {
+    let count = core::num::NonZeroU32::new(kernel.entry.logical_shape[0])
+        .ok_or(RocmDispatchError::GeometryOverflow)?;
+    let shape = fusion_pcu::PcuInvocationShape::invocations(count);
+    let projection = crate::codegen::lower::map_binding_projection(kernel);
+    kernel
+        .bindings
+        .iter()
+        .filter(|binding| {
+            projection.is_none_or(|schema| {
+                schema.contains_output(binding.reference())
+                    || schema.input_bindings().contains(&binding.reference())
+            })
+        })
+        .map(|binding| {
+            PcuOwnedBindingRequirement::from_verified_binding(kernel, binding.reference(), shape)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(RocmDispatchError::Binding)
 }
 
 const fn decode_fault_word(
@@ -228,6 +249,12 @@ const fn decode_fault_word(
     }
     let recovered = word & (1 << 63) != 0;
     let payload = word & !(1 << 63);
+    // The same bounded one-dimensional map ABI is used by the legacy synchronous adapter.
+    if payload >> 3 > 0xffff_ffff {
+        return Err(RocmDispatchError::Hip(HipError::InvalidExecutionFaultWord(
+            word,
+        )));
+    }
     let kind = match payload & 7 {
         1 => fusion_pcu::PcuExecutionFaultKind::DivideByZero,
         2 => fusion_pcu::PcuExecutionFaultKind::SignedDivisionOverflow,
@@ -295,7 +322,6 @@ mod tests {
         decode_fault_word,
         launch_grid,
         operations_use_checked_fault,
-        scalar_byte_width,
     };
     use fusion_pcu::PcuValueType;
     #[test]
@@ -315,10 +341,13 @@ mod tests {
         );
         assert!(decode_fault_word((1 << 63) | (3_u64 << 3) | 1).is_err());
         assert!(decode_fault_word(6).is_err());
-        assert!(matches!(
-            scalar_byte_width(fusion_pcu::PcuBindingType::Value(PcuValueType::f64())),
-            Ok(8)
-        ));
+        for code in 1..=5 {
+            for recovered in [0, 1_u64 << 63] {
+                assert!(
+                    decode_fault_word(((u64::from(u32::MAX) + 1) << 3) | code | recovered).is_err()
+                );
+            }
+        }
     }
 
     #[test]
@@ -344,3 +373,7 @@ mod tests {
         assert!(operations_use_checked_fault(&outer));
     }
 }
+
+#[cfg(all(test, feature = "tensor"))]
+#[path = "dispatch/domain_tests.rs"]
+mod domain_tests;

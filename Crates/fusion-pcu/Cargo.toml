@@ -22,11 +22,15 @@ default = []
 insights = ["fusion-pcu-core/insights"]
 std = ["fusion-pcu-core/std"]
 hosted = ["std"]
-tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor", "fusion-pcu-cuda?/tensor"]
+tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor", "fusion-pcu-cuda?/tensor", "fusion-pcu-cpu?/tensor", "fusion-pcu-vulkan?/tensor", "fusion-pcu-metal?/tensor"]
 vm-reference = ["fusion-pcu-core/vm-reference"]
 cpu = ["std", "dep:fusion-pcu-cpu", "fusion-pcu-cpu/std"]
+cpu-benchmark-control = ["cpu"]
 rocm = ["std", "dep:fusion-pcu-rocm"]
 cuda = ["std", "dep:fusion-pcu-cuda"]
+mlx-benchmark-control = ["mlx", "fusion-pcu-mlx/benchmark-control"]
+mlx-view-census = ["mlx-benchmark-control", "fusion-pcu-mlx/view-census"]
+mlx = ["std", "tensor", "dep:fusion-pcu-mlx", "fusion-pcu-mlx/tensor"]
 metal = ["std", "dep:fusion-pcu-metal"]
 vulkan = ["std", "dep:fusion-pcu-vulkan", "fusion-pcu-vulkan/hosted"]
 
@@ -36,6 +40,7 @@ fusion-pcu-core.workspace = true
 fusion-pcu-macros.workspace = true
 fusion-pcu-rocm = { workspace = true, optional = true }
 fusion-pcu-cuda = { workspace = true, optional = true }
+fusion-pcu-mlx = { workspace = true, optional = true }
 fusion-pcu-metal = { workspace = true, optional = true }
 fusion-pcu-vulkan = { workspace = true, optional = true }
 smallvec.workspace = true
@@ -69,6 +74,16 @@ path = "examples/cpu-transform/cpu-transform.rs"
 required-features = ["cpu"]
 
 [[example]]
+name = "scalar-program"
+path = "examples/scalar-program/scalar-program.rs"
+required-features = ["cpu"]
+
+[[example]]
+name = "scalar-transport"
+path = "examples/scalar-transport/scalar-transport.rs"
+required-features = ["cpu"]
+
+[[example]]
 name = "vulkan-transform"
 path = "examples/vulkan-transform/vulkan-transform.rs"
 required-features = ["vulkan"]
@@ -86,3 +101,64 @@ name = "cpu_source"
 path = "benches/cpu_source/cpu_source.rs"
 harness = false
 required-features = ["cpu"]
+
+[[example]]
+name = "checked-arithmetic"
+path = "examples/checked-arithmetic/checked-arithmetic.rs"
+required-features = ["cpu"]
+
+[[example]]
+name = "checked-training"
+path = "examples/checked-training/checked-training.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "portable-arithmetic"
+path = "examples/portable-arithmetic/portable-arithmetic.rs"
+required-features = ["cpu"]
+
+[[test]]
+name = "mlx_opaque"
+path = "tests/opaque/mlx.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "mlx-matmul"
+path = "examples/mlx-matmul/mlx-matmul.rs"
+required-features = ["mlx"]
+
+[[example]]
+name = "mlx-resident"
+path = "examples/mlx-resident/mlx-resident.rs"
+required-features = ["mlx"]
+
+[[bench]]
+name = "mlx_source"
+path = "benches/mlx_source/mlx_source.rs"
+harness = false
+required-features = ["mlx-benchmark-control"]
+
+[[test]]
+name = "invocation_numerical"
+path = "tests/invocation_numerical/invocation_numerical.rs"
+required-features = ["cpu"]
+
+[[test]]
+name = "scalar_locals"
+path = "tests/scalar_locals/scalar_locals.rs"
+required-features = ["std"]
+
+[[test]]
+name = "backend_parity"
+path = "tests/backend_parity/backend_parity.rs"
+required-features = ["std"]
+
+[[test]]
+name = "backend_tensor_parity"
+path = "tests/backend_tensor_parity/backend_tensor_parity.rs"
+required-features = ["std", "tensor"]
+
+[[test]]
+name = "mlx_checked_source"
+path = "tests/mlx_checked_source/mlx_checked_source.rs"
+required-features = ["mlx"]

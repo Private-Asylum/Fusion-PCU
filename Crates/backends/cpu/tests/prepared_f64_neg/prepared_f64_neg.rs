@@ -144,6 +144,11 @@ fn with_kernel(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let mut kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuImplementationRequirements {
+            float_underflow: policy,
+            range_policy: range,
+            ..original.numerical_requirements
+        },
         ops: if grid { &grid_ops } else { &direct },
         ..original
     };
@@ -623,6 +628,10 @@ fn f64_instruction_ids_are_distinct_and_typed_unified_offers_agree() {
             ] {
                 with_kernel(grid, underflow, PcuRangePolicy::Reject, |kernel| {
                     for mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
+                        let mut kernel = *kernel;
+                        kernel.numerical_requirements.numerical_mode = mode;
+                        kernel.numerical_requirements.float_underflow = underflow;
+                        let kernel = &kernel;
                         let request = PcuImplementationRequest {
                             device: identity(1),
                             executor: PcuExecutorId(0),
@@ -662,7 +671,7 @@ fn f64_instruction_ids_are_distinct_and_typed_unified_offers_agree() {
 }
 
 #[test]
-fn f64_offers_keep_strictness_and_determinism_independent_and_reject_unproved_permissions() {
+fn f64_legacy_and_unified_offers_keep_distinct_portable_profiles() {
     let typed = PcuCpuNegOffers::new(PcuCpuCheckedNeg::scalar(), identity(1), PcuExecutorId(0));
     let unified = PcuCpuHostOffers::new(PcuCpuHostBackend::scalar(), identity(1), PcuExecutorId(0));
     with_kernel(
@@ -696,13 +705,41 @@ fn f64_offers_keep_strictness_and_determinism_independent_and_reject_unproved_pe
                             request.requirements.numerical_options.reproducibility = determinism;
                             request.requirements.numerical_options.compound_arithmetic = arithmetic;
                             request.requirements.numerical_options.precision = precision;
-                            let count = usize::from(
-                                determinism == PcuReproducibility::Unspecified
-                                    && arithmetic == PcuCompoundArithmeticPolicy::Checked
-                                    && precision == PcuPrecisionPolicy::Preserve,
-                            );
+                            let kernel = PcuDispatchKernelIr {
+                                numerical_requirements: request.requirements,
+                                ..*kernel
+                            };
+                            let request = PcuImplementationRequest {
+                                operation: &kernel,
+                                ..request
+                            };
+                            let count = usize::from(determinism == PcuReproducibility::Unspecified);
                             assert_eq!(typed.implementation_offers(&request, &mut []), Ok(count));
-                            assert_eq!(unified.implementation_offers(&request, &mut []), Ok(count));
+                            let mut slots = [None];
+                            assert_eq!(unified.implementation_offers(&request, &mut slots), Ok(1));
+                            let offer = slots[0].unwrap();
+                            offer.validate_request(&request).unwrap();
+                            assert_eq!(offer.requirements, request.requirements);
+                            if determinism == PcuReproducibility::PortableV1 {
+                                assert_eq!(
+                                    (offer.implementation.local_id, offer.implementation.revision),
+                                    (16404, 1)
+                                );
+                                assert_eq!(offer.workspace_bytes, Some(0));
+                                let mut mismatched = request.requirements;
+                                mismatched.numerical_options.reproducibility =
+                                    PcuReproducibility::Unspecified;
+                                assert_eq!(
+                                    unified.implementation_offers(
+                                        &PcuImplementationRequest {
+                                            requirements: mismatched,
+                                            ..request
+                                        },
+                                        &mut []
+                                    ),
+                                    Ok(0)
+                                );
+                            }
                         }
                     }
                 }
@@ -760,6 +797,14 @@ fn f64_offer_snapshot_and_underflow_mismatches_are_structured_errors() {
             );
             request.executor = PcuExecutorId(0);
             request.requirements.float_underflow = PcuFloatUnderflowPolicy::RejectSubnormalResult;
+            let kernel = PcuDispatchKernelIr {
+                numerical_requirements: request.requirements,
+                ..*request.operation
+            };
+            let request = PcuImplementationRequest {
+                operation: &kernel,
+                ..request
+            };
             assert_eq!(
                 typed.implementation_offers(&request, &mut []),
                 Err(PcuCpuNegOfferError::UnderflowMismatch)
@@ -830,4 +875,16 @@ fn f64_malformed_clamp_offer_keeps_ssa_error_instead_of_zero_admission() {
             ));
         },
     );
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[test]
+fn actual_neon_selection_executes_annotated_f64_source() {
+    let backend = PcuCpuCheckedNeg::new(PcuCpuProcessor::detect(), PcuCpuImplementation::Neon)
+        .expect("actual AArch64 host must admit NEON");
+    let bindings = source::negate_bindings();
+    let builder = source::negate_ir::<257>(&bindings).unwrap();
+    let prepared = backend.prepare_host_kernel(&builder.ir()).unwrap();
+    assert_eq!(prepared.implementation(), PcuCpuImplementation::Neon);
+    check_source::<257>(backend);
 }

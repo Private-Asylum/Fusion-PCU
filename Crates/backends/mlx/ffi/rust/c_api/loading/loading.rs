@@ -2,7 +2,10 @@
 
 #[rustfmt::skip]
 use std::{
-    ffi::{c_char, c_void},
+    ffi::{
+        c_char,
+        c_void,
+    },
     path::Path,
     rc::Rc,
 };
@@ -12,7 +15,28 @@ use crate::MlxError;
 use super::{
     admission::admit,
     api::Api,
-    abi::{CArray, CDevice, CDeviceInfo, CString, CStream, Free, ScopeBegin, ScopeEnd},
+    abi::{
+        CCarrier,
+        CarrierNew,
+        CarrierPrefixNew,
+        CarrierApply,
+        CCheckedUnary,
+        CCheckedBinary,
+        BinaryNew,
+        BinaryApply,
+        CheckedNew,
+        CheckedPrefixNew,
+        CheckedApply,
+        CheckedUpload,
+        CArray,
+        CDevice,
+        CDeviceInfo,
+        CString,
+        CStream,
+        Free,
+        ScopeBegin,
+        ScopeEnd,
+    },
     owner::Owner,
     text::bounded_text,
 };
@@ -33,6 +57,27 @@ use super::super::{
     SDK_VERSION,
 };
 
+#[rustfmt::skip]
+use super::abi::{
+    CCheckedInteger,
+    IntegerNew,
+    IntegerApply,
+};
+#[rustfmt::skip]
+use super::abi::{
+    CCheckedDivRem,
+    DivRemNew,
+    DivRemApply,
+};
+#[rustfmt::skip]
+use super::abi::{
+    CTransport,
+    TransportNew,
+    TransportApply,
+    CComposed,
+    ComposedNew,
+    ComposedApply,
+};
 impl Api {
     #[allow(
         clippy::too_many_lines,
@@ -46,6 +91,14 @@ impl Api {
             .map_err(|error| MlxError::Unavailable(error.to_string()))?;
         macro_rules! symbol {
             ($name:literal, $ty:ty) => {{
+                #[cfg(feature = "division-census")]
+                super::div_rem::census::record(super::div_rem::census::Call::TableSymbol);
+                #[cfg(feature = "carrier-census")]
+                super::carrier::census::record(super::carrier::census::Call::TableSymbol);
+                #[cfg(feature = "binary-census")]
+                super::binary::census::record(super::binary::census::Call::TableSymbol);
+                #[cfg(feature = "integer-census")]
+                super::integer::census::record(super::integer::census::Call::TableSymbol);
                 // SAFETY: names/signatures match audited exact-source upstream C headers
                 // and safety.h. Copied pointers remain bound to the retained Library.
                 unsafe { library.get::<$ty>(concat!($name, "\0").as_bytes()) }
@@ -61,6 +114,12 @@ impl Api {
         );
         let string_free = symbol!("mlx_string_free", Free<CString>);
         let api = Rc::new(Self {
+            composed_new: symbol!("pcu_mlx_c_composed_new", ComposedNew),
+            composed_apply: symbol!("pcu_mlx_c_composed_apply", ComposedApply),
+            composed_free: symbol!("pcu_mlx_c_composed_free", Free<CComposed>),
+            transport_new: symbol!("pcu_mlx_c_transport_new", TransportNew),
+            transport_apply: symbol!("pcu_mlx_c_transport_apply", TransportApply),
+            transport_free: symbol!("pcu_mlx_c_transport_free", Free<CTransport>),
             version: SDK_VERSION.into(),
             begin: symbol!("pcu_mlx_c_error_scope_begin", ScopeBegin),
             end: symbol!("pcu_mlx_c_error_scope_end", ScopeEnd),
@@ -122,6 +181,51 @@ impl Api {
                 "mlx_array_data_float32",
                 unsafe extern "C" fn(CArray) -> *const f32
             ),
+            array_data_u8: symbol!(
+                "mlx_array_data_uint8",
+                unsafe extern "C" fn(CArray) -> *const u8
+            ),
+            array_data_u16: symbol!(
+                "mlx_array_data_uint16",
+                unsafe extern "C" fn(CArray) -> *const u16
+            ),
+            array_data_u32: symbol!(
+                "mlx_array_data_uint32",
+                unsafe extern "C" fn(CArray) -> *const u32
+            ),
+            checked_new: symbol!("pcu_mlx_c_checked_unary_new", CheckedNew),
+            checked_prefix_new: symbol!("pcu_mlx_c_checked_unary_prefix_new", CheckedPrefixNew),
+            checked_apply: symbol!("pcu_mlx_c_checked_unary_apply", CheckedApply),
+            checked_upload: symbol!("pcu_mlx_c_checked_upload", CheckedUpload),
+            checked_free: symbol!("pcu_mlx_c_checked_unary_free", Free<CCheckedUnary>),
+            binary_new: symbol!("pcu_mlx_c_checked_binary_new", BinaryNew),
+            binary_prefix_new: symbol!("pcu_mlx_c_checked_binary_prefix_new", BinaryNew),
+            binary_apply: symbol!("pcu_mlx_c_checked_binary_apply", BinaryApply),
+            binary_free: symbol!("pcu_mlx_c_checked_binary_free", Free<CCheckedBinary>),
+            integer_new: symbol!("pcu_mlx_c_checked_integer_new", IntegerNew),
+            integer_prefix_new: symbol!("pcu_mlx_c_checked_integer_prefix_new", IntegerNew),
+            integer_apply: symbol!("pcu_mlx_c_checked_integer_apply", IntegerApply),
+            integer_free: symbol!("pcu_mlx_c_checked_integer_free", Free<CCheckedInteger>),
+            div_rem_new: symbol!("pcu_mlx_c_checked_div_rem_new", DivRemNew),
+            div_rem_prefix_new: symbol!("pcu_mlx_c_checked_div_rem_prefix_new", DivRemNew),
+            div_rem_apply: symbol!("pcu_mlx_c_checked_div_rem_apply", DivRemApply),
+            div_rem_free: symbol!("pcu_mlx_c_checked_div_rem_free", Free<CCheckedDivRem>),
+            f32_view_validate_shared: symbol!(
+                "pcu_mlx_c_f32_view_validate_shared",
+                unsafe extern "C" fn(CArray, CArray) -> i32
+            ),
+            f32_view: symbol!(
+                "pcu_mlx_c_f32_view",
+                unsafe extern "C" fn(*mut CArray, CArray, CStream, i32, i32, i32) -> i32
+            ),
+            encoded_prefix: symbol!(
+                "pcu_mlx_c_encoded_prefix_merge",
+                unsafe extern "C" fn(*mut CArray, CArray, CArray, CStream) -> i32
+            ),
+            carrier_new: symbol!("pcu_mlx_c_carrier_new", CarrierNew),
+            carrier_prefix_new: symbol!("pcu_mlx_c_carrier_prefix_new", CarrierPrefixNew),
+            carrier_apply: symbol!("pcu_mlx_c_carrier_apply", CarrierApply),
+            carrier_free: symbol!("pcu_mlx_c_carrier_free", Free<CCarrier>),
             array_eval: symbol!("mlx_array_eval", unsafe extern "C" fn(CArray) -> i32),
             array_wait: symbol!("_mlx_array_wait", unsafe extern "C" fn(CArray) -> i32),
             array_available: symbol!(

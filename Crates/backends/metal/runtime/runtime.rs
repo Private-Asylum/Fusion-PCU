@@ -8,12 +8,35 @@ use std::{
 
 #[rustfmt::skip]
 use fusion_pcu::{
+    PcuCheckedScalarFaultLaw,
     PcuExecutionFault,
     PcuExecutionFaultKind,
     PcuFloatUnderflowPolicy,
 };
 
 use crate::ffi;
+#[path = "binary/binary.rs"]
+mod binary;
+#[path = "carrier/carrier.rs"]
+pub mod carrier;
+#[path = "composed/composed.rs"]
+pub mod composed;
+#[path = "fault/fault.rs"]
+mod fault;
+#[path = "integer/integer.rs"]
+pub mod integer;
+#[path = "transport/transport.rs"]
+pub mod transport;
+pub use integer::IntegerControl as MetalPreparedIntegerControl;
+pub use carrier::Carrier as MetalPreparedCarrierControl;
+#[path = "unary/unary.rs"]
+mod unary;
+#[rustfmt::skip]
+pub use binary::{
+    MetalPreparedF32Binary,
+    MetalPreparedF64Binary,
+    MetalPreparedFloatBinary,
+};
 
 /// Failure of discovery, admission, transport, compilation or terminal completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +49,7 @@ pub enum MetalError {
     ForeignSession,
     /// Metal or its compiler reported an operational failure.
     Runtime(String),
-    /// Checked arithmetic failed; no useful output is published.
+    /// Checked arithmetic failed; recovered faults retain completed borrowed-output payloads.
     Arithmetic(MetalFault),
 }
 
@@ -125,7 +148,7 @@ impl MetalSession {
         Ok(MetalBuffer {
             session: self.clone(),
             native,
-            words: words.len(),
+            bytes,
         })
     }
 
@@ -133,27 +156,38 @@ impl MetalSession {
     /// No caller pointer is retained; this is ordinary staging, not a no-copy import.
     ///
     /// # Errors
-    /// Returns `InvalidExtent` for empty, non-word, overflowing or oversized extents,
+    /// Returns `InvalidExtent` for empty, overflowing or oversized extents,
     /// or a native allocation/transport error. Quarantined sessions reject before copying.
     pub fn upload_bytes(&self, bytes: &[u8]) -> Result<MetalBuffer, MetalError> {
-        if !bytes.len().is_multiple_of(4) {
-            return Err(MetalError::InvalidExtent);
-        }
-        let buffer = self.allocate_zeroed(bytes.len() / 4)?;
+        let buffer = self.allocate_zeroed_bytes(bytes.len())?;
         buffer.native.write_bytes(0, bytes)?;
         Ok(buffer)
     }
 
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn allocate_zeroed(&self, words: usize) -> Result<MetalBuffer, MetalError> {
         self.ensure_quiescent()?;
         let bytes = validate_extent(words, self.0.facts.max_buffer_bytes)?;
+        self.allocate_zeroed_bytes(bytes)
+    }
+
+    /// Allocates exact-byte initialized Shared storage in this retained session.
+    ///
+    /// Native Metal allocation establishes zero initialization without a host scratch vector.
+    /// Logical bytes are never rounded up, including odd low-format payloads.
+    ///
+    /// # Errors
+    /// Rejects zero/oversized extents, quarantined sessions or native allocation failure.
+    pub fn allocate_zeroed_bytes(&self, bytes: usize) -> Result<MetalBuffer, MetalError> {
+        self.ensure_quiescent()?;
+        validate_byte_extent(bytes, self.0.facts.max_buffer_bytes)?;
         // Metal newBufferWithLength:options: clears the allocation to zero. This concrete
         // allocator therefore establishes initialization without a temporary host zero vector.
         let native = self.0.native.allocate(bytes)?;
         Ok(MetalBuffer {
             session: self.clone(),
             native,
-            words,
+            bytes,
         })
     }
 
@@ -169,8 +203,82 @@ impl MetalSession {
         Ok(MetalPreparedIntegerMap {
             session: self.clone(),
             pipeline,
-            operation,
+            operation: operation.code(),
+            fault_law: fault::integer(
+                fusion_pcu::PcuScalarType::U32,
+                operation,
+                fusion_pcu::PcuRangePolicy::Reject,
+            )?,
         })
+    }
+    pub(crate) fn prepare_typed_integer_map(
+        &self,
+        operation: MetalIntegerOp,
+        scalar: fusion_pcu::PcuScalarType,
+    ) -> Result<MetalPreparedIntegerMap, MetalError> {
+        let code = match scalar {
+            fusion_pcu::PcuScalarType::U32 => operation.code(),
+            fusion_pcu::PcuScalarType::I32 => match operation {
+                MetalIntegerOp::Add => 9,
+                MetalIntegerOp::Subtract => 10,
+                MetalIntegerOp::Multiply => 11,
+                MetalIntegerOp::Identity => 8,
+                MetalIntegerOp::Divide => return Err(MetalError::Unsupported),
+            },
+            fusion_pcu::PcuScalarType::U64 => match operation {
+                MetalIntegerOp::Add => 16,
+                MetalIntegerOp::Subtract => 17,
+                MetalIntegerOp::Multiply => 18,
+                MetalIntegerOp::Identity => 22,
+                MetalIntegerOp::Divide => return Err(MetalError::Unsupported),
+            },
+            fusion_pcu::PcuScalarType::I64 => match operation {
+                MetalIntegerOp::Add => 19,
+                MetalIntegerOp::Subtract => 20,
+                MetalIntegerOp::Multiply => 21,
+                MetalIntegerOp::Identity => 22,
+                MetalIntegerOp::Divide => return Err(MetalError::Unsupported),
+            },
+            _ => return Err(MetalError::Unsupported),
+        };
+        Ok(MetalPreparedIntegerMap {
+            session: self.clone(),
+            pipeline: self.0.native.compile(INTEGER_SOURCE, "pcu_checked_u32")?,
+            operation: code,
+            fault_law: fault::integer(scalar, operation, fusion_pcu::PcuRangePolicy::Reject)?,
+        })
+    }
+
+    /// Prepares a checked signed I32 Add/Sub/Mul encoding map.
+    /// All arithmetic uses unsigned encodings; exact negative range failures remain underflow.
+    ///
+    /// # Errors
+    /// Rejects division before compilation, or returns native pipeline errors.
+    pub fn prepare_i32_map(
+        &self,
+        operation: MetalIntegerOp,
+    ) -> Result<MetalPreparedIntegerMap, MetalError> {
+        self.prepare_typed_integer_map(operation, fusion_pcu::PcuScalarType::I32)
+    }
+    /// Prepares checked U64 identity/Add/Sub/Mul with bounded unsigned U32 limbs.
+    ///
+    /// # Errors
+    /// Rejects division or returns native compiler/pipeline failures.
+    pub fn prepare_u64_map(
+        &self,
+        operation: MetalIntegerOp,
+    ) -> Result<MetalPreparedIntegerMap, MetalError> {
+        self.prepare_typed_integer_map(operation, fusion_pcu::PcuScalarType::U64)
+    }
+    /// Prepares checked I64 identity/Add/Sub/Mul without signed-overflow arithmetic.
+    ///
+    /// # Errors
+    /// Rejects division or returns native compiler/pipeline failures.
+    pub fn prepare_i64_map(
+        &self,
+        operation: MetalIntegerOp,
+    ) -> Result<MetalPreparedIntegerMap, MetalError> {
+        self.prepare_typed_integer_map(operation, fusion_pcu::PcuScalarType::I64)
     }
 }
 
@@ -178,7 +286,7 @@ impl MetalSession {
 pub struct MetalBuffer {
     session: MetalSession,
     native: ffi::Buffer,
-    words: usize,
+    bytes: usize,
 }
 
 impl MetalBuffer {
@@ -193,22 +301,38 @@ impl MetalBuffer {
         self.session.ensure_quiescent()?;
         self.native.write_bytes(offset, bytes)
     }
+    pub(crate) fn read_pair_bytes(
+        &self,
+        first: &mut [u8],
+        second: &mut [u8],
+    ) -> Result<(), MetalError> {
+        self.session.ensure_quiescent()?;
+        self.native.read_pair_bytes(first, second)
+    }
     pub(crate) fn read_bytes(&self, offset: usize, bytes: &mut [u8]) -> Result<(), MetalError> {
         self.session.ensure_quiescent()?;
         self.native.read_bytes(offset, bytes)
     }
+    /// Number of complete U32 words in this allocation. Non-word scalar payloads retain their
+    /// independent exact byte extent; use `byte_len` for byte transport and scalar admission.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.words
+        self.bytes / 4
+    }
+
+    /// Exact owned byte extent, including non-word-sized scalar storage.
+    #[must_use]
+    pub const fn byte_len(&self) -> usize {
+        self.bytes
     }
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.words == 0
+        self.bytes == 0
     }
 
     /// Copies the complete owned Shared buffer into an exact initialized host byte slice.
-    /// Quiescence and the entire nonempty word extent are checked before any destination write.
+    /// Quiescence and the entire nonempty byte extent are checked before any destination write.
     /// This API retains no host pointer and exposes no Shared mapping or borrowed device view.
     ///
     /// # Errors
@@ -216,7 +340,7 @@ impl MetalBuffer {
     /// no host bytes are modified. Checked callers must complete their numerical gate first.
     pub fn read_into_bytes(&self, bytes: &mut [u8]) -> Result<(), MetalError> {
         self.session.ensure_quiescent()?;
-        if self.words.checked_mul(4) != Some(bytes.len()) || bytes.is_empty() {
+        if self.bytes != bytes.len() || bytes.is_empty() {
             return Err(MetalError::InvalidExtent);
         }
         self.native.read_bytes(0, bytes)
@@ -228,15 +352,19 @@ impl MetalBuffer {
     /// Returns a native transport error.
     pub fn download_u32(&self) -> Result<Vec<u32>, MetalError> {
         self.session.ensure_quiescent()?;
-        self.native.read(self.words)
+        if !self.bytes.is_multiple_of(4) {
+            return Err(MetalError::InvalidExtent);
+        }
+        self.native.read(self.len())
     }
 }
 
 /// Fixed checked map executable retaining its queue, device and pipeline.
 pub struct MetalPreparedIntegerMap {
+    fault_law: Option<PcuCheckedScalarFaultLaw>,
     session: MetalSession,
     pipeline: ffi::Pipeline,
-    operation: MetalIntegerOp,
+    operation: u32,
 }
 
 impl MetalPreparedIntegerMap {
@@ -250,25 +378,10 @@ impl MetalPreparedIntegerMap {
     /// Returns a shape/affinity error before work, a terminal runtime failure, or the first
     /// checked arithmetic fault. A failed call never returns partially useful output.
     pub fn execute(&self, lhs: &MetalBuffer, rhs: &MetalBuffer) -> Result<MetalBuffer, MetalError> {
-        if lhs.words != rhs.words {
+        if lhs.len() != rhs.len() {
             return Err(MetalError::InvalidExtent);
         }
-        self.execute_prefix(lhs, rhs, lhs.words)
-    }
-    pub(crate) fn execute_into(
-        &self,
-        inputs: [&MetalBuffer; 2],
-        output: &MetalBuffer,
-        words: usize,
-    ) -> Result<(), MetalError> {
-        execute_profile_into(
-            &self.session,
-            &self.pipeline,
-            inputs,
-            output,
-            self.operation.code(),
-            words,
-        )
+        self.execute_prefix(lhs, rhs, lhs.len())
     }
     pub(crate) fn execute_prefix(
         &self,
@@ -281,53 +394,106 @@ impl MetalPreparedIntegerMap {
             &self.pipeline,
             lhs,
             rhs,
-            self.operation.code(),
+            self.operation,
             words,
+            self.fault_law,
         )
     }
 }
 
-/// Encoding-only checked F32 unary executable; no native floating arithmetic is executed.
-pub struct MetalPreparedF32Unary {
+/// Compatibility name for existing F32 prepared encoding maps.
+pub type MetalPreparedF32Unary = MetalPreparedFloatUnary;
+/// Compatibility name for F64 prepared encoding maps.
+pub type MetalPreparedF64Unary = MetalPreparedFloatUnary;
+/// Checked unary executable over exact encodings; no native floating arithmetic is executed.
+pub struct MetalPreparedFloatUnary {
+    fault_law: PcuCheckedScalarFaultLaw,
     session: MetalSession,
     pipeline: ffi::Pipeline,
     operation: u32,
+    scalar: fusion_pcu::PcuScalarType,
 }
-impl MetalPreparedF32Unary {
+impl MetalPreparedFloatUnary {
+    pub(crate) fn with_broadcast(mut self, broadcast: bool) -> Self {
+        self.operation |= u32::from(broadcast) << 16;
+        self
+    }
+    fn input_bytes(&self, bytes: usize) -> [usize; 2] {
+        [if self.operation & (1 << 16) != 0 {
+            usize::from(self.scalar.bit_width()) / 8
+        } else {
+            bytes
+        }; 2]
+    }
+    pub(crate) fn execute_completed(
+        &self,
+        input: &MetalBuffer,
+        bytes: usize,
+    ) -> Result<(MetalBuffer, Option<MetalFault>), MetalError> {
+        execute_byte_profile_completed(
+            &self.session,
+            &self.pipeline,
+            [input; 2],
+            self.operation,
+            bytes,
+            self.logical_count(bytes)?,
+            self.input_bytes(bytes),
+            Some(self.fault_law),
+        )
+    }
+    fn logical_count(&self, bytes: usize) -> Result<usize, MetalError> {
+        let width = usize::from(self.scalar.bit_width()) / 8;
+        if bytes == 0 || !bytes.is_multiple_of(width) {
+            return Err(MetalError::InvalidExtent);
+        }
+        Ok(bytes / width)
+    }
     /// Runs exact bit selection/sign inversion with nonfinite and underflow diagnostics.
     ///
     /// # Errors
     /// Returns affinity, extent, operational or checked numerical failure.
     pub fn execute(&self, input: &MetalBuffer) -> Result<MetalBuffer, MetalError> {
-        self.execute_prefix(input, input.words)
+        self.execute_prefix(input, input.byte_len())
     }
-    pub(crate) fn execute_into(
+    /// Writes the requested exact-byte prefix into a same-session borrowed output.
+    ///
+    /// Recovered range faults retain the terminal payload. Fatal execution faults may alter
+    /// the physical prefix and require logical discard; no useful partial value is promised.
+    ///
+    /// # Errors
+    /// Returns extent, affinity, operational or checked numerical failure.
+    pub fn execute_into(
         &self,
         input: &MetalBuffer,
         output: &MetalBuffer,
-        words: usize,
+        bytes: usize,
     ) -> Result<(), MetalError> {
-        execute_profile_into(
+        execute_byte_profile_into(
             &self.session,
             &self.pipeline,
             [input; 2],
             output,
             self.operation,
-            words,
+            bytes,
+            self.logical_count(bytes)?,
+            self.input_bytes(bytes),
+            Some(self.fault_law),
         )
     }
     pub(crate) fn execute_prefix(
         &self,
         input: &MetalBuffer,
-        words: usize,
+        bytes: usize,
     ) -> Result<MetalBuffer, MetalError> {
-        execute_profile(
+        execute_byte_profile(
             &self.session,
             &self.pipeline,
-            input,
-            input,
+            [input; 2],
             self.operation,
-            words,
+            bytes,
+            self.logical_count(bytes)?,
+            self.input_bytes(bytes),
+            Some(self.fault_law),
         )
     }
 }
@@ -339,9 +505,17 @@ impl MetalSession {
     pub fn prepare_f32_neg(
         &self,
         underflow: PcuFloatUnderflowPolicy,
-    ) -> Result<MetalPreparedF32Unary, MetalError> {
-        Ok(MetalPreparedF32Unary {
+    ) -> Result<MetalPreparedFloatUnary, MetalError> {
+        Ok(MetalPreparedFloatUnary {
+            fault_law: PcuCheckedScalarFaultLaw::float_unary(
+                fusion_pcu::PcuScalarType::F32,
+                fusion_pcu::PcuDispatchFloatUnaryOp::Neg,
+                fusion_pcu::PcuRangePolicy::Reject,
+                underflow,
+            )
+            .ok_or(MetalError::Unsupported)?,
             session: self.clone(),
+            scalar: fusion_pcu::PcuScalarType::F32,
             pipeline: self.0.native.compile(INTEGER_SOURCE, "pcu_checked_u32")?,
             operation: if underflow == PcuFloatUnderflowPolicy::RejectSubnormalResult {
                 7
@@ -357,15 +531,80 @@ impl MetalSession {
     pub fn prepare_f32_relu(
         &self,
         underflow: PcuFloatUnderflowPolicy,
-    ) -> Result<MetalPreparedF32Unary, MetalError> {
-        Ok(MetalPreparedF32Unary {
+    ) -> Result<MetalPreparedFloatUnary, MetalError> {
+        Ok(MetalPreparedFloatUnary {
+            fault_law: PcuCheckedScalarFaultLaw::float_unary(
+                fusion_pcu::PcuScalarType::F32,
+                fusion_pcu::PcuDispatchFloatUnaryOp::Relu,
+                fusion_pcu::PcuRangePolicy::Reject,
+                underflow,
+            )
+            .ok_or(MetalError::Unsupported)?,
             session: self.clone(),
+            scalar: fusion_pcu::PcuScalarType::F32,
             pipeline: self.0.native.compile(INTEGER_SOURCE, "pcu_checked_u32")?,
             operation: if underflow == PcuFloatUnderflowPolicy::RejectSubnormalResult {
                 5
             } else {
                 4
             },
+        })
+    }
+
+    /// Prepares exact F64 sign inversion with paired unsigned encoding limbs.
+    ///
+    /// # Errors
+    /// Returns native compilation failure; nonfinite inputs fault during execution.
+    pub fn prepare_f64_neg(
+        &self,
+        underflow: PcuFloatUnderflowPolicy,
+    ) -> Result<MetalPreparedFloatUnary, MetalError> {
+        self.prepare_f64_encoding(
+            if underflow == PcuFloatUnderflowPolicy::RejectSubnormalResult {
+                13
+            } else {
+                12
+            },
+            fusion_pcu::PcuDispatchFloatUnaryOp::Neg,
+            underflow,
+        )
+    }
+    /// Prepares exact F64 `ReLU` with paired unsigned encoding limbs.
+    ///
+    /// # Errors
+    /// Returns native compilation failure; nonfinite inputs fault during execution.
+    pub fn prepare_f64_relu(
+        &self,
+        underflow: PcuFloatUnderflowPolicy,
+    ) -> Result<MetalPreparedFloatUnary, MetalError> {
+        self.prepare_f64_encoding(
+            if underflow == PcuFloatUnderflowPolicy::RejectSubnormalResult {
+                15
+            } else {
+                14
+            },
+            fusion_pcu::PcuDispatchFloatUnaryOp::Relu,
+            underflow,
+        )
+    }
+    fn prepare_f64_encoding(
+        &self,
+        operation: u32,
+        kind: fusion_pcu::PcuDispatchFloatUnaryOp,
+        underflow: PcuFloatUnderflowPolicy,
+    ) -> Result<MetalPreparedFloatUnary, MetalError> {
+        Ok(MetalPreparedFloatUnary {
+            fault_law: PcuCheckedScalarFaultLaw::float_unary(
+                fusion_pcu::PcuScalarType::F64,
+                kind,
+                fusion_pcu::PcuRangePolicy::Reject,
+                underflow,
+            )
+            .ok_or(MetalError::Unsupported)?,
+            session: self.clone(),
+            scalar: fusion_pcu::PcuScalarType::F64,
+            pipeline: self.0.native.compile(INTEGER_SOURCE, "pcu_checked_u32")?,
+            operation,
         })
     }
 }
@@ -376,12 +615,13 @@ fn execute_profile(
     rhs: &MetalBuffer,
     operation: u32,
     words: usize,
+    fault_law: Option<PcuCheckedScalarFaultLaw>,
 ) -> Result<MetalBuffer, MetalError> {
     session.ensure_quiescent()?;
     if !Rc::ptr_eq(&session.0, &lhs.session.0) || !Rc::ptr_eq(&session.0, &rhs.session.0) {
         return Err(MetalError::ForeignSession);
     }
-    if lhs.words < words || rhs.words < words {
+    if lhs.len() < words || rhs.len() < words {
         return Err(MetalError::InvalidExtent);
     }
     let bytes = validate_extent(words, session.0.facts.max_buffer_bytes)?;
@@ -389,9 +629,17 @@ fn execute_profile(
     let output = MetalBuffer {
         session: session.clone(),
         native: output,
-        words,
+        bytes,
     };
-    execute_profile_into(session, pipeline, [lhs, rhs], &output, operation, words)?;
+    execute_profile_into(
+        session,
+        pipeline,
+        [lhs, rhs],
+        &output,
+        operation,
+        words,
+        fault_law,
+    )?;
     Ok(output)
 }
 
@@ -403,20 +651,135 @@ fn execute_profile_into(
     output: &MetalBuffer,
     operation: u32,
     words: usize,
+    fault_law: Option<PcuCheckedScalarFaultLaw>,
 ) -> Result<(), MetalError> {
     session.ensure_quiescent()?;
     for buffer in [inputs[0], inputs[1], output] {
         if !session.same_session(buffer.session()) {
             return Err(MetalError::ForeignSession);
         }
-        if buffer.words < words {
+        if buffer.len() < words {
             return Err(MetalError::InvalidExtent);
         }
     }
-    let bytes = validate_extent(words, session.0.facts.max_buffer_bytes)?;
+    let logical_count = if matches!(operation, 12..=22 | 32..=43) {
+        if !words.is_multiple_of(2) {
+            return Err(MetalError::InvalidExtent);
+        }
+        words / 2
+    } else {
+        words
+    };
+    execute_byte_profile_into(
+        session,
+        pipeline,
+        inputs,
+        output,
+        operation,
+        words.checked_mul(4).ok_or(MetalError::InvalidExtent)?,
+        logical_count,
+        [words.checked_mul(4).ok_or(MetalError::InvalidExtent)?; 2],
+        fault_law,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Frozen physical input/output extents and diagnostic lane count differ.
+fn execute_byte_profile(
+    session: &MetalSession,
+    pipeline: &ffi::Pipeline,
+    inputs: [&MetalBuffer; 2],
+    operation: u32,
+    bytes: usize,
+    logical_count: usize,
+    input_bytes: [usize; 2],
+    fault_law: Option<PcuCheckedScalarFaultLaw>,
+) -> Result<MetalBuffer, MetalError> {
+    let (output, fault) = execute_byte_profile_completed(
+        session,
+        pipeline,
+        inputs,
+        operation,
+        bytes,
+        logical_count,
+        input_bytes,
+        fault_law,
+    )?;
+    fault.map_or(Ok(output), |fault| Err(MetalError::Arithmetic(fault)))
+}
+
+#[allow(clippy::too_many_arguments)] // Detached payload, diagnostic count and physical input extents are independent.
+fn execute_byte_profile_completed(
+    session: &MetalSession,
+    pipeline: &ffi::Pipeline,
+    inputs: [&MetalBuffer; 2],
+    operation: u32,
+    bytes: usize,
+    logical_count: usize,
+    input_bytes: [usize; 2],
+    fault_law: Option<PcuCheckedScalarFaultLaw>,
+) -> Result<(MetalBuffer, Option<MetalFault>), MetalError> {
+    session.ensure_quiescent()?;
+    validate_byte_extent(bytes, session.0.facts.max_buffer_bytes)?;
+    validate_extent(logical_count, session.0.facts.max_buffer_bytes)?;
+    for (buffer, required) in inputs.into_iter().zip(input_bytes) {
+        validate_byte_extent(required, session.0.facts.max_buffer_bytes)?;
+        if !session.same_session(buffer.session()) {
+            return Err(MetalError::ForeignSession);
+        }
+        if buffer.byte_len() < required {
+            return Err(MetalError::InvalidExtent);
+        }
+    }
+    let output = session.allocate_zeroed_bytes(bytes)?;
+    let fault = match execute_byte_profile_into(
+        session,
+        pipeline,
+        inputs,
+        &output,
+        operation,
+        bytes,
+        logical_count,
+        input_bytes,
+        fault_law,
+    ) {
+        Ok(()) => None,
+        Err(MetalError::Arithmetic(fault)) if fault.recovered => Some(fault),
+        Err(error) => return Err(error),
+    };
+    Ok((output, fault))
+}
+
+#[allow(clippy::too_many_arguments)] // Physical payload bytes and logical status lanes are independent.
+fn execute_byte_profile_into(
+    session: &MetalSession,
+    pipeline: &ffi::Pipeline,
+    inputs: [&MetalBuffer; 2],
+    output: &MetalBuffer,
+    operation: u32,
+    payload_bytes: usize,
+    logical_count: usize,
+    input_bytes: [usize; 2],
+    fault_law: Option<PcuCheckedScalarFaultLaw>,
+) -> Result<(), MetalError> {
+    session.ensure_quiescent()?;
+    validate_byte_extent(payload_bytes, session.0.facts.max_buffer_bytes)?;
+    for (buffer, required) in [inputs[0], inputs[1], output].into_iter().zip([
+        input_bytes[0],
+        input_bytes[1],
+        payload_bytes,
+    ]) {
+        validate_byte_extent(required, session.0.facts.max_buffer_bytes)?;
+        if !session.same_session(buffer.session()) {
+            return Err(MetalError::ForeignSession);
+        }
+        if buffer.byte_len() < required {
+            return Err(MetalError::InvalidExtent);
+        }
+    }
+    let bytes = validate_extent(logical_count, session.0.facts.max_buffer_bytes)?;
     let records = session.0.native.allocate(bytes)?;
     records.fill_ones();
-    let count = u32::try_from(words).map_err(|_| MetalError::InvalidExtent)?;
+    let count = u32::try_from(logical_count).map_err(|_| MetalError::InvalidExtent)?;
     session.0.native.execute(
         pipeline,
         [
@@ -426,9 +789,19 @@ fn execute_profile_into(
             &records,
         ],
         [count, operation],
-        words,
+        logical_count,
     )?;
-    records.inspect_words(words, select_fault)
+    records.inspect_words(logical_count, |records| {
+        fault::validate(records, logical_count, fault_law, fault::Encoding::Scalar)?;
+        select_fault(records)
+    })
+}
+
+fn validate_byte_extent(bytes: usize, maximum: u64) -> Result<(), MetalError> {
+    if bytes == 0 || u64::try_from(bytes).map_or(true, |bytes| bytes > maximum) {
+        return Err(MetalError::InvalidExtent);
+    }
+    Ok(())
 }
 
 fn validate_extent(words: usize, maximum: u64) -> Result<usize, MetalError> {
@@ -443,35 +816,62 @@ fn validate_extent(words: usize, maximum: u64) -> Result<usize, MetalError> {
 }
 
 fn select_fault(records: &[u32]) -> Result<(), MetalError> {
-    if records.iter().any(|&record| record > 4) {
+    // Bit 8 denotes a completed range recovery. Only overflow/underflow may carry it;
+    // fatal operand/division failures and unwritten/unknown records never imply completion.
+    if records
+        .iter()
+        .any(|&record| !matches!(record, 0..=4 | 0x101 | 0x103))
+    {
         return Err(MetalError::Runtime("invalid checked status record".into()));
     }
-    for (element, &record) in records.iter().enumerate() {
-        match record {
-            0 => {}
-            1..=4 => {
-                return Err(MetalError::Arithmetic(MetalFault {
-                    invocation_id: u64::try_from(element).map_err(|_| MetalError::InvalidExtent)?,
-                    kind: match record {
-                        1 => PcuExecutionFaultKind::ArithmeticOverflow,
-                        2 => PcuExecutionFaultKind::DivideByZero,
-                        3 => PcuExecutionFaultKind::ArithmeticUnderflow,
-                        _ => PcuExecutionFaultKind::InvalidFloatingOperand,
-                    },
-                    recovered: false,
-                }));
-            }
-            _ => return Err(MetalError::Runtime("invalid checked status record".into())),
-        }
+    let selected = records
+        .iter()
+        .position(|&record| (1..=4).contains(&record))
+        .or_else(|| records.iter().position(|&record| record != 0));
+    if let Some(element) = selected {
+        let record = records[element];
+        return Err(MetalError::Arithmetic(MetalFault {
+            invocation_id: u64::try_from(element).map_err(|_| MetalError::InvalidExtent)?,
+            kind: match record & 0xff {
+                1 => PcuExecutionFaultKind::ArithmeticOverflow,
+                2 => PcuExecutionFaultKind::DivideByZero,
+                3 => PcuExecutionFaultKind::ArithmeticUnderflow,
+                _ => PcuExecutionFaultKind::InvalidFloatingOperand,
+            },
+            recovered: record & 0x100 != 0,
+        }));
     }
     Ok(())
 }
 
 // Every path assigns its private record. Guard before division avoids undefined arithmetic;
-// unsigned subtraction/wrap is used only after the range proof succeeds. No floating ALU.
+// Signed operations use defined unsigned wrapping encodings to classify exact range failure.
+// Signed multiply guards magnitude before multiplication; no signed overflow or floating ALU.
+// F64 Neg implements the binary sign-bit operation (IEEE 754-2019 6.3); exact finite
+// magnitude bits require no rounding. Rejecting nonfinite operands is a PCU policy,
+// not an IEEE sign-operation requirement. ReLU is the neutral PCU selection contract.
 const INTEGER_SOURCE: &str = r"
 #include <metal_stdlib>
 using namespace metal;
+// Exact 32x32 -> 64 from bounded 16-bit products; every intermediate fits uint.
+inline uint2 pcu_mul32(uint x, uint y) {
+    uint x0 = x & 0xffffu, x1 = x >> 16, y0 = y & 0xffffu, y1 = y >> 16;
+    uint w0 = x0 * y0, t = x1 * y0 + (w0 >> 16);
+    uint w1 = (t & 0xffffu) + x0 * y1;
+    return uint2((w1 << 16) | (w0 & 0xffffu), x1 * y1 + (t >> 16) + (w1 >> 16));
+}
+inline uint2 pcu_neg64(uint2 x) { return uint2(0u - x.x, 0u - x.y - uint(x.x != 0)); }
+// Exact 64x64 -> 128: retain every upper limb for range classification.
+inline uint4 pcu_mul64(uint2 x, uint2 y) {
+    uint2 p00 = pcu_mul32(x.x, y.x), p01 = pcu_mul32(x.x, y.y);
+    uint2 p10 = pcu_mul32(x.y, y.x), p11 = pcu_mul32(x.y, y.y);
+    uint r1 = p00.y + p01.x, r2 = p01.y + uint(r1 < p00.y);
+    uint next = r1 + p10.x, carry = next < r1; r1 = next;
+    next = r2 + p10.y; uint r3 = next < r2;
+    r2 = next + carry; r3 += uint(r2 < next);
+    next = r2 + p11.x; r3 += p11.y + uint(next < r2);
+    return uint4(p00.x, r1, next, r3);
+}
 kernel void pcu_checked_u32(device const uint* a [[buffer(0)]],
                             device const uint* b [[buffer(1)]],
                             device uint* out [[buffer(2)]],
@@ -479,6 +879,56 @@ kernel void pcu_checked_u32(device const uint* a [[buffer(0)]],
                             constant uint2& config [[buffer(4)]],
                             uint i [[thread_position_in_grid]]) {
     if (i >= config.x) return;
+    if (config.y >= 12 && config.y <= 15) {
+        uint low = a[2 * i], high = a[2 * i + 1], code = 0;
+        if ((high & 0x7ff00000u) == 0x7ff00000u) {
+            code = 4; low = 0; high = 0;
+        } else {
+            if (config.y <= 13) high ^= 0x80000000u;
+            else if ((high & 0x80000000u) != 0) { low = 0; high = 0; }
+            if ((config.y == 13 || config.y == 15) &&
+                (high & 0x7ff00000u) == 0 && ((high & 0xfffffu) != 0 || low != 0)) code = 3;
+        }
+        out[2 * i] = low; out[2 * i + 1] = high; fault[i] = code;
+        return;
+    }
+    if (config.y >= 16 && config.y <= 22) {
+        uint2 x(a[2 * i], a[2 * i + 1]), y(b[2 * i], b[2 * i + 1]);
+        uint2 value(0, 0); uint code = 0;
+        if (config.y == 16 || config.y == 19) {
+            value.x = x.x + y.x;
+            uint carry = value.x < x.x;
+            uint high = x.y + y.y;
+            value.y = high + carry;
+            if (config.y == 16) {
+                if (high < x.y || value.y < high) code = 1;
+            } else if (((x.y ^ value.y) & (y.y ^ value.y) & 0x80000000u) != 0)
+                code = (x.y & 0x80000000u) != 0 ? 3 : 1;
+        } else if (config.y == 17 || config.y == 20) {
+            value.x = x.x - y.x;
+            value.y = x.y - y.y - uint(x.x < y.x);
+            if (config.y == 17) {
+                if (x.y < y.y || (x.y == y.y && x.x < y.x)) code = 3;
+            } else if (((x.y ^ y.y) & (x.y ^ value.y) & 0x80000000u) != 0)
+                code = (x.y & 0x80000000u) != 0 ? 3 : 1;
+        } else if (config.y == 18 || config.y == 21) {
+            bool negative = config.y == 21 && ((x.y ^ y.y) & 0x80000000u) != 0;
+            if (config.y == 21) {
+                if ((x.y & 0x80000000u) != 0) x = pcu_neg64(x);
+                if ((y.y & 0x80000000u) != 0) y = pcu_neg64(y);
+            }
+            uint4 product = pcu_mul64(x, y);
+            bool outside = product.z != 0 || product.w != 0;
+            if (config.y == 21) {
+                uint2 limit = negative ? uint2(0, 0x80000000u) : uint2(0xffffffffu, 0x7fffffffu);
+                outside = outside || product.y > limit.y || (product.y == limit.y && product.x > limit.x);
+            }
+            if (outside) code = negative ? 3 : 1;
+            else { value = product.xy; if (negative) value = pcu_neg64(value); }
+        } else value = x;
+        out[2 * i] = value.x; out[2 * i + 1] = value.y; fault[i] = code;
+        return;
+    }
     uint x = a[i], y = b[i], value = 0, code = 0;
     switch (config.y) {
         case 0: if (x > 0xffffffffu - y) code = 1; else value = x + y; break;
@@ -500,6 +950,25 @@ kernel void pcu_checked_u32(device const uint* a [[buffer(0)]],
             }
             break;
         case 8: value = x; break;
+        case 9:
+            value = x + y;
+            if (((x ^ value) & (y ^ value) & 0x80000000u) != 0)
+                code = (x & 0x80000000u) != 0 ? 3 : 1;
+            break;
+        case 10:
+            value = x - y;
+            if (((x ^ y) & (x ^ value) & 0x80000000u) != 0)
+                code = (x & 0x80000000u) != 0 ? 3 : 1;
+            break;
+        case 11: {
+            bool negative = ((x ^ y) & 0x80000000u) != 0;
+            uint ax = (x & 0x80000000u) != 0 ? 0u - x : x;
+            uint ay = (y & 0x80000000u) != 0 ? 0u - y : y;
+            uint limit = negative ? 0x80000000u : 0x7fffffffu;
+            if (ay != 0 && ax > limit / ay) code = negative ? 3 : 1;
+            else { value = ax * ay; if (negative) value = 0u - value; }
+            break;
+        }
         default: code = 99; break;
     }
     out[i] = value;
@@ -513,6 +982,13 @@ mod tests {
 
     #[test]
     fn extent_checks_precede_allocation() {
+        assert_eq!(
+            validate_byte_extent(0, u64::MAX),
+            Err(MetalError::InvalidExtent)
+        );
+        assert_eq!(validate_byte_extent(1, 1), Ok(()));
+        assert_eq!(validate_byte_extent(6, 6), Ok(()));
+        assert_eq!(validate_byte_extent(6, 5), Err(MetalError::InvalidExtent));
         assert_eq!(validate_extent(0, u64::MAX), Err(MetalError::InvalidExtent));
         assert_eq!(validate_extent(2, 7), Err(MetalError::InvalidExtent));
         assert_eq!(validate_extent(2, 8), Ok(8));
@@ -539,6 +1015,43 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn recovered_records_require_complete_payload_and_fatal_priority() {
+        let fault = |records| match select_fault(records) {
+            Err(MetalError::Arithmetic(fault)) => fault,
+            other => panic!("expected fault, got {other:?}"),
+        };
+        assert_eq!(
+            fault(&[0x103, 0, 0x101]),
+            MetalFault {
+                invocation_id: 0,
+                kind: PcuExecutionFaultKind::ArithmeticUnderflow,
+                recovered: true
+            }
+        );
+        assert_eq!(
+            fault(&[0x103, 4, 2]),
+            MetalFault {
+                invocation_id: 1,
+                kind: PcuExecutionFaultKind::InvalidFloatingOperand,
+                recovered: false
+            }
+        );
+        assert_eq!(
+            fault(&[0, 0x101, 0x103]),
+            MetalFault {
+                invocation_id: 1,
+                kind: PcuExecutionFaultKind::ArithmeticOverflow,
+                recovered: true
+            }
+        );
+        for invalid in [5, 0x100, 0x102, 0x104, 0x203, u32::MAX] {
+            assert!(matches!(
+                select_fault(&[0x103, invalid]),
+                Err(MetalError::Runtime(_))
+            ));
+        }
+    }
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn unsupported_platform_never_opens_a_fallback() {
@@ -571,10 +1084,19 @@ mod hardware_tests {
             Err(MetalError::InvalidExtent)
         );
         assert_eq!(copied, [93, 1, 2, 3, 4, 93]);
-        assert!(matches!(
-            session.upload_bytes(&host[..5]),
-            Err(MetalError::InvalidExtent)
-        ));
+        for length in 1..=5 {
+            let staged = session.upload_bytes(&host[..length]).unwrap();
+            assert_eq!(staged.byte_len(), length);
+            let mut copied = vec![0; length];
+            staged.read_into_bytes(&mut copied).unwrap();
+            assert_eq!(copied, host[..length]);
+            if !length.is_multiple_of(4) {
+                assert!(matches!(
+                    staged.download_u32(),
+                    Err(MetalError::InvalidExtent)
+                ));
+            }
+        }
         assert!(matches!(
             session.upload_bytes(&[]),
             Err(MetalError::InvalidExtent)
@@ -826,3 +1348,7 @@ mod hardware_tests {
         );
     }
 }
+
+#[path = "div_rem/div_rem.rs"]
+pub mod div_rem;
+pub use div_rem::MetalPreparedDivRemControl;

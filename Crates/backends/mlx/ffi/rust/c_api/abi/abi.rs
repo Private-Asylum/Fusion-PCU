@@ -21,7 +21,20 @@ pub(super) trait Opaque: Copy {
     fn empty() -> Self;
     fn is_empty(self) -> bool;
 }
-handle!(CArray, CDevice, CStream, CString, CDeviceInfo);
+handle!(
+    CArray,
+    CDevice,
+    CStream,
+    CString,
+    CDeviceInfo,
+    CCheckedUnary,
+    CCheckedBinary,
+    CCarrier
+);
+handle!(CCheckedInteger);
+handle!(CCheckedDivRem);
+handle!(CTransport);
+handle!(CComposed);
 #[cfg(feature = "tensor")]
 handle!(CClosure, CVector);
 
@@ -64,3 +77,85 @@ pub(super) type ReplayNew =
 pub(super) type ReplayApply = unsafe extern "C" fn(*mut CArray, *mut c_void, CArray, CArray) -> i32;
 #[cfg(feature = "tensor")]
 pub(super) type ReplayFree = unsafe extern "C" fn(*mut c_void) -> i32;
+
+pub(super) type CheckedNew =
+    unsafe extern "C" fn(*mut CCheckedUnary, CStream, u32, u32, u32, u32, u32, i32) -> i32;
+pub(super) type CheckedPrefixNew =
+    unsafe extern "C" fn(*mut CCheckedUnary, CStream, u32, u32, u32, u32, u32, u32, i32) -> i32;
+pub(super) type CheckedApply =
+    unsafe extern "C" fn(*mut CArray, *mut CArray, CCheckedUnary, CArray) -> i32;
+pub(super) type CheckedUpload = unsafe extern "C" fn(*mut CArray, *const c_void, usize, u32) -> i32;
+pub(super) type BinaryNew = unsafe extern "C" fn(
+    *mut CCheckedBinary,
+    CStream,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+) -> i32;
+pub(super) type BinaryApply =
+    unsafe extern "C" fn(*mut CArray, *mut CArray, CCheckedBinary, CArray, CArray) -> i32;
+
+pub(super) type CarrierNew =
+    unsafe extern "C" fn(*mut CCarrier, CStream, u32, u32, u32, i32) -> i32;
+pub(super) type CarrierPrefixNew =
+    unsafe extern "C" fn(*mut CCarrier, CStream, u32, u32, u32, u32, i32) -> i32;
+pub(super) type CarrierApply = unsafe extern "C" fn(*mut CArray, CCarrier, CArray) -> i32;
+
+pub(super) type IntegerNew = unsafe extern "C" fn(
+    *mut CCheckedInteger,
+    CStream,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+) -> i32;
+pub(super) type IntegerApply =
+    unsafe extern "C" fn(*mut CArray, *mut CArray, CCheckedInteger, CArray, CArray) -> i32;
+
+pub(super) type DivRemNew =
+    unsafe extern "C" fn(*mut CCheckedDivRem, CStream, u32, u32, u32, u32, u32, u32) -> i32;
+pub(super) type DivRemApply = unsafe extern "C" fn(
+    *mut CArray,
+    *mut CArray,
+    *mut CArray,
+    CCheckedDivRem,
+    CArray,
+    CArray,
+) -> i32;
+
+pub(super) type TransportNew = unsafe extern "C" fn(
+    *mut CTransport,
+    CStream,
+    u32,
+    *const u32,
+    u32,
+    u32,
+    u32,
+    *const c_char,
+) -> i32;
+pub(super) type TransportApply =
+    unsafe extern "C" fn(*mut CArray, CTransport, *const CArray, u32) -> i32;
+pub(super) type ComposedNew = unsafe extern "C" fn(
+    *mut CComposed,
+    CStream,
+    u32,
+    *const u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *const c_char,
+    *const c_char,
+) -> i32;
+pub(super) type ComposedApply =
+    unsafe extern "C" fn(*mut CArray, CComposed, *const CArray, u32) -> i32;

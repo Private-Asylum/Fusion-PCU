@@ -130,12 +130,3 @@ pub fn measure<T>(call: impl FnOnce() -> T) -> (T, Census) {
     let result = call();
     (result, capture.finish())
 }
-
-pub fn census(label: &str, call: impl FnOnce()) {
-    let ((), counts) = measure(call);
-    // Reporting can allocate: capture has already finished before any formatting starts.
-    eprintln!(
-        "Rust allocation census/{label}: alloc={}, realloc={}, dealloc={}, requested_bytes={} (one warm caller-thread call; excludes device/driver/runtime internal allocations)",
-        counts.alloc_calls, counts.realloc_calls, counts.dealloc_calls, counts.requested_bytes,
-    );
-}

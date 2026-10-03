@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn invocation_flags_reject_unimplemented_requirements_before_lowering() {
+    fn invocation_flags_preserve_requirements_for_cold_backend_admission() {
         let source = syn::parse_quote! {
             fn negate(input: &[f32], output: &mut [f32]) {
                 let id = pcu::context::global_invocation_id();
@@ -176,8 +176,9 @@ mod tests {
         for flag in ["native_compound", "backend_precision", "deterministic"] {
             let args =
                 syn::parse_str::<PcuDispatchArgs>(&format!("invocations=4,flag({flag})")).unwrap();
-            let error = expand_pcu_dispatch(args, &source).unwrap_err().to_string();
-            assert!(error.contains("owned tensor"), "{error}");
+            let generated = expand_pcu_dispatch(args, &source).unwrap().to_string();
+            assert!(generated.contains("with_numerical_requirements"));
+            assert!(generated.contains("with_overrides"));
         }
     }
 }

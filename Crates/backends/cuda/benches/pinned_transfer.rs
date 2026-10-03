@@ -1,6 +1,19 @@
-//! Reused-allocation, complete H2D+D2H comparison for pageable and pinned host staging.
+//! Genuine identity roundtrip plus explicitly distinct copy-only staging diagnostics.
+extern crate pcu_facade as fusion_pcu;
+
 #[path = "support/activity.rs"]
 mod activity;
+#[cfg(feature = "allocation-census")]
+#[path = "support/allocations/allocations.rs"]
+mod allocations;
+#[path = "pinned_transfer/driver/driver.rs"]
+mod driver;
+#[path = "pinned_transfer/native/native.rs"]
+mod native;
+#[path = "support/discovery/discovery.rs"]
+mod selection;
+#[path = "pinned_transfer/source/source.rs"]
+mod source;
 
 #[rustfmt::skip]
 use criterion::{
@@ -14,13 +27,17 @@ use std::hint::black_box;
 
 fn pinned_transfer(criterion: &mut Criterion) {
     activity::activity_guard();
+    let (_discovery, backend) = selection::selected_device();
+    driver::configure(&backend);
     let runtime = CudaRuntime::new(0).expect("selected CUDA device");
+    driver::case::<4096>(criterion, &backend, &runtime);
+    driver::case::<4_194_304>(criterion, &backend, &runtime);
     let stream = runtime.create_stream().expect("transfer stream");
-    let mut group = criterion.benchmark_group("cuda_reused_host_device_roundtrip");
+    let mut group = criterion.benchmark_group("cuda_copy_only_host_device_roundtrip_diagnostic");
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(3));
     for bytes in [4096_usize, 4 * 1024 * 1024] {
-        activity::activity_guard();
+        activity::compute_owner_guard();
         let mut device = runtime.allocate(bytes).unwrap();
         let mut pageable_source = vec![0; bytes];
         let mut pageable_output = vec![0; bytes];

@@ -28,7 +28,8 @@ pub type PcuInvocationScorer = fn(&PcuInvocationCandidate<'_>) -> i128;
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 ))]
 pub(super) fn score_candidate<E>(
     policy: super::PcuExecutionPolicy,
@@ -62,7 +63,8 @@ pub(super) fn score_candidate<E>(
         feature = "cuda",
         feature = "metal",
         feature = "vulkan",
-        feature = "cpu"
+        feature = "cpu",
+        feature = "mlx"
     )
 ))]
 mod tests;

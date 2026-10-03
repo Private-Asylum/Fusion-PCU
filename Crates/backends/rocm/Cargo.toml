@@ -34,7 +34,7 @@ smallvec.workspace = true
 workspace = true
 
 [dev-dependencies]
-pcu-facade = { workspace = true, features = ["rocm"] }
+pcu-facade = { workspace = true, features = ["rocm", "cpu"] }
 # Test-only path dependencies stay out of the published dependency graph.
 fusion-pcu-macros = { path = "../../macros" }
 libloading.workspace = true
@@ -476,4 +476,390 @@ required-features = ["tensor"]
 [[example]]
 name = "fusion-rocm-strict-sgd"
 path = "examples/strict_sgd/strict_sgd.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "relu_backward_source"
+path = "tests/relu_backward_source/relu_backward_source.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "relu_backward"
+path = "benches/relu_backward/relu_backward.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "strict_mse_source"
+path = "tests/strict_mse_source/strict_mse_source.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "strict_mse"
+path = "benches/strict_mse/strict_mse.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "training_step"
+path = "examples/training_step/training_step.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "native_sgd_f64"
+path = "benches/native_sgd_f64/native_sgd_f64.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "native_sgd_f64_source"
+path = "tests/native_sgd_f64_source/native_sgd_f64_source.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-native-sgd-f64"
+path = "examples/native_sgd_f64/native_sgd_f64.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "native_mse_f64"
+path = "benches/native_mse_f64/native_mse_f64.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "native_mse_f64_source"
+path = "tests/native_mse_f64_source/native_mse_f64_source.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-native-mse-f64"
+path = "examples/native_mse_f64/native_mse_f64.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_div_rem"
+path = "benches/checked_div_rem/checked_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_div_rem_source"
+path = "tests/checked_div_rem_source/checked_div_rem_source.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-checked-div-rem"
+path = "examples/checked_div_rem/checked_div_rem.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_low_precision_source"
+path = "tests/checked_low_precision_source/checked_low_precision_source.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-checked-low-precision"
+path = "examples/checked_low_precision/checked_low_precision.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_low_precision"
+path = "benches/checked_low_precision/checked_low_precision.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "portable_low_precision"
+path = "benches/portable_low_precision/portable_low_precision.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "portable_low_precision_source"
+path = "tests/portable_low_precision_source/portable_low_precision_source.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-portable-low-precision"
+path = "examples/portable_low_precision/portable_low_precision.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "low_unary"
+path = "tests/low_unary/low_unary.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "low_unary"
+path = "benches/low_unary/low_unary.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "low_unary"
+path = "examples/low_unary/low_unary.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "wide_transport"
+path = "benches/wide_transport/wide_transport.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "wide_transport"
+path = "examples/wide_transport/wide_transport.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "wide_integer"
+path = "benches/wide_integer/wide_integer.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "wide_integer"
+path = "tests/wide_integer/wide_integer.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "wide_integer"
+path = "examples/wide_integer/wide_integer.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "integer_clamp"
+path = "benches/integer_clamp/integer_clamp.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "integer_clamp"
+path = "tests/integer_clamp/integer_clamp.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "integer_clamp"
+path = "examples/integer_clamp/integer_clamp.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "wide_tensor"
+path = "tests/wide_tensor/wide_tensor.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "wide_tensor"
+path = "benches/wide_tensor/wide_tensor.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "wide_tensor"
+path = "examples/wide_tensor/wide_tensor.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "low_tensor"
+path = "benches/low_tensor/low_tensor.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "low_tensor"
+path = "tests/low_tensor/low_tensor.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "low_tensor"
+path = "examples/low_tensor/low_tensor.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_relu_backward"
+path = "benches/checked_relu_backward/checked_relu_backward.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_relu_backward"
+path = "tests/checked_relu_backward/checked_relu_backward.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "checked_relu_backward"
+path = "examples/checked_relu_backward/checked_relu_backward.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_float_operands"
+path = "tests/checked_float_operands/checked_float_operands.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_float_operands"
+path = "benches/checked_float_operands/checked_float_operands.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "checked_float_operands"
+path = "examples/checked_float_operands/checked_float_operands.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "checked_integer_operands"
+path = "tests/checked_integer_operands/checked_integer_operands.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "checked_integer_operands"
+path = "benches/checked_integer_operands/checked_integer_operands.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "checked_integer_operands"
+path = "examples/checked_integer_operands/checked_integer_operands.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "portable_integer_operands"
+path = "benches/portable_integer_operands/portable_integer_operands.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "portable_integer_operands"
+path = "tests/portable_integer_operands/portable_integer_operands.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "portable_integer_operands"
+path = "examples/portable_integer_operands/portable_integer_operands.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "wide_div_rem"
+path = "benches/wide_div_rem/wide_div_rem.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "wide_div_rem"
+path = "tests/wide_div_rem/wide_div_rem.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-wide-div-rem"
+path = "examples/wide_div_rem/wide_div_rem.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "joint_div_rem_operands"
+path = "benches/joint_div_rem_operands/joint_div_rem_operands.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "joint_div_rem_operands"
+path = "tests/joint_div_rem_operands/joint_div_rem_operands.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-joint-div-rem-operands"
+path = "examples/joint_div_rem_operands/joint_div_rem_operands.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "fault_domain"
+path = "tests/fault_domain/fault_domain.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "composed_float_maps"
+path = "benches/composed_float_maps/composed_float_maps.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "composed_float_maps"
+path = "tests/composed_float_maps/composed_float_maps.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-composed-float-maps"
+path = "examples/composed_float_maps/composed_float_maps.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "portable_unary"
+path = "benches/portable_unary/portable_unary.rs"
+harness = false
+required-features = ["tensor"]
+
+[[test]]
+name = "portable_unary"
+path = "tests/portable_unary/portable_unary.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-portable-unary"
+path = "examples/portable_unary/portable_unary.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "ordered_float_maps"
+path = "benches/ordered_float_maps/ordered_float_maps.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-ordered-float-maps"
+path = "examples/ordered_float_maps/ordered_float_maps.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "mutable_ordered_float_maps"
+path = "benches/mutable_ordered_float_maps/mutable_ordered_float_maps.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "ordered_transport"
+path = "benches/ordered_transport/ordered_transport.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-ordered-transport"
+path = "examples/ordered_transport/ordered_transport.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "helper_ordered_float_maps"
+path = "benches/helper_ordered_float_maps/helper_ordered_float_maps.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-checked-integer-helpers"
+path = "examples/checked_integer_helpers/checked_integer_helpers.rs"
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-handwritten-tiny-goldens"
+path = "examples/handwritten_tiny_goldens/handwritten_tiny_goldens.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "helper_ordered_integer_maps"
+path = "benches/helper_ordered_integer_maps/helper_ordered_integer_maps.rs"
+harness = false
+required-features = ["tensor"]
+
+[[example]]
+name = "fusion-rocm-handwritten-integer-product-goldens"
+path = "examples/handwritten_integer_product_goldens/handwritten_integer_product_goldens.rs"
 required-features = ["tensor"]

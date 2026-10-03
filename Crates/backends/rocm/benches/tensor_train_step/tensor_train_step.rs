@@ -2,6 +2,13 @@
 
 extern crate pcu_facade as fusion_pcu;
 
+#[path = "../strict_matmul/activity.rs"]
+mod activity;
+#[path = "source/source.rs"]
+mod source;
+#[path = "source_driver/source_driver.rs"]
+mod source_driver;
+
 #[path = "../support/alloc.rs"]
 pub mod alloc;
 #[path = "../../examples/support/reference/reference.rs"]
@@ -49,7 +56,7 @@ use memory_profile::ProfiledMemory;
 mod train_step_reference;
 #[rustfmt::skip]
 use train_step_reference::{
-    cpu_strict_two_steps,
+    cpu_separated_update_two_steps,
     cpu_two_steps,
     verify,
 };
@@ -67,7 +74,7 @@ struct Program {
     output: ValueId,
 }
 
-struct StrictProgram {
+struct SeparatedUpdateProgram {
     graph: Graph,
     samples: ValueId,
     weights: ValueId,
@@ -107,7 +114,9 @@ macro_rules! record_node_timings {
                 .zip(timings)
                 .any(|(key, timing)| *key != (timing.operation, timing.value))
         {
-            return Err("strict profiled node sequence changed between executions".into());
+            return Err(
+                "separated-update profiled node sequence changed between executions".into(),
+            );
         }
         let node_sum: std::time::Duration = timings.iter().map(|timing| timing.elapsed).sum();
         for (((samples, sgemm), elementwise), timing) in node_samples
@@ -133,6 +142,10 @@ macro_rules! record_node_timings {
 
 fn program(rows: usize, features: usize) -> Result<Program, Box<dyn Error>> {
     let mut graph = Graph::default();
+    graph.set_numerical_options(fusion_pcu::PcuNumericalOptions {
+        compound_arithmetic: fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined,
+        ..fusion_pcu::PcuNumericalOptions::default()
+    });
     let samples = graph.input([rows, features], fusion_pcu::PcuScalarType::F32)?;
     let weights = graph.input([features, 1], fusion_pcu::PcuScalarType::F32)?;
     let target = graph.input([rows, 1], fusion_pcu::PcuScalarType::F32)?;
@@ -161,8 +174,15 @@ fn program(rows: usize, features: usize) -> Result<Program, Box<dyn Error>> {
     })
 }
 
-fn strict_program(rows: usize, features: usize) -> Result<StrictProgram, Box<dyn Error>> {
+fn separated_update_program(
+    rows: usize,
+    features: usize,
+) -> Result<SeparatedUpdateProgram, Box<dyn Error>> {
     let mut graph = Graph::default();
+    graph.set_numerical_options(fusion_pcu::PcuNumericalOptions {
+        compound_arithmetic: fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined,
+        ..fusion_pcu::PcuNumericalOptions::default()
+    });
     let samples = graph.input([rows, features], fusion_pcu::PcuScalarType::F32)?;
     let weights = graph.input([features, 1], fusion_pcu::PcuScalarType::F32)?;
     let target = graph.input([rows, 1], fusion_pcu::PcuScalarType::F32)?;
@@ -174,9 +194,9 @@ fn strict_program(rows: usize, features: usize) -> Result<StrictProgram, Box<dyn
         .position(|node| node.value == weights)
         .ok_or("weight input missing")?;
     let gradient = gradients[weight_index].ok_or("weight gradient missing")?;
-    // SgdUpdate preserves the multiply-then-subtract rounding boundary in the strict ROCm path.
+    // This legacy native contract separates optimizer rounding; it does not claim PCU Strict.
     let output = graph.sgd_update(weights, gradient, 0.001)?;
-    Ok(StrictProgram {
+    Ok(SeparatedUpdateProgram {
         graph,
         samples,
         weights,
@@ -186,6 +206,9 @@ fn strict_program(rows: usize, features: usize) -> Result<StrictProgram, Box<dyn
 }
 
 fn bench(criterion: &mut Criterion) {
+    if !std::env::args().any(|arg| arg == "--test") {
+        activity::guard();
+    }
     run(criterion).expect("paired ROCm training-step benchmark failed");
 }
 
@@ -232,6 +255,35 @@ fn run_on(
             .map(|index| (small_integer(index % 9) - 4.0) / 16.0)
             .collect::<Vec<_>>();
         let rate_values = vec![0.001_f32; features];
+        macro_rules! source_case {
+            ($r:literal,$k:literal) => {
+                source_driver::case::<$r, $k>(
+                    criterion,
+                    discovery,
+                    &session,
+                    selected,
+                    [
+                        &sample_values,
+                        &target_values,
+                        &initial_weights,
+                        &rate_values,
+                    ],
+                )?
+            };
+        }
+        match (rows, features) {
+            (4, 2) => source_case!(4, 2),
+            (1024, 64) => source_case!(1024, 64),
+            (8192, 1024) => source_case!(8192, 1024),
+            _ => unreachable!(),
+        }
+
+        // Semantic mode exercises the complete genuine source/graph/native training family.
+        // Legacy profiled controls collect host-wall samples and require the guarded statistical run.
+        if std::env::args().any(|arg| arg == "--test") {
+            continue;
+        }
+
         let samples = Tensor::new([rows, features], sample_values.clone())?;
         let target = Tensor::new([rows, 1], target_values.clone())?;
         let rate = Tensor::new([features, 1], rate_values.clone())?;
@@ -528,16 +580,16 @@ fn run_on(
             profile.download_time,
         );
 
-        // A route-matched strict profile uses the dedicated SGD update operation, which keeps
+        // A route-matched separated-update profile uses the dedicated SGD update operation, which keeps
         // the multiply/subtract rounding boundary explicit and reduces the PCU pointwise work
-        // to the same three kernels per step as the strict native peer.
-        let strict = strict_program(rows, features)?;
+        // to the same three kernels per step as the separated-update native peer.
+        let strict = separated_update_program(rows, features)?;
         let strict_prepared = assessor.prepare_graph(&strict.graph, strict.output)?;
         let mut strict_bank_memory =
             PcuOwnedDispatchMemorySession::memory_provider(&session, selected.pool);
         let (mut strict_bank_scratch, mut strict_first_bank, mut strict_second_bank) =
             support::cold_once(
-                "strict PCU two-step output-bank and scratch preparation",
+                "separated-update PCU two-step output-bank and scratch preparation",
                 || {
                     Ok::<_, Box<dyn Error>>((
                         assessor.prepare_scratch(
@@ -558,23 +610,24 @@ fn run_on(
                     ))
                 },
             )?;
-        let strict_native = support::cold_once("strict native HIP training setup", || {
-            native::NativeTrainStep::prepare_strict(
-                discovery,
-                selected.device,
-                &native::TrainInputs {
-                    rows,
-                    features,
-                    samples: &sample_values,
-                    target: &target_values,
-                    factor: &factor_values,
-                    initial_weights: &initial_weights,
-                    rate: &rate_values,
-                },
-                0.001,
-            )
-        })?;
-        let strict_expected = cpu_strict_two_steps(&strict, &samples, &target, &initial)?;
+        let strict_native =
+            support::cold_once("separated-update native HIP training setup", || {
+                native::NativeTrainStep::prepare_strict(
+                    discovery,
+                    selected.device,
+                    &native::TrainInputs {
+                        rows,
+                        features,
+                        samples: &sample_values,
+                        target: &target_values,
+                        factor: &factor_values,
+                        initial_weights: &initial_weights,
+                        rate: &rate_values,
+                    },
+                    0.001,
+                )
+            })?;
+        let strict_expected = cpu_separated_update_two_steps(&strict, &samples, &target, &initial)?;
         {
             let mut execute_strict_pcu_banked = |batched: bool,
                                                  mut device_times: Option<&mut Vec<f32>>|
@@ -616,7 +669,7 @@ fn run_on(
                 let first_weights = strict_first_bank
                     .outputs()
                     .first()
-                    .ok_or("strict first output bank is empty")?;
+                    .ok_or("separated-update first output bank is empty")?;
                 let second_inputs = [
                     (strict.samples, &device_samples),
                     (strict.weights, first_weights),
@@ -654,7 +707,7 @@ fn run_on(
                 let final_weights = strict_second_bank
                     .outputs()
                     .first()
-                    .ok_or("strict second output bank is empty")?;
+                    .ok_or("separated-update second output bank is empty")?;
                 let final_output = assessor.download_output(
                     final_weights,
                     selected.pool,
@@ -663,18 +716,18 @@ fn run_on(
                 Ok(final_output.into_data())
             };
             verify(&strict_expected, &execute_strict_pcu_banked(false, None)?)
-                .map_err(|error| format!("strict PCU banked: {error}"))?;
+                .map_err(|error| format!("separated-update PCU banked: {error}"))?;
             verify(&strict_expected, &execute_strict_pcu_banked(true, None)?)
-                .map_err(|error| format!("strict PCU batched banked: {error}"))?;
+                .map_err(|error| format!("separated-update PCU batched banked: {error}"))?;
             verify(&strict_expected, &strict_native.execute_two()?)
-                .map_err(|error| format!("strict native: {error}"))?;
+                .map_err(|error| format!("separated-update native: {error}"))?;
             verify(&strict_expected, &strict_native.execute_two_batched()?)
-                .map_err(|error| format!("strict native batched: {error}"))?;
+                .map_err(|error| format!("separated-update native batched: {error}"))?;
             verify(
                 &strict_expected,
                 &strict_native.execute_two_fully_batched()?,
             )
-            .map_err(|error| format!("strict native fully batched: {error}"))?;
+            .map_err(|error| format!("separated-update native fully batched: {error}"))?;
             let mut pcu_allocations = [AllocationCounts::default(); 16];
             let mut native_allocations = [AllocationCounts::default(); 16];
             for pair in 0_usize..16 {
@@ -683,33 +736,37 @@ fn run_on(
                     let output = execute_strict_pcu_banked(false, None)?;
                     let measured = AllocationCapture::finish();
                     pcu_allocations[pair] = measured;
-                    verify(&strict_expected, &output)
-                        .map_err(|error| format!("strict PCU allocation diagnostic: {error}"))?;
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("separated-update PCU allocation diagnostic: {error}")
+                    })?;
 
                     let _capture = AllocationCapture::start();
                     let output = strict_native.execute_two()?;
                     let measured = AllocationCapture::finish();
                     native_allocations[pair] = measured;
-                    verify(&strict_expected, &output)
-                        .map_err(|error| format!("strict native allocation diagnostic: {error}"))?;
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("separated-update native allocation diagnostic: {error}")
+                    })?;
                 } else {
                     let _capture = AllocationCapture::start();
                     let output = strict_native.execute_two()?;
                     let measured = AllocationCapture::finish();
                     native_allocations[pair] = measured;
-                    verify(&strict_expected, &output)
-                        .map_err(|error| format!("strict native allocation diagnostic: {error}"))?;
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("separated-update native allocation diagnostic: {error}")
+                    })?;
 
                     let _capture = AllocationCapture::start();
                     let output = execute_strict_pcu_banked(false, None)?;
                     let measured = AllocationCapture::finish();
                     pcu_allocations[pair] = measured;
-                    verify(&strict_expected, &output)
-                        .map_err(|error| format!("strict PCU allocation diagnostic: {error}"))?;
+                    verify(&strict_expected, &output).map_err(|error| {
+                        format!("separated-update PCU allocation diagnostic: {error}")
+                    })?;
                 }
             }
             println!(
-                "{rows}x{features} strict warm alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
+                "{rows}x{features} separated-update warm alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
                 median_allocation_field(&pcu_allocations, |counts| counts.alloc_calls),
                 median_allocation_field(&pcu_allocations, |counts| counts.realloc_calls),
                 median_allocation_field(&pcu_allocations, |counts| counts.dealloc_calls),
@@ -727,33 +784,33 @@ fn run_on(
                     let output = execute_strict_pcu_banked(true, None)?;
                     pcu_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict PCU batched allocation diagnostic: {error}")
+                        format!("separated-update PCU batched allocation diagnostic: {error}")
                     })?;
 
                     let _capture = AllocationCapture::start();
                     let output = strict_native.execute_two_batched()?;
                     native_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict native batched allocation diagnostic: {error}")
+                        format!("separated-update native batched allocation diagnostic: {error}")
                     })?;
                 } else {
                     let _capture = AllocationCapture::start();
                     let output = strict_native.execute_two_batched()?;
                     native_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict native batched allocation diagnostic: {error}")
+                        format!("separated-update native batched allocation diagnostic: {error}")
                     })?;
 
                     let _capture = AllocationCapture::start();
                     let output = execute_strict_pcu_banked(true, None)?;
                     pcu_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict PCU batched allocation diagnostic: {error}")
+                        format!("separated-update PCU batched allocation diagnostic: {error}")
                     })?;
                 }
             }
             println!(
-                "{rows}x{features} strict warm pointwise-batched alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
+                "{rows}x{features} separated-update warm pointwise-batched alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
                 median_allocation_field(&pcu_batched_allocations, |counts| counts.alloc_calls),
                 median_allocation_field(&pcu_batched_allocations, |counts| counts.realloc_calls),
                 median_allocation_field(&pcu_batched_allocations, |counts| counts.dealloc_calls),
@@ -772,33 +829,37 @@ fn run_on(
                     let output = execute_strict_pcu_banked(true, None)?;
                     pcu_fully_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict PCU fully batched allocation diagnostic: {error}")
+                        format!("separated-update PCU fully batched allocation diagnostic: {error}")
                     })?;
 
                     let _capture = AllocationCapture::start();
                     let output = strict_native.execute_two_fully_batched()?;
                     native_fully_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict native fully batched allocation diagnostic: {error}")
+                        format!(
+                            "separated-update native fully batched allocation diagnostic: {error}"
+                        )
                     })?;
                 } else {
                     let _capture = AllocationCapture::start();
                     let output = strict_native.execute_two_fully_batched()?;
                     native_fully_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict native fully batched allocation diagnostic: {error}")
+                        format!(
+                            "separated-update native fully batched allocation diagnostic: {error}"
+                        )
                     })?;
 
                     let _capture = AllocationCapture::start();
                     let output = execute_strict_pcu_banked(true, None)?;
                     pcu_fully_batched_allocations[pair] = AllocationCapture::finish();
                     verify(&strict_expected, &output).map_err(|error| {
-                        format!("strict PCU fully batched allocation diagnostic: {error}")
+                        format!("separated-update PCU fully batched allocation diagnostic: {error}")
                     })?;
                 }
             }
             println!(
-                "{rows}x{features} strict warm fully-batched alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
+                "{rows}x{features} separated-update warm fully-batched alternating allocation diagnostics (16 executions each; per-execution median): PCU {} allocs, {} reallocs, {} deallocs, {} requested bytes; native {} allocs, {} reallocs, {} deallocs, {} requested bytes",
                 median_allocation_field(&pcu_fully_batched_allocations, |counts| counts
                     .alloc_calls),
                 median_allocation_field(&pcu_fully_batched_allocations, |counts| counts
@@ -817,7 +878,7 @@ fn run_on(
                     .requested_bytes),
             );
             {
-                let mut group = criterion.benchmark_group("tensor_train_step_strict");
+                let mut group = criterion.benchmark_group("tensor_train_step_separated-update");
                 group.throughput(Throughput::Elements(u64::try_from(rows * features * 2)?));
                 group.bench_function(
                     BenchmarkId::new("pcu_sgd_update_output_bank", format!("{rows}x{features}")),
@@ -825,7 +886,7 @@ fn run_on(
                         b.iter(|| {
                             black_box(
                                 execute_strict_pcu_banked(false, None)
-                                    .expect("strict PCU banked training failed"),
+                                    .expect("separated-update PCU banked training failed"),
                             )
                         });
                     },
@@ -839,26 +900,29 @@ fn run_on(
                         b.iter(|| {
                             black_box(
                                 execute_strict_pcu_banked(true, None)
-                                    .expect("strict PCU batched banked training failed"),
-                            )
-                        });
-                    },
-                );
-                group.bench_function(
-                    BenchmarkId::new("native_hip_rocblas_strict", format!("{rows}x{features}")),
-                    |b| {
-                        b.iter(|| {
-                            black_box(
-                                strict_native
-                                    .execute_two()
-                                    .expect("strict native training failed"),
+                                    .expect("separated-update PCU batched banked training failed"),
                             )
                         });
                     },
                 );
                 group.bench_function(
                     BenchmarkId::new(
-                        "native_hip_rocblas_strict_batched",
+                        "native_hip_rocblas_separated-update",
+                        format!("{rows}x{features}"),
+                    ),
+                    |b| {
+                        b.iter(|| {
+                            black_box(
+                                strict_native
+                                    .execute_two()
+                                    .expect("separated-update native training failed"),
+                            )
+                        });
+                    },
+                );
+                group.bench_function(
+                    BenchmarkId::new(
+                        "native_hip_rocblas_separated-update_batched",
                         format!("{rows}x{features}"),
                     ),
                     |b| {
@@ -866,22 +930,22 @@ fn run_on(
                             black_box(
                                 strict_native
                                     .execute_two_batched()
-                                    .expect("strict native batched training failed"),
+                                    .expect("separated-update native batched training failed"),
                             )
                         });
                     },
                 );
                 group.bench_function(
                     BenchmarkId::new(
-                        "native_hip_rocblas_strict_fully_batched",
+                        "native_hip_rocblas_separated-update_fully_batched",
                         format!("{rows}x{features}"),
                     ),
                     |b| {
                         b.iter(|| {
                             black_box(
-                                strict_native
-                                    .execute_two_fully_batched()
-                                    .expect("strict native fully batched training failed"),
+                                strict_native.execute_two_fully_batched().expect(
+                                    "separated-update native fully batched training failed",
+                                ),
                             )
                         });
                     },
@@ -889,18 +953,18 @@ fn run_on(
                 group.finish();
             }
             verify(&strict_expected, &execute_strict_pcu_banked(false, None)?)
-                .map_err(|error| format!("strict PCU final: {error}"))?;
+                .map_err(|error| format!("separated-update PCU final: {error}"))?;
             verify(&strict_expected, &execute_strict_pcu_banked(true, None)?)
-                .map_err(|error| format!("strict PCU batched final: {error}"))?;
+                .map_err(|error| format!("separated-update PCU batched final: {error}"))?;
             verify(&strict_expected, &strict_native.execute_two()?)
-                .map_err(|error| format!("strict native final: {error}"))?;
+                .map_err(|error| format!("separated-update native final: {error}"))?;
             verify(&strict_expected, &strict_native.execute_two_batched()?)
-                .map_err(|error| format!("strict native batched final: {error}"))?;
+                .map_err(|error| format!("separated-update native batched final: {error}"))?;
             verify(
                 &strict_expected,
                 &strict_native.execute_two_fully_batched()?,
             )
-            .map_err(|error| format!("strict native fully batched final: {error}"))?;
+            .map_err(|error| format!("separated-update native fully batched final: {error}"))?;
             let mut strict_pair_pcu = Vec::with_capacity(16);
             let mut strict_pair_native = Vec::with_capacity(16);
             let mut strict_pair_ratio = Vec::with_capacity(16);
@@ -919,7 +983,7 @@ fn run_on(
                 strict_pair_ratio.push(pcu_time / native_time);
             }
             println!(
-                "{rows}x{features} strict order-alternating paired host-wall diagnostics (16 pairs): PCU median {:.3} us, native median {:.3} us, PCU/native median {:.3}x, range {:.3}–{:.3}x",
+                "{rows}x{features} separated-update order-alternating paired host-wall diagnostics (16 pairs): PCU median {:.3} us, native median {:.3} us, PCU/native median {:.3}x, range {:.3}–{:.3}x",
                 median(&mut strict_pair_pcu) * 1_000_000.0,
                 median(&mut strict_pair_native) * 1_000_000.0,
                 median(&mut strict_pair_ratio),
@@ -945,7 +1009,7 @@ fn run_on(
                 strict_batch_ratio.push(batch_time / sync_time);
             }
             println!(
-                "{rows}x{features} strict PCU output-bank batched/sync paired host-wall diagnostics (16 pairs): sync median {:.3} us, batched median {:.3} us, batched/sync median {:.3}x, range {:.3}–{:.3}x",
+                "{rows}x{features} separated-update PCU output-bank batched/sync paired host-wall diagnostics (16 pairs): sync median {:.3} us, batched median {:.3} us, batched/sync median {:.3}x, range {:.3}–{:.3}x",
                 median(&mut strict_sync) * 1_000_000.0,
                 median(&mut strict_batched) * 1_000_000.0,
                 median(&mut strict_batch_ratio),
@@ -981,7 +1045,7 @@ fn run_on(
                 batched_pcu_native_ratio.push(pcu_batch_time / native_batch_time);
             }
             println!(
-                "{rows}x{features} strict native batched/sync paired host-wall diagnostics (16 pairs): sync median {:.3} us, batched median {:.3} us, batched/sync median {:.3}x, range {:.3}–{:.3}x",
+                "{rows}x{features} separated-update native batched/sync paired host-wall diagnostics (16 pairs): sync median {:.3} us, batched median {:.3} us, batched/sync median {:.3}x, range {:.3}–{:.3}x",
                 median(&mut native_sync) * 1_000_000.0,
                 median(&mut native_batched) * 1_000_000.0,
                 median(&mut native_batch_ratio),
@@ -989,7 +1053,7 @@ fn run_on(
                 max(&native_batch_ratio),
             );
             println!(
-                "{rows}x{features} strict matched batched PCU/native paired host-wall diagnostics (16 pairs): PCU median {:.3} us, native median {:.3} us, PCU/native median {:.3}x, range {:.3}–{:.3}x",
+                "{rows}x{features} separated-update matched batched PCU/native paired host-wall diagnostics (16 pairs): PCU median {:.3} us, native median {:.3} us, PCU/native median {:.3}x, range {:.3}–{:.3}x",
                 median(&mut batched_pcu) * 1_000_000.0,
                 median(&mut batched_native) * 1_000_000.0,
                 median(&mut batched_pcu_native_ratio),
@@ -1041,7 +1105,7 @@ fn run_on(
                 .enumerate()
                 {
                     println!(
-                        "{rows}x{features} strict batched device {label} (16 alternating pairs): PCU median {:.3} us, native median {:.3} us",
+                        "{rows}x{features} separated-update batched device {label} (16 alternating pairs): PCU median {:.3} us, native median {:.3} us",
                         median(&mut pcu_segments[segment]),
                         median(&mut native_segments[segment]),
                     );
@@ -1069,7 +1133,7 @@ fn run_on(
                     let first_weights = strict_first_bank
                         .outputs()
                         .first()
-                        .ok_or("strict first output bank is empty")?;
+                        .ok_or("separated-update first output bank is empty")?;
                     let second_inputs = [
                         (strict.samples, &device_samples),
                         (strict.weights, first_weights),
@@ -1087,7 +1151,7 @@ fn run_on(
                     let output = strict_second_bank
                         .outputs()
                         .first()
-                        .ok_or("strict second output bank is empty")?;
+                        .ok_or("separated-update second output bank is empty")?;
                     let started = Instant::now();
                     let result =
                         assessor.download_output(output, selected.pool, &mut strict_bank_memory)?;
@@ -1122,69 +1186,69 @@ fn run_on(
                 }
             }
             print_duration_summary(
-                &format!("Strict batched PCU {rows}x{features} step one"),
+                &format!("Separated-update batched PCU {rows}x{features} step one"),
                 pcu_phases.iter().map(|timings| timings.step_one),
             );
             print_duration_summary(
-                &format!("Strict batched PCU {rows}x{features} step two"),
+                &format!("Separated-update batched PCU {rows}x{features} step two"),
                 pcu_phases.iter().map(|timings| timings.step_two),
             );
             print_duration_summary(
-                &format!("Strict batched PCU {rows}x{features} readback"),
+                &format!("Separated-update batched PCU {rows}x{features} readback"),
                 pcu_phases.iter().map(|timings| timings.output_readback),
             );
             print_duration_summary(
-                &format!("Strict batched PCU {rows}x{features} total"),
+                &format!("Separated-update batched PCU {rows}x{features} total"),
                 pcu_phases.iter().map(|timings| timings.total),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} forward SGEMM"),
+                &format!("Separated-update batched native {rows}x{features} forward SGEMM"),
                 native_phases.iter().map(|timings| timings.forward_sgemm),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} gradient SGEMM"),
+                &format!("Separated-update batched native {rows}x{features} gradient SGEMM"),
                 native_phases.iter().map(|timings| timings.gradient_sgemm),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} delta+scale"),
+                &format!("Separated-update batched native {rows}x{features} delta+scale"),
                 native_phases
                     .iter()
                     .map(|timings| timings.batched_delta_scale),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} delta+scale launch"),
+                &format!("Separated-update batched native {rows}x{features} delta+scale launch"),
                 native_phases
                     .iter()
                     .map(|timings| timings.batched_delta_scale_launch),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} delta+scale wait"),
+                &format!("Separated-update batched native {rows}x{features} delta+scale wait"),
                 native_phases
                     .iter()
                     .map(|timings| timings.batched_delta_scale_wait),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} update"),
+                &format!("Separated-update batched native {rows}x{features} update"),
                 native_phases.iter().map(|timings| timings.batched_update),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} update launch"),
+                &format!("Separated-update batched native {rows}x{features} update launch"),
                 native_phases
                     .iter()
                     .map(|timings| timings.batched_update_launch),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} update wait"),
+                &format!("Separated-update batched native {rows}x{features} update wait"),
                 native_phases
                     .iter()
                     .map(|timings| timings.batched_update_wait),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} readback"),
+                &format!("Separated-update batched native {rows}x{features} readback"),
                 native_phases.iter().map(|timings| timings.output_readback),
             );
             print_duration_summary(
-                &format!("Strict batched native {rows}x{features} total"),
+                &format!("Separated-update batched native {rows}x{features} total"),
                 native_phases.iter().map(|timings| timings.total),
             );
         }
@@ -1220,7 +1284,7 @@ fn run_on(
                 let first_weights = strict_first_bank
                     .outputs()
                     .first()
-                    .ok_or("strict first output bank is empty")?;
+                    .ok_or("separated-update first output bank is empty")?;
                 let second_inputs = [
                     (strict.samples, &device_samples),
                     (strict.weights, first_weights),
@@ -1252,7 +1316,9 @@ fn run_on(
                             .zip(timings)
                             .any(|(key, timing)| *key != (timing.operation, timing.value))
                     {
-                        return Err("strict batched profiled node sequence changed".into());
+                        return Err(
+                            "separated-update batched profiled node sequence changed".into()
+                        );
                     }
                     step_wall.push(wall.as_secs_f64());
                     step_node_sum.push(
@@ -1281,7 +1347,7 @@ fn run_on(
                 let final_weights = strict_second_bank
                     .outputs()
                     .first()
-                    .ok_or("strict second output bank is empty")?;
+                    .ok_or("separated-update second output bank is empty")?;
                 let output = assessor.download_output(
                     final_weights,
                     selected.pool,
@@ -1320,7 +1386,7 @@ fn run_on(
                     native_batched_phases.push(timing);
                 }
             }
-            println!("Strict batched PCU {rows}x{features} node host wall (32 steps):");
+            println!("Separated-update batched PCU {rows}x{features} node host wall (32 steps):");
             for (ordinal, (((operation, value), samples), sgemm)) in node_keys
                 .iter()
                 .zip(&mut node_samples)
@@ -1339,25 +1405,25 @@ fn run_on(
                 }
             }
             println!(
-                "Strict batched PCU {rows}x{features} step/node-sum host-wall medians: {:.3}/{:.3} us",
+                "Separated-update batched PCU {rows}x{features} step/node-sum host-wall medians: {:.3}/{:.3} us",
                 median(&mut step_wall) * 1_000_000.0,
                 median(&mut step_node_sum) * 1_000_000.0,
             );
             print_pcu_sgemm_host_pair_phases(
-                &format!("Strict batched PCU {rows}x{features} forward SGEMM"),
+                &format!("Separated-update batched PCU {rows}x{features} forward SGEMM"),
                 &pcu_forward_host,
             );
             print_sgemm_host_phases(
-                &format!("Strict batched native {rows}x{features} forward SGEMM"),
+                &format!("Separated-update batched native {rows}x{features} forward SGEMM"),
                 &native_batched_phases,
                 |timing| timing.forward_sgemm_host,
             );
             print_pcu_sgemm_host_pair_phases(
-                &format!("Strict batched PCU {rows}x{features} gradient SGEMM"),
+                &format!("Separated-update batched PCU {rows}x{features} gradient SGEMM"),
                 &pcu_gradient_host,
             );
             print_sgemm_host_phases(
-                &format!("Strict batched native {rows}x{features} gradient SGEMM"),
+                &format!("Separated-update batched native {rows}x{features} gradient SGEMM"),
                 &native_batched_phases,
                 |timing| timing.gradient_sgemm_host,
             );
@@ -1384,7 +1450,7 @@ fn run_on(
             let first_weights = strict_first_bank
                 .outputs()
                 .first()
-                .ok_or("strict first output bank is empty")?;
+                .ok_or("separated-update first output bank is empty")?;
             let second_inputs = [
                 (strict.samples, &device_samples),
                 (strict.weights, first_weights),
@@ -1402,7 +1468,7 @@ fn run_on(
             let output = strict_second_bank
                 .outputs()
                 .first()
-                .ok_or("strict second output bank is empty")?;
+                .ok_or("separated-update second output bank is empty")?;
             let started = Instant::now();
             let result = assessor.download_output(output, selected.pool, &mut strict_profile)?;
             let output_readback = started.elapsed();
@@ -1436,70 +1502,70 @@ fn run_on(
             }
         }
         print_duration_summary(
-            &format!("Strict PCU {rows}x{features} step one"),
+            &format!("Separated-update PCU {rows}x{features} step one"),
             pcu_phases.iter().map(|timings| timings.step_one),
         );
         print_duration_summary(
-            &format!("Strict PCU {rows}x{features} step two"),
+            &format!("Separated-update PCU {rows}x{features} step two"),
             pcu_phases.iter().map(|timings| timings.step_two),
         );
         print_duration_summary(
-            &format!("Strict PCU {rows}x{features} output readback"),
+            &format!("Separated-update PCU {rows}x{features} output readback"),
             pcu_phases.iter().map(|timings| timings.output_readback),
         );
         print_duration_summary(
-            &format!("Strict PCU {rows}x{features} total"),
+            &format!("Separated-update PCU {rows}x{features} total"),
             pcu_phases.iter().map(|timings| timings.total),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} rocBLAS"),
+            &format!("Separated-update native {rows}x{features} rocBLAS"),
             native_phases.iter().map(|timings| timings.rocblas),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} forward SGEMM"),
+            &format!("Separated-update native {rows}x{features} forward SGEMM"),
             native_phases.iter().map(|timings| timings.forward_sgemm),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} gradient SGEMM"),
+            &format!("Separated-update native {rows}x{features} gradient SGEMM"),
             native_phases.iter().map(|timings| timings.gradient_sgemm),
         );
         print_sgemm_host_phases(
-            &format!("Strict native {rows}x{features} forward SGEMM"),
+            &format!("Separated-update native {rows}x{features} forward SGEMM"),
             &native_phases,
             |timings| timings.forward_sgemm_host,
         );
         print_sgemm_host_phases(
-            &format!("Strict native {rows}x{features} gradient SGEMM"),
+            &format!("Separated-update native {rows}x{features} gradient SGEMM"),
             &native_phases,
             |timings| timings.gradient_sgemm_host,
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} delta HIP"),
+            &format!("Separated-update native {rows}x{features} delta HIP"),
             native_phases.iter().map(|timings| timings.delta_hip),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} scale HIP"),
+            &format!("Separated-update native {rows}x{features} scale HIP"),
             native_phases.iter().map(|timings| timings.scale_hip),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} update HIP"),
+            &format!("Separated-update native {rows}x{features} update HIP"),
             native_phases.iter().map(|timings| timings.update_hip),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} HIP launch+wait"),
+            &format!("Separated-update native {rows}x{features} HIP launch+wait"),
             native_phases.iter().map(|timings| timings.hip_kernels),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} output readback"),
+            &format!("Separated-update native {rows}x{features} output readback"),
             native_phases.iter().map(|timings| timings.output_readback),
         );
         print_duration_summary(
-            &format!("Strict native {rows}x{features} total"),
+            &format!("Separated-update native {rows}x{features} total"),
             native_phases.iter().map(|timings| timings.total),
         );
         let profile = strict_profile.profile();
         println!(
-            "Strict PCU {rows}x{features} warm output-bank provider across 16 profiled pairs: {} allocations ({} bytes, {:?}), {} uploads ({} bytes, {:?}), {} downloads ({} bytes, {:?})",
+            "Separated-update PCU {rows}x{features} warm output-bank provider across 16 profiled pairs: {} allocations ({} bytes, {:?}), {} uploads ({} bytes, {:?}), {} downloads ({} bytes, {:?})",
             profile.allocations,
             profile.allocated_bytes,
             profile.allocation_time,
@@ -1525,7 +1591,7 @@ fn run_on(
             let profile_native = || -> Result<native::NativeTrainTimings, Box<dyn Error>> {
                 let (output, timings) = strict_native.execute_two_profiled()?;
                 verify(&strict_expected, &output)
-                    .map_err(|error| format!("strict profiled native pass: {error}"))?;
+                    .map_err(|error| format!("separated-update profiled native pass: {error}"))?;
                 Ok(timings)
             };
             for pass in 0_usize..16 {
@@ -1576,7 +1642,7 @@ fn run_on(
                 let first_weights = strict_first_bank
                     .outputs()
                     .first()
-                    .ok_or("strict first output bank is empty")?;
+                    .ok_or("separated-update first output bank is empty")?;
                 let second_inputs = [
                     (strict.samples, &device_samples),
                     (strict.weights, first_weights),
@@ -1622,20 +1688,20 @@ fn run_on(
                 let final_weights = strict_second_bank
                     .outputs()
                     .first()
-                    .ok_or("strict second output bank is empty")?;
+                    .ok_or("separated-update second output bank is empty")?;
                 let result = assessor.download_output(
                     final_weights,
                     selected.pool,
                     &mut strict_bank_memory,
                 )?;
                 verify(&strict_expected, result.data())
-                    .map_err(|error| format!("strict profiled PCU pass: {error}"))?;
+                    .map_err(|error| format!("separated-update profiled PCU pass: {error}"))?;
                 if pass.is_multiple_of(2) {
                     native_phase_samples.push(profile_native()?);
                 }
             }
             println!(
-                "Strict PCU {rows}x{features} per-node diagnostic (16 two-step passes; host wall time, profiler enabled; timings include synchronous completion and profiling perturbs short kernels):"
+                "Separated-update PCU {rows}x{features} per-node diagnostic (16 two-step passes; host wall time, profiler enabled; timings include synchronous completion and profiling perturbs short kernels):"
             );
             for (ordinal, ((operation, value), samples)) in
                 node_keys.iter().zip(&mut node_samples).enumerate()
@@ -1649,13 +1715,15 @@ fn run_on(
                 );
                 if !sgemm_samples[ordinal].is_empty() {
                     print_pcu_sgemm_host_phases(
-                        &format!("Strict PCU {rows}x{features} node {ordinal} MatMul"),
+                        &format!("Separated-update PCU {rows}x{features} node {ordinal} MatMul"),
                         &sgemm_samples[ordinal],
                     );
                 }
                 if !elementwise_samples[ordinal].is_empty() {
                     print_elementwise_host_phases(
-                        &format!("Strict PCU {rows}x{features} node {ordinal} {operation}"),
+                        &format!(
+                            "Separated-update PCU {rows}x{features} node {ordinal} {operation}"
+                        ),
                         &elementwise_samples[ordinal],
                     );
                 }
@@ -1666,7 +1734,7 @@ fn run_on(
                 if matches!(*operation, "Sub" | "Mul" | "SgdUpdate") {
                     print_duration_summary_with_context(
                         &format!(
-                            "Strict PCU {rows}x{features} two-step node {ordinal} {operation} value {value:?}"
+                            "Separated-update PCU {rows}x{features} two-step node {ordinal} {operation} value {value:?}"
                         ),
                         samples.iter().copied(),
                         "16 alternating pairs",
@@ -1674,65 +1742,65 @@ fn run_on(
                 }
             }
             print_pcu_sgemm_host_pair_phases(
-                &format!("Strict PCU {rows}x{features} two-step forward SGEMM"),
+                &format!("Separated-update PCU {rows}x{features} two-step forward SGEMM"),
                 &pcu_forward_sgemm_host,
             );
             print_pcu_sgemm_host_pair_phases(
-                &format!("Strict PCU {rows}x{features} two-step gradient SGEMM"),
+                &format!("Separated-update PCU {rows}x{features} two-step gradient SGEMM"),
                 &pcu_gradient_sgemm_host,
             );
             print_duration_summary(
-                &format!("Strict native {rows}x{features} two-step delta HIP"),
+                &format!("Separated-update native {rows}x{features} two-step delta HIP"),
                 native_phase_samples.iter().map(|timings| timings.delta_hip),
             );
             print_duration_summary(
-                &format!("Strict native {rows}x{features} two-step scale HIP"),
+                &format!("Separated-update native {rows}x{features} two-step scale HIP"),
                 native_phase_samples.iter().map(|timings| timings.scale_hip),
             );
             print_duration_summary(
-                &format!("Strict native {rows}x{features} two-step update HIP"),
+                &format!("Separated-update native {rows}x{features} two-step update HIP"),
                 native_phase_samples
                     .iter()
                     .map(|timings| timings.update_hip),
             );
             print_native_hip_phases(
-                &format!("Strict native {rows}x{features} two-step delta HIP"),
+                &format!("Separated-update native {rows}x{features} two-step delta HIP"),
                 &native_phase_samples,
                 |timings| (timings.delta_launch, timings.delta_wait),
             );
             print_native_hip_phases(
-                &format!("Strict native {rows}x{features} two-step scale HIP"),
+                &format!("Separated-update native {rows}x{features} two-step scale HIP"),
                 &native_phase_samples,
                 |timings| (timings.scale_launch, timings.scale_wait),
             );
             print_native_hip_phases(
-                &format!("Strict native {rows}x{features} two-step update HIP"),
+                &format!("Separated-update native {rows}x{features} two-step update HIP"),
                 &native_phase_samples,
                 |timings| (timings.update_launch, timings.update_wait),
             );
             print_sgemm_host_phases(
-                &format!("Strict native {rows}x{features} two-step forward SGEMM"),
+                &format!("Separated-update native {rows}x{features} two-step forward SGEMM"),
                 &native_phase_samples,
                 |timings| timings.forward_sgemm_host,
             );
             print_sgemm_host_phases(
-                &format!("Strict native {rows}x{features} two-step gradient SGEMM"),
+                &format!("Separated-update native {rows}x{features} two-step gradient SGEMM"),
                 &native_phase_samples,
                 |timings| timings.gradient_sgemm_host,
             );
             print_duration_summary_with_context(
-                &format!("Strict PCU {rows}x{features} profiled whole-step host wall"),
+                &format!("Separated-update PCU {rows}x{features} profiled whole-step host wall"),
                 step_wall_samples.iter().copied(),
                 "32 profiled steps",
             );
             print_duration_summary_with_context(
-                &format!("Strict PCU {rows}x{features} profiled sum of node timings"),
+                &format!("Separated-update PCU {rows}x{features} profiled sum of node timings"),
                 node_sum_samples.iter().copied(),
                 "32 profiled steps",
             );
             print_duration_summary_with_context(
                 &format!(
-                    "Strict PCU {rows}x{features} estimated non-node host overhead (includes profiler collection itself)"
+                    "Separated-update PCU {rows}x{features} estimated non-node host overhead (includes profiler collection itself)"
                 ),
                 non_node_samples.iter().copied(),
                 "32 profiled steps",

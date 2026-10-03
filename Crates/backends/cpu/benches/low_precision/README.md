@@ -1,0 +1,7 @@
+# Matched low-format host invocation peers
+
+Run `cargo bench -p fusion-pcu-cpu --bench low_precision --features source-low-precision -- --test` for semantic qualification. Four formats × four arithmetic operations × N=1/4096 × four routes produce 128 groups: genuine generic source preparation, genuine ordinary source, explicitly labelled graph preparation diagnostic, and independent manually decoded native binary64/midpoint arithmetic. Each route performs whole-map checked preflight then writes caller-owned output, preserving three tail elements. The first input changes every invocation; the complete output is checked before any measurement.
+
+Each warmed route executes 256 calls under an isolated allocator census and asserts zero allocations, reallocations and frees. Ordinary cache ranking is counted separately and must remain unchanged after warmup. Source bodies are the actual `#[pcu]` workloads under `tests/low_precision/source`, not workload names attached to handwritten IR. Native controls share representation carriers and fault enums only; they do not call PCU arithmetic or packing. See the integration fixture README for the bounded binary64 oracle argument and native rounding assumption. Production CPU arithmetic is software integer/rational execution.
+
+Semantic `--test` completion establishes correctness and heap/ranking laws; it supplies no statistical latency result. Any later estimates must retain machine/toolchain/source hashes and the actual ownership boundaries.

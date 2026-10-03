@@ -281,6 +281,7 @@ fn run_case<T: FloatCase>(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: fusion_pcu::PcuKernelId(if T::SCALAR == PcuScalarType::F32 {
             0xf320
         } else {

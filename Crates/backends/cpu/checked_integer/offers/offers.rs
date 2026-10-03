@@ -5,7 +5,6 @@ use fusion_pcu::{
     PcuCheckedInteger,
     PcuCostBoundary,
     PcuDeviceIdentity,
-    PcuDispatchIntegerBinaryOp,
     PcuDispatchKernelIr,
     PcuExecutorId,
     PcuHostKernelBackend,
@@ -15,13 +14,9 @@ use fusion_pcu::{
     PcuImplementationOffer,
     PcuImplementationOffers,
     PcuImplementationRequest,
-    PcuNumericalOptions,
-    PcuRangePolicy,
-    PcuScalarType,
 };
 #[rustfmt::skip]
 use super::{
-    PCU_CPU_INTEGER_IMPLEMENTATION_REVISION,
     PcuCpuCheckedInteger,
     PcuCpuCheckedIntegerError,
 };
@@ -36,8 +31,8 @@ pub enum PcuCpuIntegerOfferError {
 
 /// One exact typed scalar integer backend bound to a provider's CPU discovery snapshot.
 ///
-/// It advertises host execution only. No discovery, resident memory or `PortableV1` proof is
-/// established by this wrapper, and integer checking does not inherit Neg's SIMD capability.
+/// It advertises host execution only. Cold preparation admits the bounded exact integer
+/// `PortableV1` descriptor; no discovery, tensor, division or resident ownership promise follows.
 #[derive(Debug, Clone, Copy)]
 pub struct PcuCpuIntegerOffers<T: PcuCheckedInteger> {
     backend: PcuCpuCheckedInteger<T>,
@@ -77,36 +72,22 @@ impl<T: PcuCheckedInteger> PcuImplementationOffers<PcuDispatchKernelIr<'_>>
             Err(PcuCpuCheckedIntegerError::UnsupportedProfile) => return Ok(0),
             Err(error) => return Err(PcuCpuIntegerOfferError::Provider(error)),
         };
+        if request.requirements != request.operation.numerical_requirements {
+            return Ok(0);
+        }
         if request.boundary != PcuCostBoundary::Host
-            || request.requirements.range_policy != PcuRangePolicy::Reject
-            || request.requirements.numerical_options != PcuNumericalOptions::default()
+            || request.requirements.range_policy != prepared.range_policy()
         {
             return Ok(0);
         }
-        let scalar = match T::TYPE {
-            PcuScalarType::I8 => 0,
-            PcuScalarType::U8 => 1,
-            PcuScalarType::I16 => 2,
-            PcuScalarType::U16 => 3,
-            PcuScalarType::I32 => 4,
-            PcuScalarType::U32 => 5,
-            PcuScalarType::I64 => 6,
-            PcuScalarType::U64 => 7,
-            _ => unreachable!("sealed checked integer widths"),
-        };
-        let operation = match prepared.operation() {
-            PcuDispatchIntegerBinaryOp::Add => 0,
-            PcuDispatchIntegerBinaryOp::Sub => 1,
-            PcuDispatchIntegerBinaryOp::Mul => 2,
-        };
         if let Some(first) = output.first_mut() {
             *first = Some(PcuImplementationOffer {
                 implementation: PcuImplementationId {
                     device: self.device,
                     executor: self.executor,
                     // IDs 0..=3 are reserved for the Neg instruction implementations.
-                    local_id: 4 + scalar * 3 + operation,
-                    revision: PCU_CPU_INTEGER_IMPLEMENTATION_REVISION,
+                    local_id: prepared.local_id(),
+                    revision: prepared.implementation_revision(),
                 },
                 kind: PcuImplementationMechanism::NativeKernel,
                 requirements: request.requirements,

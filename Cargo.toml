@@ -56,7 +56,7 @@ ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
 proc-macro2 = "1.0.103"
 quote = "1.0.41"
 syn = { version = "2.0.108", features = ["full"] }
-smallvec = "1"
+smallvec = { version = "1", features = ["const_generics"] }
 libloading = "0.8"
 libc = "0.2"
 sha2 = "=0.10.9"

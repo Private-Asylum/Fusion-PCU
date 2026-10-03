@@ -15,6 +15,13 @@ use crate::{
 
 const VALUE_LIMIT: usize = 256;
 
+#[cfg(test)]
+#[path = "typed_dispatch/checked_div_rem/tests/tests.rs"]
+mod checked_div_rem_tests;
+#[cfg(test)]
+#[path = "typed_dispatch/scratch/tests/tests.rs"]
+mod scratch_tests;
+
 /// First type or value-flow error found in the bounded scalar Dispatch profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuTypedDispatchValidationError {
@@ -32,6 +39,11 @@ pub enum PcuTypedDispatchValidationError {
 
 /// Type-check scalar value flow for direct instructions and one bounded grid-stride region.
 ///
+/// This convenience profile reserves 256 SSA slots on the stack. Larger or
+/// sparse value IDs may use [`validate_typed_dispatch_value_flow_with_scratch`]
+/// with caller-chosen cold metadata capacity; this is not a universal IR limit.
+/// Neither entry grants provider, physical-layout or numerical admission.
+///
 /// The accepted subset is `BindingLoad`, scalar `Alu`, `CheckedDivRem`, the explicitly defined
 /// integer widening and f32/half conversions, checked F64-to-F32 conversion, `BindingStore` and `Return`. Values are SSA scoped
 /// to their region. The verifier deliberately rejects vector/matrix values and unlisted casts.
@@ -43,6 +55,33 @@ pub enum PcuTypedDispatchValidationError {
 pub fn validate_typed_dispatch_value_flow(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<(), PcuTypedDispatchValidationError> {
+    let mut types = [None; VALUE_LIMIT];
+    validate_typed_dispatch_value_flow_with_scratch(kernel, &mut types)
+}
+
+/// Type-check the same bounded scalar instruction subset with caller-owned scratch.
+///
+/// Scratch is indexed by the original SSA ID; its length must exceed every
+/// referenced ID. Sparse IDs are not silently renumbered. All metadata slots
+/// are cleared before checking this region, including after an earlier failed
+/// check, so stale types cannot satisfy an undefined use. On return, scratch
+/// contains only partial or complete verifier metadata, never executable values.
+/// This function allocates nothing and may run entirely in a `no_std` cold path.
+///
+/// The convenience verifier and default submission/map profiles retain their
+/// own capacity. This entry does not widen those profiles, admit more operations,
+/// validate physical resources or certify a numerical implementation. Providers
+/// must still enforce their separate declared execution and capacity contracts.
+///
+/// # Errors
+/// Returns the same first operation/type/SSA failure as the convenience entry.
+/// An ID outside the caller's scratch returns `ValueOutOfRange`; no partial
+/// success or inferred provider support escapes a failed check.
+pub fn validate_typed_dispatch_value_flow_with_scratch(
+    kernel: &PcuDispatchKernelIr<'_>,
+    types: &mut [Option<PcuValueType>],
+) -> Result<(), PcuTypedDispatchValidationError> {
+    types.fill(None);
     if let [
         PcuDispatchOp::GridStrideLoop { body, extent },
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
@@ -51,9 +90,9 @@ pub fn validate_typed_dispatch_value_flow(
         if *extent == 0 {
             return Err(PcuTypedDispatchValidationError::UnsupportedOperation(0));
         }
-        validate_region(kernel, body, true)
+        validate_region(kernel, body, true, types)
     } else {
-        validate_region(kernel, kernel.ops, false)
+        validate_region(kernel, kernel.ops, false, types)
     }
 }
 
@@ -61,17 +100,17 @@ fn validate_region(
     kernel: &PcuDispatchKernelIr<'_>,
     ops: &[PcuDispatchOp<'_>],
     in_grid: bool,
+    types: &mut [Option<PcuValueType>],
 ) -> Result<(), PcuTypedDispatchValidationError> {
-    let mut types: [Option<PcuValueType>; VALUE_LIMIT] = [None; VALUE_LIMIT];
     for (position, op) in ops.iter().copied().enumerate() {
         match op {
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingLoad { .. }) => {
-                validate_load(kernel, &mut types, op, position, in_grid)?;
+                validate_load(kernel, types, op, position, in_grid)?;
             }
             PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { .. }) => {
-                validate_store(kernel, &types, op)?;
+                validate_store(kernel, types, op)?;
             }
-            PcuDispatchOp::Data(data) => validate_computation(&mut types, data, position)?,
+            PcuDispatchOp::Data(data) => validate_computation(types, data, position)?,
             PcuDispatchOp::Control(PcuDispatchControlOp::Return) if !in_grid => {}
             _ => {
                 return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
@@ -85,7 +124,7 @@ fn validate_region(
 
 fn validate_load(
     kernel: &PcuDispatchKernelIr<'_>,
-    types: &mut [Option<PcuValueType>; VALUE_LIMIT],
+    types: &mut [Option<PcuValueType>],
     op: PcuDispatchOp<'_>,
     position: usize,
     in_grid: bool,
@@ -125,7 +164,7 @@ fn validate_load(
 
 fn validate_store(
     kernel: &PcuDispatchKernelIr<'_>,
-    types: &[Option<PcuValueType>; VALUE_LIMIT],
+    types: &[Option<PcuValueType>],
     op: PcuDispatchOp<'_>,
 ) -> Result<(), PcuTypedDispatchValidationError> {
     let PcuDispatchOp::Data(PcuDispatchDataOp::BindingStore { binding, value, .. }) = op else {
@@ -143,7 +182,7 @@ fn validate_store(
 }
 
 fn validate_computation(
-    types: &mut [Option<PcuValueType>; VALUE_LIMIT],
+    types: &mut [Option<PcuValueType>],
     data: PcuDispatchDataOp,
     position: usize,
 ) -> Result<(), PcuTypedDispatchValidationError> {
@@ -184,12 +223,20 @@ fn validate_computation(
         }
         PcuDispatchDataOp::CheckedDivRem {
             value_type,
+            flags,
             quotient,
             remainder,
             lhs,
             rhs,
-            ..
         } => {
+            // Equal operand types alone do not define integer division. The reserved
+            // quotient-only alternative is not an executable CheckedDivRem contract.
+            require_checked_integer_type(value_type, position)?;
+            if flags.bits() != 0 {
+                return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+                    position,
+                ));
+            }
             check_type(value_type, require(types, lhs)?)?;
             check_type(value_type, require(types, rhs)?)?;
             define(types, quotient, value_type)?;
@@ -202,11 +249,7 @@ fn validate_computation(
             rhs,
             ..
         } => {
-            if !is_supported_checked_integer(value_type) {
-                return Err(PcuTypedDispatchValidationError::UnsupportedOperation(
-                    position,
-                ));
-            }
+            require_checked_integer_type(value_type, position)?;
             check_type(value_type, require(types, lhs)?)?;
             check_type(value_type, require(types, rhs)?)?;
             define(types, result, value_type)
@@ -247,6 +290,19 @@ fn validate_computation(
     }
 }
 
+const fn require_checked_integer_type(
+    value_type: PcuValueType,
+    position: usize,
+) -> Result<(), PcuTypedDispatchValidationError> {
+    if is_supported_checked_integer(value_type) {
+        Ok(())
+    } else {
+        Err(PcuTypedDispatchValidationError::UnsupportedOperation(
+            position,
+        ))
+    }
+}
+
 const fn is_supported_checked_float(value_type: PcuValueType) -> bool {
     matches!(
         value_type,
@@ -255,11 +311,14 @@ const fn is_supported_checked_float(value_type: PcuValueType) -> bool {
                 | crate::PcuScalarType::BF16
                 | crate::PcuScalarType::F32
                 | crate::PcuScalarType::F64
+                | crate::PcuScalarType::F8E4M3FN
+                | crate::PcuScalarType::F8E5M2
         )
     )
 }
 
-const fn is_supported_checked_integer(value_type: PcuValueType) -> bool {
+// Shared structural admission also serves neutral numerical eligibility descriptors.
+pub(crate) const fn is_supported_checked_integer(value_type: PcuValueType) -> bool {
     matches!(
         value_type,
         PcuValueType::Scalar(
@@ -271,13 +330,22 @@ const fn is_supported_checked_integer(value_type: PcuValueType) -> bool {
                 | crate::PcuScalarType::U32
                 | crate::PcuScalarType::I64
                 | crate::PcuScalarType::U64
+                | crate::PcuScalarType::I128
+                | crate::PcuScalarType::U128
+                | crate::PcuScalarType::I256
+                | crate::PcuScalarType::U256
+                | crate::PcuScalarType::I512
+                | crate::PcuScalarType::U512
         )
     )
 }
 
-fn slot(value: PcuDispatchValueId) -> Result<usize, PcuTypedDispatchValidationError> {
+fn slot(
+    value: PcuDispatchValueId,
+    capacity: usize,
+) -> Result<usize, PcuTypedDispatchValidationError> {
     let index = usize::from(value.0);
-    if index < VALUE_LIMIT {
+    if index < capacity {
         Ok(index)
     } else {
         Err(PcuTypedDispatchValidationError::ValueOutOfRange(value))
@@ -285,11 +353,11 @@ fn slot(value: PcuDispatchValueId) -> Result<usize, PcuTypedDispatchValidationEr
 }
 
 fn define(
-    types: &mut [Option<PcuValueType>; VALUE_LIMIT],
+    types: &mut [Option<PcuValueType>],
     value: PcuDispatchValueId,
     value_type: PcuValueType,
 ) -> Result<(), PcuTypedDispatchValidationError> {
-    let index = slot(value)?;
+    let index = slot(value, types.len())?;
     if types[index].is_some() {
         return Err(PcuTypedDispatchValidationError::DuplicateValue(value));
     }
@@ -298,10 +366,10 @@ fn define(
 }
 
 fn require(
-    types: &[Option<PcuValueType>; VALUE_LIMIT],
+    types: &[Option<PcuValueType>],
     value: PcuDispatchValueId,
 ) -> Result<PcuValueType, PcuTypedDispatchValidationError> {
-    types[slot(value)?].ok_or(PcuTypedDispatchValidationError::UndefinedValue(value))
+    types[slot(value, types.len())?].ok_or(PcuTypedDispatchValidationError::UndefinedValue(value))
 }
 
 fn check_type(
@@ -344,6 +412,7 @@ mod tests {
 
     fn kernel<'a>(bindings: &'a [PcuBinding<'a>], ops: &'a [Op<'a>]) -> PcuDispatchKernelIr<'a> {
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "typed",
@@ -579,6 +648,7 @@ mod tests {
         let checked = Op::Data(Data::CheckedIntegerBinary {
             value_type: PcuValueType::i32(),
             op: crate::model::PcuDispatchIntegerBinaryOp::Add,
+            range_policy: crate::PcuRangePolicy::Reject,
             result: Id(3),
             lhs: Id(1),
             rhs: Id(2),
@@ -591,6 +661,7 @@ mod tests {
         let bad_type = Op::Data(Data::CheckedIntegerBinary {
             value_type: PcuValueType::f32(),
             op: crate::model::PcuDispatchIntegerBinaryOp::Mul,
+            range_policy: crate::PcuRangePolicy::Reject,
             result: Id(3),
             lhs: Id(1),
             rhs: Id(2),
@@ -602,6 +673,7 @@ mod tests {
         let duplicate = Op::Data(Data::CheckedIntegerBinary {
             value_type: PcuValueType::i32(),
             op: crate::model::PcuDispatchIntegerBinaryOp::Sub,
+            range_policy: crate::PcuRangePolicy::Reject,
             result: Id(1),
             lhs: Id(1),
             rhs: Id(2),
@@ -613,6 +685,7 @@ mod tests {
         let undefined = Op::Data(Data::CheckedIntegerBinary {
             value_type: PcuValueType::i32(),
             op: crate::model::PcuDispatchIntegerBinaryOp::Sub,
+            range_policy: crate::PcuRangePolicy::Reject,
             result: Id(3),
             lhs: Id(99),
             rhs: Id(2),

@@ -57,6 +57,52 @@ impl RocmMemoryProvider {
         }
     }
 
+    /// Same provider/pool/range admission as borrowed `transfer_from`, but keeps the completed
+    /// host endpoint private under the native allocation lease until sibling publication.
+    pub(crate) fn readback_owned(
+        &self,
+        resource: &RocmMemoryResource,
+        offset_bytes: u64,
+        bytes: usize,
+    ) -> Result<crate::OwnedHostReadback, PcuMemoryProviderError> {
+        let op = PcuMemoryProviderOperation::TransferFrom;
+        self.validate_resource(resource, op)?;
+        if !matches!(
+            resource.access,
+            PcuMemoryAccess::ReadOnly | PcuMemoryAccess::ReadWrite
+        ) {
+            return Err(self.error(
+                op,
+                PcuMemoryProviderFailure::AccessDenied,
+                PcuMemoryDisposition::Reject,
+            ));
+        }
+        if !range_fits(
+            resource.buffer.len() as u64,
+            PcuMemoryRange {
+                offset_bytes,
+                size_bytes: bytes as u64,
+            },
+        ) {
+            return Err(self.error(
+                op,
+                PcuMemoryProviderFailure::RangeOutOfBounds,
+                PcuMemoryDisposition::Reject,
+            ));
+        }
+        let offset = usize::try_from(offset_bytes).map_err(|_| {
+            self.error(
+                op,
+                PcuMemoryProviderFailure::RangeOutOfBounds,
+                PcuMemoryDisposition::Reject,
+            )
+        })?;
+        resource
+            .buffer
+            .readback_owned_at(offset, bytes)
+            .map_err(|error| hip_failure(self, op, &error))
+    }
+
     pub(crate) fn validate_resource(
         &self,
         resource: &RocmMemoryResource,

@@ -1,0 +1,29 @@
+error: generic checked integer maps support indexed resources, read-only scalar borrows, and + - *; literals, casts, negation, division and helper calls require a separately supported profile
+ --> tests/ui/generic_checked_integer_expressions.rs:7:30
+  |
+7 |     output[id] = input[id] + 1;
+  |                              ^
+
+error: generic checked integer maps support indexed resources, read-only scalar borrows, and + - *; literals, casts, negation, division and helper calls require a separately supported profile
+  --> tests/ui/generic_checked_integer_expressions.rs:13:18
+   |
+13 |     output[id] = input[id] as T;
+   |                  ^^^^^^^^^^^^^^
+
+error: generic checked integer maps support indexed resources, read-only scalar borrows, and + - *; literals, casts, negation, division and helper calls require a separately supported profile
+  --> tests/ui/generic_checked_integer_expressions.rs:19:18
+   |
+19 |     output[id] = -input[id];
+   |                  ^^^^^^^^^^
+
+error: generic checked integer maps support indexed resources, read-only scalar borrows, and + - *; literals, casts, negation, division and helper calls require a separately supported profile
+  --> tests/ui/generic_checked_integer_expressions.rs:25:18
+   |
+25 |     output[id] = left[id] / right[id];
+   |                  ^^^^^^^^^^^^^^^^^^^^
+
+error: generic checked integer maps support indexed resources, read-only scalar borrows, and + - *; literals, casts, negation, division and helper calls require a separately supported profile
+  --> tests/ui/generic_checked_integer_expressions.rs:35:18
+   |
+35 |     output[id] = helper(input[id]);
+   |                  ^^^^^^^^^^^^^^^^^

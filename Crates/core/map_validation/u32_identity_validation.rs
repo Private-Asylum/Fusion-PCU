@@ -244,6 +244,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: crate::PcuKernelId(1),
             entry: crate::PcuDispatchEntryPoint {
                 name: "identity",

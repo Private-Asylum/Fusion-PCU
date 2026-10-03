@@ -148,7 +148,7 @@ fn checked_faults(output: &mut [f32; 20]) {
     ));
     assert_eq!(output.map(f32::to_bits), previous);
     let failure = unsupported_add::<17>(&input, output).unwrap_err();
-    let global::PcuExecutionError::NoCompatibleInvocationDevice { rejected, .. } = failure else {
+    let global::PcuExecutionError::NoCompatibleDevice { rejected, .. } = failure else {
         panic!("cold source admission error")
     };
     assert!(!rejected.is_empty());

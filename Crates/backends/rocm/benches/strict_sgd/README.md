@@ -13,8 +13,9 @@ Each accepted update checks and rounds `0.5 * gradient`, then checks and rounds
 `weight - product`, in the destination F32/F64 format. It never contracts these
 steps. The IEEE-derived default reports tiny, inexact results after rounding;
 exact subnormals remain legal. Tight and gradual policies are separate controls.
-Default checked boundary SGD, portable determinism, and incompatible numerical
-permissions are explicit cold rejections.
+Default checked Boundary SGD and portable determinism remain cold rejections.
+Native compound and optimized precision permissions use the stronger ordered
+checker with the complete requested tuple retained in its cache identity.
 
 Thirty-six Criterion peers cover F32/F64, 65/65,536/1,048,576 elements, full-host
 and resident boundaries, and three execution routes:
@@ -46,3 +47,11 @@ Setup, code generation, selection, numerical probes and oracle work stay outside
 timed submission. `--test` checks correctness without establishing throughput.
 The AMD activity guard runs before setup and each shape; other GPU users still
 make any timing measurements provisional.
+
+The current permission extension adds all four independent compound/precision
+combinations and all three underflow policies at the small boundary. Original
+larger default-profile cases remain. Benchmark group and census labels retain
+the requested tuple. New hardware acceptance is recorded separately in the
+backend plan; these executable definitions alone do not establish device proof.
+Warm census runs 64 changing-input calls for each source/graph/native route,
+including matched completion, explicit output readback, oracle and release.

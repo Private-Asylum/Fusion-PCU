@@ -21,28 +21,120 @@ use fusion_pcu::{
     PcuSupport,
     PcuValueTypeCaps,
 };
-const TYPES: PcuValueTypeCaps = PcuValueTypeCaps::UINT32
-    .union(PcuValueTypeCaps::FLOAT32)
-    .union(PcuValueTypeCaps::SCALAR_VALUES);
+const fn carrier_types() -> PcuValueTypeCaps {
+    let mut types = PcuValueTypeCaps::SCALAR_VALUES;
+    let mut index = 0;
+    while index < PcuScalarType::COUNT {
+        let scalar = PcuScalarType::ALL[index];
+        if scalar.bit_width() >= 8 {
+            types = types.union(PcuValueTypeCaps::for_scalar(scalar));
+        }
+        index += 1;
+    }
+    types
+}
+const TYPES: PcuValueTypeCaps = carrier_types();
 const INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+    .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
+    .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
     .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY)
     .union(PcuDispatchOpCaps::BINDING_LOAD)
+    .union(PcuDispatchOpCaps::BINDING_LOAD_ELEMENT_ZERO)
     .union(PcuDispatchOpCaps::BINDING_STORE)
     .union(PcuDispatchOpCaps::CONTROL_RETURN)
     .union(PcuDispatchOpCaps::CONTROL_LOOP);
 const SCALAR: PcuDispatchScalarAluSupport = PcuDispatchScalarAluSupport::empty()
     .with(
+        PcuScalarType::I8,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::U8,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::I16,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::U16,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::I128,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::U128,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::I256,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::U256,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::I512,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::U512,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::F16,
+        PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+    )
+    .with(
+        PcuScalarType::BF16,
+        PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+    )
+    .with(
+        PcuScalarType::F8E4M3FN,
+        PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+    )
+    .with(
+        PcuScalarType::F8E5M2,
+        PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+    )
+    .with(
+        PcuScalarType::I64,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::U64,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
+        PcuScalarType::F64,
+        PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY),
+    )
+    .with(
+        PcuScalarType::I32,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+    )
+    .with(
         PcuScalarType::U32,
-        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY,
+        PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY.union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
     )
     .with(
         PcuScalarType::F32,
-        PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY,
+        PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY),
     );
 const POLICY: PcuDispatchPolicyCaps =
     PcuDispatchPolicyCaps::SERIAL.union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION);
-const FEATURES: PcuDispatchFeatureCaps =
-    PcuDispatchFeatureCaps::MUTABLE_RESOURCES.union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES);
+const FEATURES: PcuDispatchFeatureCaps = PcuDispatchFeatureCaps::MUTABLE_RESOURCES
+    .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES)
+    .union(PcuDispatchFeatureCaps::RANGE_CLAMP);
 pub(super) const fn support() -> PcuSupport {
     let mut support = PcuSupport::unsupported();
     support.caps = PcuCaps::ENUMERATE_EXECUTORS

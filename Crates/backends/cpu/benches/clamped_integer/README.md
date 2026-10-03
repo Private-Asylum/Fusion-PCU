@@ -1,0 +1,9 @@
+# Checked integer Clamp peers
+
+Fourteen I/U8/16/32/64/128/256/512 formats execute Add/Sub/Mul with useful saturated output plus an observable recovered error. Each workload is an actual generic `#[pcu]` function. N=1 and N=257 give336paired semantic groups across prepared source, ordinary cached source, explicit graph diagnostic and independent base-256 native arithmetic.
+
+Preparation chooses the range/operation/broadcast function once. Existing Reject IDs/revision2 and two-pass transaction executor remain intact. New Clamp IDs320..361/revision1 use one publication pass: sealed Add/Sub/Mul clamped arithmetic has no fatal condition and always produces an exact or useful saturated value. The first logical range notice is returned after every output is initialized. Complete schema/span checks precede mutation; tails remain untouched and invalid calls permit retry. DivRem remains Reject-only; no Portable integer/tensor/resident claim follows.
+
+Every route receives changing full-width inputs and a separate64-call warm heap census requiring zero Rust allocations, reallocations and frees, with no repeated ordinary scoring. Native control uses independent signed-magnitude base-256 arithmetic and explicit endpoints; it calls no PCU checked/clamped arithmetic. Its arithmetic is a reference control and may be slower than optimized primitive/wide implementations. Cold allocations and compilation are excluded from every warm route equally.
+
+Run `cargo bench -p fusion-pcu-cpu --all-features --bench clamped_integer -- --test` for semantic qualification. Independent full-bit tests additionally include every eight-bit operand pair and12larger formats against4096edge/random pairs for540,672arithmetic rows, plus public source/preflight/retry and exact cold offer matrices. These counts do not certify broader SIMD, full IR or tensors.

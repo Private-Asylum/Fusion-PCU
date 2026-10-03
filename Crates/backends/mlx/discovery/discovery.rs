@@ -11,19 +11,14 @@ use std::{
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuCapabilitySnapshot,
-    PcuCaps,
     PcuContextDescriptor,
     PcuContextKind,
     PcuDeviceActivation,
     PcuDeviceClass,
     PcuDeviceDescriptor,
     PcuDeviceIdentity,
-    PcuExecutorClass,
     PcuExecutorDescriptor,
     PcuExecutorId,
-    PcuExecutorOrigin,
-    PcuExecutorSupport,
-    PcuImplementationKind,
     PcuMemoryDomainDescriptor,
     PcuMemoryDomainKind,
     PcuObjectKind,
@@ -54,7 +49,8 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 ///
 /// SDK inspection may initialize its device/library caches, but
 /// no PCU stream, tensor allocation or requested workload is created until activation.
-/// Generic dispatch IR is unsupported; tensor implementations are offered separately.
+/// Generic dispatch admits exact byte-aligned carrier maps and fixed checked six-format floating and fourteen-width integer profiles. Native tensor offers
+/// remain separately admitted; memory domains still describe opaque MLX-owned backing.
 pub struct MlxDiscovery {
     runtime: MlxRuntime,
     generation: u64,
@@ -142,14 +138,12 @@ impl MlxDiscovery {
             reason: None,
         }
     }
-    fn support(&self) -> PcuSupport {
-        let mut support = PcuSupport::unsupported();
-        if !self.devices.is_empty() {
-            support.caps = PcuCaps::ENUMERATE_EXECUTORS | PcuCaps::CLAIM_EXECUTOR;
-            support.implementation = PcuImplementationKind::Native;
-            support.executor_count = 1;
+    const fn support(&self) -> PcuSupport {
+        if self.devices.is_empty() {
+            PcuSupport::unsupported()
+        } else {
+            caps::support()
         }
-        support
     }
 }
 
@@ -291,13 +285,7 @@ impl PcuRuntimeDiscovery for MlxDiscovery {
             return Ok(0);
         }
         if let Some(slot) = output.first_mut() {
-            *slot = PcuExecutorDescriptor {
-                id: EXECUTOR,
-                name: "MLX delegated tensor executor",
-                class: PcuExecutorClass::Adapter,
-                origin: PcuExecutorOrigin::TopologyBound,
-                support: PcuExecutorSupport::unsupported(),
-            };
+            *slot = caps::EXECUTORS[0];
         }
         Ok(1)
     }
@@ -308,3 +296,19 @@ impl PcuRuntimeDiscovery for MlxDiscovery {
 mod offers;
 #[cfg(feature = "tensor")]
 pub use offers::MlxMatmulRequest;
+
+#[path = "caps/caps.rs"]
+mod caps;
+#[path = "checked_offers/checked_offers.rs"]
+mod checked_offers;
+
+#[cfg(feature = "tensor")]
+#[path = "checked_tensor_offers/checked_tensor_offers.rs"]
+mod checked_tensor_offers;
+#[cfg(feature = "tensor")]
+#[rustfmt::skip]
+pub use checked_tensor_offers::{
+    MlxCheckedTensorRequest,
+    MlxTensorBinaryRequest,
+    MlxTensorIntegerRequest,
+};

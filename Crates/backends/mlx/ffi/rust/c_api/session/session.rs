@@ -44,7 +44,6 @@ impl Api {
 }
 
 impl Session {
-    #[cfg(feature = "tensor")]
     pub fn same(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }

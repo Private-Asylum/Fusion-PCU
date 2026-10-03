@@ -631,12 +631,18 @@ impl TensorValueStorageRequirement {
 
 pub const fn dense_scalar_layout(scalar_type: PcuScalarType) -> Option<(usize, usize)> {
     match scalar_type {
-        PcuScalarType::I8 | PcuScalarType::U8 => Some((1, 1)),
+        PcuScalarType::I8 | PcuScalarType::U8 | PcuScalarType::F8E4M3FN | PcuScalarType::F8E5M2 => {
+            Some((1, 1))
+        }
         PcuScalarType::I16 | PcuScalarType::U16 | PcuScalarType::F16 | PcuScalarType::BF16 => {
             Some((2, 2))
         }
         PcuScalarType::I32 | PcuScalarType::U32 | PcuScalarType::F32 => Some((4, 4)),
         PcuScalarType::I64 | PcuScalarType::U64 | PcuScalarType::F64 => Some((8, 8)),
+        PcuScalarType::I128 | PcuScalarType::U128 => Some((16, 16)),
+        PcuScalarType::F128 => Some((16, 8)),
+        PcuScalarType::I256 | PcuScalarType::U256 | PcuScalarType::F256 => Some((32, 8)),
+        PcuScalarType::I512 | PcuScalarType::U512 => Some((64, 8)),
         // These scalar vocabulary entries have no agreed byte-addressable dense encoding.
         PcuScalarType::Bool | PcuScalarType::I4 | PcuScalarType::U4 => None,
     }

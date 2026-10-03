@@ -72,6 +72,15 @@ pub fn validate_dispatch_for_spirv(
     kernel: &PcuDispatchKernelIr<'_>,
     options: PcuSpirvLoweringOptions,
 ) -> Result<(), PcuSpirvError> {
+    // Exact scalar arithmetic does not certify the complete PortableV1 contract.
+    if kernel
+        .numerical_requirements
+        .numerical_options
+        .reproducibility
+        == fusion_pcu::PcuReproducibility::PortableV1
+    {
+        return Err(PcuSpirvError::UnsupportedNumericalRequirements);
+    }
     require_capability(options, PcuSpirvCapability::Shader)?;
     validate_spirv_version(options)?;
     validate_kernel_signature(kernel, options)?;
@@ -301,7 +310,17 @@ const fn validate_scalar_type(scalar: PcuScalarType) -> Result<(), PcuSpirvError
         | PcuScalarType::U64
         | PcuScalarType::F16
         | PcuScalarType::BF16
-        | PcuScalarType::F64 => Err(PcuSpirvError::UnsupportedValueType(PcuValueType::Scalar(
+        | PcuScalarType::F64
+        | PcuScalarType::I128
+        | PcuScalarType::U128
+        | PcuScalarType::I256
+        | PcuScalarType::U256
+        | PcuScalarType::I512
+        | PcuScalarType::U512
+        | PcuScalarType::F128
+        | PcuScalarType::F256
+        | PcuScalarType::F8E4M3FN
+        | PcuScalarType::F8E5M2 => Err(PcuSpirvError::UnsupportedValueType(PcuValueType::Scalar(
             scalar,
         ))),
     }

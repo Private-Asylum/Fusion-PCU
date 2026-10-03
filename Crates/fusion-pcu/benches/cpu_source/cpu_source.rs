@@ -9,6 +9,8 @@ use criterion::{
     criterion_main,
 };
 use fusion_pcu_cpu::PcuCpuHostBackend;
+#[path = "composition/composition.rs"]
+mod composition;
 #[path = "native/native.rs"]
 mod native;
 #[path = "oracle/oracle.rs"]
@@ -17,6 +19,13 @@ mod oracle;
 mod setup;
 #[path = "source/source.rs"]
 mod source;
+
+#[cfg(feature = "cpu-benchmark-control")]
+#[path = "census/census.rs"]
+mod census;
+#[cfg(feature = "cpu-benchmark-control")]
+#[global_allocator]
+static ALLOCATOR: census::CountingAllocator = census::CountingAllocator;
 
 fn neg_case<const N: usize>(criterion: &mut Criterion) {
     let backend = PcuCpuHostBackend::detect();
@@ -109,6 +118,7 @@ fn comparisons(criterion: &mut Criterion) {
     integer_case::<17, true>(criterion);
     integer_case::<4096, true>(criterion);
     integer_case::<1_048_576, true>(criterion);
+    composition::comparisons(criterion);
 }
 criterion_group!(benches, comparisons);
 criterion_main!(benches);

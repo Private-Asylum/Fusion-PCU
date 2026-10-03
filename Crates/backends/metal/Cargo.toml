@@ -18,6 +18,13 @@ path = "metal.rs"
 
 [features]
 default = []
+tensor = ["fusion-pcu-core/tensor"]
+source-tensor = ["tensor", "pcu-facade/tensor"]
+benchmark-control = ["tensor"]
+portable-joint-control = ["benchmark-control"]
+portable-unary-control = ["benchmark-control"]
+# Explicit caller protocol attempts, absent from ordinary builds/timing controls.
+api-census = ["benchmark-control", "allocation-census"]
 allocation-census = []
 
 [dependencies]
@@ -30,9 +37,29 @@ workspace = true
 criterion.workspace = true
 pcu-facade = { workspace = true, features = ["std", "metal"] }
 
+[[bench]]
+name = "transport"
+path = "benches/transport/transport.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "transport"
+path = "examples/transport/transport.rs"
+
 [[test]]
 name = "source"
 path = "tests/source/source.rs"
+
+[[bench]]
+name = "checked_div_rem_roles"
+path = "benches/checked_div_rem_roles/checked_div_rem_roles.rs"
+harness = false
+required-features = ["benchmark-control"]
+
+[[example]]
+name = "checked_div_rem_roles"
+path = "examples/checked_div_rem_roles/checked_div_rem_roles.rs"
 
 [[bench]]
 name = "checked_neg"
@@ -43,3 +70,194 @@ harness = false
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true
+
+[[bench]]
+name = "checked_i32"
+path = "benches/checked_i32/checked_i32.rs"
+harness = false
+
+[[example]]
+name = "checked_i32"
+path = "examples/checked_i32/checked_i32.rs"
+
+[[bench]]
+name = "checked_neg_f64"
+path = "benches/checked_neg_f64/checked_neg_f64.rs"
+harness = false
+
+[[bench]]
+name = "checked_i64"
+path = "benches/checked_i64/checked_i64.rs"
+harness = false
+
+[[bench]]
+name = "checked_u64"
+path = "benches/checked_u64/checked_u64.rs"
+harness = false
+
+[[bench]]
+name = "checked_f64"
+path = "benches/checked_f64/checked_f64.rs"
+harness = false
+
+[[example]]
+name = "checked_f64"
+path = "examples/checked_f64/checked_f64.rs"
+
+[[bench]]
+name = "checked_f32"
+path = "benches/checked_f32/checked_f32.rs"
+harness = false
+
+[[example]]
+name = "checked_f32"
+path = "examples/checked_f32/checked_f32.rs"
+
+[[bench]]
+name = "checked_low_precision"
+path = "benches/checked_low_precision/checked_low_precision.rs"
+harness = false
+
+[[example]]
+name = "checked_low_precision"
+path = "examples/checked_low_precision/checked_low_precision.rs"
+
+[[bench]]
+name = "checked_portable"
+path = "benches/checked_portable/checked_portable.rs"
+harness = false
+
+[[example]]
+name = "checked_portable"
+path = "examples/checked_portable/checked_portable.rs"
+
+[[bench]]
+name = "checked_low_unary"
+path = "benches/checked_low_unary/checked_low_unary.rs"
+harness = false
+
+[[example]]
+name = "checked_low_unary"
+path = "examples/checked_low_unary/checked_low_unary.rs"
+
+[[bench]]
+name = "checked_native_unary"
+path = "benches/checked_native_unary/checked_native_unary.rs"
+harness = false
+
+[[example]]
+name = "checked_native_unary"
+path = "examples/checked_native_unary/checked_native_unary.rs"
+
+[[bench]]
+name = "checked_binary_range"
+path = "benches/checked_binary_range/checked_binary_range.rs"
+harness = false
+
+[[example]]
+name = "checked_binary_range"
+path = "examples/checked_binary_range/checked_binary_range.rs"
+
+[[bench]]
+name = "carrier"
+path = "benches/carrier/carrier.rs"
+harness = false
+
+[[example]]
+name = "carrier"
+path = "examples/carrier/carrier.rs"
+
+[[test]]
+name="checked_integer"
+path="tests/checked_integer/checked_integer.rs"
+
+[[bench]]
+name="checked_integer"
+path="benches/checked_integer/checked_integer.rs"
+harness=false
+
+[[example]]
+name="checked_integer"
+path="examples/checked_integer/checked_integer.rs"
+
+[[test]]
+name = "checked_div_rem"
+path = "tests/checked_div_rem/checked_div_rem.rs"
+
+[[bench]]
+name = "checked_div_rem"
+path = "benches/checked_div_rem/checked_div_rem.rs"
+harness = false
+
+[[example]]
+name = "checked_div_rem"
+path = "examples/checked_div_rem/checked_div_rem.rs"
+
+[[bench]]
+name = "tensor_relu"
+path = "benches/tensor_relu/tensor_relu.rs"
+harness = false
+required-features = ["source-tensor", "benchmark-control"]
+
+[[test]]
+name = "tensor_relu"
+path = "tests/tensor_relu/tensor_relu.rs"
+required-features = ["source-tensor"]
+
+[[example]]
+name = "tensor_relu"
+path = "examples/tensor_relu/tensor_relu.rs"
+required-features = ["source-tensor"]
+
+[[bench]]
+name = "tensor_leaf"
+path = "benches/tensor_leaf/tensor_leaf.rs"
+harness = false
+required-features = ["source-tensor", "benchmark-control"]
+
+[[bench]]
+name = "tensor_binary"
+path = "benches/tensor_binary/tensor_binary.rs"
+harness = false
+required-features = ["source-tensor", "benchmark-control"]
+
+[[example]]
+name = "tensor_binary"
+path = "examples/tensor_binary/tensor_binary.rs"
+required-features = ["source-tensor"]
+
+[[test]]
+name = "tensor_binary"
+path = "tests/tensor_binary/tensor_binary.rs"
+required-features = ["source-tensor"]
+
+[[example]]
+name = "tensor_leaf"
+path = "examples/tensor_leaf/tensor_leaf.rs"
+required-features = ["source-tensor"]
+
+[[bench]]
+name = "portable_unary"
+path = "benches/portable_unary/portable_unary.rs"
+harness = false
+required-features = ["portable-unary-control"]
+
+[[example]]
+name = "portable_unary"
+path = "examples/portable_unary/portable_unary.rs"
+
+[[bench]]
+name = "normal_unary_roles"
+path = "benches/normal_unary_roles/normal_unary_roles.rs"
+harness = false
+
+[[example]]
+name = "normal_unary_roles"
+path = "examples/normal_unary_roles/normal_unary_roles.rs"
+required-features = ["source-tensor"]
+
+[[bench]]
+name = "operand_roles"
+path = "benches/operand_roles/operand_roles.rs"
+harness = false
+required-features = ["benchmark-control"]

@@ -40,17 +40,56 @@ pub enum PcuExecutionFaultKind {
     InvalidFloatingOperand,
 }
 
-/// A deterministic arithmetic fault attributed to the first affected logical invocation.
+/// A deterministic arithmetic fault within one reported execution unit.
+///
+/// Fatal faults take precedence over recovered range notices: a useful clamped lane must not
+/// conceal another lane that failed to produce its result. Within the selected class, the
+/// lowest affected logical invocation is reported. An all-recovered execution reports its
+/// first range notice while retaining the prescribed continuation outputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuExecutionFault {
     pub kind: PcuExecutionFaultKind,
+    /// Logical fault position within the prepared execution unit's defined domain.
+    /// A scalar map uses its element index; a grid-stride map uses its visited
+    /// extent rather than its number of launched invocations. A compound may
+    /// encode ordered arithmetic steps and must specify that mapping separately:
+    /// neither its output size nor its launch count establishes the fault domain.
+    /// Providers must validate decoded status against
+    /// this domain and the admitted operation's fault law before lifting it.
+    /// A malformed status is a backend protocol failure, not an arithmetic fault.
     pub invocation_id: u64,
-    /// True when execution completed with a defined continuation value after this fault.
-    /// This does not by itself imply that a graph produced or published a fresh owner.
+    /// True when the reported execution unit completed with its defined continuation outputs.
+    /// This is not merely whether the reported lane could recover: any terminal lane prevents
+    /// recovered publication. A containing graph still needs its own complete success/output
+    /// proof before producing or publishing a fresh owner.
     pub recovered: bool,
 }
 
-/// Scalar element types surfaced by the current PCU core.
+impl PcuExecutionFault {
+    /// Whether this record addresses an element of the prepared logical domain.
+    ///
+    /// This predicate imposes no device-specific index-width limit. Providers
+    /// validate their physical status encoding separately, then supply the
+    /// operation-defined logical fault extent (including a grid-stride loop's
+    /// visited extent or a compound's ordered-step extent). Output storage length
+    /// does not generally establish this bound.
+    /// It does not certify the fault kind, recovery policy or device completion.
+    #[must_use]
+    pub const fn is_within_logical_extent(self, extent: u64) -> bool {
+        self.invocation_id < extent
+    }
+}
+
+#[cfg(test)]
+#[path = "fault_domain/tests/tests.rs"]
+mod fault_domain_tests;
+
+/// Named scalar representations; execution is admitted independently per operation.
+///
+/// F128 is IEEE binary128. F256 uses generalized binary256 interchange fields.
+/// The two FP8 variants identify exact OFP8 encodings; neither is TF32, a scale
+/// descriptor, or a permission to change accumulation precision. New entries
+/// are appended to preserve existing capability-table indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PcuScalarType {
     Bool,
@@ -68,11 +107,21 @@ pub enum PcuScalarType {
     BF16,
     F32,
     F64,
+    I128,
+    U128,
+    I256,
+    U256,
+    I512,
+    U512,
+    F128,
+    F256,
+    F8E4M3FN,
+    F8E5M2,
 }
 
 impl PcuScalarType {
     /// Number of scalar variants represented by the core scalar vocabulary.
-    pub const COUNT: usize = 15;
+    pub const COUNT: usize = 25;
 
     /// All scalar variants in stable capability-table order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -91,18 +140,31 @@ impl PcuScalarType {
         Self::BF16,
         Self::F32,
         Self::F64,
+        Self::I128,
+        Self::U128,
+        Self::I256,
+        Self::U256,
+        Self::I512,
+        Self::U512,
+        Self::F128,
+        Self::F256,
+        Self::F8E4M3FN,
+        Self::F8E5M2,
     ];
 
     /// Returns the honest bit width for this scalar type.
     #[must_use]
-    pub const fn bit_width(self) -> u8 {
+    pub const fn bit_width(self) -> u16 {
         match self {
             Self::Bool => 1,
             Self::I4 | Self::U4 => 4,
-            Self::I8 | Self::U8 => 8,
+            Self::I8 | Self::U8 | Self::F8E4M3FN | Self::F8E5M2 => 8,
             Self::I16 | Self::U16 | Self::F16 | Self::BF16 => 16,
             Self::I32 | Self::U32 | Self::F32 => 32,
             Self::I64 | Self::U64 | Self::F64 => 64,
+            Self::I128 | Self::U128 | Self::F128 => 128,
+            Self::I256 | Self::U256 | Self::F256 => 256,
+            Self::I512 | Self::U512 => 512,
         }
     }
 }
@@ -276,6 +338,16 @@ impl PcuValueTypeCaps {
     pub const SCALAR_VALUES: Self = Self(1 << 15);
     pub const VECTOR_VALUES: Self = Self(1 << 16);
     pub const MATRIX_VALUES: Self = Self(1 << 17);
+    pub const INT128: Self = Self(1 << 18);
+    pub const UINT128: Self = Self(1 << 19);
+    pub const INT256: Self = Self(1 << 20);
+    pub const UINT256: Self = Self(1 << 21);
+    pub const INT512: Self = Self(1 << 22);
+    pub const UINT512: Self = Self(1 << 23);
+    pub const FLOAT128: Self = Self(1 << 24);
+    pub const FLOAT256: Self = Self(1 << 25);
+    pub const FLOAT8_E4M3FN: Self = Self(1 << 26);
+    pub const FLOAT8_E5M2: Self = Self(1 << 27);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -315,6 +387,16 @@ impl PcuValueTypeCaps {
             PcuScalarType::BF16 => Self::BFLOAT16,
             PcuScalarType::F32 => Self::FLOAT32,
             PcuScalarType::F64 => Self::FLOAT64,
+            PcuScalarType::I128 => Self::INT128,
+            PcuScalarType::U128 => Self::UINT128,
+            PcuScalarType::I256 => Self::INT256,
+            PcuScalarType::U256 => Self::UINT256,
+            PcuScalarType::I512 => Self::INT512,
+            PcuScalarType::U512 => Self::UINT512,
+            PcuScalarType::F128 => Self::FLOAT128,
+            PcuScalarType::F256 => Self::FLOAT256,
+            PcuScalarType::F8E4M3FN => Self::FLOAT8_E4M3FN,
+            PcuScalarType::F8E5M2 => Self::FLOAT8_E5M2,
         }
     }
 

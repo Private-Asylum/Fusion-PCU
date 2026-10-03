@@ -9,7 +9,14 @@ use crate::{
     PcuMemoryResource,
     PcuScalar,
 };
-#[cfg(any(feature = "tensor", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "tensor",
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan",
+    feature = "cpu",
+    feature = "mlx"
+))]
 use crate::PcuOwnedDispatchBackend;
 #[cfg(all(feature = "tensor", any(feature = "rocm", feature = "cuda")))]
 #[rustfmt::skip]
@@ -133,7 +140,49 @@ impl<T: PcuScalar> DeviceTensor<T> {
     }
 }
 impl Session {
-    #[cfg(any(feature = "tensor", feature = "cuda", feature = "metal"))]
+    #[cfg(all(feature = "metal", feature = "tensor"))]
+    #[cfg_attr(
+        not(any(feature = "rocm", feature = "cuda")),
+        allow(clippy::unnecessary_wraps)
+    )] // Mixed provider builds reject non-Metal sessions through the same static accessor.
+    pub(in crate::global) fn metal_backend(
+        &self,
+    ) -> Option<&fusion_pcu_metal::MetalOwnedDispatchBackend> {
+        match self {
+            Self::Metal(session) => Some(&session.backend),
+            #[cfg(any(feature = "rocm", feature = "cuda"))]
+            _ => None,
+        }
+    }
+
+    #[cfg(all(feature = "metal", feature = "tensor"))]
+    pub(in crate::global) fn from_metal_backend(
+        backend: fusion_pcu_metal::MetalOwnedDispatchBackend,
+        block_size: u32,
+    ) -> Self {
+        Self::Metal(Rc::new(MetalSession {
+            backend: Rc::new(backend),
+            block_size,
+        }))
+    }
+
+    #[cfg(feature = "metal")]
+    pub(super) fn shares_metal_session(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Metal(left), Self::Metal(right)) => left.backend.shares_session(&right.backend),
+            #[cfg(any(feature = "rocm", feature = "cuda"))]
+            _ => false,
+        }
+    }
+
+    #[cfg(any(
+        feature = "tensor",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu",
+        feature = "mlx"
+    ))]
     pub(super) fn device_id(&self) -> u32 {
         match self {
             #[cfg(feature = "rocm")]
@@ -144,7 +193,14 @@ impl Session {
             Self::Metal(session) => session.backend.device_identity().device_id(),
         }
     }
-    #[cfg(any(feature = "tensor", feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "tensor",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu",
+        feature = "mlx"
+    ))]
     pub(super) fn block_size(&self) -> u32 {
         match self {
             #[cfg(feature = "rocm")]
@@ -294,7 +350,7 @@ mod graph {
                 (Self::Cuda(memory), Resource::Cuda(resource)) => {
                     memory.transfer_to(resource, offset, bytes)
                 }
-                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
+                #[cfg(all(feature = "rocm", feature = "cuda"))]
                 _ => unreachable!("staging resources are allocated by their entry memory provider"),
             }
         }
@@ -405,7 +461,7 @@ mod graph {
                     .borrow_resource_input_ref(resource, dimensions, scalar_type, pool)
                     .map(InputRef::Cuda)
                     .map_err(PcuExecutionError::from),
-                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
+                #[cfg(all(feature = "rocm", feature = "cuda"))]
                 _ => Err(mismatch()),
             }
         }
@@ -471,7 +527,7 @@ mod graph {
                         .map(DeviceTensor::Cuda)
                         .map_err(PcuExecutionError::from)
                 }
-                #[cfg(any(all(feature = "rocm", feature = "cuda"), feature = "metal"))]
+                #[cfg(all(feature = "rocm", feature = "cuda"))]
                 _ => Err(mismatch()),
             }
         }
@@ -751,7 +807,8 @@ pub(super) fn prepare_tensor<R>(
     feature = "cuda",
     feature = "metal",
     feature = "vulkan",
-    feature = "cpu"
+    feature = "cpu",
+    feature = "mlx"
 ))]
 impl Session {
     pub(super) fn validate_policy(
@@ -879,7 +936,12 @@ fn prepare_candidates<R>(
                 (Provider::Cuda, Session::Cuda(_)) => true,
                 #[cfg(feature = "rocm")]
                 (Provider::Rocm, Session::Rocm(_)) => true,
-                #[cfg(feature = "rocm")]
+                #[cfg(any(
+                    feature = "rocm",
+                    feature = "metal",
+                    feature = "cpu",
+                    feature = "vulkan"
+                ))]
                 _ => false,
             };
             same_provider
@@ -922,14 +984,10 @@ fn prepare_candidates<R>(
             Err(error) => rejected.push((candidate.device, error)),
         }
     }
-    if rejected.is_empty() {
-        Err(PcuExecutionError::BackendFailure(format!(
-            "no compatible resident device: {}",
-            discovery_errors.join("; ")
-        )))
-    } else {
-        Err(PcuExecutionError::NoCompatibleResidentDevice(rejected))
-    }
+    Err(PcuExecutionError::NoCompatibleDevice {
+        rejected,
+        discovery: discovery_errors,
+    })
 }
 
 #[cfg(all(feature = "cuda", feature = "tensor"))]
@@ -941,6 +999,8 @@ fn open_candidate(
 ) -> Result<Session, PcuExecutionError> {
     use super::provider_hosted::Provider;
     match candidate.provider {
+        #[cfg(feature = "mlx")]
+        Provider::Mlx => Err(PcuExecutionError::TensorExecutionUnavailable),
         #[cfg(feature = "metal")]
         Provider::Metal => Err(PcuExecutionError::TensorExecutionUnavailable),
         #[cfg(feature = "vulkan")]
@@ -1041,8 +1101,30 @@ pub(super) fn from_metal_buffer<T: PcuScalar>(
     // Generic PcuDeviceBufferAllocator does not promise initialization; future adapters must
     // establish their own initialized payload before constructing a Ready logical owner.
     let scalar = match T::TYPE {
-        crate::PcuScalarType::U32 => crate::PcuValueType::u32(),
-        crate::PcuScalarType::F32 => crate::PcuValueType::f32(),
+        // These exact representations have qualified Metal storage and transfer paths.
+        // This is transport admission, not a claim that every arithmetic operation exists.
+        crate::PcuScalarType::U8
+        | crate::PcuScalarType::I8
+        | crate::PcuScalarType::U16
+        | crate::PcuScalarType::I16
+        | crate::PcuScalarType::U128
+        | crate::PcuScalarType::I128
+        | crate::PcuScalarType::U256
+        | crate::PcuScalarType::I256
+        | crate::PcuScalarType::U512
+        | crate::PcuScalarType::I512
+        | crate::PcuScalarType::F128
+        | crate::PcuScalarType::F256
+        | crate::PcuScalarType::U32
+        | crate::PcuScalarType::I32
+        | crate::PcuScalarType::U64
+        | crate::PcuScalarType::I64
+        | crate::PcuScalarType::F16
+        | crate::PcuScalarType::BF16
+        | crate::PcuScalarType::F32
+        | crate::PcuScalarType::F64
+        | crate::PcuScalarType::F8E4M3FN
+        | crate::PcuScalarType::F8E5M2 => crate::PcuValueType::Scalar(T::TYPE),
         _ => {
             return Err(PcuExecutionError::BackendFailure(
                 "unsupported Metal resident scalar".into(),
@@ -1062,7 +1144,7 @@ pub(super) fn from_metal_buffer<T: PcuScalar>(
         .map_err(PcuExecutionError::from)?;
     let bytes = buffer
         .len()
-        .checked_mul(4)
+        .checked_mul(T::HOST_SIZE)
         .and_then(|size| u64::try_from(size).ok())
         .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?;
     if buffer.resource().size_bytes() < bytes {

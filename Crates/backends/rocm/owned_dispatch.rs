@@ -10,6 +10,9 @@ use std::{
     fmt,
 };
 
+#[path = "owned_dispatch/fault_law.rs"]
+mod fault_law;
+
 const INLINE_ARGUMENTS: usize = 8;
 const FAULT_WORD_SENTINEL: u64 = u64::MAX;
 const RECOVERED_FAULT_BIT: u64 = 1 << 63;
@@ -26,7 +29,7 @@ const fn validate_batch_fault_semantics(
     Ok(())
 }
 
-fn kernel_uses_checked_arithmetic(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+pub fn kernel_uses_checked_arithmetic(kernel: &PcuDispatchKernelIr<'_>) -> bool {
     ops_use_checked_arithmetic(kernel.ops)
 }
 
@@ -60,12 +63,25 @@ fn ops_use_checked_arithmetic(ops: &[PcuDispatchOp<'_>]) -> bool {
 // faults leave it clear, so `atomicMin` always gives fatal faults priority. Within either
 // class, the smallest logical index wins, and clamp-mode code records only the first
 // recoverable range fault per invocation.
+#[cfg(test)]
 const fn decode_fault_word(word: u64) -> Result<Option<PcuExecutionFault>, HipError> {
+    decode_encoded_fault_word(word, true)
+}
+
+const fn decode_encoded_fault_word(
+    word: u64,
+    scalar_abi: bool,
+) -> Result<Option<PcuExecutionFault>, HipError> {
     if word == FAULT_WORD_SENTINEL {
         return Ok(None);
     }
     let recovered = word & RECOVERED_FAULT_BIT != 0;
     let payload = word & !RECOVERED_FAULT_BIT;
+    // Only the backend's admitted one-dimensional u32 map index is encoded here.
+    // Reject malformed statuses before classifying recovered output as publishable.
+    if scalar_abi && payload >> 3 > 0xffff_ffff {
+        return Err(HipError::InvalidExecutionFaultWord(word));
+    }
     let kind = match payload & 0b111 {
         1 => PcuExecutionFaultKind::DivideByZero,
         2 => PcuExecutionFaultKind::SignedDivisionOverflow,
@@ -89,6 +105,56 @@ const fn decode_fault_word(word: u64) -> Result<Option<PcuExecutionFault>, HipEr
     }))
 }
 
+#[cfg(test)]
+fn decode_fault_word_in_extent(
+    word: u64,
+    extent: u32,
+) -> Result<Option<PcuExecutionFault>, HipError> {
+    match decode_fault_word(word) {
+        Ok(Some(fault)) if !fault.is_within_logical_extent(u64::from(extent)) => {
+            Err(HipError::InvalidExecutionFaultWord(word))
+        }
+        result => result,
+    }
+}
+
+// The raw encoding and actual extent are independent of the operation's fault law.
+// Success has no fault to validate, so the common sentinel path skips the policy check.
+fn decode_fault_word_under_law(
+    word: u64,
+    extent: u64,
+    scalar_abi: bool,
+    law: Option<fault_law::Retained>,
+) -> Result<Option<PcuExecutionFault>, HipError> {
+    match decode_encoded_fault_word(word, scalar_abi) {
+        Ok(Some(fault))
+            if !fault.is_within_logical_extent(extent)
+                || law.is_some_and(|law| !law.accepts(fault)) =>
+        {
+            Err(HipError::InvalidExecutionFaultWord(word))
+        }
+        result => result,
+    }
+}
+
+pub fn checked_scalar_fault_law(
+    kernel: &PcuDispatchKernelIr<'_>,
+) -> Option<PcuCheckedScalarFaultLaw> {
+    fault_law::capture(kernel)
+}
+
+// Cold preparation has already validated the canonical map geometry. A grid's fault
+// index is its logical induction variable, independent of submitted hardware lanes.
+pub const fn checked_fault_extent(kernel: &PcuDispatchKernelIr<'_>) -> u32 {
+    match kernel.ops {
+        [
+            PcuDispatchOp::GridStrideLoop { extent, .. },
+            PcuDispatchOp::Control(fusion_pcu::PcuDispatchControlOp::Return),
+        ] => *extent,
+        _ => kernel.entry.logical_shape[0],
+    }
+}
+
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuBaseContract,
@@ -98,6 +164,7 @@ use fusion_pcu::{
     PcuCompletionOutcome,
     PcuCompletionState,
     PcuExecutionFault,
+    PcuCheckedScalarFaultLaw,
     PcuExecutionFaultKind,
     PcuDeviceIdentity,
     PcuDispatchDataOp,
@@ -541,6 +608,9 @@ impl RocmOwnedDispatchBackend {
             function,
             stream: stream.clone(),
             binding_targets,
+            fault_extent: spec.fault_extent(),
+            scalar_fault_word: false,
+            fault_law: Some(fault_law::Retained::Compound(spec.fault_domain())),
             checked_arithmetic: true,
         })
     }
@@ -586,7 +656,106 @@ impl RocmOwnedDispatchBackend {
             function,
             stream: stream.clone(),
             binding_targets,
+            fault_extent: spec.fault_extent(),
+            scalar_fault_word: false,
+            fault_law: Some(fault_law::Retained::Compound(spec.fault_domain())),
             checked_arithmetic: true,
+        })
+    }
+
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_relu_backward_dispatch(
+        &self,
+        spec: crate::tensor::relu_backward::Profile,
+        stream: &crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
+        }
+        let compiler = self
+            .compiler
+            .ok_or(RocmOwnedDispatchError::CompilerUnavailable)?;
+        let source = spec.source();
+        let image = match crate::compile_hip_source_for_device(&self.runtime, &source) {
+            Ok(image) => image,
+            Err(_) if compiler == crate::discovery::DispatchCompiler::Hipcc => {
+                self.compile_tensor_source(&source)?
+            }
+            Err(error) => return Err(RocmOwnedDispatchError::HipRtc(error)),
+        };
+        let module = self.runtime.load_module(&image)?;
+        let function = module.function(c"fusion_kernel")?;
+        let binding_requirements = spec.requirements().to_vec();
+        let binding_targets = binding_requirements
+            .iter()
+            .map(|requirement| requirement.target)
+            .collect();
+        let shape = fusion_pcu::PcuInvocationShape::invocations(
+            core::num::NonZeroU32::new(spec.count()).expect("profile verifies nonempty output"),
+        );
+        let grid_x = launch_grid(shape.invocation_count().get(), self.block_size)?;
+        Ok(RocmPreparedDispatch {
+            runtime: self.runtime.clone(),
+            device: self.device,
+            binding_requirements,
+            shape,
+            grid_x,
+            block_size: self.block_size,
+            function,
+            stream: stream.clone(),
+            binding_targets,
+            fault_extent: u64::from(shape.invocation_count().get()),
+            scalar_fault_word: true,
+            fault_law: spec.fault_law().map(fault_law::Retained::Scalar),
+            checked_arithmetic: spec.checked(),
+        })
+    }
+
+    #[cfg(feature = "tensor")]
+    pub(crate) fn prepare_strict_mse_dispatch(
+        &self,
+        spec: crate::tensor::strict_mse::Profile,
+        stream: &crate::HipStreamHandle,
+    ) -> Result<RocmPreparedDispatch, RocmOwnedDispatchError> {
+        if !stream.belongs_to_runtime(&self.runtime) {
+            return Err(RocmOwnedDispatchError::Hip(HipError::DifferentRuntime));
+        }
+        let compiler = self
+            .compiler
+            .ok_or(RocmOwnedDispatchError::CompilerUnavailable)?;
+        let source = spec.source();
+        let image = match crate::compile_hip_source_for_device(&self.runtime, &source) {
+            Ok(image) => image,
+            Err(_) if compiler == crate::discovery::DispatchCompiler::Hipcc => {
+                self.compile_tensor_source(&source)?
+            }
+            Err(error) => return Err(RocmOwnedDispatchError::HipRtc(error)),
+        };
+        let module = self.runtime.load_module(&image)?;
+        let function = module.function(c"fusion_kernel")?;
+        let binding_requirements = spec.requirements().to_vec();
+        let binding_targets = binding_requirements
+            .iter()
+            .map(|requirement| requirement.target)
+            .collect();
+        let shape = fusion_pcu::PcuInvocationShape::invocations(
+            core::num::NonZeroU32::new(spec.count()).expect("profile verifies nonempty output"),
+        );
+        let grid_x = launch_grid(shape.invocation_count().get(), self.block_size)?;
+        Ok(RocmPreparedDispatch {
+            runtime: self.runtime.clone(),
+            device: self.device,
+            binding_requirements,
+            shape,
+            grid_x,
+            block_size: self.block_size,
+            function,
+            stream: stream.clone(),
+            binding_targets,
+            fault_extent: spec.fault_extent(),
+            scalar_fault_word: false,
+            fault_law: Some(fault_law::Retained::Compound(spec.fault_domain())),
+            checked_arithmetic: spec.checked(),
         })
     }
 
@@ -626,6 +795,9 @@ impl RocmOwnedDispatchBackend {
         shape: fusion_pcu::PcuInvocationShape,
     ) -> Result<ValidatedDispatch, RocmOwnedDispatchError> {
         let source = lower_dispatch_to_hip_source(&kernel)?;
+        if kernel_uses_checked_arithmetic(&kernel) && checked_scalar_fault_law(&kernel).is_none() {
+            return Err(RocmOwnedDispatchError::UnsupportedRequirements);
+        }
         let logical_invocations = shape.invocation_count().get();
         if kernel.entry.logical_shape != [logical_invocations, 1, 1] {
             return Err(RocmOwnedDispatchError::Lower(
@@ -693,14 +865,23 @@ impl RocmOwnedDispatchBackend {
         };
         let module = self.runtime.load_module(&image)?;
         let function = module.function(c"fusion_kernel")?;
+        let operands = crate::codegen::lower::map_binding_projection(&kernel);
+        let active = |binding: &&fusion_pcu::PcuBinding<'_>| {
+            operands.is_none_or(|schema| {
+                schema.contains_output(binding.reference())
+                    || schema.input_bindings().contains(&binding.reference())
+            })
+        };
         let binding_targets = kernel
             .bindings
             .iter()
+            .filter(active)
             .map(|binding| PcuBindingRef::new(binding.set, binding.binding))
             .collect();
         let binding_requirements = kernel
             .bindings
             .iter()
+            .filter(active)
             .map(|binding| {
                 PcuOwnedBindingRequirement::from_verified_binding(
                     &kernel,
@@ -720,6 +901,9 @@ impl RocmOwnedDispatchBackend {
             function,
             stream,
             binding_targets,
+            fault_extent: u64::from(checked_fault_extent(&kernel)),
+            scalar_fault_word: false,
+            fault_law: checked_scalar_fault_law(&kernel).map(fault_law::Retained::Scalar),
             checked_arithmetic,
         })
     }
@@ -746,6 +930,9 @@ pub struct RocmPreparedDispatch {
     function: crate::HipKernel,
     stream: crate::HipStreamHandle,
     binding_targets: Vec<PcuBindingRef>,
+    fault_extent: u64,
+    scalar_fault_word: bool,
+    fault_law: Option<fault_law::Retained>,
     checked_arithmetic: bool,
 }
 
@@ -965,6 +1152,9 @@ impl RocmPreparedDispatch {
             hip: Some(hip),
             fault_word: fault_word.take(),
             terminal: None,
+            fault_extent: self.fault_extent,
+            scalar_fault_word: self.scalar_fault_word,
+            fault_law: self.fault_law,
         })
     }
 
@@ -1183,6 +1373,9 @@ pub struct RocmCheckedDispatchBatch {
     checked_attempted: bool,
     checked_submitted: bool,
     fault_word: Option<DeviceBuffer>,
+    fault_extent: u64,
+    scalar_fault_word: bool,
+    fault_law: Option<fault_law::Retained>,
 }
 
 impl RocmCheckedDispatchBatch {
@@ -1194,6 +1387,9 @@ impl RocmCheckedDispatchBatch {
             checked_attempted: false,
             checked_submitted: false,
             fault_word: None,
+            fault_extent: 0,
+            scalar_fault_word: true,
+            fault_law: None,
         }
     }
 
@@ -1259,6 +1455,9 @@ impl RocmCheckedDispatchBatch {
             .ok_or(RocmOwnedDispatchError::CheckedBatchFaultWordUnavailable)?;
         dispatch.submit_checked_into_batch(bindings, batch, fault_word)?;
         self.checked_submitted = true;
+        self.fault_extent = dispatch.fault_extent;
+        self.scalar_fault_word = dispatch.scalar_fault_word;
+        self.fault_law = dispatch.fault_law;
         Ok(())
     }
 
@@ -1282,6 +1481,9 @@ impl RocmCheckedDispatchBatch {
             hip: Some(hip),
             fault_word: self.fault_word.take(),
             terminal: None,
+            fault_extent: self.fault_extent,
+            scalar_fault_word: self.scalar_fault_word,
+            fault_law: self.fault_law,
         })
     }
 }
@@ -1291,6 +1493,9 @@ pub struct RocmCheckedBatchCompletion {
     hip: Option<crate::HipBatchCompletion>,
     fault_word: Option<DeviceBuffer>,
     terminal: Option<PcuCompletionOutcome>,
+    fault_extent: u64,
+    scalar_fault_word: bool,
+    fault_law: Option<fault_law::Retained>,
 }
 
 impl RocmCheckedBatchCompletion {
@@ -1317,8 +1522,13 @@ impl RocmCheckedBatchCompletion {
             .ok_or(RocmOwnedDispatchError::CheckedBatchFaultWordUnavailable)?;
         let mut bytes = [0_u8; core::mem::size_of::<u64>()];
         fault_word.copy_to(&mut bytes)?;
-        let outcome = decode_fault_word(u64::from_le_bytes(bytes))?
-            .map_or(PcuCompletionOutcome::Succeeded, PcuCompletionOutcome::Fault);
+        let outcome = decode_fault_word_under_law(
+            u64::from_le_bytes(bytes),
+            self.fault_extent,
+            self.scalar_fault_word,
+            self.fault_law,
+        )?
+        .map_or(PcuCompletionOutcome::Succeeded, PcuCompletionOutcome::Fault);
         self.fault_word.take();
         self.terminal = Some(outcome);
         Ok(outcome)
@@ -1470,6 +1680,9 @@ pub struct RocmOwnedCompletion {
     hip: Option<HipCompletion>,
     fault_word: Option<DeviceBuffer>,
     terminal: Option<PcuCompletionOutcome>,
+    fault_extent: u64,
+    scalar_fault_word: bool,
+    fault_law: Option<fault_law::Retained>,
 }
 
 impl RocmOwnedCompletion {
@@ -1520,8 +1733,13 @@ impl PcuOwnedCompletion for RocmOwnedCompletion {
             let mut bytes = [0_u8; core::mem::size_of::<u64>()];
             fault_word.copy_to(&mut bytes)?;
             let word = u64::from_le_bytes(bytes);
-            decode_fault_word(word)?
-                .map_or(PcuCompletionOutcome::Succeeded, PcuCompletionOutcome::Fault)
+            decode_fault_word_under_law(
+                word,
+                self.fault_extent,
+                self.scalar_fault_word,
+                self.fault_law,
+            )?
+            .map_or(PcuCompletionOutcome::Succeeded, PcuCompletionOutcome::Fault)
         } else {
             PcuCompletionOutcome::Succeeded
         };
@@ -1553,6 +1771,118 @@ fn find_binding<R>(
         .ok_or(PcuOwnedDispatchBindingError::Missing(target))
 }
 
+// Cold typed arithmetic offers are shared by discovery and executor descriptors.
+const fn scalar_alu_support() -> fusion_pcu::PcuDispatchScalarAluSupport {
+    fusion_pcu::PcuDispatchScalarAluSupport::empty()
+        .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
+        .with(
+            fusion_pcu::PcuScalarType::F16,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::BF16,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::F8E4M3FN,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::F8E5M2,
+            PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY),
+        )
+        .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
+        .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
+        .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps())
+        .with(
+            fusion_pcu::PcuScalarType::I128,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::U128,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::I256,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::U256,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::I512,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+        .with(
+            fusion_pcu::PcuScalarType::U512,
+            PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY
+                .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM),
+        )
+}
+
+// Storage transport is independent of arithmetic offers: all 22 sealed byte carriers.
+const fn scalar_storage_caps() -> PcuValueTypeCaps {
+    PcuValueTypeCaps::FLOAT32
+        .union(PcuValueTypeCaps::FLOAT16)
+        .union(PcuValueTypeCaps::BFLOAT16)
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F8E4M3FN,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F8E5M2,
+        ))
+        .union(PcuValueTypeCaps::FLOAT64)
+        .union(PcuValueTypeCaps::INT8)
+        .union(PcuValueTypeCaps::UINT8)
+        .union(PcuValueTypeCaps::UINT16)
+        .union(PcuValueTypeCaps::UINT32)
+        .union(PcuValueTypeCaps::INT32)
+        .union(PcuValueTypeCaps::INT16)
+        .union(PcuValueTypeCaps::UINT64)
+        .union(PcuValueTypeCaps::INT64)
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::I128,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::U128,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::I256,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::U256,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::I512,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::U512,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F128,
+        ))
+        .union(PcuValueTypeCaps::for_scalar(
+            fusion_pcu::PcuScalarType::F256,
+        ))
+        .union(PcuValueTypeCaps::SCALAR_VALUES)
+}
+
 const fn owned_dispatch_support() -> PcuSupport {
     let mut support = PcuSupport::unsupported();
     support.caps = fusion_pcu::PcuCaps::ENUMERATE_EXECUTORS
@@ -1563,22 +1893,8 @@ const fn owned_dispatch_support() -> PcuSupport {
     support.primitive_support = PcuPrimitiveSupport {
         primitives: PcuFeatureSupport::new(PcuPrimitiveCaps::DISPATCH, PcuPrimitiveCaps::empty()),
     };
-    support.value_type_support = PcuFeatureSupport::new(
-        PcuValueTypeCaps::FLOAT32
-            .union(PcuValueTypeCaps::FLOAT16)
-            .union(PcuValueTypeCaps::BFLOAT16)
-            .union(PcuValueTypeCaps::FLOAT64)
-            .union(PcuValueTypeCaps::INT8)
-            .union(PcuValueTypeCaps::UINT8)
-            .union(PcuValueTypeCaps::UINT16)
-            .union(PcuValueTypeCaps::UINT32)
-            .union(PcuValueTypeCaps::INT32)
-            .union(PcuValueTypeCaps::INT16)
-            .union(PcuValueTypeCaps::UINT64)
-            .union(PcuValueTypeCaps::INT64)
-            .union(PcuValueTypeCaps::SCALAR_VALUES),
-        PcuValueTypeCaps::empty(),
-    );
+    support.value_type_support =
+        PcuFeatureSupport::new(scalar_storage_caps(), PcuValueTypeCaps::empty());
     let mut dispatch = PcuDispatchSupport::unsupported();
     dispatch.flags = PcuDispatchPolicyCaps::SERIAL.union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION);
     dispatch.instructions = PcuFeatureSupport::new(
@@ -1597,17 +1913,7 @@ const fn owned_dispatch_support() -> PcuSupport {
         PcuDispatchOpCaps::empty(),
     );
     dispatch.scalar_alu = PcuFeatureSupport::new(
-        fusion_pcu::PcuDispatchScalarAluSupport::empty()
-            .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
+        scalar_alu_support(),
         fusion_pcu::PcuDispatchScalarAluSupport::empty(),
     );
     dispatch.features = PcuFeatureSupport::new(
@@ -1706,31 +2012,9 @@ const OWNED_EXECUTORS: [PcuExecutorDescriptor; 1] = [PcuExecutorDescriptor {
         primitives: PcuPrimitiveCaps::DISPATCH,
         dispatch_policy: PcuDispatchPolicyCaps::SERIAL
             .union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION),
-        value_types: PcuValueTypeCaps::FLOAT32
-            .union(PcuValueTypeCaps::FLOAT16)
-            .union(PcuValueTypeCaps::BFLOAT16)
-            .union(PcuValueTypeCaps::FLOAT64)
-            .union(PcuValueTypeCaps::INT8)
-            .union(PcuValueTypeCaps::UINT8)
-            .union(PcuValueTypeCaps::UINT16)
-            .union(PcuValueTypeCaps::UINT32)
-            .union(PcuValueTypeCaps::INT32)
-            .union(PcuValueTypeCaps::INT16)
-            .union(PcuValueTypeCaps::UINT64)
-            .union(PcuValueTypeCaps::INT64)
-            .union(PcuValueTypeCaps::SCALAR_VALUES),
+        value_types: scalar_storage_caps(),
         dispatch_instructions: OWNED_DISPATCH_INSTRUCTIONS,
-        dispatch_scalar_alu: fusion_pcu::PcuDispatchScalarAluSupport::empty()
-            .with(fusion_pcu::PcuScalarType::F32, f32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::F64, f64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U32, checked_u32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U16, checked_u16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I16, checked_i16_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U8, checked_u8_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I8, checked_i8_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I32, checked_i32_alu_caps())
-            .with(fusion_pcu::PcuScalarType::U64, checked_u64_alu_caps())
-            .with(fusion_pcu::PcuScalarType::I64, checked_i64_alu_caps()),
+        dispatch_scalar_alu: scalar_alu_support(),
         dispatch_features: PcuDispatchFeatureCaps::MUTABLE_RESOURCES
             .union(PcuDispatchFeatureCaps::READ_ONLY_RESOURCES)
             .union(PcuDispatchFeatureCaps::RANGE_CLAMP),
@@ -1852,6 +2136,12 @@ mod tests {
         let completion = RocmCheckedBatchCompletion {
             hip: None,
             fault_word: None,
+            fault_extent: 8,
+            scalar_fault_word: true,
+            fault_law: fusion_pcu::PcuCheckedScalarFaultLaw::integer_div_rem(
+                fusion_pcu::PcuScalarType::I32,
+            )
+            .map(super::fault_law::Retained::Scalar),
             terminal: Some(PcuCompletionOutcome::Fault(PcuExecutionFault {
                 kind: PcuExecutionFaultKind::DivideByZero,
                 invocation_id: 7,
@@ -1981,6 +2271,45 @@ mod tests {
     }
 
     #[test]
+    fn established_status_codes_and_noncanonical_words_are_checked() {
+        use fusion_pcu::PcuExecutionFaultKind;
+        for (code, kind) in [
+            (1, PcuExecutionFaultKind::DivideByZero),
+            (2, PcuExecutionFaultKind::SignedDivisionOverflow),
+            (3, PcuExecutionFaultKind::ArithmeticOverflow),
+        ] {
+            let fault = decode_fault_word((7 << 3) | code).unwrap().unwrap();
+            assert_eq!(
+                (fault.kind, fault.invocation_id, fault.recovered),
+                (kind, 7, false)
+            );
+        }
+        assert_eq!(decode_fault_word(u64::MAX).unwrap(), None);
+        for word in [
+            0,
+            6,
+            7,
+            (1_u64 << 63) | 1,
+            (1_u64 << 63) | 2,
+            (1_u64 << 63) | 5,
+        ] {
+            assert!(decode_fault_word(word).is_err());
+        }
+        // Every admitted checked map is one-dimensional with a u32 logical extent.
+        // Neither fatal nor recovered codes may turn an impossible index into a result.
+        for code in 1..=5 {
+            for recovered in [0, 1_u64 << 63] {
+                let word = ((u64::from(u32::MAX) + 1) << 3) | code | recovered;
+                let result = decode_fault_word(word);
+                assert!(
+                    result.is_err(),
+                    "noncanonical status {word:#x} accepted: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn range_fault_words_decode_recovery_and_fatal_faults_sort_first() {
         for (tag, kind) in [
             (3, PcuExecutionFaultKind::ArithmeticOverflow),
@@ -2066,6 +2395,34 @@ mod tests {
                 .contains(PcuDispatchOpCaps::VALUE_CAST)
         );
         assert!(OWNED_DISPATCH_INSTRUCTIONS.contains(PcuDispatchOpCaps::VALUE_CAST));
+    }
+
+    #[test]
+    fn owned_dispatch_advertises_only_checked_low_float_binary_and_unary() {
+        let expected = PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY);
+        for scalar in [
+            fusion_pcu::PcuScalarType::F16,
+            fusion_pcu::PcuScalarType::BF16,
+            fusion_pcu::PcuScalarType::F8E4M3FN,
+            fusion_pcu::PcuScalarType::F8E5M2,
+        ] {
+            assert_eq!(
+                owned_dispatch_support()
+                    .dispatch_support
+                    .scalar_alu
+                    .direct
+                    .for_scalar(scalar),
+                expected
+            );
+            assert_eq!(
+                OWNED_EXECUTORS[0]
+                    .support
+                    .dispatch_scalar_alu
+                    .for_scalar(scalar),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2206,6 +2563,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: fusion_pcu::PcuKernelId(0xfeed),
             entry: PcuDispatchEntryPoint {
                 name: "checked_float_conversion_caps",
@@ -2309,6 +2667,7 @@ mod tests {
             PcuDispatchOp::Control(PcuDispatchControlOp::Return),
         ];
         let kernel = PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: fusion_pcu::PcuKernelId(0xbeef),
             entry: PcuDispatchEntryPoint {
                 name: "checked_float_binary_caps",
@@ -2496,6 +2855,8 @@ pub use execution::{
     RocmOwnedExecutionOperation,
     RocmOwnedExecutionTwoSlot,
     RocmTwoSlotExecutionStep,
+
+
 };
 
 #[cfg(test)]
@@ -2514,3 +2875,48 @@ mod fault_word;
 #[allow(clippy::redundant_pub_crate)]
 // Keep the state machine internal even if this module is exposed later.
 pub(crate) use fault_word::FaultWordState;
+
+#[cfg(test)]
+mod fault_extent_tests {
+    use super::decode_fault_word;
+    #[test]
+    fn checked_fault_domain_uses_actual_logical_extent() {
+        for extent in [4, 65] {
+            for tag in 1..=5 {
+                assert!(
+                    super::decode_fault_word_in_extent((u64::from(extent - 1) << 3) | tag, extent)
+                        .is_ok()
+                );
+                assert!(
+                    super::decode_fault_word_in_extent((u64::from(extent) << 3) | tag, extent)
+                        .is_err()
+                );
+                assert!(
+                    super::decode_fault_word_in_extent(
+                        ((u64::from(extent) + 7) << 3) | tag,
+                        extent
+                    )
+                    .is_err()
+                );
+            }
+            for tag in [3, 4] {
+                assert!(
+                    super::decode_fault_word_in_extent(
+                        (1 << 63) | (u64::from(extent) << 3) | tag,
+                        extent
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(
+                super::decode_fault_word_in_extent(u64::MAX, extent).unwrap(),
+                None
+            );
+        }
+        assert!(decode_fault_word((u64::from(u32::MAX) << 3) | 3).is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "tensor"))]
+#[path = "owned_dispatch/fault_law_tests.rs"]
+pub mod scalar_fault_law_tests;

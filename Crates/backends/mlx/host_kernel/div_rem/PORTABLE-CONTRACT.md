@@ -1,0 +1,17 @@
+# Bounded MLX PortableV1 joint integer division
+
+This candidate admits only the neutral `describe_portable_v1_integer_div_rem_map` profile: fourteen integer encodings, checked quotient/remainder, Reject, actual unique input roles, bounded direct/grid indexes and zero-index reads. The original numerical tuple remains in the detached plan and offer. Canonical IDs 0x1500..0x150d and role IDs 0x1600..0x160d are distinct from prior Unspecified IDs. Requested-header native source/publication qualification is required before this candidate is recorded as conformance.
+
+## Defined language dependencies
+
+[Apple's Metal Shading Language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf), version 4.1 dated 2026-06-04, sections 2.1 and 3.1, defines uint as a 32-bit unsigned integer, unsigned arithmetic modulo 2^32 and zero-filling unsigned right shifts. Scalar operators exist from Metal 1. Its integral division rules leave zero-divisor and signed MIN/-1 results unspecified; these shaders never issue those native divisions. All shifts here are 1,31, or bit%32, so none depends on out-of-range shift behavior. Unsigned comparison, bitwise Boolean operations and ordinary sequential assignment complete the arithmetic substrate.
+
+The small kernel uses two U32 dividend/divisor/quotient limbs and three remainder limbs. The wide kernel uses L<=16 U32 limbs and L+1 remainder limbs. Restoring division maintains r<divisor before each shift and r<2*divisor immediately after it; the additional remainder limb retains the shifted high bit. Subtraction then restores the invariant. Quotient bits are written once at a bounded limb and bit index. Signed encodings are interpreted through unsigned two's-complement magnitude and unsigned negation. Zero and MIN/-1 are checked before the loop. No native float, native signed division, Int64 ALU, atomics or arrival-order reduction contributes to values or fault selection.
+
+Each logical lane owns its two output locations and status word. Complete status readback scans logical order; any domain fault releases both private results before publication. Resident output replacement, prefix merging and two host reads/checked cleanup precede joint commit. No graph, Clamp division, floating conversion or whole-model reproducibility is admitted by this contract.
+
+The pinned MLX runtime owns and schedules the custom primitive on the retained real stream/session. Its runtime/build/platform requirements still apply; no M4-only numerical gate is invented. Actual M4 tests establish the tested deployment, while defined U32 arithmetic explains the implementation's numeric portability. SDK-internal allocation and JIT remain unobserved.
+
+## Cold capacity costs
+
+The full-capacity constructor primes with two synthetic inputs at the actual mathematical input extents, including two synthetic arrays when runtime inputs are repeated. Logical and physical input payload bytes here are (L+R)*element_width; the exact UInt8/UInt16/U32-limb carrier occupies that same byte extent. Priming also retains Rust host scratch 2*N*element_width, creates private quotient/remainder payload 2*N*element_width and N U32 status words, and temporarily owns synthetic host vectors. This is payload accounting, not a measured peak heap or total native-memory census. Warm absence of adapter constructors, priming, table resolution and real-input uploads does not remove those cold costs. Very large full owners with a tiny read prefix can therefore incur substantial cold priming cost.

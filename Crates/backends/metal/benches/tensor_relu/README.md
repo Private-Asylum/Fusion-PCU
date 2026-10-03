@@ -1,0 +1,7 @@
+# Bounded owned checked ReLU controls
+
+Six checked formats, extents65/4096, three underflow policies and captured genuine `#[pcu]` source/independent Graph/direct native control give108 peers. This backend comparison invokes the actual source's cold capture entry, then retains its assessed program. It does not execute ordinary global owned calls; that fourth peer awaits facade integration.
+
+Every measured call stages fresh exact host bytes, allocates a private checked payload and status, retains resources through terminal completion, scans all faults, publishes one fresh initialized MetalTensorOwner, reads its exact typed prefix and drops it. Shape ownership is retained Rc metadata. The direct native control uses the same unary/pool/initialized-resource ownership boundary without fabricating neutral graph identifiers. Three independent literal finite-bit banks and untouched readback tails surround every independently filtered peer. No native floating instructions or CPU numerical evaluation supply results.
+
+Allocation census is optional and records caller Rust allocations only; Objective-C/device/compiler/driver allocations remain real and excluded. Criterion --test is semantic qualification, without a statistical timing or cost estimate. Graph range remains Reject; no fresh-owner Clamp recovery or Portable graph admission is invented. Backend proof and later ordinary source/owner routing have separate source identities.

@@ -253,7 +253,7 @@ fn multiplication_rounding_is_not_erased_by_fma_and_nonfinite_operands_fail() {
 }
 
 #[test]
-fn binary64_overflow_is_checked_before_cancellation_and_strict_other_compounds_reject() {
+fn binary64_overflow_is_checked_before_cancellation_and_strict_loss_is_supported() {
     let mut graph = Graph::default();
     graph.set_numerical_mode(PcuNumericalMode::Strict);
     let a = graph.constant_typed(Tensor::new([1, 3], vec![f64::MAX; 3]).unwrap());
@@ -271,16 +271,18 @@ fn binary64_overflow_is_checked_before_cancellation_and_strict_other_compounds_r
     let mut graph = Graph::default();
     graph.set_numerical_mode(PcuNumericalMode::Strict);
     let value = graph.constant_typed(Tensor::new([1], vec![1.0_f32]).unwrap());
-    graph
+    let loss = graph
         .mean_squared_error(value.erase(), value.erase())
         .unwrap();
-    assert!(matches!(
-        graph.evaluate(&[]),
-        Err(TensorError::UnsupportedNumericalMode {
-            mode: PcuNumericalMode::Strict,
-            ..
-        })
-    ));
+    assert_eq!(
+        graph
+            .evaluate_checked(&[])
+            .unwrap()
+            .value_typed::<f32>(loss)
+            .unwrap()
+            .data(),
+        &[0.0]
+    );
 }
 
 #[test]

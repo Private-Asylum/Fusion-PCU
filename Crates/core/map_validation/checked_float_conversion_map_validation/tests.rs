@@ -38,6 +38,7 @@ fn binding(slot: u32, value_type: PcuValueType, access: PcuBindingAccess) -> Pcu
 
 fn kernel<'a>(bindings: &'a [PcuBinding<'a>], ops: &'a [Op<'a>]) -> PcuDispatchKernelIr<'a> {
     PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(1),
         entry: PcuDispatchEntryPoint {
             name: "checked-float-convert-map",

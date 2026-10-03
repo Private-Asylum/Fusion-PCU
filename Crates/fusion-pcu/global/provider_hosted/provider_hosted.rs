@@ -9,16 +9,48 @@ use std::ffi::OsString;
     feature = "rocm",
     feature = "cuda",
     feature = "metal",
-    feature = "vulkan"
+    feature = "vulkan",
+    feature = "mlx"
 ))]
 use std::rc::Rc;
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(
+    feature = "cpu",
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "vulkan"
+))]
 use smallvec::SmallVec;
 #[path = "affinity/affinity.rs"]
 mod affinity;
 #[path = "discovery/discovery.rs"]
 mod discovery;
-use affinity::ResidentAffinity;
+#[cfg(feature = "mlx")]
+#[path = "mlx/mlx.rs"]
+mod mlx;
+#[cfg(feature = "mlx")]
+#[rustfmt::skip]
+use mlx::{
+    call_mlx_arguments,
+    collect_mlx_candidates,
+    map_mlx_error,
+    MlxInvocation,
+    MlxInputLayout,
+    MlxOutputLayout,
+    open_mlx,
+};
+#[cfg(feature = "mlx")]
+#[rustfmt::skip]
+use fusion_pcu_mlx::{
+    MlxDiscovery,
+    MlxError,
+    MlxSession,
+};
+#[rustfmt::skip]
+use affinity::{
+    BorrowedAffinity,
+    ResidentAffinity,
+};
 #[cfg(feature = "cpu")]
 #[rustfmt::skip]
 use fusion_pcu_cpu::{
@@ -35,7 +67,7 @@ use fusion_pcu_vulkan::{
     PcuVulkanBackend,
     PcuVulkanDiscovery,
     PcuVulkanError,
-    PcuVulkanPreparedBitMap,
+    PcuVulkanPreparedHost,
 };
 #[cfg(feature = "cuda")]
 #[rustfmt::skip]
@@ -87,8 +119,9 @@ use super::{
 };
 
 #[rustfmt::skip]
-#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "rocm", feature = "cuda", feature = "metal", all(feature = "vulkan", feature = "tensor")))]
 use super::arguments::{
+    finish_resident_writes,
     PcuCallArgumentKind,
     ResidentWriteGuard,
 };
@@ -97,6 +130,8 @@ use super::resident::DeviceArgument;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Provider {
+    #[cfg(feature = "mlx")]
+    Mlx,
     #[cfg(feature = "metal")]
     Metal,
     #[cfg(feature = "cuda")]
@@ -118,6 +153,8 @@ pub(super) struct Candidate {
 
 #[derive(Clone)]
 enum Session {
+    #[cfg(feature = "mlx")]
+    Mlx(Rc<MlxSession>),
     #[cfg(feature = "metal")]
     Metal(Rc<MetalOwnedDispatchBackend>),
     #[cfg(feature = "cuda")]
@@ -132,7 +169,12 @@ enum Session {
     Rocm(Rc<RocmOwnedDispatchBackend>),
 }
 
+// Concrete executors remain inline in the retained cold cache. Boxing for size balance would
+// add ownership indirection without benefiting the statically matched warm submission path.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Prepared {
+    #[cfg(feature = "mlx")]
+    Mlx(MlxInvocation),
     #[cfg(feature = "metal")]
     Metal(MetalPreparedHostKernel),
     #[cfg(feature = "cuda")]
@@ -140,7 +182,9 @@ pub(super) enum Prepared {
     #[cfg(feature = "rocm")]
     Rocm(RocmPreparedHostKernel),
     #[cfg(feature = "vulkan")]
-    Vulkan(PcuVulkanPreparedBitMap),
+    Vulkan(PcuVulkanPreparedHost),
+    #[cfg(all(feature = "vulkan", feature = "tensor"))]
+    VulkanMixed(fusion_pcu_vulkan::PcuVulkanPreparedMixed),
     #[cfg(feature = "cpu")]
     Cpu(PcuCpuPreparedHost),
 }
@@ -148,6 +192,8 @@ pub(super) enum Prepared {
 impl Prepared {
     fn call(&mut self, args: &mut [PcuHostArgument<'_>]) -> Result<(), PcuExecutionError> {
         match self {
+            #[cfg(feature = "mlx")]
+            Self::Mlx(prepared) => prepared.kernel.call(args).map_err(map_mlx_error),
             #[cfg(feature = "metal")]
             Self::Metal(prepared) => prepared.call(args).map_err(map_metal_error),
             #[cfg(feature = "cuda")]
@@ -156,6 +202,10 @@ impl Prepared {
             Self::Rocm(prepared) => prepared.call(args).map_err(map_rocm_error),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(prepared) => prepared.call(args).map_err(map_vulkan_error),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            Self::VulkanMixed(_) => Err(PcuExecutionError::Argument(
+                super::PcuArgumentError::SessionMismatch,
+            )),
             #[cfg(feature = "cpu")]
             Self::Cpu(prepared) => prepared.call(args).map_err(map_cpu_error),
         }
@@ -165,6 +215,8 @@ impl Prepared {
         arguments: [super::arguments::PcuCallArgument<'_>; N],
     ) -> Result<(), PcuExecutionError> {
         match self {
+            #[cfg(feature = "mlx")]
+            Self::Mlx(prepared) => call_mlx_arguments(prepared, arguments),
             #[cfg(feature = "metal")]
             Self::Metal(prepared) => call_metal_arguments(prepared, arguments),
             #[cfg(feature = "cuda")]
@@ -173,6 +225,8 @@ impl Prepared {
             Self::Rocm(prepared) => call_rocm_arguments(prepared, arguments),
             #[cfg(feature = "vulkan")]
             Self::Vulkan(prepared) => call_vulkan_arguments(prepared, arguments),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            Self::VulkanMixed(prepared) => call_vulkan_mixed_arguments(prepared, arguments),
             #[cfg(feature = "cpu")]
             Self::Cpu(prepared) => call_cpu_arguments(prepared, arguments),
         }
@@ -183,6 +237,8 @@ pub(super) struct Preparation {
     policy: PcuExecutionPolicy,
     result: Option<(Session, Prepared)>,
     affinity: Option<ResidentAffinity>,
+    #[cfg(feature = "mlx")]
+    mlx_inputs: MlxInputLayout,
 }
 
 impl Preparation {
@@ -191,16 +247,27 @@ impl Preparation {
             policy,
             result: None,
             affinity: None,
+            #[cfg(feature = "mlx")]
+            mlx_inputs: MlxInputLayout::new(),
         }
     }
-    pub(super) const fn float_underflow_policy(&self) -> crate::PcuFloatUnderflowPolicy {
-        self.policy.float_underflow
-    }
-    pub(super) const fn range_policy(&self) -> crate::PcuRangePolicy {
-        self.policy.range_policy
+    pub(super) const fn numerical_requirements(&self) -> crate::PcuImplementationRequirements {
+        crate::PcuImplementationRequirements {
+            numerical_mode: self.policy.numerical_mode,
+            numerical_options: self.policy.numerical_options,
+            float_underflow: self.policy.float_underflow,
+            range_policy: self.policy.range_policy,
+        }
     }
 
-    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "mlx",
+        feature = "cpu",
+        all(feature = "vulkan", feature = "tensor")
+    ))]
     fn prepare_affinity(
         &mut self,
         kernel: &crate::PcuDispatchKernelIr<'_>,
@@ -208,21 +275,54 @@ impl Preparation {
         let Some(root) = &self.affinity else {
             return Ok(false);
         };
-        affinity::validate(root, self.policy)?;
-        let prepared = root.prepare_host_kernel(kernel)?;
-        self.result = Some((Session::Resident(Rc::clone(root)), prepared));
+        affinity::validate(affinity::borrow(root), self.policy)?;
+        self.result = Some(match root {
+            #[cfg(feature = "cpu")]
+            ResidentAffinity::Cpu => {
+                let session = Session::Cpu(PcuCpuHostBackend::detect());
+                let prepared = prepare_session(
+                    &session,
+                    kernel,
+                    #[cfg(feature = "mlx")]
+                    self.mlx_inputs,
+                )?;
+                (session, prepared)
+            }
+            #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+            ResidentAffinity::Device(root) => (
+                Session::Resident(Rc::clone(root)),
+                root.prepare_host_kernel(kernel)?,
+            ),
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            ResidentAffinity::Vulkan(root) => (
+                Session::Vulkan(Rc::clone(root)),
+                Prepared::VulkanMixed(
+                    root.prepare_mixed_kernel(kernel)
+                        .map_err(map_vulkan_error)?,
+                ),
+            ),
+            #[cfg(feature = "mlx")]
+            ResidentAffinity::Mlx(root) => {
+                let session = Session::Mlx(Rc::new(root.session.clone()));
+                let prepared = prepare_session(&session, kernel, self.mlx_inputs)?;
+                (session, prepared)
+            }
+        });
         Ok(true)
     }
     pub(super) fn prepare(
         &mut self,
         kernel: &crate::PcuDispatchKernelIr<'_>,
     ) -> Result<(), PcuExecutionError> {
-        if self.policy.numerical_options.reproducibility != crate::PcuReproducibility::Unspecified {
-            return Err(PcuExecutionError::UnsupportedNumericalOptions(
-                self.policy.numerical_options,
-            ));
-        }
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        super::numerical::validate_invocation_contract(kernel)?;
+        #[cfg(any(
+            feature = "rocm",
+            feature = "cuda",
+            feature = "metal",
+            feature = "mlx",
+            feature = "cpu",
+            all(feature = "vulkan", feature = "tensor")
+        ))]
         if self.prepare_affinity(kernel)? {
             return Ok(());
         }
@@ -250,7 +350,12 @@ impl Preparation {
                     continue;
                 }
             };
-            let prepared = prepare_session(&session, kernel);
+            let prepared = prepare_session(
+                &session,
+                kernel,
+                #[cfg(feature = "mlx")]
+                self.mlx_inputs,
+            );
             match prepared {
                 Ok(prepared) => {
                     self.result = Some((session, prepared));
@@ -265,9 +370,79 @@ impl Preparation {
 
 struct Entry {
     specialization: TypeId,
+    layout: CallLayout,
     _session: Session,
     affinity: Option<ResidentAffinity>,
     prepared: Prepared,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct CallLayout {
+    #[cfg(feature = "mlx")]
+    mlx_inputs: MlxInputLayout,
+    #[cfg(feature = "mlx")]
+    mlx_outputs: MlxOutputLayout,
+}
+
+impl CallLayout {
+    #[cfg(feature = "mlx")]
+    fn from_arguments<const N: usize>(
+        arguments: &[super::arguments::PcuCallArgument<'_>; N],
+    ) -> Result<Self, PcuExecutionError> {
+        #[cfg(feature = "mlx")]
+        {
+            let mut layout = Self::default();
+            for argument in arguments {
+                match argument.kind() {
+                    super::arguments::PcuCallArgumentKind::MlxRead(input) => {
+                        layout
+                            .mlx_inputs
+                            .record(input.target, input.array.element_count())?;
+                    }
+                    super::arguments::PcuCallArgumentKind::MlxWrite(output) => {
+                        layout
+                            .mlx_inputs
+                            .record_mutable(output.target, output.array.element_count())?;
+                        layout
+                            .mlx_outputs
+                            .record(output.target, output.array.element_count())?;
+                    }
+                    super::arguments::PcuCallArgumentKind::Host(_) => {}
+                    #[cfg(all(feature = "cpu", feature = "tensor"))]
+                    super::arguments::PcuCallArgumentKind::CpuOwner(_) => {}
+                    #[cfg(all(feature = "vulkan", feature = "tensor"))]
+                    super::arguments::PcuCallArgumentKind::VulkanRead(_)
+                    | super::arguments::PcuCallArgumentKind::VulkanWrite(_) => {}
+                    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+                    super::arguments::PcuCallArgumentKind::ResidentRead(_)
+                    | super::arguments::PcuCallArgumentKind::ResidentWrite(_) => {}
+                }
+            }
+            Ok(layout)
+        }
+    }
+
+    #[cfg(feature = "mlx")]
+    fn prepare(
+        self,
+        prepared: &mut Prepared,
+        session: &Session,
+        resident: bool,
+    ) -> Result<(), PcuExecutionError> {
+        match (prepared, session) {
+            (Prepared::Mlx(prepared), Session::Mlx(session)) => {
+                prepared.prepare_outputs(session, self.mlx_outputs, resident)
+            }
+            #[cfg(any(
+                feature = "cpu",
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "vulkan"
+            ))]
+            _ => Ok(()),
+        }
+    }
 }
 #[derive(Default)]
 struct State {
@@ -278,6 +453,8 @@ struct State {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RuntimeRealm {
+    #[cfg(feature = "mlx")]
+    mlx_library: Option<OsString>,
     hip_runtime: Option<OsString>,
     hipcc: Option<OsString>,
     cuda_runtime: Option<OsString>,
@@ -293,6 +470,8 @@ struct RuntimeRealm {
 impl RuntimeRealm {
     fn current() -> Self {
         Self {
+            #[cfg(feature = "mlx")]
+            mlx_library: std::env::var_os("PCU_MLX_LIBRARY"),
             hip_runtime: std::env::var_os("HIP_RUNTIME_LIBRARY"),
             hipcc: std::env::var_os("HIPCC"),
             cuda_runtime: std::env::var_os("CUDA_RUNTIME_LIBRARY"),
@@ -314,15 +493,21 @@ pub(super) fn call_host(
     arguments: &mut [PcuHostArgument<'_>],
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
 ) -> Result<(), PcuExecutionError> {
-    with_entry(site, specialization, None, prepare, |prepared| {
-        prepared.call(arguments)
-    })
+    with_entry(
+        site,
+        specialization,
+        None,
+        CallLayout::default(),
+        prepare,
+        |prepared| prepared.call(arguments),
+    )
 }
 
 fn with_entry<R>(
     site: &PcuHostCallSite,
     specialization: TypeId,
-    affinity: Option<&ResidentAffinity>,
+    affinity: Option<BorrowedAffinity<'_>>,
+    layout: CallLayout,
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
     execute: impl FnOnce(&mut Prepared) -> Result<R, PcuExecutionError>,
 ) -> Result<R, PcuExecutionError> {
@@ -335,9 +520,12 @@ fn with_entry<R>(
             let hint = site.provider_slot.load(Ordering::Relaxed);
             let matches = |entry: &Entry| {
                 entry.specialization == specialization
+                    && entry.layout == layout
                     && match (&entry.affinity, affinity) {
                         (None, None) => true,
-                        (Some(retained), Some(requested)) => affinity::same(retained, requested),
+                        (Some(retained), Some(requested)) => {
+                            affinity::same(affinity::borrow(retained), requested)
+                        }
                         _ => false,
                     }
             };
@@ -377,13 +565,21 @@ fn with_entry<R>(
                 shared: Some(Preparation::new(policy)),
             };
             if let Some(preparation) = context.shared.as_mut() {
-                preparation.affinity = affinity.cloned();
+                preparation.affinity = affinity.map(affinity::retain);
+                #[cfg(feature = "mlx")]
+                {
+                    preparation.mlx_inputs = layout.mlx_inputs;
+                }
             }
             prepare(&mut context)?;
             let (session, prepared) = context
                 .shared
                 .and_then(|mut context| context.result.take())
                 .ok_or(PcuExecutionError::PreparationDidNotProduceKernel)?;
+            #[cfg(feature = "mlx")]
+            let mut prepared = prepared;
+            #[cfg(feature = "mlx")]
+            layout.prepare(&mut prepared, &session, affinity.is_some())?;
             if policy.cache_capacity == 0 {
                 let mut prepared = prepared;
                 return execute(&mut prepared);
@@ -392,16 +588,18 @@ fn with_entry<R>(
                 let victim = hint.min(state.entries.len() - 1);
                 state.entries[victim] = Entry {
                     specialization,
+                    layout,
                     _session: session,
-                    affinity: affinity.cloned(),
+                    affinity: affinity.map(affinity::retain),
                     prepared,
                 };
                 victim
             } else {
                 state.entries.push(Entry {
                     specialization,
+                    layout,
                     _session: session,
-                    affinity: affinity.cloned(),
+                    affinity: affinity.map(affinity::retain),
                     prepared,
                 });
                 state.entries.len() - 1
@@ -432,9 +630,18 @@ pub(super) fn call_arguments<const N: usize>(
     prepare: impl FnOnce(&mut PcuHostPreparation) -> Result<(), PcuExecutionError>,
 ) -> Result<(), PcuExecutionError> {
     let affinity = affinity::from_arguments(&arguments)?;
-    with_entry(site, specialization, affinity, prepare, |prepared| {
-        prepared.call_arguments(arguments)
-    })
+    #[cfg(feature = "mlx")]
+    let layout = CallLayout::from_arguments(&arguments)?;
+    #[cfg(not(feature = "mlx"))]
+    let layout = CallLayout::default();
+    with_entry(
+        site,
+        specialization,
+        affinity,
+        layout,
+        prepare,
+        |prepared| prepared.call_arguments(arguments),
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -458,6 +665,8 @@ fn map_rocm_error(error: RocmHostKernelError) -> PcuExecutionError {
 
 const fn provider_id(provider: Provider) -> u32 {
     match provider {
+        #[cfg(feature = "mlx")]
+        Provider::Mlx => 0x4d4c_5831,
         #[cfg(feature = "cuda")]
         Provider::Cuda => 0x4355_4441,
         #[cfg(feature = "metal")]
@@ -633,6 +842,10 @@ mod tests {
             ..PcuExecutionPolicy::default()
         });
         let kernel = crate::PcuDispatchKernelIr {
+            numerical_requirements: crate::PcuImplementationRequirements {
+                numerical_options: options,
+                ..crate::PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+            },
             id: crate::PcuKernelId(1),
             entry: crate::PcuDispatchEntryPoint {
                 name: "portable_probe",
@@ -764,11 +977,17 @@ fn call_metal_arguments<'a, const N: usize>(
 ) -> Result<(), PcuExecutionError> {
     let mut guards: [Option<ResidentWriteGuard<'a>>; N] = core::array::from_fn(|_| None);
 
-    let mut bindings: SmallVec<[fusion_pcu_metal::MetalMixedHostArgument<'_>; 8]> = SmallVec::new();
+    let mut bindings: SmallVec<[fusion_pcu_metal::MetalMixedHostArgument<'_>; N]> = SmallVec::new();
     for (index, argument) in arguments.into_iter().enumerate() {
         let (_, kind) = argument.into_parts();
         let binding = match kind {
             PcuCallArgumentKind::Host(host) => fusion_pcu_metal::MetalMixedHostArgument::Host(host),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            PcuCallArgumentKind::CpuOwner(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
             PcuCallArgumentKind::ResidentRead(resident) => {
                 #[allow(irrefutable_let_patterns)]
                 let DeviceArgument::Metal(argument) = resident.argument else {
@@ -788,23 +1007,32 @@ fn call_metal_arguments<'a, const N: usize>(
                 guards[index] = Some(resident.guard);
                 fusion_pcu_metal::MetalMixedHostArgument::Resident(argument)
             }
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            PcuCallArgumentKind::VulkanRead(_) | PcuCallArgumentKind::VulkanWrite(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
+            #[cfg(feature = "mlx")]
+            PcuCallArgumentKind::MlxRead(_) | PcuCallArgumentKind::MlxWrite(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
         };
         bindings.push(binding);
     }
     for guard in guards.iter_mut().flatten() {
         guard.mark_may_have_written();
     }
-    let result = prepared.call_mixed(&mut bindings);
-    if result.is_ok() {
-        for guard in guards.iter_mut().flatten() {
-            guard.mark_complete();
-        }
-    } else if !prepared.last_call_completion_uncertain() {
-        for guard in guards.iter_mut().flatten() {
-            guard.mark_known_partial();
-        }
-    }
-    result.map_err(map_metal_error)
+    let result = prepared.call_mixed(&mut bindings).map_err(map_metal_error);
+    finish_resident_writes(
+        &mut guards,
+        prepared.last_call_may_have_written(),
+        prepared.last_call_completion_uncertain(),
+        &result,
+    );
+    result
 }
 
 #[cfg(feature = "cuda")]
@@ -814,11 +1042,17 @@ fn call_cuda_arguments<'a, const N: usize>(
 ) -> Result<(), PcuExecutionError> {
     let mut guards: [Option<ResidentWriteGuard<'a>>; N] = core::array::from_fn(|_| None);
 
-    let mut bindings: SmallVec<[fusion_pcu_cuda::CudaMixedHostArgument<'_>; 8]> = SmallVec::new();
+    let mut bindings: SmallVec<[fusion_pcu_cuda::CudaMixedHostArgument<'_>; N]> = SmallVec::new();
     for (index, argument) in arguments.into_iter().enumerate() {
         let (_, kind) = argument.into_parts();
         let binding = match kind {
             PcuCallArgumentKind::Host(host) => fusion_pcu_cuda::CudaMixedHostArgument::Host(host),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            PcuCallArgumentKind::CpuOwner(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
             PcuCallArgumentKind::ResidentRead(resident) => {
                 #[allow(irrefutable_let_patterns)]
                 let DeviceArgument::Cuda(argument) = resident.argument else {
@@ -838,23 +1072,32 @@ fn call_cuda_arguments<'a, const N: usize>(
                 guards[index] = Some(resident.guard);
                 fusion_pcu_cuda::CudaMixedHostArgument::Resident(argument)
             }
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            PcuCallArgumentKind::VulkanRead(_) | PcuCallArgumentKind::VulkanWrite(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
+            #[cfg(feature = "mlx")]
+            PcuCallArgumentKind::MlxRead(_) | PcuCallArgumentKind::MlxWrite(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
         };
         bindings.push(binding);
     }
     for guard in guards.iter_mut().flatten() {
         guard.mark_may_have_written();
     }
-    let result = prepared.call_mixed(&mut bindings);
-    if result.is_ok() {
-        for guard in guards.iter_mut().flatten() {
-            guard.mark_complete();
-        }
-    } else if !prepared.last_call_completion_uncertain() {
-        for guard in guards.iter_mut().flatten() {
-            guard.mark_known_partial();
-        }
-    }
-    result.map_err(map_cuda_error)
+    let result = prepared.call_mixed(&mut bindings).map_err(map_cuda_error);
+    finish_resident_writes(
+        &mut guards,
+        prepared.last_call_may_have_written(),
+        prepared.last_call_completion_uncertain(),
+        &result,
+    );
+    result
 }
 
 #[cfg(feature = "rocm")]
@@ -864,11 +1107,17 @@ fn call_rocm_arguments<'a, const N: usize>(
 ) -> Result<(), PcuExecutionError> {
     let mut guards: [Option<ResidentWriteGuard<'a>>; N] = core::array::from_fn(|_| None);
 
-    let mut bindings: SmallVec<[fusion_pcu_rocm::RocmMixedHostArgument<'_>; 8]> = SmallVec::new();
+    let mut bindings: SmallVec<[fusion_pcu_rocm::RocmMixedHostArgument<'_>; N]> = SmallVec::new();
     for (index, argument) in arguments.into_iter().enumerate() {
         let (_, kind) = argument.into_parts();
         let binding = match kind {
             PcuCallArgumentKind::Host(host) => fusion_pcu_rocm::RocmMixedHostArgument::Host(host),
+            #[cfg(all(feature = "cpu", feature = "tensor"))]
+            PcuCallArgumentKind::CpuOwner(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
             PcuCallArgumentKind::ResidentRead(resident) => {
                 #[allow(irrefutable_let_patterns)]
                 let DeviceArgument::Rocm(argument) = resident.argument else {
@@ -888,30 +1137,42 @@ fn call_rocm_arguments<'a, const N: usize>(
                 guards[index] = Some(resident.guard);
                 fusion_pcu_rocm::RocmMixedHostArgument::Resident(argument)
             }
+            #[cfg(all(feature = "vulkan", feature = "tensor"))]
+            PcuCallArgumentKind::VulkanRead(_) | PcuCallArgumentKind::VulkanWrite(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
+            #[cfg(feature = "mlx")]
+            PcuCallArgumentKind::MlxRead(_) | PcuCallArgumentKind::MlxWrite(_) => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
         };
         bindings.push(binding);
     }
     for guard in guards.iter_mut().flatten() {
         guard.mark_may_have_written();
     }
-    let result = prepared.call_mixed(&mut bindings);
-    if result.is_ok() {
-        for guard in guards.iter_mut().flatten() {
-            guard.mark_complete();
-        }
-    } else if !prepared.last_call_completion_uncertain() {
-        for guard in guards.iter_mut().flatten() {
-            guard.mark_known_partial();
-        }
-    }
-    result.map_err(map_rocm_error)
+    let result = prepared.call_mixed(&mut bindings).map_err(map_rocm_error);
+    finish_resident_writes(
+        &mut guards,
+        prepared.last_call_may_have_written(),
+        prepared.last_call_completion_uncertain(),
+        &result,
+    );
+    result
 }
 
 fn prepare_session(
     session: &Session,
     kernel: &crate::PcuDispatchKernelIr<'_>,
+    #[cfg(feature = "mlx")] inputs: MlxInputLayout,
 ) -> Result<Prepared, PcuExecutionError> {
     match session {
+        #[cfg(feature = "mlx")]
+        Session::Mlx(backend) => MlxInvocation::prepare(backend, kernel, inputs).map(Prepared::Mlx),
         #[cfg(feature = "metal")]
         Session::Metal(backend) => backend
             .prepare_host_kernel(kernel)
@@ -955,7 +1216,7 @@ fn rejected_candidates(
     if rejected.is_empty() && discovery.is_empty() {
         return PcuExecutionError::NoBackendEnabled;
     }
-    PcuExecutionError::NoCompatibleInvocationDevice {
+    PcuExecutionError::NoCompatibleDevice {
         rejected,
         discovery,
     }
@@ -1041,12 +1302,12 @@ fn collect_vulkan_candidates(
 
 #[cfg(feature = "vulkan")]
 fn call_vulkan_arguments<const N: usize>(
-    prepared: &mut PcuVulkanPreparedBitMap,
+    prepared: &mut PcuVulkanPreparedHost,
     arguments: [super::arguments::PcuCallArgument<'_>; N],
 ) -> Result<(), PcuExecutionError> {
-    // This profile admits exactly two host bindings. A fixed stack array adds no warm heap work.
+    // Frozen unary, binary and paired-output profiles keep host bindings on the stack.
     // Other providers' resident arguments are never silently read back or reinterpreted.
-    if N != 2 {
+    if N != prepared.argument_count() {
         return Err(PcuExecutionError::VulkanExecution(
             PcuVulkanError::InvalidArguments,
         ));
@@ -1061,14 +1322,36 @@ fn call_vulkan_arguments<const N: usize>(
         .1
     {
         super::arguments::PcuCallArgumentKind::Host(argument) => Ok(argument),
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        #[cfg(all(feature = "cpu", feature = "tensor"))]
+        super::arguments::PcuCallArgumentKind::CpuOwner(_) => Err(PcuExecutionError::Argument(
+            super::PcuArgumentError::SessionMismatch,
+        )),
+        #[cfg(any(
+            feature = "rocm",
+            feature = "cuda",
+            feature = "metal",
+            feature = "mlx",
+            all(feature = "vulkan", feature = "tensor")
+        ))]
         _ => Err(PcuExecutionError::Argument(
             super::PcuArgumentError::SessionMismatch,
         )),
     };
-    prepared
-        .call(&mut [host()?, host()?])
-        .map_err(map_vulkan_error)
+    match prepared.argument_count() {
+        2 => prepared.call(&mut [host()?, host()?]),
+        3 => prepared.call(&mut [host()?, host()?, host()?]),
+        4 => prepared.call(&mut [host()?, host()?, host()?, host()?]),
+        _ => {
+            // Authored arity is a compile-time stack capacity, not a universal
+            // backend argument limit. Exact count was checked before conversion.
+            let mut bindings: SmallVec<[crate::PcuHostArgument<'_>; N]> = SmallVec::new();
+            for _ in 0..N {
+                bindings.push(host()?);
+            }
+            prepared.call(&mut bindings)
+        }
+    }
+    .map_err(map_vulkan_error)
 }
 
 #[cfg(feature = "cpu")]
@@ -1130,11 +1413,7 @@ fn call_cpu_arguments<const N: usize>(
     prepared: &mut PcuCpuPreparedHost,
     arguments: [super::arguments::PcuCallArgument<'_>; N],
 ) -> Result<(), PcuExecutionError> {
-    let expected = if matches!(prepared, PcuCpuPreparedHost::Neg(_)) {
-        2
-    } else {
-        3
-    };
+    let expected = prepared.argument_count();
     if N != expected {
         return Err(PcuExecutionError::CpuExecution(PcuCpuHostError::Arguments(
             PcuCpuHostArgumentError::Count {
@@ -1156,16 +1435,78 @@ fn call_cpu_arguments<const N: usize>(
         .1
     {
         super::arguments::PcuCallArgumentKind::Host(argument) => Ok(argument),
-        #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+        #[cfg(all(feature = "cpu", feature = "tensor"))]
+        super::arguments::PcuCallArgumentKind::CpuOwner(argument) => Ok(argument),
+        #[cfg(any(
+            feature = "rocm",
+            feature = "cuda",
+            feature = "metal",
+            feature = "mlx",
+            all(feature = "vulkan", feature = "tensor")
+        ))]
         _ => Err(PcuExecutionError::Argument(
             super::PcuArgumentError::SessionMismatch,
         )),
     };
     // Profile counts are frozen at preparation. Arguments stay on the stack at warm submission.
-    if expected == 2 {
-        prepared.call(&mut [host()?, host()?])
-    } else {
-        prepared.call(&mut [host()?, host()?, host()?])
+    match expected {
+        2 => prepared.call(&mut [host()?, host()?]),
+        3 => prepared.call(&mut [host()?, host()?, host()?]),
+        4 => prepared.call(&mut [host()?, host()?, host()?, host()?]),
+        _ => {
+            let mut bindings: SmallVec<[crate::PcuHostArgument<'_>; N]> = SmallVec::new();
+            for _ in 0..N {
+                bindings.push(host()?);
+            }
+            prepared.call(&mut bindings)
+        }
     }
     .map_err(map_cpu_error)
+}
+
+#[cfg(all(feature = "vulkan", feature = "tensor"))]
+fn call_vulkan_mixed_arguments<'a, const N: usize>(
+    prepared: &mut fusion_pcu_vulkan::PcuVulkanPreparedMixed,
+    arguments: [super::arguments::PcuCallArgument<'a>; N],
+) -> Result<(), PcuExecutionError> {
+    if N != prepared.argument_count() {
+        return Err(PcuExecutionError::VulkanExecution(
+            PcuVulkanError::InvalidArguments,
+        ));
+    }
+    let mut guards: [Option<ResidentWriteGuard<'a>>; N] = core::array::from_fn(|_| None);
+    let mut bindings: SmallVec<[fusion_pcu_vulkan::PcuVulkanArgument<'a>; N]> = SmallVec::new();
+    for (index, argument) in arguments.into_iter().enumerate() {
+        let binding = match argument.into_parts().1 {
+            PcuCallArgumentKind::Host(host) => fusion_pcu_vulkan::PcuVulkanArgument::host(host),
+            PcuCallArgumentKind::VulkanRead(resident) => resident.argument,
+            PcuCallArgumentKind::VulkanWrite(resident) => {
+                guards[index] = Some(resident.guard);
+                resident.argument
+            }
+            #[cfg(any(
+                feature = "cpu",
+                feature = "rocm",
+                feature = "cuda",
+                feature = "metal",
+                feature = "mlx"
+            ))]
+            _ => {
+                return Err(PcuExecutionError::Argument(
+                    super::PcuArgumentError::SessionMismatch,
+                ));
+            }
+        };
+        bindings.push(binding);
+    }
+    // Guards remain NotSubmitted through conversion/preflight/private arithmetic. The backend's
+    // explicit publication/quiescence report decides logical validity after the entire call.
+    let result = prepared.call(&mut bindings).map_err(map_vulkan_error);
+    finish_resident_writes(
+        &mut guards,
+        prepared.last_call_may_have_written(),
+        prepared.last_call_completion_uncertain(),
+        &result,
+    );
+    result
 }

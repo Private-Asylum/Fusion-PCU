@@ -549,6 +549,8 @@ impl Api {
             census.matmuls += 1;
             cell.set(census);
         });
+        #[cfg(feature = "allocation-census")]
+        super::census::lt_matmul();
         let code = unsafe {
             (self.matmul)(
                 handle,

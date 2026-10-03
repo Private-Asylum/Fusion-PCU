@@ -1,6 +1,49 @@
 //! Typed prepared host calls for the exact bit-map Vulkan implementation.
 
 use std::rc::Rc;
+#[path = "composed/composed.rs"]
+mod composed;
+pub use composed::PcuVulkanPreparedComposed;
+#[path = "ordered_transport/ordered_transport.rs"]
+mod ordered_transport;
+pub use ordered_transport::PcuVulkanPreparedOrderedTransport;
+#[path = "mixed/mixed.rs"]
+mod mixed;
+pub use mixed::PcuVulkanPreparedMixed;
+#[path = "binary/binary.rs"]
+mod binary;
+#[rustfmt::skip]
+pub use binary::{
+    PcuVulkanPreparedBinary,
+    PcuVulkanBinaryMemoryRealizations,
+};
+#[path = "div_rem/div_rem.rs"]
+mod div_rem;
+#[path = "integer/integer.rs"]
+mod integer;
+#[rustfmt::skip]
+pub use div_rem::{
+    PcuVulkanPreparedDivRem,
+    PcuVulkanDivRemMemoryRealizations,
+};
+#[rustfmt::skip]
+pub use integer::{
+    PcuVulkanPreparedInteger,
+    PcuVulkanIntegerMemoryRealizations,
+};
+#[path = "conversion/conversion.rs"]
+mod conversion;
+#[path = "unary/unary.rs"]
+mod unary;
+pub use conversion::PcuVulkanPreparedConversion;
+#[rustfmt::skip]
+pub use unary::{
+    PcuVulkanPreparedUnary,
+    PcuVulkanPreparedUnaryRoles,
+};
+#[path = "scalar_transport/scalar_transport.rs"]
+mod scalar_transport;
+pub use scalar_transport::PcuVulkanPreparedScalarTransport;
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuBindingAccess,
@@ -9,25 +52,166 @@ use fusion_pcu::{
     PcuHostKernelBackend,
     PcuPreparedHostKernel,
     PcuScalarType,
+    PcuDispatchOp,
+    PcuDispatchDataOp,
 };
 #[rustfmt::skip]
 use fusion_pcu_spirv::{
+    lower_scalar_transport_to_spirv,
+    validate_scalar_transport_map,
     lower_float_bit_map_to_spirv,
+    validate_checked_float_unary_map,
+    validate_checked_float_conversion_map,
+    lower_checked_float_conversion_to_spirv,
+    lower_checked_float_unary_to_spirv,
     PcuSpirvCapabilityCaps,
     validate_float_bit_map,
     PcuSpirvBitMapProfile,
     PcuSpirvFixedSink,
     PcuSpirvLoweringOptions,
     PcuSpirvVersion,
+    validate_checked_float_binary_map,
+    lower_checked_float_binary_to_spirv,
+    validate_checked_integer_map,
+    validate_checked_div_rem_map,
+    lower_checked_div_rem_to_spirv,
+    lower_checked_integer_to_spirv,
 };
 #[rustfmt::skip]
 use crate::{
     ffi::VulkanPreparedBitMap,
+    ffi::VulkanPreparedBinary,
+    ffi::VulkanPreparedInteger,
+    ffi::VulkanPreparedDivRem,
+    ffi::VulkanPreparedUnary,
+    ffi::VulkanPreparedConversion,
+    ffi::VulkanPreparedScalarTransport,
     PcuVulkanBackend,
     PcuVulkanError,
     PcuVulkanMemoryRealization,
     PcuVulkanCallMeasurements,
+    PcuVulkanComposedMemoryRealizations,
 };
+
+/// Detached prepared host executable with its frozen typed declaration schema.
+pub enum PcuVulkanPreparedHost {
+    BitMap(PcuVulkanPreparedBitMap),
+    Binary(PcuVulkanPreparedBinary),
+    Integer(PcuVulkanPreparedInteger),
+    DivRem(PcuVulkanPreparedDivRem),
+    Unary(PcuVulkanPreparedUnary),
+    UnaryRoles(PcuVulkanPreparedUnaryRoles),
+    Conversion(PcuVulkanPreparedConversion),
+    ScalarTransport(PcuVulkanPreparedScalarTransport),
+    // Constructed once cold; keep other prepared variants at their existing stack size.
+    Composed(Box<PcuVulkanPreparedComposed>),
+    OrderedTransport(Box<PcuVulkanPreparedOrderedTransport>),
+}
+
+/// Actual allocation metadata for each private native buffer in schema order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcuVulkanPreparedMemoryRealizations {
+    BitMap([PcuVulkanMemoryRealization; 3]),
+    Binary(PcuVulkanBinaryMemoryRealizations),
+    Integer(PcuVulkanIntegerMemoryRealizations),
+    DivRem(PcuVulkanDivRemMemoryRealizations),
+    Unary([PcuVulkanMemoryRealization; 3]),
+    Conversion([PcuVulkanMemoryRealization; 3]),
+    ScalarTransport([PcuVulkanMemoryRealization; 2]),
+    Composed(PcuVulkanComposedMemoryRealizations),
+    OrderedTransport(PcuVulkanComposedMemoryRealizations),
+}
+
+impl PcuVulkanPreparedHost {
+    #[must_use]
+    pub const fn argument_count(&self) -> usize {
+        match self {
+            Self::BitMap(_) | Self::Unary(_) | Self::Conversion(_) | Self::ScalarTransport(_) => 2,
+            Self::UnaryRoles(plan) => plan.argument_count(),
+            Self::Binary(plan) => plan.profile.declaration_count,
+            Self::Integer(plan) => plan.profile.declaration_count,
+            Self::DivRem(plan) => plan.profile.declaration_count,
+            Self::Composed(plan) => plan.profile().declarations().len(),
+            Self::OrderedTransport(plan) => plan.argument_count(),
+        }
+    }
+
+    #[must_use]
+    pub fn memory_realizations(&self) -> Option<PcuVulkanPreparedMemoryRealizations> {
+        match self {
+            Self::BitMap(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::BitMap),
+            Self::Unary(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::Unary),
+            Self::UnaryRoles(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::Unary),
+            Self::Conversion(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::Conversion),
+            Self::ScalarTransport(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::ScalarTransport),
+            Self::Binary(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::Binary),
+            Self::Integer(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::Integer),
+            Self::DivRem(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::DivRem),
+            Self::Composed(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::Composed),
+            Self::OrderedTransport(map) => map
+                .memory_realizations()
+                .map(PcuVulkanPreparedMemoryRealizations::OrderedTransport),
+        }
+    }
+
+    /// Measures one complete prepared native call.
+    ///
+    /// # Errors
+    /// Returns argument, numerical or native errors from the frozen executable.
+    pub fn call_profiled(
+        &mut self,
+        arguments: &mut [PcuHostArgument<'_>],
+    ) -> Result<PcuVulkanCallMeasurements, PcuVulkanError> {
+        match self {
+            Self::BitMap(map) => map.call_profiled(arguments),
+            Self::Binary(map) => map.call_profiled(arguments),
+            Self::Integer(map) => map.call_profiled(arguments),
+            Self::DivRem(map) => map.call_profiled(arguments),
+            Self::Unary(map) => map.call_profiled(arguments),
+            Self::UnaryRoles(map) => map.call_profiled(arguments),
+            Self::Conversion(map) => map.call_profiled(arguments),
+            Self::ScalarTransport(map) => map.call_profiled(arguments),
+            Self::Composed(map) => map.call_profiled(arguments),
+            Self::OrderedTransport(map) => map.call_profiled(arguments),
+        }
+    }
+}
+
+impl PcuPreparedHostKernel for PcuVulkanPreparedHost {
+    type Error = PcuVulkanError;
+    fn call(&mut self, arguments: &mut [PcuHostArgument<'_>]) -> Result<(), Self::Error> {
+        match self {
+            Self::BitMap(map) => map.call(arguments),
+            Self::Binary(map) => map.call(arguments),
+            Self::Integer(map) => map.call(arguments),
+            Self::DivRem(map) => map.call(arguments),
+            Self::Unary(map) => map.call(arguments),
+            Self::UnaryRoles(map) => map.call(arguments),
+            Self::Conversion(map) => map.call(arguments),
+            Self::ScalarTransport(map) => map.call(arguments),
+            Self::Composed(map) => map.call(arguments),
+            Self::OrderedTransport(map) => map.call(arguments),
+        }
+    }
+}
 
 /// Reusable exact F32/F64 Copy/checked Neg executable. Owns native storage and a retained session.
 pub struct PcuVulkanPreparedBitMap {
@@ -85,7 +269,7 @@ impl PcuVulkanPreparedBitMap {
 }
 
 impl PcuHostKernelBackend for PcuVulkanBackend {
-    type Prepared = PcuVulkanPreparedBitMap;
+    type Prepared = PcuVulkanPreparedHost;
     type Error = PcuVulkanError;
 
     fn prepare_host_kernel(
@@ -94,6 +278,36 @@ impl PcuHostKernelBackend for PcuVulkanBackend {
     ) -> Result<Self::Prepared, Self::Error> {
         if cfg!(target_endian = "big") {
             return Err(PcuVulkanError::UnsupportedPreparedProfile);
+        }
+        let operations = scalar_body(kernel);
+        if let Some(prepared) = self.prepare_integer_operation(operations, kernel) {
+            return prepared;
+        }
+        if PcuVulkanPreparedComposed::admitted_profile(kernel).is_some() {
+            return PcuVulkanPreparedComposed::prepare(self, kernel)
+                .map(|plan| PcuVulkanPreparedHost::Composed(Box::new(plan)));
+        }
+        if let Some(prepared) = self.prepare_checked_float_operation(operations, kernel) {
+            return prepared;
+        }
+        if let Ok(profile) = validate_scalar_transport_map(kernel) {
+            self.device.validate_scalar_transport_geometry(profile)?;
+            let mut words = Vec::new();
+            let (_, profile) = lower_scalar_transport_to_spirv(
+                kernel,
+                PcuSpirvLoweringOptions::minimal_shader(),
+                &mut words,
+            )
+            .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+            let native =
+                VulkanPreparedScalarTransport::new(Rc::clone(&self.device), &words, profile)?;
+            return Ok(PcuVulkanPreparedHost::ScalarTransport(
+                PcuVulkanPreparedScalarTransport { native, profile },
+            ));
+        }
+        if PcuVulkanPreparedOrderedTransport::admitted_profile(kernel).is_some() {
+            return PcuVulkanPreparedOrderedTransport::prepare(self, kernel)
+                .map(|plan| PcuVulkanPreparedHost::OrderedTransport(Box::new(plan)));
         }
         let admitted = validate_float_bit_map(kernel)
             .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
@@ -118,7 +332,77 @@ impl PcuHostKernelBackend for PcuVulkanBackend {
         )
         .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
         let native = VulkanPreparedBitMap::new(Rc::clone(&self.device), sink.as_slice(), profile)?;
-        Ok(PcuVulkanPreparedBitMap { native, profile })
+        Ok(PcuVulkanPreparedHost::BitMap(PcuVulkanPreparedBitMap {
+            native,
+            profile,
+        }))
+    }
+}
+
+const fn scalar_body<'a>(kernel: &PcuDispatchKernelIr<'a>) -> &'a [PcuDispatchOp<'a>] {
+    if let [PcuDispatchOp::GridStrideLoop { body, .. }, _] = kernel.ops {
+        body
+    } else {
+        kernel.ops
+    }
+}
+
+impl PcuVulkanBackend {
+    fn prepare_integer_operation(
+        &self,
+        operations: &[PcuDispatchOp<'_>],
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Option<Result<PcuVulkanPreparedHost, PcuVulkanError>> {
+        operations.iter().find_map(|op| match op {
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedDivRem { .. }) => {
+                Some(self.prepare_div_rem(kernel))
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary { .. }) => {
+                Some(self.prepare_integer(kernel))
+            }
+            _ => None,
+        })
+    }
+    fn prepare_integer(
+        &self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<PcuVulkanPreparedHost, PcuVulkanError> {
+        let profile = validate_checked_integer_map(kernel)
+            .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        self.device.validate_integer_geometry(profile)?;
+        let mut words = Vec::new();
+        let (_, profile) = lower_checked_integer_to_spirv(
+            kernel,
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut words,
+        )
+        .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        let native = VulkanPreparedInteger::new(Rc::clone(&self.device), &words, profile)?;
+        Ok(PcuVulkanPreparedHost::Integer(PcuVulkanPreparedInteger {
+            native,
+            profile,
+        }))
+    }
+
+    fn prepare_div_rem(
+        &self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<PcuVulkanPreparedHost, PcuVulkanError> {
+        let profile = validate_checked_div_rem_map(kernel)
+            .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        self.device.validate_div_rem_geometry(profile)?;
+        let mut words = Vec::new();
+        let (_, profile) = lower_checked_div_rem_to_spirv(
+            kernel,
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut words,
+        )
+        .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        let native = VulkanPreparedDivRem::new(Rc::clone(&self.device), &words, profile)?;
+        Ok(PcuVulkanPreparedHost::DivRem(PcuVulkanPreparedDivRem {
+            native,
+            profile,
+        }))
     }
 }
 
@@ -160,6 +444,90 @@ fn validate_arguments(
         return Err(PcuVulkanError::InvalidArguments);
     }
     Ok((input, output))
+}
+
+impl PcuVulkanBackend {
+    fn prepare_checked_float_operation(
+        &self,
+        operations: &[PcuDispatchOp<'_>],
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Option<Result<PcuVulkanPreparedHost, PcuVulkanError>> {
+        operations.iter().find_map(|operation| match operation {
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatConvert { .. }) => {
+                Some(self.prepare_conversion(kernel))
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary { .. }) => {
+                Some(self.prepare_binary(kernel))
+            }
+            PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary { .. }) => {
+                Some(self.prepare_unary(kernel))
+            }
+            _ => None,
+        })
+    }
+    fn prepare_conversion(
+        &self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<PcuVulkanPreparedHost, PcuVulkanError> {
+        let profile = validate_checked_float_conversion_map(kernel)
+            .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        self.device.validate_conversion_geometry(profile)?;
+        let mut words = Vec::new();
+        let (_, profile) = lower_checked_float_conversion_to_spirv(
+            kernel,
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut words,
+        )
+        .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        let native = VulkanPreparedConversion::new(Rc::clone(&self.device), &words, profile)?;
+        Ok(PcuVulkanPreparedHost::Conversion(
+            PcuVulkanPreparedConversion { native, profile },
+        ))
+    }
+    fn prepare_binary(
+        &self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<PcuVulkanPreparedHost, PcuVulkanError> {
+        let profile = validate_checked_float_binary_map(kernel)
+            .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        self.device.validate_binary_geometry(profile)?;
+        let mut words = Vec::new();
+        let (_, profile) = lower_checked_float_binary_to_spirv(
+            kernel,
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut words,
+        )
+        .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        let native = VulkanPreparedBinary::new(Rc::clone(&self.device), &words, profile)?;
+        Ok(PcuVulkanPreparedHost::Binary(PcuVulkanPreparedBinary {
+            native,
+            profile,
+        }))
+    }
+    fn prepare_unary(
+        &self,
+        kernel: &PcuDispatchKernelIr<'_>,
+    ) -> Result<PcuVulkanPreparedHost, PcuVulkanError> {
+        if fusion_pcu_spirv::validate_checked_float_unary_roles_map(kernel).is_ok() {
+            return PcuVulkanPreparedUnaryRoles::prepare(Rc::clone(&self.device), kernel)
+                .map(PcuVulkanPreparedHost::UnaryRoles);
+        }
+        let profile = validate_checked_float_unary_map(kernel)
+            .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        self.device.validate_unary_geometry(profile)?;
+        let mut words = Vec::new();
+        let (_, profile) = lower_checked_float_unary_to_spirv(
+            kernel,
+            PcuSpirvLoweringOptions::minimal_shader(),
+            &mut words,
+        )
+        .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
+        let native = VulkanPreparedUnary::new(Rc::clone(&self.device), &words, profile)?;
+        Ok(PcuVulkanPreparedHost::Unary(PcuVulkanPreparedUnary {
+            native,
+            profile,
+        }))
+    }
 }
 
 #[cfg(test)]

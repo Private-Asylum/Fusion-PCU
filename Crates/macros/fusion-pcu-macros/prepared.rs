@@ -17,10 +17,27 @@ use syn::{
     Visibility,
 };
 
+/// Source access and authoritative lowering use; mutable access alone is not a use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentAccess {
+    ReadOnly,
+    UnusedReadOnly,
+    ReadWrite,
+    UnusedReadWrite,
+}
+impl ArgumentAccess {
+    pub const fn writable(self) -> bool {
+        matches!(self, Self::ReadWrite | Self::UnusedReadWrite)
+    }
+    pub const fn used(self) -> bool {
+        !matches!(self, Self::UnusedReadOnly | Self::UnusedReadWrite)
+    }
+}
+
 pub struct Argument {
     pub ident: Ident,
     pub binding: u32,
-    pub read_write: bool,
+    pub access: ArgumentAccess,
     pub scalar_reference: bool,
     pub flatten_matrix: bool,
     pub scalar: TokenStream,
@@ -40,7 +57,7 @@ pub struct Input<'a> {
     pub policy_builder_ident: Ident,
     pub explicit_policy: Option<TokenStream>,
     pub explicit_range_policy: Option<TokenStream>,
-    pub supports_float_range: bool,
+    pub supports_range_policy: bool,
 }
 
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
@@ -58,8 +75,14 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         policy_builder_ident: _,
         explicit_policy: _,
         explicit_range_policy: _,
-        supports_float_range: _,
+        supports_range_policy: _,
     } = input;
+    // Prepared closures retain the authored typed argument schema, including unread inputs.
+    // Referencing an underscore-named formal here is generated adaptation, not authored use.
+    let unread_underscore_allow = args
+        .iter()
+        .any(|arg| !arg.access.used() && arg.ident.to_string().starts_with('_'))
+        .then(|| quote! { #[allow(clippy::used_underscore_binding)] });
     let host_prepare_fn = format_ident!("{}_prepare", function_ident);
     let device_prepare_fn = format_ident!("{}_device", host_prepare_fn);
     let backend_ident = unique_generic_ident("__PcuBackend", &function.sig.generics);
@@ -131,12 +154,12 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         let slot = arg.binding;
         let target = quote! { #pcu::PcuBindingRef::new(0, #slot) };
         if arg.flatten_matrix {
-            let view = if arg.read_write {
+            let view = if arg.access.writable() {
                 quote! { #ident.as_flattened_mut() }
             } else {
                 quote! { #ident.as_flattened() }
             };
-            let borrow = if arg.read_write {
+            let borrow = if arg.access.writable() {
                 quote! { read_write }
             } else {
                 quote! { read }
@@ -146,7 +169,7 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         if arg.scalar_reference {
             let scalar = &arg.scalar;
             quote! { #pcu::PcuHostArgument::read_scalar::<#scalar>(#target, #ident) }
-        } else if arg.read_write {
+        } else if arg.access.writable() {
             quote! { #pcu::PcuHostArgument::read_write(#target, #ident) }
         } else {
             quote! { #pcu::PcuHostArgument::read(#target, #ident) }
@@ -164,7 +187,7 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         .collect::<Vec<_>>();
     let device_argument_types = args.iter().zip(&call_lifetimes).map(|(arg, lifetime)| {
         let scalar = &arg.scalar;
-        let borrow = if arg.read_write {
+        let borrow = if arg.access.writable() {
             quote! { &#lifetime mut }
         } else {
             quote! { &#lifetime }
@@ -175,7 +198,7 @@ pub fn generate(input: Input<'_>) -> TokenStream {
     }).collect::<Vec<_>>();
     let device_closure_types = args.iter().map(|arg| {
         let scalar = &arg.scalar;
-        let borrow = if arg.read_write { quote! { &mut } } else { quote! { & } };
+        let borrow = if arg.access.writable() { quote! { &mut } } else { quote! { & } };
         quote! {
             #borrow #pcu::PcuDeviceBuffer<#scalar, <#device_backend_ident as #pcu::PcuDeviceKernelBackend>::Resource>
         }
@@ -184,7 +207,7 @@ pub fn generate(input: Input<'_>) -> TokenStream {
         let ident = &arg.ident;
         let slot = arg.binding;
         let target = quote! { #pcu::PcuBindingRef::new(0, #slot) };
-        let access = if arg.read_write {
+        let access = if arg.access.writable() {
             quote! { read_write }
         } else {
             quote! { read }
@@ -195,6 +218,7 @@ pub fn generate(input: Input<'_>) -> TokenStream {
     quote! {
         // Optional execution entry points may be unused by kernels that only inspect their IR.
         #[allow(dead_code)]
+        #unread_underscore_allow
         #vis fn #host_prepare_fn <#prepare_params>(backend: &#backend_ident)
             -> ::core::result::Result<
                 impl for<#(#call_lifetimes),*> ::core::ops::FnMut(#(#host_call_types),*)
@@ -219,6 +243,7 @@ pub fn generate(input: Input<'_>) -> TokenStream {
 
         // The resident-device entry point is likewise optional for IR-only users.
         #[allow(dead_code)]
+        #unread_underscore_allow
         #vis fn #device_prepare_fn <#device_prepare_params>(backend: &#device_backend_ident)
             -> ::core::result::Result<
                 impl for<#(#call_lifetimes),*> ::core::ops::FnMut(#(#device_argument_types),*)

@@ -1,0 +1,7 @@
+# Exact MLX carrier owner controls
+
+Each of132 peers executes fresh host bytes → copied MLX UInt backing → immutable completed owner → terminal typed host prefix read → fresh owner drop. The three routes are genuine generic `#[pcu]` source capture prepared through the backend, an independently constructed selected Identity graph, and direct native carrier upload. All22 byte-aligned scalar types and extents257/65537 participate. Larger initialized host tails and three changed raw input banks are verified before and after each peer, including filtered runs.
+
+Logical element types/counts remain distinct from physical UInt8/UInt16/UInt32 lane counts. Signalling NaNs, negative zero and high wide limbs are raw transport data; no arithmetic conversion participates. Preparation and frozen shape ownership stay outside each warm owner/read/drop call. Fresh escaped owner allocation is real and reported by the optional caller-thread Rust census; native MLX/driver/device allocation is excluded. No in-place resident mutation, zero-allocation or measured cost claim is implied.
+
+Use `cargo bench -p fusion-pcu-mlx --features tensor --bench encoded_carrier -- --test` for semantic smoke and add `allocation-census` for caller Rust census. The activity guard requires an idle GPU before workload. Ordinary facade-owned source routing is a separate shared integration gate; these backend-prepared peers do not retroqualify it.

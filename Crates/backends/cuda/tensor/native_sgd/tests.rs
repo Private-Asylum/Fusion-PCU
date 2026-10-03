@@ -90,7 +90,7 @@ fn native_sgd_policy_and_finite_frozen_rate_are_admitted_cold() {
             );
         }
         node.float_underflow_policy = None;
-        node.scalar_type = PcuScalarType::F64;
+        node.scalar_type = PcuScalarType::F16;
         assert_eq!(
             super::assess(node),
             Err(TensorUnsupportedReason::ElementType)
@@ -260,5 +260,30 @@ fn native_sgd_complete_output_frozen_rates_rounding_and_exception_permission() {
                 0
             }
         );
+    }
+}
+
+#[test]
+fn native_f64_width_and_precision_are_separate_cold_kernel_identities() {
+    for precision in [
+        PcuPrecisionPolicy::Preserve,
+        PcuPrecisionPolicy::BackendOptimized,
+    ] {
+        let mut graph = Graph::default();
+        graph.set_numerical_options(options(precision));
+        let weights = graph.input([17], PcuScalarType::F64).unwrap();
+        let gradient = graph.input([17], PcuScalarType::F64).unwrap();
+        let output = graph.sgd_update(weights, gradient, -0.0_f32).unwrap();
+        let source = super::lower_native_sgd_to_cuda_source(&graph, output).unwrap();
+        assert!(source.contains("const double *weights"));
+        assert!(source.contains("double learning_rate"));
+        assert_eq!(
+            source.contains("__fma_rn"),
+            precision == PcuPrecisionPolicy::BackendOptimized
+        );
+        graph
+            .set_value_numerical_mode(output, PcuNumericalMode::Strict)
+            .unwrap();
+        assert!(super::lower_native_sgd_to_cuda_source(&graph, output).is_err());
     }
 }

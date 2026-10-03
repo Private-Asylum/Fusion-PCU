@@ -245,6 +245,7 @@ fn run_case(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
+        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
         id: PcuKernelId(1),
         entry: PcuDispatchEntryPoint {
             name: "f32_f64_exact",

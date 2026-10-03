@@ -43,6 +43,9 @@ mod error;
 #[path = "ffi/ffi.rs"]
 mod ffi;
 use ffi::Library;
+#[cfg(feature = "allocation-census")]
+#[rustfmt::skip]
+pub use ffi::{RocmApiCensus, rocm_api_census, reset_rocm_api_census};
 use smallvec::SmallVec;
 mod host_kernel;
 mod memory;
@@ -120,6 +123,12 @@ pub use codegen::rtc::{
 pub use tensor::{
     lower_strict_matmul_to_hip_source,
     lower_strict_sgd_to_hip_source,
+    lower_strict_mse_to_hip_source,
+    lower_relu_backward_to_hip_source,
+    lower_native_sgd_to_hip_source,
+    lower_checked_float_tensor_to_hip_source,
+    lower_checked_integer_tensor_to_hip_source,
+    lower_native_mse_to_hip_source,
     RocmAdmittedTensorFeedbackResources,
     RocmPreparedTensorGraph,
     RocmTensorExecution,
@@ -178,11 +187,17 @@ pub struct HipRuntimeProbe {
 
 struct RuntimeInner {
     library: Arc<Library>,
+    api: ffi::RetainedApi,
     device: HipDevice,
     name: String,
 }
 
 impl HipRuntime {
+    #[cfg(feature = "tensor")]
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Load HIP and report visible devices without selecting one. Zero devices is a valid result.
     ///
     /// # Errors
@@ -370,8 +385,10 @@ impl HipRuntime {
             let mut count: c_int = 0;
             let status =
                 unsafe { crate::ffi::raw_hipGetDeviceCount(&get_count, ptr::from_mut(&mut count)) };
+            let api = ffi::RetainedApi::load(&library);
             let runtime = Self(Arc::new(RuntimeInner {
                 library,
+                api,
                 device: 0,
                 name: String::new(),
             }));
@@ -396,6 +413,7 @@ impl HipRuntime {
             let name = runtime.device_name(device)?;
             return Ok(Self(Arc::new(RuntimeInner {
                 library: runtime.0.library.clone(),
+                api: runtime.0.api.clone(),
                 device,
                 name,
             })));
@@ -424,7 +442,15 @@ impl HipRuntime {
     pub fn device_info(&self) -> Result<HipDeviceInfo, HipError> {
         let mut total = 0_usize;
         unsafe { crate::ffi::invoke_hipDeviceTotalMem(self, &raw mut total, self.0.device) }?;
-        let pci_bus_id = query_pci_bus_id(&self.0.library, self.0.device);
+        let mut pci = [0_i8; 64];
+        let pci_bus_id = unsafe {
+            crate::ffi::invoke_hipDeviceGetPCIBusId(self, pci.as_mut_ptr(), 64, self.0.device)
+        }
+        .ok()
+        .and_then(|()| {
+            let value = bounded_device_name(&pci);
+            (!value.is_empty()).then_some(value)
+        });
         Ok(HipDeviceInfo {
             index: self.0.device,
             name: self.0.name.clone(),
@@ -491,6 +517,7 @@ impl HipRuntime {
                 runtime: self.clone(),
                 pointer,
                 bytes,
+                host_transfer: RefCell::new(Vec::new()),
                 access: Rc::new(AllocationAccess {
                     state: Cell::new(AllocationAccessState::Idle),
                 }),
@@ -723,6 +750,7 @@ fn query_architecture(pci_bus_id: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::missing_const_for_fn)] // Match the Linux runtime I/O query; unavailable metadata is not a const provider contract.
 fn query_architecture(_pci_bus_id: &str) -> Option<String> {
     // No portable, safely versioned HIP property query is wired into this backend yet.
     None
@@ -786,6 +814,8 @@ struct DeviceAllocation {
     pointer: *mut c_void,
     bytes: usize,
     access: Rc<AllocationAccess>,
+    // The exclusive allocation gate protects this retained native host endpoint.
+    host_transfer: RefCell<Vec<u8>>,
 }
 
 /// Shared single-operation gate consulted through every cloned device-buffer handle.
@@ -1103,6 +1133,32 @@ impl Drop for DeviceAllocation {
     }
 }
 
+/// A completed private host readback retaining the allocation's exclusive access lease.
+///
+/// The bytes remain private until publication; holding this ticket blocks cloned allocation
+/// reuse. Drop releases the lease. Unknown native completion never returns a ticket and instead
+/// retains the complete allocation, host endpoint and runtime through its quarantined lease.
+#[doc(hidden)]
+pub struct OwnedHostReadback {
+    lease: DeviceAccessLease,
+    bytes: usize,
+}
+impl OwnedHostReadback {
+    /// Copy a completed readback into an exactly sized destination, without an SDK operation.
+    ///
+    /// # Panics
+    /// Panics if the destination length differs from the requested readback extent.
+    pub fn publish_to(&self, destination: &mut [u8]) {
+        assert_eq!(
+            destination.len(),
+            self.bytes,
+            "validated readback destination extent"
+        );
+        let bytes = self.lease.allocation.host_transfer.borrow();
+        destination.copy_from_slice(&bytes[..self.bytes]);
+    }
+}
+
 /// Owned HIP device-memory allocation. Clones share the same allocation.
 #[derive(Clone)]
 pub struct DeviceBuffer {
@@ -1138,15 +1194,25 @@ impl DeviceBuffer {
             return Ok(());
         }
         let lease = self.acquire_access()?;
+        let mut scratch = self
+            .allocation
+            .host_transfer
+            .try_borrow_mut()
+            .map_err(|_| HipError::Busy)?;
+        if scratch.len() < source.len() {
+            scratch.resize(source.len(), 0);
+        }
+        scratch[..source.len()].copy_from_slice(source);
         let result = unsafe {
             crate::ffi::invoke_hipMemcpy(
                 &self.allocation.runtime,
                 (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
-                source.as_ptr().cast(),
+                scratch.as_ptr().cast(),
                 source.len(),
                 HIP_MEMCPY_HOST_TO_DEVICE,
             )
         };
+        drop(scratch);
         lease.finish_synchronous(result)
     }
     /// Copy this allocation into host memory.
@@ -1169,17 +1235,53 @@ impl DeviceBuffer {
         if destination.is_empty() {
             return Ok(());
         }
+        self.readback_owned_at(offset, destination.len())?
+            .publish_to(destination);
+        Ok(())
+    }
+    /// Read into the allocation's retained private RAM and retain exclusive access until drop.
+    ///
+    /// Caller memory is never a native destination. All sibling readbacks can therefore finish
+    /// before their infallible publication. Growth happens before native submission and stable
+    /// shapes reuse the same RAM. Error-only quiescence/quarantine retains both native endpoints.
+    ///
+    /// # Errors
+    /// Returns range, busy, copy or completion errors; no caller host output is modified.
+    #[doc(hidden)]
+    pub fn readback_owned_at(
+        &self,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<OwnedHostReadback, HipError> {
+        self.check_range(offset, bytes)?;
         let lease = self.acquire_access()?;
-        let result = unsafe {
-            crate::ffi::invoke_hipMemcpy(
-                &self.allocation.runtime,
-                destination.as_mut_ptr().cast(),
-                (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
-                destination.len(),
-                HIP_MEMCPY_DEVICE_TO_HOST,
-            )
+        let mut scratch = self
+            .allocation
+            .host_transfer
+            .try_borrow_mut()
+            .map_err(|_| HipError::Busy)?;
+        if scratch.len() < bytes {
+            scratch.resize(bytes, 0);
+        }
+        let result = if bytes == 0 {
+            Ok(())
+        } else {
+            unsafe {
+                crate::ffi::invoke_hipMemcpy(
+                    &self.allocation.runtime,
+                    scratch.as_mut_ptr().cast(),
+                    (self.allocation.pointer.cast::<u8>().wrapping_add(offset)).cast(),
+                    bytes,
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                )
+            }
         };
-        lease.finish_synchronous(result)
+        drop(scratch);
+        if let Err(error) = result {
+            lease.finish_synchronous(Err(error))?;
+            unreachable!("a failed copy cannot become successful completion");
+        }
+        Ok(OwnedHostReadback { lease, bytes })
     }
     /// Copy bytes from another device allocation.
     /// Copy bytes from a different allocation belonging to the same HIP runtime and device.
@@ -1274,6 +1376,11 @@ impl DeviceBuffer {
 }
 
 impl DeviceAccessLease {
+    const fn retain_after_unknown_completion(self) {
+        // Retain the native allocation, exclusive gate, owned host endpoint and runtime roots.
+        std::mem::forget(self);
+    }
+
     fn quarantine(&self) {
         self.guard.quarantine_stream();
     }
@@ -1285,7 +1392,7 @@ impl DeviceAccessLease {
                 if unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.allocation.runtime) }
                     .is_err()
                 {
-                    std::mem::forget(self);
+                    self.retain_after_unknown_completion();
                 }
                 Err(error)
             }
@@ -1303,8 +1410,8 @@ impl DeviceAccessLease {
                 if unsafe { crate::ffi::invoke_hipDeviceSynchronize(&self.allocation.runtime) }
                     .is_err()
                 {
-                    std::mem::forget(self);
-                    std::mem::forget(other);
+                    self.retain_after_unknown_completion();
+                    other.retain_after_unknown_completion();
                 }
                 Err(error)
             }
@@ -3530,6 +3637,63 @@ mod memory_snapshot_tests {
             Ok(())
         );
         assert!(dependencies.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires native device; deterministic full-owner quarantine/drop witness"]
+    fn quarantined_launch_retains_module_stream_runtime_after_cache_owner_drop() {
+        let runtime = HipRuntime::new(0).unwrap();
+        let image = crate::compile_hip_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void retained_word(unsigned int *value, unsigned long long *status) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) { value[0] = 42; status[0] = ~0ULL; }
+}
+"#,
+        )
+        .unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"retained_word").unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let buffer = runtime.allocate(size_of::<u32>()).unwrap();
+        let status = runtime.allocate(size_of::<u64>()).unwrap();
+        let runtime_owner = Arc::downgrade(&runtime.0);
+        let module_owner = Rc::downgrade(&module.inner);
+        let stream_owner = Rc::downgrade(&stream.inner);
+        let allocation_owner = Rc::downgrade(&buffer.allocation);
+        let status_owner = Rc::downgrade(&status.allocation);
+        let mut batch = HipCompletionBatch::new(&stream);
+        let arguments = [
+            HipKernelArgument::Buffer(&buffer),
+            HipKernelArgument::Buffer(&status),
+        ];
+        // SAFETY: writable u32/u64 pointers have separate exact allocations; one invocation writes both.
+        unsafe {
+            kernel
+                .launch_into_batch(&mut batch, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .unwrap();
+        }
+        // Establish real quiescence before a deterministic protocol injection. We do not induce
+        // driver loss: the same private quarantine path then models an unknown terminal result.
+        stream.synchronize().unwrap();
+        batch.failed = true;
+        batch.quarantine_and_forget();
+        assert!(buffer.validate_access_available().is_err());
+        assert!(status.validate_access_available().is_err());
+        drop(batch);
+        drop(kernel);
+        drop(module);
+        drop(stream);
+        drop(buffer);
+        drop(status);
+        drop(runtime);
+        // This is the same owner drop as cache/session eviction: code, queue, context/loader and
+        // data owners all survive. Intentionally retained roots are not freed on unknown proof.
+        assert!(module_owner.upgrade().is_some());
+        assert!(stream_owner.upgrade().is_some());
+        assert!(allocation_owner.upgrade().is_some());
+        assert!(status_owner.upgrade().is_some());
+        assert!(runtime_owner.upgrade().is_some());
     }
 
     #[test]

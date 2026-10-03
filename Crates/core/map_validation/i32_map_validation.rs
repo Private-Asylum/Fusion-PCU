@@ -33,7 +33,8 @@ const fn map_error(error: IntegerMapValidationError) -> PcuI32MapValidationError
         IntegerMapValidationError::UnsupportedInterface => {
             PcuI32MapValidationError::UnsupportedInterface
         }
-        IntegerMapValidationError::UnsupportedRequirements => {
+        IntegerMapValidationError::UnsupportedRequirements
+        | IntegerMapValidationError::RangePolicyMismatch => {
             PcuI32MapValidationError::UnsupportedRequirements
         }
         IntegerMapValidationError::InvalidBinding(value) => {
@@ -182,6 +183,7 @@ mod tests {
             ])),
         };
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "map",
@@ -354,6 +356,7 @@ mod tests {
             ])),
         };
         PcuDispatchKernelIr {
+            numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
             id: PcuKernelId(1),
             entry: PcuDispatchEntryPoint {
                 name: "divrem_i32",

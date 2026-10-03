@@ -522,6 +522,7 @@ dependencies = [
  "fusion-pcu-cuda",
  "fusion-pcu-macros",
  "fusion-pcu-metal",
+ "fusion-pcu-mlx",
  "fusion-pcu-rocm",
  "fusion-pcu-vulkan",
  "smallvec",

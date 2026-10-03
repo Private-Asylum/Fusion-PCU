@@ -1,76 +1,46 @@
 # Fusion PCU Vulkan
 
-Enable `hosted` for explicit Vulkan discovery and synchronous execution. Default
-features load no Vulkan runtime. Per-function source uses
-`negate_prepare(&backend)` through the neutral prepared host interface.
+Vulkan execution is explicit and default-off. `hosted` enables discovery and synchronous scalar invocation; `tensor` also enables the bounded retained tensor plans. No CPU fallback executes a Vulkan workload. Software Vulkan devices are excluded from native qualification.
 
-The admitted source slice is exact F32/F64 transport and checked F32/F64 sign-bit
-Neg. F64 is admitted only on a device reporting `shaderFloat64`; activation enables
-that feature. F64 loads/stores use Float64 with two uint32 bitcast words, without
-Int64 capability or floating arithmetic. Cold discovery and exact offers carry
-this device-dependent type support.
-Neg rejects nonfinite operands, preserves signed zero and subnormal bits, and
-supports the three explicit underflow policies. Clamp and portable numerical
-profiles are not admitted. Boundary and Strict have the same scalar contract.
-The implementation uses integer bit operations and per-element diagnostic status.
-No shader floating-point arithmetic or host CPU execution of the workload occurs.
+The qualified profiles are recorded below. A scalar carrier or coarse device capability does not admit every operation on that type.
 
-Preparation validates the exact IR schema and device limits and retains pipeline,
-three owned coherent mappings, command buffer and fence. Every call stages fresh
-host input, waits for terminal completion, checks the lowest logical fault, and
-publishes only the initialized output prefix on success. A checked fault leaves
-caller output unchanged. Unknown completion quarantines all native owners and
-the retained session; a poisoned session rejects further calls. Borrowed caller
-RAM is never an asynchronous device pointer.
+| Boundary | Qualified concrete profile |
+| --- | --- |
+| Scalar transport | All 22 sealed carriers, dense identity and scalar broadcast, arbitrary raw bits |
+| Checked integer map | All 14 signed/unsigned widths 8–512, Add/Sub/Mul, Reject or observable Clamp; actual repeated/unused/reversed read roles |
+| Checked joint division | All 14 integer widths, canonical and actual three/four-declaration read roles, direct/grid and readonly scalar operands, Reject; zero and signed MIN/-1 faults preserve both outputs |
+| Checked float map | F16/BF16/E4M3FN/E5M2/F32/F64 Add/Sub/Mul/Div and Neg/ReLU, all three underflow policies, Reject or observable Clamp |
+| Checked conversion | F32/F64 widening/narrowing, exact finite/rounding/underflow law, Reject or observable Clamp |
+| Portable scalar map | Four low float formats: one Reject binary operation; all 14 integers: one Add/Sub/Mul operation with Reject or Clamp and the exact operand descriptor |
+| Owned leaf | All 22 carriers: selected Input/Constant/Uniform transport; genuine ordinary source qualification covers Input identity |
+| Owned pointwise | All 14 integers and six checked floats: bounded checked Binary; six-format ReLU and ReLUBackward; Reject/Unspecified |
+| Owned compound | Ordered Strict F32/F64 MatMul/MSE/SGD with four compound/precision permission tuples and all three underflow policies; Reject/Unspecified |
+| Requested gradient | Bounded Strict F32/F64 target-selective MSE training, with checked forward effects and complete source/graph/native controls |
+| Borrowed resident invocation | Same logical-device owners and host/native mixtures with exact prefix publication, retained roots, tails and preflight/fatal rollback |
 
-The host path prefers a reported `HOST_CACHED | HOST_COHERENT | HOST_VISIBLE`
-memory type when compatible; it falls back to coherent host-visible memory.
-`memory_realizations()` reports the actual selected native memory type, property
-flags and allocation bytes for input, output and status. Cached host storage
-does not imply shared caller allocations, unified RAM or external interop.
+Joint division operand roles have a separate native certificate; their mixed/resident routes remain unqualified. Portable joint division has descriptor-only cold opt-in and is awaiting its independent native qualification. Graph Clamp, general Portable tensors/compounds, asynchronous execution, cross-thread ownership transfer, external memory and graphics/ray execution are not implied by these profiles.
 
-`PcuVulkanDiscovery` implements bounded generation-scoped discovery. Activation
-validates references and rechecks the physical Vulkan device UUID and native
-vendor/device IDs. CPU software Vulkan devices are excluded. Stable device
-identity does not establish CUDA/HIP/Vulkan import compatibility. Discovery
-reports optional physical facts and query-only capabilities; descriptor indexing
-and device-address bits are not enabled execution offers.
+All current checked scalar arithmetic and transport modules use U32 storage/bit synthesis. They do not depend on native Int64/Float64 arithmetic or infer IEEE preservation from Vulkan float controls. The separate legacy public F64 bit-map API keeps its own `shaderFloat64` feature gate. Integer precision/compound permissions and scalar Boundary/Strict requests retain the stronger exact checked implementation. Strict compounds perform the specified scalar round/check sequence and preserve node, output-lane and reduction/step fault provenance; a finite final result cannot erase an intermediate checked fault.
 
-Cold `PcuImplementationOffers` describes exact Copy/Neg host requests for a
-discovered backend. Offers carry the discovered device/executor identity, exact
-numerical envelope and unknown native workspace/performance cost. Logical status
-uses four bytes per element; prepared allocation facts report actual padding. Resident,
-native library, PortableV1, graphics/ray and external memory execution remain
-unsupported. The warm call contains no discovery, compilation, ranking or
-allocation of pipeline/storage/submission objects.
+Cold preparation validates the numerical header, typed SSA, actual operand roles, original declarations, logical extents and native device limits. It freezes independent indexed/element-zero operands and their actual spans. Schema-proved unread declarations retain type/access checks but require zero elements; repeated reads share one physical input. Warm invocation performs no discovery, ranking, shader compilation or graph evaluation. Numerical requirements remain part of the exact request and cache key.
 
-Repository targets:
+Host calls stage fresh inputs into retained private storage, submit retained commands and wait for terminal completion. Fatal status is scanned before either public result prefix is written. Reject faults and argument failures preserve the complete caller outputs. A completed scalar Clamp map with recovered range faults publishes all useful values and returns the earliest logical recovered fault; any fatal lane takes precedence and prevents publication. Tails remain untouched.
+
+`PcuVulkanOwnedBuffer<T>` retains its originating logical-device root and real native allocation. Facade `PcuTensor` owners retain that backend and cached shape across borrowing, cache clear and sibling drops. Borrowed invocation uses a dedicated native byte argument, never a forged host pointer or a recreated session. Private output computation precedes public copies; Vulkan byte copies use the exact positive logical prefix, including odd U8/FP8/F16 lengths. Unknown completion quarantines the full allocation/code/command/queue/device roots. A poisoned shared device makes borrowed owners unusable even if uncertainty arose before public writes. Current facade owners are thread-local and carry no cross-thread transfer guarantee.
+
+`memory_realizations()` reports actual buffer allocation bytes, memory types and property flags. Compatible host-visible coherent/cached memory is preferred; this does not imply zero-copy caller RAM or external interoperability. Repeated joint reads use four physical buffers (input, quotient, remainder, status) behind five descriptors; distinct reads use five. Cold and escaping-owner allocations are separate from warm caller allocation counts.
+
+Hardware fixtures stay ignored on machines without the required physical device and tools. Genuine `#[pcu]` prepared/ordinary routes are paired with explicit graph diagnostics and separate GLSL/compiler/ash ownership controls. Controls share audited shader arithmetic where stated; independent full-bit integer oracles validate values and status. Constant/Uniform backend diagnostics do not establish ordinary Uniform/Constant source support. Matched ownership/publication boundaries and allocation/API census are recorded per workload; no universal zero-allocation escaping-owner or SDK-allocation claim follows from a scalar caller census.
+
+Examples of bounded qualification targets:
 
 ```sh
-cargo run -p fusion-pcu-vulkan --features hosted --example checked-neg
-cargo test -p fusion-pcu-vulkan --features hosted --test prepared_bit_map -- --ignored --test-threads=1
-cargo bench -p fusion-pcu-vulkan --features hosted --bench checked_neg
-cargo test -p fusion-pcu-spirv --test bit_map -- --ignored
+cargo test -p fusion-pcu-vulkan --features tensor --test wide_div_rem -- --ignored --test-threads=1
+cargo test -p fusion-pcu-vulkan --features tensor --test div_rem_roles -- --ignored --test-threads=1
+cargo bench -p fusion-pcu-vulkan --features tensor --bench div_rem_roles -- --test
+cargo run -p fusion-pcu-vulkan --features tensor --example div-rem-roles
 ```
 
-Hardware tests are ignored by default. Criterion has actual per-function source,
-explicit graph, ordinary global calls and a matched independent native ash/GLSL
-control at both scalar widths. The control owns a separate logical device and
-builds its shader with `glslangValidator`, then performs actual Vulkan calls; it
-does not call PCU lowering or execution. UUID matching ensures the same physical
-device. All peers use retained coherent/cached buffers, identical bit checking,
-dense status, terminal fence wait and transactional host publication. Every
-invocation changes its input and checks all output and padded tails outside timing.
-`PCU_VULKAN_CENSUS=1` reports warm Rust heap allocation counts, full call wall
-time and independently sampled submission/completion/upload/status-publication
-stages. `call_profiled` provides optional graph stage measurements; ordinary
-calls do not read a measurement clock. Driver-internal C allocation counts are
-not measured. Each benchmark has a GPU idle guard. It measures the full synchronous host boundary, excluding cold
-preparation. Guard configuration uses `PCU_VULKAN_GPU_BUSY_PATH`; the default is
-the local RX 6900 XT counter. It requires three consecutive <=5% readings and
-permits a bounded ten-second cooldown after a previous sample.
+Criterion `--test` provides semantic evidence without latency estimates. Statistical timing requires the unchanged GPU activity guard and exclusive task ownership; correctness under recorded user activity is not an idle performance result. Modern Khronos synchronization validation, exact frozen source/binary hashes, native device/driver information, independent oracles and measured source/graph/native census are retained in the assigned SPIR-V/Vulkan plan and text-only evidence archives. Earlier certificates remain tied to their original source cuts.
 
-Facade-dependent development targets run from this repository checkout. Their
-path-only development dependencies are omitted from normalized published
-manifests. A standalone backend archive is not claimed to contain the complete
-development harness.
+Offline shader maintenance scripts live beside each SPIR-V profile. Crate execution consumes checked-in words and needs no shader compiler. Facade-dependent development targets use repository-only path dependencies; a standalone published backend archive is not claimed to include that complete harness.

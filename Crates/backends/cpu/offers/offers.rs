@@ -13,7 +13,7 @@ use fusion_pcu::{
     PcuImplementationOffer,
     PcuImplementationOffers,
     PcuImplementationRequest,
-    PcuNumericalOptions,
+    PcuReproducibility,
     PcuRangePolicy,
 };
 #[rustfmt::skip]
@@ -76,11 +76,18 @@ impl PcuImplementationOffers<PcuDispatchKernelIr<'_>> for PcuCpuNegOffers {
         let prepared = match self.backend.prepare_host_kernel(request.operation) {
             Ok(prepared) => prepared,
             Err(PcuCpuPreparedNegError::UnsupportedProfile) => return Ok(0),
+            Err(PcuCpuPreparedNegError::HeaderUnderflowMismatch) => {
+                return Err(PcuCpuNegOfferError::UnderflowMismatch);
+            }
             Err(error) => return Err(PcuCpuNegOfferError::Provider(error)),
         };
+        if request.requirements != request.operation.numerical_requirements {
+            return Ok(0);
+        }
         if request.boundary != PcuCostBoundary::Host
             || request.requirements.range_policy != PcuRangePolicy::Reject
-            || request.requirements.numerical_options != PcuNumericalOptions::default()
+            || request.requirements.numerical_options.reproducibility
+                == PcuReproducibility::PortableV1
         {
             return Ok(0);
         }

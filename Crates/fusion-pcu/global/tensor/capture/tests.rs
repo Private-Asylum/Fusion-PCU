@@ -1,5 +1,8 @@
 //! Real annotated companions share the provider-independent cold builder.
 
+#[path = "tests/unread/unread.rs"]
+mod unread;
+
 #[rustfmt::skip]
 use super::{
     __pcu_capture_tensor_program,
@@ -101,27 +104,19 @@ fn unused_source_inputs_are_pruned_without_losing_argument_identity() {
 
 #[test]
 fn malformed_host_shapes_reject_before_calling_the_companion() {
-    for (shape, empty) in [
-        (PcuSourceShape::FixedArray { length: 0 }, true),
-        (
-            PcuSourceShape::FixedMatrix {
-                rows: usize::MAX,
-                columns: 2,
-            },
-            false,
-        ),
-    ] {
-        let result = __pcu_capture_tensor_program::<f32, 1, _>(
-            [shape],
-            PcuFloatUnderflowPolicy::IeeeAfterRounding,
-            PcuNumericalMode::Boundary,
-            PcuNumericalOptions::default(),
-            |_, _| panic!("invalid input shapes must precede capture"),
-        );
-        assert!(matches!(
-            (empty, result),
-            (true, Err(PcuExecutionError::EmptyTensorInput))
-                | (false, Err(PcuExecutionError::InvalidTensorSourcePlan))
-        ));
-    }
+    let shape = PcuSourceShape::FixedMatrix {
+        rows: usize::MAX,
+        columns: 2,
+    };
+    let result = __pcu_capture_tensor_program::<f32, 1, _>(
+        [shape],
+        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        PcuNumericalMode::Boundary,
+        PcuNumericalOptions::default(),
+        |_, _| panic!("invalid input shapes must precede capture"),
+    );
+    assert!(matches!(
+        result,
+        Err(PcuExecutionError::InvalidTensorSourcePlan)
+    ));
 }

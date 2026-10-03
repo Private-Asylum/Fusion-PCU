@@ -12,6 +12,20 @@ use crate::{
     PcuValueType,
 };
 
+#[path = "scalar/wide/wide.rs"]
+pub mod wide;
+pub use wide::*;
+#[path = "scalar/format/format.rs"]
+pub mod format;
+pub use format::*;
+#[path = "scalar/integer_division/integer_division.rs"]
+pub mod integer_division;
+pub use integer_division::*;
+#[path = "scalar/low_precision/low_precision.rs"]
+mod low_precision;
+#[path = "scalar/selection/selection.rs"]
+mod selection;
+
 mod sealed {
     pub trait Sealed {}
 
@@ -25,9 +39,31 @@ mod sealed {
     impl Sealed for i16 {}
     impl Sealed for i32 {}
     impl Sealed for i64 {}
+    impl Sealed for u128 {}
+    impl Sealed for i128 {}
     impl Sealed for super::PcuF16Bits {}
     impl Sealed for super::PcuBf16Bits {}
 }
+
+macro_rules! scalar128 {
+    ($ty:ty, $kind:ident) => {
+        impl PcuScalar for $ty {
+            const TYPE: PcuScalarType = PcuScalarType::$kind;
+            const HOST_SIZE: usize = core::mem::size_of::<Self>();
+            const HOST_ALIGNMENT: usize = core::mem::align_of::<Self>();
+            const ENCODED_SIZE: usize = 16;
+            type Encoded = [u8; 16];
+            fn encode_le(self) -> Self::Encoded {
+                self.to_le_bytes()
+            }
+            fn decode_le(bytes: Self::Encoded) -> Self {
+                Self::from_le_bytes(bytes)
+            }
+        }
+    };
+}
+scalar128!(u128, U128);
+scalar128!(i128, I128);
 
 /// Lossless binary16 storage bits, without an implied arithmetic or conversion policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
