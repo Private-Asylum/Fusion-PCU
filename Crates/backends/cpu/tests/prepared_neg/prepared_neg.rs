@@ -51,6 +51,8 @@ fn implementations() -> std::vec::Vec<PcuCpuCheckedNeg> {
         for implementation in [
             PcuCpuImplementation::Sse2,
             PcuCpuImplementation::Avx2,
+            PcuCpuImplementation::Avx,
+            PcuCpuImplementation::Avx512,
             PcuCpuImplementation::Neon,
         ] {
             if let Ok(backend) = PcuCpuCheckedNeg::new(processor, implementation) {
@@ -190,6 +192,8 @@ fn explicit_unavailable_instruction_is_rejected() {
     for implementation in [
         PcuCpuImplementation::Sse2,
         PcuCpuImplementation::Avx2,
+        PcuCpuImplementation::Avx,
+        PcuCpuImplementation::Avx512,
         PcuCpuImplementation::Neon,
     ] {
         assert!(PcuCpuCheckedNeg::new(PcuCpuProcessor::scalar(), implementation).is_err());

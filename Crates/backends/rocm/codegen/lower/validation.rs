@@ -45,8 +45,18 @@ use super::{
     validate_u8_map_kernel,
 };
 
+// Numerical admission remains bounded by the neutral exact resource descriptor.
+fn portable_composed_contract(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    fusion_pcu::describe_portable_v1_checked_integer_composed_map::<4>(kernel).is_ok()
+}
+
 #[allow(clippy::too_many_lines)] // One pass keeps the supported IR subset's validation rules together.
 pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), RocmLowerError> {
+    // Reject nested/cyclic borrowed regions before recursive capability/type scans.
+    // This guard is independent of the requested arithmetic/reproducibility profile.
+    if super::has_nested_regions(kernel.ops) {
+        return Err(RocmLowerError::UnsupportedRequirements);
+    }
     // Only independently qualified synthesized low-float and exact integer maps opt in.
     // The neutral descriptor supplies structural eligibility, never broad backend conformance.
     if kernel
@@ -58,6 +68,7 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Ro
         && fusion_pcu::describe_portable_v1_integer_map(kernel).is_err()
         && fusion_pcu::describe_portable_v1_integer_div_rem_map(kernel).is_err()
         && fusion_pcu::describe_portable_v1_unary_map(kernel).is_err()
+        && !portable_composed_contract(kernel)
     {
         return Err(RocmLowerError::UnsupportedRequirements);
     }

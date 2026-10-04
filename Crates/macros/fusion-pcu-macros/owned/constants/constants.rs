@@ -8,6 +8,19 @@ use syn::{
     UnOp,
 };
 
+/// Rust inline-const evaluation guarantees a cached payload cannot depend on runtime input.
+/// Shape/type and unsupported const operations are checked by Rust and the typed capture API.
+pub(super) fn immutable_inline_const(expression: &Expr) -> Result<Expr, Error> {
+    let candidate = super::unwrap_transparent(expression)?;
+    if matches!(candidate, Expr::Const(value) if value.attrs.is_empty()) {
+        return Ok(candidate.clone());
+    }
+    Err(Error::new_spanned(
+        expression,
+        "PCU tensor literal payloads require `const { ... }`; runtime values must remain input bindings and cannot be frozen into the prepared cache",
+    ))
+}
+
 /// A literal is immutable across calls. A runtime expression must become a real resource
 /// binding before it can participate in a cached graph; evaluating it during capture is unsound.
 pub(super) fn finite_f32_literal(expression: &Expr) -> Result<Expr, Error> {
@@ -35,6 +48,34 @@ pub(super) fn finite_f32_literal(expression: &Expr) -> Result<Expr, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tensor_payloads_require_rust_inline_const_and_leave_types_to_rust() {
+        for source in [
+            "const { [1_u32, 2] }",
+            "(const { [7_u64; 65] })",
+            "const { PcuU512::from_limbs_le([1, 0, 0, 0, 0, 0, 0, 8]) }",
+        ] {
+            assert!(
+                immutable_inline_const(&syn::parse_str(source).unwrap()).is_ok(),
+                "{source}"
+            );
+        }
+        for source in [
+            "payload",
+            "[1_u32, 2]",
+            "[runtime; 65]",
+            "get_payload()",
+            "2_u32",
+            "CONST_PAYLOAD",
+            "&mut payload",
+        ] {
+            assert!(
+                immutable_inline_const(&syn::parse_str(source).unwrap()).is_err(),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn rates_admit_finite_f32_literals_and_preserve_signed_zero_syntax() {

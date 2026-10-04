@@ -264,18 +264,40 @@ impl Ownership {
         let Expr::Path(path) = unwrap_transparent(&call.func)? else {
             return Err(super::composition_body_error(&call.func));
         };
+        if is_pcu_builtin(&path.path, "constant") {
+            if call.args.len() != 1 {
+                return Err(super::composition_body_error(call));
+            }
+            super::constants::immutable_inline_const(&call.args[0])?;
+            return Ok(());
+        }
+        if is_pcu_builtin(&path.path, "uniform_like") {
+            if call.args.len() != 2 {
+                return Err(super::composition_body_error(call));
+            }
+            super::constants::immutable_inline_const(&call.args[1])?;
+            // Shape inspection borrows the owner, even if its source spelling is bare.
+            return self.visit(&call.args[0], true, depth + 1);
+        }
+        if is_pcu_builtin(&path.path, "sgd_update") {
+            if call.args.len() != 3 {
+                return Err(super::composition_body_error(call));
+            }
+            // The rate is an immutable scalar, not a graph owner. Apply the same
+            // finite-literal validation as lowering, then track only the tensor operands.
+            super::constants::finite_f32_literal(&call.args[2])?;
+            self.visit(&call.args[0], false, depth + 1)?;
+            return self.visit(&call.args[1], false, depth + 1);
+        }
         if path
             .path
             .segments
             .first()
             .is_some_and(|segment| segment.ident == "pcu")
-            && ![
-                "identity", "relu", "add", "sub", "mul", "matmul", "gradient",
-            ]
-            .iter()
-            .any(|name| is_pcu_builtin(&path.path, name))
         {
-            return Err(super::composition_body_error(&call.func));
+            // Builtin acceptance must use the lowering table. A second whitelist
+            // previously rejected supported operations only when an input moved.
+            super::operation_for_path(&path.path, &call.func, &[], &[], &[], &[])?;
         }
         for argument in &call.args {
             self.visit(argument, false, depth + 1)?;
@@ -301,6 +323,8 @@ mod tests {
             "let a = pcu::identity(&input)?; let b = pcu::relu(input)?; Ok(pcu::add(a, b)?)",
             "Ok(pcu::relu(pcu::identity(input)?)?)",
             "Ok(input)",
+            "let literal = pcu::constant(const { [1_f32; 3] })?; Ok(pcu::add(input, literal)?)",
+            "let uniform = pcu::uniform_like(input, const { 2_f32 })?; Ok(pcu::add(input, uniform)?)",
             "let a = helper(&input)?; let b = pcu::relu(input)?; Ok(pcu::add(a, b)?)",
             "let a = helper(input)?; Ok(a)",
             "let owner = input; let alias = owner; let view = &alias; let a = helper(view)?; Ok(pcu::relu(alias)?)",
@@ -315,9 +339,49 @@ mod tests {
     }
 
     #[test]
+    fn supported_compound_and_binary_operations_preserve_consuming_owner_rules() {
+        for operation in [
+            "pcu::div(input, &other)",
+            "pcu::relu_backward(input, &other)",
+            "pcu::mean_squared_error(input, &other)",
+            "pcu::sgd_update(input, &other, 0.5_f32)",
+        ] {
+            for borrowed in [false, true] {
+                let expression = if borrowed {
+                    operation.replace("(input,", "(&input,")
+                } else {
+                    operation.to_owned()
+                };
+                let valid: syn::ItemFn = syn::parse_str(&format!(
+                    "fn test(input: PcuTensor<f32>, other: &[[f32; 2]; 2]) -> Result<PcuTensor<f32>, Error> {{ let output = {expression}?; Ok(output) }}"
+                )).unwrap();
+                validate_body(&valid, &[syn::parse_quote!(input)]).unwrap();
+            }
+            let moved: syn::ItemFn = syn::parse_str(&format!(
+                "fn test(input: PcuTensor<f32>, other: &[[f32; 2]; 2]) -> Result<PcuTensor<f32>, Error> {{ let output = {operation}?; Ok(pcu::identity(&input)?) }}"
+            )).unwrap();
+            assert!(validate_body(&moved, &[syn::parse_quote!(input)]).is_err());
+        }
+        for invalid in [
+            "pcu::sgd_update(input, &other, rate)",
+            "pcu::sgd_update(input, &other, f32::INFINITY)",
+            "pcu::sgd_update(input, &other, 0.5_f64)",
+            "pcu::not_an_operation(input, &other)",
+        ] {
+            let function: syn::ItemFn = syn::parse_str(&format!(
+                "fn test(input: PcuTensor<f32>, other: &[[f32; 2]; 2]) -> Result<PcuTensor<f32>, Error> {{ Ok({invalid}?) }}"
+            )).unwrap();
+            assert!(validate_body(&function, &[syn::parse_quote!(input)]).is_err());
+        }
+    }
+
+    #[test]
     fn erased_graph_ids_cannot_hide_external_use_after_move_or_aliases() {
         for body in [
             "Ok(pcu::add(input, input)?)",
+            "let moved = pcu::relu(input)?; Ok(pcu::uniform_like(input, const { 2_f32 })?)",
+            "Ok(pcu::constant(input)?)",
+            "Ok(pcu::uniform_like(input, runtime)?)",
             "let a = pcu::relu(input)?; Ok(pcu::add(a, &input)?)",
             "let a = pcu::relu(input)?; Ok(input)",
             "let a = helper(input)?; Ok(pcu::relu(input)?)",

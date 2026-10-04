@@ -1,7 +1,7 @@
 //! Retained private resource shadows; only a complete validated call publishes RAM.
 use std::rc::Rc;
 use fusion_pcu::PcuHostArgument;
-use fusion_pcu_spirv::PcuSpirvComposedFloatProfile;
+use fusion_pcu_spirv::PcuSpirvComposedProfile;
 #[rustfmt::skip]
 use super::{
     mem,
@@ -40,7 +40,7 @@ impl VulkanPreparedComposed {
     pub(crate) fn new(
         device: Rc<VulkanDevice>,
         words: &[u32],
-        profile: &PcuSpirvComposedFloatProfile,
+        profile: &PcuSpirvComposedProfile,
     ) -> Result<Self, PcuVulkanError> {
         let owners = match profile.resources().len() {
             1 => build(device, words, profile).map(Owners::One),
@@ -71,7 +71,7 @@ impl VulkanPreparedComposed {
 
     pub(crate) fn call(
         &mut self,
-        profile: &PcuSpirvComposedFloatProfile,
+        profile: &PcuSpirvComposedProfile,
         arguments: &mut [PcuHostArgument<'_>],
         positions: [usize; 4],
         measurements: Option<&mut PcuVulkanCallMeasurements>,
@@ -88,7 +88,7 @@ impl VulkanPreparedComposed {
 fn build<const N: usize, const OUTPUTS: usize>(
     device: Rc<VulkanDevice>,
     words: &[u32],
-    profile: &PcuSpirvComposedFloatProfile,
+    profile: &PcuSpirvComposedProfile,
 ) -> Result<VulkanPreparedMap<N, true, OUTPUTS>, PcuVulkanError> {
     let count = profile.resources().len();
     let mut lengths = [0; N];
@@ -125,7 +125,7 @@ fn build<const N: usize, const OUTPUTS: usize>(
 
 fn execute<const N: usize, const OUTPUTS: usize>(
     map: &mut VulkanPreparedMap<N, true, OUTPUTS>,
-    profile: &PcuSpirvComposedFloatProfile,
+    profile: &PcuSpirvComposedProfile,
     arguments: &mut [PcuHostArgument<'_>],
     positions: [usize; 4],
     mut measurements: Option<&mut PcuVulkanCallMeasurements>,
@@ -152,11 +152,14 @@ fn execute<const N: usize, const OUTPUTS: usize>(
     let uploaded = started.map(|_| std::time::Instant::now());
     vk_try("reset retained Vulkan composed fence", unsafe {
         // SAFETY: All prior calls completed or poisoned the entire retained device.
-        map.device.device.reset_fences(&[resources.fence])
+        vk_api_owner!(
+            map.device,
+            ResetFences,
+            map.device.device.reset_fences(&[resources.fence])
+        )
     })?;
     if let Err(error) = submit_and_wait_measured(
-        &map.device.device,
-        map.device.queue,
+        &map.device,
         resources.command,
         resources.fence,
         measurements.as_deref_mut(),

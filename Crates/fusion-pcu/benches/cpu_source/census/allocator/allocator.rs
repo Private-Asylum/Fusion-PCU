@@ -8,7 +8,7 @@ use std::alloc::{
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Counts {
+pub struct Counts {
     pub allocations: usize,
     pub reallocations: usize,
     pub frees: usize,
@@ -75,7 +75,7 @@ impl Drop for Guard {
     }
 }
 
-pub(super) fn observe<T>(action: impl FnOnce() -> T) -> (T, Counts) {
+pub fn observe<T>(action: impl FnOnce() -> T) -> (T, Counts) {
     ACTIVE.with(|active| assert!(!active.get(), "allocation scopes cannot nest"));
     COUNTS.with(|counts| counts.set(Counts::default()));
     ACTIVE.with(|active| active.set(true));

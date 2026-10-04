@@ -166,7 +166,10 @@ impl Program {
         let mut stream = std::ptr::null_mut();
         let mut event = std::ptr::null_mut();
         assert_eq!(unsafe { load(&raw mut module, image.as_ptr().cast()) }, 0);
-        assert_eq!(unsafe { get(&raw mut function, module, c"native_helpers".as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { get(&raw mut function, module, c"native_helpers".as_ptr()) },
+            0
+        );
         assert_eq!(unsafe { create_stream(&raw mut stream, 1) }, 0);
         assert_eq!(unsafe { create_event(&raw mut event, 2) }, 0);
         Self {

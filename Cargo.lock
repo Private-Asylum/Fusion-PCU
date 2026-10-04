@@ -637,6 +637,7 @@ version = "0.0.8"
 dependencies = [
  "fusion-pcu-core",
  "fusion-pcu-macros",
+ "sha2",
 ]
 
 [[package]]

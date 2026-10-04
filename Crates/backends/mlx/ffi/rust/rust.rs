@@ -19,6 +19,8 @@ pub use c_api::{
     CarrierCopy,
     Transport,
     Composed,
+    Conversion,
+    ReluBackward,
 };
 #[cfg(feature = "tensor")]
 pub use c_api::PreparedMatmul;
@@ -97,3 +99,12 @@ pub use c_api::{
     integer_call_census,
     reset_integer_call_census,
 };
+
+#[cfg(feature = "tensor")]
+pub use c_api::StrictMatMul;
+
+#[cfg(feature = "tensor")]
+pub use c_api::StrictSgd;
+
+#[cfg(feature="tensor")]
+pub use c_api::StrictMse;

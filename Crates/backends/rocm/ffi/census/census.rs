@@ -8,6 +8,9 @@ pub struct RocmApiCensus {
     pub frees: u64,
     pub host_to_device_copies: u64,
     pub device_to_host_copies: u64,
+    pub device_to_device_copies: u64,
+    pub device_synchronizations: u64,
+    pub stream_synchronizations: u64,
     pub kernel_launches: u64,
     pub event_creates: u64,
     pub event_records: u64,
@@ -15,7 +18,7 @@ pub struct RocmApiCensus {
     pub event_destroys: u64,
     pub module_loads: u64,
 }
-std::thread_local! { static CENSUS: std::cell::Cell<RocmApiCensus> = const { std::cell::Cell::new(RocmApiCensus { symbol_resolutions: 0, runtime_calls: 0, device_selections: 0, allocations: 0, frees: 0, host_to_device_copies: 0, device_to_host_copies: 0, kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0 }) }; }
+std::thread_local! { static CENSUS: std::cell::Cell<RocmApiCensus> = const { std::cell::Cell::new(RocmApiCensus { symbol_resolutions: 0, runtime_calls: 0, device_selections: 0, allocations: 0, frees: 0, host_to_device_copies: 0, device_to_host_copies: 0, device_to_device_copies: 0, device_synchronizations: 0, stream_synchronizations: 0, kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0 }) }; }
 #[must_use]
 pub fn rocm_api_census() -> RocmApiCensus {
     CENSUS.get()
@@ -36,6 +39,7 @@ pub(super) fn copy(direction: i32) {
         match direction {
             1 => value.host_to_device_copies += 1,
             2 => value.device_to_host_copies += 1,
+            3 => value.device_to_device_copies += 1,
             _ => (),
         }
         cell.set(value);
@@ -55,6 +59,8 @@ pub(super) fn call(name: &str) {
             "hipEventSynchronize" => value.event_waits += 1,
             "hipEventDestroy" => value.event_destroys += 1,
             "hipModuleLoadData" => value.module_loads += 1,
+            "hipDeviceSynchronize" => value.device_synchronizations += 1,
+            "hipStreamSynchronize" => value.stream_synchronizations += 1,
             _ => (),
         }
         cell.set(value);

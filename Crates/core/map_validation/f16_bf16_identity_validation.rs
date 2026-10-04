@@ -83,6 +83,10 @@ fn validate_half_interface(
     } | PcuValueTypeCaps::SCALAR_VALUES;
     let supported_features =
         PcuDispatchFeatureCaps::MUTABLE_RESOURCES | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES;
+    // Guard flat-map admission before recursive capability scanners.
+    if kernel.has_nested_grid_stride_loop() {
+        return Err(E::UnsupportedOperation(0));
+    }
     if kernel.required_type_support().bits() & !supported_type.bits() != 0
         || kernel.required_feature_support().bits() & !supported_features.bits() != 0
     {

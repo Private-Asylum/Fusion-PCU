@@ -1,5 +1,6 @@
 //! Independent ash/GLSL lifecycle for a fixed two-step checked composed expression.
-//! Integer-bit arithmetic helpers are shared and disclosed; no PCU lowering,
+//! Floating-bit arithmetic helpers are shared and disclosed; integer arithmetic
+//! is independently handwritten. No PCU lowering,
 //! preparation, executor or submission routine is called by this control.
 
 #[rustfmt::skip]
@@ -18,6 +19,7 @@ use ash::vk;
 use pcu_facade::{
     PcuCheckedScalarFaultLaw,
     PcuDispatchFloatBinaryOp,
+    PcuDispatchIntegerBinaryOp,
     PcuExecutionFault,
     PcuExecutionFaultKind,
     PcuFloatUnderflowPolicy,
@@ -25,6 +27,42 @@ use pcu_facade::{
     PcuScalarType,
     PcuStableDeviceIdentity,
 };
+
+#[cfg(feature = "insights")]
+#[path = "api_census/api_census.rs"]
+mod api_census;
+#[cfg(feature = "insights")]
+#[allow(unused_imports)] // Explicit API-census harness attaches the handwritten owner.
+pub use api_census::with_scope as with_api_census_scope;
+#[cfg(feature = "insights")]
+macro_rules! sdk_call {
+    ($point:ident, $call:expr) => {{
+        api_census::count_current(fusion_pcu_vulkan::PcuVulkanApiPoint::$point);
+        $call
+    }};
+}
+#[cfg(not(feature = "insights"))]
+macro_rules! sdk_call {
+    ($point:ident, $call:expr) => {
+        $call
+    };
+}
+#[cfg(feature = "insights")]
+macro_rules! owned_sdk_call {
+    ($owner:expr, $point:ident, $call:expr) => {{
+        api_census::count(
+            $owner.api_census.as_deref(),
+            fusion_pcu_vulkan::PcuVulkanApiPoint::$point,
+        );
+        $call
+    }};
+}
+#[cfg(not(feature = "insights"))]
+macro_rules! owned_sdk_call {
+    ($owner:expr, $point:ident, $call:expr) => {
+        $call
+    };
+}
 
 type NativeResult<T> = Result<T, Box<dyn Error>>;
 #[path = "compile/compile.rs"]
@@ -51,6 +89,8 @@ struct Storage {
 
 /// An independent logical device, three retained buffers with aliased readonly descriptors and one terminal fence.
 pub struct NativeComposed {
+    #[cfg(feature = "insights")]
+    api_census: Option<std::rc::Rc<fusion_pcu_vulkan::PcuVulkanApiInsights>>,
     entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
@@ -101,6 +141,7 @@ impl NativeComposed {
     ///
     /// # Errors
     /// Returns cold compiler, resource and native device failures.
+    #[allow(dead_code)] // The integer companion reuses this owner but has no one-effect case.
     pub fn one_effect(
         identity: PcuStableDeviceIdentity,
         extent: u32,
@@ -132,21 +173,48 @@ impl NativeComposed {
             1 => PcuRangePolicy::Clamp,
             _ => return Err("native range policy".into()),
         };
-        let laws = [PcuDispatchFloatBinaryOp::Add, PcuDispatchFloatBinaryOp::Mul]
-            .map(|op| PcuCheckedScalarFaultLaw::float_binary(scalar, op, range, underflow));
+        let laws = if matches!(
+            scalar,
+            PcuScalarType::U8
+                | PcuScalarType::I8
+                | PcuScalarType::U16
+                | PcuScalarType::I16
+                | PcuScalarType::U32
+                | PcuScalarType::I32
+                | PcuScalarType::U64
+                | PcuScalarType::I64
+                | PcuScalarType::U128
+                | PcuScalarType::I128
+                | PcuScalarType::U256
+                | PcuScalarType::I256
+                | PcuScalarType::U512
+                | PcuScalarType::I512
+        ) {
+            [
+                PcuDispatchIntegerBinaryOp::Add,
+                PcuDispatchIntegerBinaryOp::Mul,
+            ]
+            .map(|op| PcuCheckedScalarFaultLaw::integer_binary(scalar, op, range))
+        } else {
+            [PcuDispatchFloatBinaryOp::Add, PcuDispatchFloatBinaryOp::Mul]
+                .map(|op| PcuCheckedScalarFaultLaw::float_binary(scalar, op, range, underflow))
+        };
         let [Some(add), Some(mul)] = laws else {
             return Err("native scalar law".into());
         };
         // SAFETY: ash loads the system Vulkan library and the owner retains it through device Drop.
-        let entry = unsafe { ash::Entry::load()? };
+        let entry = unsafe { sdk_call!(LoaderLoad, ash::Entry::load())? };
         let app = vk::ApplicationInfo::default()
             .application_name(c"pcu-native-composed-control")
             .api_version(vk::API_VERSION_1_1);
         // SAFETY: The stack create info is valid and no extension pointers are supplied.
         let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app),
-                None,
+            sdk_call!(
+                CreateInstance,
+                entry.create_instance(
+                    &vk::InstanceCreateInfo::default().application_info(&app),
+                    None,
+                )
             )?
         };
         let selection = select_device(&instance, identity, false);
@@ -155,7 +223,7 @@ impl NativeComposed {
             Err(error) => {
                 // SAFETY: No logical device or native resource has been created.
                 unsafe {
-                    instance.destroy_instance(None);
+                    sdk_call!(DestroyInstance, instance.destroy_instance(None));
                 }
                 return Err(error);
             }
@@ -167,26 +235,31 @@ impl NativeComposed {
         let features = vk::PhysicalDeviceFeatures::default().shader_float64(false);
         // SAFETY: Selected physical device and compute queue belong to this instance; Float64 was queried.
         let device = match unsafe {
-            instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queues)
-                    .enabled_features(&features),
-                None,
+            sdk_call!(
+                CreateDevice,
+                instance.create_device(
+                    physical,
+                    &vk::DeviceCreateInfo::default()
+                        .queue_create_infos(&queues)
+                        .enabled_features(&features),
+                    None,
+                )
             )
         } {
             Ok(device) => device,
             Err(error) => {
                 // SAFETY: Failed logical-device creation leaves this instance with no child owners.
                 unsafe {
-                    instance.destroy_instance(None);
+                    sdk_call!(DestroyInstance, instance.destroy_instance(None));
                 }
                 return Err(error.into());
             }
         };
         // SAFETY: Queue zero was requested for this selected compute family.
-        let queue = unsafe { device.get_device_queue(family, 0) };
+        let queue = unsafe { sdk_call!(GetDeviceQueue, device.get_device_queue(family, 0)) };
         let mut owner = Self {
+            #[cfg(feature = "insights")]
+            api_census: api_census::current(),
             entry,
             instance,
             device,
@@ -229,33 +302,54 @@ impl NativeComposed {
             .collect();
         // SAFETY: All create infos reference live owner handles or stack/owned arrays through each call.
         unsafe {
-            owner.shader = owner
-                .device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)?;
-            owner.descriptor_layout = owner.device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&layouts),
-                None,
+            owner.shader = owned_sdk_call!(
+                owner,
+                CreateShaderModule,
+                owner.device.create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&words),
+                    None
+                )
+            )?;
+            owner.descriptor_layout = owned_sdk_call!(
+                owner,
+                CreateDescriptorSetLayout,
+                owner.device.create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&layouts),
+                    None,
+                )
             )?;
             let sets = [owner.descriptor_layout];
-            owner.pipeline_layout = owner.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
-                None,
+            owner.pipeline_layout = owned_sdk_call!(
+                owner,
+                CreatePipelineLayout,
+                owner.device.create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
+                    None,
+                )
             )?;
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(owner.shader)
                 .name(c"main");
-            owner.pipeline = match owner.device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(owner.pipeline_layout)],
-                None,
+            owner.pipeline = match owned_sdk_call!(
+                owner,
+                CreateComputePipelines,
+                owner.device.create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(stage)
+                        .layout(owner.pipeline_layout)],
+                    None,
+                )
             ) {
                 Ok(pipelines) => pipelines[0],
                 Err((partial, error)) => {
                     for pipeline in partial {
-                        owner.device.destroy_pipeline(pipeline, None);
+                        owned_sdk_call!(
+                            owner,
+                            DestroyPipeline,
+                            owner.device.destroy_pipeline(pipeline, None)
+                        );
                     }
                     return Err(error.into());
                 }
@@ -263,16 +357,24 @@ impl NativeComposed {
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(5)];
-            owner.descriptors = owner.device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(&sizes),
-                None,
+            owner.descriptors = owned_sdk_call!(
+                owner,
+                CreateDescriptorPool,
+                owner.device.create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(1)
+                        .pool_sizes(&sizes),
+                    None,
+                )
             )?;
-            let set = owner.device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(owner.descriptors)
-                    .set_layouts(&sets),
+            let set = owned_sdk_call!(
+                owner,
+                AllocateDescriptorSets,
+                owner.device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(owner.descriptors)
+                        .set_layouts(&sets),
+                )
             )?[0];
             let infos: Vec<_> = [1, 0, 0, 0, 2]
                 .into_iter()
@@ -297,61 +399,101 @@ impl NativeComposed {
                         .buffer_info(info)
                 })
                 .collect();
-            owner.device.update_descriptor_sets(&writes, &[]);
-            owner.commands = owner.device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default().queue_family_index(family),
-                None,
+            owned_sdk_call!(
+                owner,
+                UpdateDescriptorSets,
+                owner.device.update_descriptor_sets(&writes, &[])
+            );
+            owner.commands = owned_sdk_call!(
+                owner,
+                CreateCommandPool,
+                owner.device.create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(family),
+                    None,
+                )
             )?;
-            owner.command = owner.device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(owner.commands)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
+            owner.command = owned_sdk_call!(
+                owner,
+                AllocateCommandBuffers,
+                owner.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(owner.commands)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
             )?[0];
-            owner
-                .device
-                .begin_command_buffer(owner.command, &vk::CommandBufferBeginInfo::default())?;
-            owner.device.cmd_bind_pipeline(
-                owner.command,
-                vk::PipelineBindPoint::COMPUTE,
-                owner.pipeline,
+            owned_sdk_call!(
+                owner,
+                BeginCommandBuffer,
+                owner
+                    .device
+                    .begin_command_buffer(owner.command, &vk::CommandBufferBeginInfo::default())
+            )?;
+            owned_sdk_call!(
+                owner,
+                BindPipeline,
+                owner.device.cmd_bind_pipeline(
+                    owner.command,
+                    vk::PipelineBindPoint::COMPUTE,
+                    owner.pipeline,
+                )
             );
-            owner.device.cmd_bind_descriptor_sets(
-                owner.command,
-                vk::PipelineBindPoint::COMPUTE,
-                owner.pipeline_layout,
-                0,
-                &[set],
-                &[],
+            owned_sdk_call!(
+                owner,
+                BindDescriptorSets,
+                owner.device.cmd_bind_descriptor_sets(
+                    owner.command,
+                    vk::PipelineBindPoint::COMPUTE,
+                    owner.pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                )
             );
-            owner.device.cmd_dispatch(
-                owner.command,
-                extent
-                    .div_ceil(if scalar.bit_width() < 32 {
-                        32 / u32::from(scalar.bit_width())
-                    } else {
-                        1
-                    })
-                    .div_ceil(64),
-                1,
-                1,
+            owned_sdk_call!(
+                owner,
+                Dispatch,
+                owner.device.cmd_dispatch(
+                    owner.command,
+                    extent
+                        .div_ceil(if scalar.bit_width() < 32 {
+                            32 / u32::from(scalar.bit_width())
+                        } else {
+                            1
+                        })
+                        .div_ceil(64),
+                    1,
+                    1,
+                )
             );
             let barrier = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ)];
-            owner.device.cmd_pipeline_barrier(
-                owner.command,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &barrier,
-                &[],
-                &[],
+            owned_sdk_call!(
+                owner,
+                PipelineBarrier,
+                owner.device.cmd_pipeline_barrier(
+                    owner.command,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &barrier,
+                    &[],
+                    &[],
+                )
             );
-            owner.device.end_command_buffer(owner.command)?;
-            owner.fence = owner
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)?;
+            owned_sdk_call!(
+                owner,
+                EndCommandBuffer,
+                owner.device.end_command_buffer(owner.command)
+            )?;
+            owner.fence = owned_sdk_call!(
+                owner,
+                CreateFence,
+                owner
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+            )?;
         }
         println!(
             "native cold allocations {:?}",
@@ -395,19 +537,27 @@ impl NativeComposed {
         let uploaded = started.map(|_| Instant::now());
         // SAFETY: Previous synchronous call completed and owner retains all handles.
         unsafe {
-            self.device.reset_fences(&[self.fence])?;
+            owned_sdk_call!(self, ResetFences, self.device.reset_fences(&[self.fence]))?;
         }
         let commands = [self.command];
         let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
         // SAFETY: Recorded command uses owner resources; queue submissions are serial here.
         self.pending = true;
         unsafe {
-            self.device.queue_submit(self.queue, &submits, self.fence)?;
+            owned_sdk_call!(
+                self,
+                QueueSubmit,
+                self.device.queue_submit(self.queue, &submits, self.fence)
+            )?;
         }
         let submitted = started.map(|_| Instant::now());
         // SAFETY: Fence belongs to this one outstanding submission; infinite wait proves terminal completion.
         unsafe {
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            owned_sdk_call!(
+                self,
+                WaitForFences,
+                self.device.wait_for_fences(&[self.fence], true, u64::MAX)
+            )?;
         }
         self.pending = false;
         let completed = started.map(|_| Instant::now());
@@ -484,26 +634,64 @@ impl Drop for NativeComposed {
         // SAFETY: Successfully completed calls are terminal. A failed pending call requires idle proof;
         // absent proof, abandon this independent session rather than freeing possibly used resources.
         unsafe {
-            if self.pending && self.device.device_wait_idle().is_err() {
+            if self.pending
+                && owned_sdk_call!(self, DeviceWaitIdle, self.device.device_wait_idle()).is_err()
+            {
                 mem::forget(self.entry.clone());
                 return;
             }
-            self.device.destroy_fence(self.fence, None);
-            self.device.destroy_command_pool(self.commands, None);
-            self.device.destroy_descriptor_pool(self.descriptors, None);
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_layout, None);
-            self.device.destroy_shader_module(self.shader, None);
+            owned_sdk_call!(
+                self,
+                DestroyFence,
+                self.device.destroy_fence(self.fence, None)
+            );
+            owned_sdk_call!(
+                self,
+                DestroyCommandPool,
+                self.device.destroy_command_pool(self.commands, None)
+            );
+            owned_sdk_call!(
+                self,
+                DestroyDescriptorPool,
+                self.device.destroy_descriptor_pool(self.descriptors, None)
+            );
+            owned_sdk_call!(
+                self,
+                DestroyPipeline,
+                self.device.destroy_pipeline(self.pipeline, None)
+            );
+            owned_sdk_call!(
+                self,
+                DestroyPipelineLayout,
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None)
+            );
+            owned_sdk_call!(
+                self,
+                DestroyDescriptorSetLayout,
+                self.device
+                    .destroy_descriptor_set_layout(self.descriptor_layout, None)
+            );
+            owned_sdk_call!(
+                self,
+                DestroyShaderModule,
+                self.device.destroy_shader_module(self.shader, None)
+            );
             for buffer in &self.buffers {
-                self.device.unmap_memory(buffer.memory);
-                self.device.destroy_buffer(buffer.buffer, None);
-                self.device.free_memory(buffer.memory, None);
+                owned_sdk_call!(self, UnmapMemory, self.device.unmap_memory(buffer.memory));
+                owned_sdk_call!(
+                    self,
+                    DestroyBuffer,
+                    self.device.destroy_buffer(buffer.buffer, None)
+                );
+                owned_sdk_call!(
+                    self,
+                    FreeMemory,
+                    self.device.free_memory(buffer.memory, None)
+                );
             }
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            owned_sdk_call!(self, DestroyDevice, self.device.destroy_device(None));
+            owned_sdk_call!(self, DestroyInstance, self.instance.destroy_instance(None));
         }
     }
 }
@@ -515,31 +703,44 @@ fn select_device(
 ) -> NativeResult<(vk::PhysicalDevice, u32)> {
     // SAFETY: All inventory queries use a live instance and returned physical handles.
     unsafe {
-        for physical in instance.enumerate_physical_devices()? {
-            let properties = instance.get_physical_device_properties(physical);
+        for physical in sdk_call!(
+            EnumeratePhysicalDevices,
+            instance.enumerate_physical_devices()
+        )? {
+            let properties = sdk_call!(
+                PhysicalDeviceProperties,
+                instance.get_physical_device_properties(physical)
+            );
             if properties.device_type == vk::PhysicalDeviceType::CPU {
                 continue;
             }
             let mut id = vk::PhysicalDeviceIDProperties::default();
-            instance.get_physical_device_properties2(
-                physical,
-                &mut vk::PhysicalDeviceProperties2::default().push_next(&mut id),
+            sdk_call!(
+                PhysicalDeviceProperties,
+                instance.get_physical_device_properties2(
+                    physical,
+                    &mut vk::PhysicalDeviceProperties2::default().push_next(&mut id),
+                )
             );
             if identity.namespace() != "vulkan.deviceUUID" || identity.value() != id.device_uuid {
                 continue;
             }
             if f64
-                && instance
-                    .get_physical_device_features(physical)
-                    .shader_float64
+                && sdk_call!(
+                    PhysicalDeviceFeatures,
+                    instance.get_physical_device_features(physical)
+                )
+                .shader_float64
                     == 0
             {
                 return Err("native shaderFloat64 unavailable".into());
             }
-            for (family, queue) in instance
-                .get_physical_device_queue_family_properties(physical)
-                .iter()
-                .enumerate()
+            for (family, queue) in sdk_call!(
+                QueueFamilyProperties,
+                instance.get_physical_device_queue_family_properties(physical)
+            )
+            .iter()
+            .enumerate()
             {
                 if queue.queue_count > 0 && queue.queue_flags.contains(vk::QueueFlags::COMPUTE) {
                     println!(
@@ -563,15 +764,24 @@ fn create_buffer(
 ) -> NativeResult<Storage> {
     // SAFETY: Device/physical handles share this instance and every failed partial allocation is cleaned.
     unsafe {
-        let buffer = device.create_buffer(
-            &vk::BufferCreateInfo::default()
-                .size(bytes as u64)
-                .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE),
-            None,
+        let buffer = sdk_call!(
+            CreateBuffer,
+            device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bytes as u64)
+                    .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
         )?;
-        let requirements = device.get_buffer_memory_requirements(buffer);
-        let properties = instance.get_physical_device_memory_properties(physical);
+        let requirements = sdk_call!(
+            BufferMemoryRequirements,
+            device.get_buffer_memory_requirements(buffer)
+        );
+        let properties = sdk_call!(
+            MemoryProperties,
+            instance.get_physical_device_memory_properties(physical)
+        );
         let needed = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let compatible = |index: u32, cached: bool| {
             requirements.memory_type_bits & (1 << index) != 0
@@ -590,28 +800,38 @@ fn create_buffer(
             .find(|index| compatible(*index, true))
             .or_else(|| (0..properties.memory_type_count).find(|index| compatible(*index, false)));
         let Some(memory_type) = selected else {
-            device.destroy_buffer(buffer, None);
+            sdk_call!(DestroyBuffer, device.destroy_buffer(buffer, None));
             return Err("native coherent memory unavailable".into());
         };
-        let memory = match device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(requirements.size)
-                .memory_type_index(memory_type),
-            None,
+        let memory = match sdk_call!(
+            AllocateMemory,
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type),
+                None,
+            )
         ) {
             Ok(memory) => memory,
             Err(error) => {
-                device.destroy_buffer(buffer, None);
+                sdk_call!(DestroyBuffer, device.destroy_buffer(buffer, None));
                 return Err(error.into());
             }
         };
-        let mapped = match device.bind_buffer_memory(buffer, memory, 0).and_then(|()| {
-            device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        let mapped = match sdk_call!(
+            BindBufferMemory,
+            device.bind_buffer_memory(buffer, memory, 0)
+        )
+        .and_then(|()| {
+            sdk_call!(
+                MapMemory,
+                device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            )
         }) {
             Ok(mapped) => mapped.cast(),
             Err(error) => {
-                device.destroy_buffer(buffer, None);
-                device.free_memory(memory, None);
+                sdk_call!(DestroyBuffer, device.destroy_buffer(buffer, None));
+                sdk_call!(FreeMemory, device.free_memory(memory, None));
                 return Err(error.into());
             }
         };
@@ -696,11 +916,11 @@ pub fn count_heap(run: impl FnOnce()) -> HeapCounts {
     }
 }
 
-pub const fn bytes<T: pcu_facade::PcuCheckedFloat>(values: &[T]) -> &[u8] {
-    // SAFETY: The six sealed checked float carriers have no padding; a read-only byte view has identical lifetime and valid extent.
+pub const fn bytes<T: pcu_facade::PcuScalar>(values: &[T]) -> &[u8] {
+    // SAFETY: The sealed scalar carriers have no padding; a read-only byte view has identical lifetime and valid extent.
     unsafe { core::slice::from_raw_parts(values.as_ptr().cast(), core::mem::size_of_val(values)) }
 }
-pub const fn bytes_mut<T: pcu_facade::PcuCheckedFloat>(values: &mut [T]) -> &mut [u8] {
+pub const fn bytes_mut<T: pcu_facade::PcuScalar>(values: &mut [T]) -> &mut [u8] {
     // SAFETY: Every representation bit pattern of the sealed checked float carriers is valid; exclusive bytes retain the original slice lifetime.
     unsafe {
         core::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), core::mem::size_of_val(values))

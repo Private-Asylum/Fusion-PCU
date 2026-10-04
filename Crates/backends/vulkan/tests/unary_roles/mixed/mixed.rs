@@ -220,7 +220,7 @@ fn ordinary<T: Native>(mut policy: pcu_facade::global::PcuExecutionPolicy) {
         for role in 0..6 {
             let input = banks[phase * 6 + role];
             let input_owner = &owners[phase * 6 + role];
-            let operation = if role % 2 == 0 {
+            let operation = if role.is_multiple_of(2) {
                 PcuDispatchFloatUnaryOp::Neg
             } else {
                 PcuDispatchFloatUnaryOp::Relu

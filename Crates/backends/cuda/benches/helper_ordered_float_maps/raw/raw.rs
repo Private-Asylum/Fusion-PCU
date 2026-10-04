@@ -261,7 +261,9 @@ impl Raw {
             OWNER_DROPS.load(std::sync::atomic::Ordering::Relaxed),
             before
         );
-        eprintln!("known-terminal-retirement: stable boxed faultword RAM and full allocation/code/event/stream/runtime/SDK owner retained without destructor");
+        eprintln!(
+            "known-terminal-retirement: stable boxed faultword RAM and full allocation/code/event/stream/runtime/SDK owner retained without destructor"
+        );
     }
     pub fn call(&mut self, bank: usize) {
         assert_eq!(

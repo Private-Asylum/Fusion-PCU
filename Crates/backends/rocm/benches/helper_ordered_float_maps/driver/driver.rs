@@ -96,6 +96,7 @@ fn arithmetic(ir: &PcuDispatchKernelIr<'_>) {
     );
 }
 #[allow(clippy::too_many_lines)] // One scope matches both observable outputs and complete API boundary.
+#[allow(clippy::cognitive_complexity)] // Six fixed measured routes retain one shared fault/census scope.
 fn case<T: Format, const N: usize>(
     criterion: &mut Criterion,
     backend: &RocmOwnedDispatchBackend,

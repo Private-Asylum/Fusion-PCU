@@ -335,6 +335,8 @@ impl fusion_pcu::PcuHostKernelBackend for MetalOwnedDispatchBackend {
         &self,
         kernel: &fusion_pcu::PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         self.session.prepare_host_kernel(kernel)
     }
 }
@@ -381,7 +383,7 @@ impl PcuOwnedDispatchBackend for MetalOwnedDispatchBackend {
             match self.session.prepare_joint_host_kernel(submission.kernel).map_err(|error|match error {fusion_pcu::PcuHostDispatchError::Backend(error)=>MetalOwnedDispatchError::Metal(error),_=>MetalOwnedDispatchError::Metal(MetalError::Unsupported)})? {
                 crate::MetalPreparedHostKernel::DivRem(kernel) => Program::DivRem(kernel),
                 crate::MetalPreparedHostKernel::DivRemRoles(kernel) => Program::DivRemRoles(kernel),
-                crate::MetalPreparedHostKernel::Single(_) | crate::MetalPreparedHostKernel::Transport(_) | crate::MetalPreparedHostKernel::Composed(_) => return Err(MetalError::Unsupported.into()),
+                crate::MetalPreparedHostKernel::Conversion(_) | crate::MetalPreparedHostKernel::Single(_) | crate::MetalPreparedHostKernel::Transport(_) | crate::MetalPreparedHostKernel::Composed(_) => return Err(MetalError::Unsupported.into()),
             }
         } else if fusion_pcu::describe_checked_float_unary_map(submission.kernel).is_ok() {
             Program::Float(self.session.prepare_float_unary_kernel(submission.kernel)?)

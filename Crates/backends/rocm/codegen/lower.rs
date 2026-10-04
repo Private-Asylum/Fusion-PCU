@@ -123,7 +123,7 @@ impl fmt::Display for RocmLowerError {
                 )
             }
             Self::UnsupportedConstant => {
-                formatter.write_str("HIP lowering supports f32 constants only")
+                formatter.write_str("HIP lowering supports F32/F64 and I/U8/16/32/64 constants")
             }
             Self::UnsupportedAlu(op) => write!(formatter, "HIP lowering does not support {op:?}"),
             Self::UnsupportedOperation { index, support } => write!(
@@ -179,11 +179,20 @@ impl MapBindingProjection {
     }
 }
 
+pub fn has_nested_regions(ops: &[PcuDispatchOp<'_>]) -> bool {
+    ops.iter().any(|operation| matches!(operation,
+        PcuDispatchOp::GridStrideLoop { body, .. } if body.iter().any(|nested| matches!(nested, PcuDispatchOp::GridStrideLoop { .. }))
+    ))
+}
+
 /// Cold opt-in preserves actual loads, independent indices and mathematical SSA roles.
 /// The neutral schema owns read obligations and joint quotient/remainder destinations.
 /// Emission retains original declaration order and typed SSA; only unread declarations
 /// leave the device ABI. The original exact numerical request is never rewritten.
 pub fn map_binding_projection(kernel: &PcuDispatchKernelIr<'_>) -> Option<MapBindingProjection> {
+    if has_nested_regions(kernel.ops) {
+        return None;
+    }
     if let Some(schema) = checked_float_binary_operand_schema(kernel) {
         return Some(MapBindingProjection::Float(schema));
     }
@@ -241,6 +250,9 @@ const fn admitted_integer(value_type: PcuValueType) -> bool {
 pub fn checked_float_binary_operand_schema(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Option<fusion_pcu::CheckedFloatBinaryOperandSchema> {
+    if has_nested_regions(kernel.ops) {
+        return None;
+    }
     let value_type = validation::checked_float_binary_profile(kernel)?;
     if !matches!(
         value_type.scalar_type(),
@@ -599,6 +611,9 @@ fn lower_dispatch_to_hip_source_with_preamble(
                 result.0
             )
             .map_err(|_| RocmLowerError::FormattingFailure)?,
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
+                integer_constant::emit(&mut source, "    ", result, value)?;
+            }
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
                 result,
                 op,
@@ -1718,6 +1733,9 @@ fn emit_hip_data_op(
             result.0
         )
         .map_err(|_| RocmLowerError::FormattingFailure),
+        PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
+            integer_constant::emit(source, "        ", result, value)
+        }
         PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
             result,
             op,
@@ -4132,3 +4150,6 @@ mod transport;
 #[cfg(test)]
 #[path = "lower/transport/tests.rs"]
 mod transport_tests;
+
+#[path = "lower/integer_constant/integer_constant.rs"]
+mod integer_constant;

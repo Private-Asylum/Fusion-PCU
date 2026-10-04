@@ -1,0 +1,5 @@
+error: float underflow flags require a checked float owned tensor helper; generic scalar helpers are checked at capture time
+ --> tests/ui/zero_argument_integer_underflow_flag.rs:3:18
+  |
+3 | fn unsupported() -> Result<pcu_alias::PcuTensor<u32>, pcu_alias::PcuExecutionError> {
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

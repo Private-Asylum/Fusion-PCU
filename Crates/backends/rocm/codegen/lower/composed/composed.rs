@@ -11,7 +11,6 @@ use fusion_pcu::{
     PcuDispatchIndex,
     PcuDispatchKernelIr,
     PcuDispatchOp,
-    PcuScalarType,
     PcuValueTypeCaps,
 };
 
@@ -46,14 +45,6 @@ pub(super) fn project(kernel: &PcuDispatchKernelIr<'_>) -> Option<ComposedProjec
         })?;
     let caps = PcuValueTypeCaps::for_scalar(value_type.scalar_type());
     let resources = if super::admitted_integer(value_type) {
-        if matches!(
-            value_type.scalar_type(),
-            PcuScalarType::U256 | PcuScalarType::I256 | PcuScalarType::U512 | PcuScalarType::I512
-        ) {
-            // Four wide carrier identities remain structural-only for composition.
-            // Existing single-binary and joint integer profiles remain independent.
-            return None;
-        }
         // Integer helpers reuse the same homogeneous SSA/resource law. The physical
         // packed status retains the exact union of constituent integer fault kinds.
         fusion_pcu::assess_checked_integer_map_resources::<CAPACITY>(kernel, value_type, caps)
@@ -83,13 +74,6 @@ pub(super) fn project(kernel: &PcuDispatchKernelIr<'_>) -> Option<ComposedProjec
             ) if range_policy != kernel.numerical_requirements.range_policy => {
                 // The retained word's disposition must implement the requested header.
                 // Exact lexical underflow policies are still kept on each instruction.
-                return None;
-            }
-            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { .. })
-                if super::admitted_integer(value_type) =>
-            {
-                // This provider's existing integer emitter has no constant producer.
-                // Neutral structural eligibility does not create executable support.
                 return None;
             }
             _ => (),

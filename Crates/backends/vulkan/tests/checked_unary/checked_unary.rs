@@ -329,67 +329,70 @@ fn six_format_full_policies_grid_broadcast_fatal_precedence_tails_and_retry() {
 
 macro_rules! genuine {
     ($backend:ident,$entry:ident,$prepare:ident,$op:ident,$policy:ident,$clamp:literal) => {{
-        let mut prepared = source::$prepare::<T, 7, _>($backend).unwrap();
-        let tiny = T::from_raw(1);
-        let normal = T::from_raw(1 << T::FRACTION);
-        let sentinel = T::from_raw(17);
-        let mut input = [tiny; 7];
-        let mut output = [sentinel; 10];
-        for ordinary in [false, true] {
-            output.fill(sentinel);
-            let result = if ordinary {
-                source::$entry::<T, 7>(&input, &mut output).map_err(|e| match e {
-                    global::PcuExecutionError::ArithmeticFault(f) => f,
-                    other => panic!("unexpected {other:?}"),
-                })
-            } else {
-                prepared(&input, &mut output).map_err(fault)
-            };
-            let (bits, underflow) = oracle::evaluate::<T>(
-                1,
-                PcuDispatchFloatUnaryOp::$op,
-                PcuFloatUnderflowPolicy::$policy,
-            )
-            .unwrap();
-            assert_eq!(
-                result,
-                if underflow {
-                    Err(PcuExecutionFault {
-                        recovered: $clamp,
-                        invocation_id: 0,
-                        kind: PcuExecutionFaultKind::ArithmeticUnderflow,
+        fn case<T: Float>($backend: &PcuVulkanBackend) {
+            let mut prepared = source::$prepare::<T, 7, _>($backend).unwrap();
+            let tiny = T::from_raw(1);
+            let normal = T::from_raw(1 << T::FRACTION);
+            let sentinel = T::from_raw(17);
+            let mut input = [tiny; 7];
+            let mut output = [sentinel; 10];
+            for ordinary in [false, true] {
+                output.fill(sentinel);
+                let result = if ordinary {
+                    source::$entry::<T, 7>(&input, &mut output).map_err(|e| match e {
+                        global::PcuExecutionError::ArithmeticFault(f) => f,
+                        other => panic!("unexpected {other:?}"),
                     })
                 } else {
-                    Ok(())
+                    prepared(&input, &mut output).map_err(fault)
+                };
+                let (bits, underflow) = oracle::evaluate::<T>(
+                    1,
+                    PcuDispatchFloatUnaryOp::$op,
+                    PcuFloatUnderflowPolicy::$policy,
+                )
+                .unwrap();
+                assert_eq!(
+                    result,
+                    if underflow {
+                        Err(PcuExecutionFault {
+                            recovered: $clamp,
+                            invocation_id: 0,
+                            kind: PcuExecutionFaultKind::ArithmeticUnderflow,
+                        })
+                    } else {
+                        Ok(())
+                    }
+                );
+                same(
+                    &output[..7],
+                    &[T::from_raw(if underflow && !$clamp { 17 } else { bits }); 7],
+                );
+                same(&output[7..], &[sentinel; 3]);
+                input[6] = T::from_raw(T::MAX + 1);
+                let before = output;
+                let result = if ordinary {
+                    source::$entry::<T, 7>(&input, &mut output).map_err(|e| match e {
+                        global::PcuExecutionError::ArithmeticFault(f) => f,
+                        other => panic!("unexpected {other:?}"),
+                    })
+                } else {
+                    prepared(&input, &mut output).map_err(fault)
+                };
+                let first = if underflow && !$clamp { 0 } else { 6 };
+                assert_eq!(result.unwrap_err().invocation_id, first);
+                same(&output, &before);
+                input.fill(normal);
+                if ordinary {
+                    source::$entry::<T, 7>(&input, &mut output).unwrap();
+                } else {
+                    prepared(&input, &mut output).unwrap();
                 }
-            );
-            same(
-                &output[..7],
-                &[T::from_raw(if underflow && !$clamp { 17 } else { bits }); 7],
-            );
-            same(&output[7..], &[sentinel; 3]);
-            input[6] = T::from_raw(T::MAX + 1);
-            let before = output;
-            let result = if ordinary {
-                source::$entry::<T, 7>(&input, &mut output).map_err(|e| match e {
-                    global::PcuExecutionError::ArithmeticFault(f) => f,
-                    other => panic!("unexpected {other:?}"),
-                })
-            } else {
-                prepared(&input, &mut output).map_err(fault)
-            };
-            let first = if underflow && !$clamp { 0 } else { 6 };
-            assert_eq!(result.unwrap_err().invocation_id, first);
-            same(&output, &before);
-            input.fill(normal);
-            if ordinary {
-                source::$entry::<T, 7>(&input, &mut output).unwrap();
-            } else {
-                prepared(&input, &mut output).unwrap();
+                same(&output[7..], &[sentinel; 3]);
+                input.fill(tiny);
             }
-            same(&output[7..], &[sentinel; 3]);
-            input.fill(tiny);
         }
+        case::<T>($backend);
     }};
 }
 fn genuine_source<T: Float>(backend: &PcuVulkanBackend) {

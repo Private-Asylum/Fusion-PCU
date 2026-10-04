@@ -2,6 +2,9 @@
 #[rustfmt::skip]
 use fusion_pcu::{
     assess_checked_float_map_resources,
+    assess_checked_integer_map_resources,
+    describe_portable_v1_checked_integer_composed_map,
+    PcuDispatchIntegerBinaryOp,
     validate_typed_dispatch_value_flow,
     PcuCheckedScalarFaultLaw,
     PcuDispatchControlOp,
@@ -27,7 +30,7 @@ use super::{
     STEPS,
     Step,
     PcuSpirvComposedResource as Resource,
-    PcuSpirvComposedFloatProfile as Profile,
+    PcuSpirvComposedProfile as Profile,
     PcuSpirvError as Error,
 };
 
@@ -35,21 +38,36 @@ pub(super) fn prepare(
     kernel: &PcuDispatchKernelIr<'_>,
     one_effect: bool,
 ) -> Result<Profile, Error> {
-    if kernel
-        .numerical_requirements
-        .numerical_options
-        .reproducibility
-        != PcuReproducibility::Unspecified
-    {
-        return Err(Error::UnsupportedNumericalRequirements);
-    }
-    let scalar = scalar(kernel)?;
-    let schema = assess_checked_float_map_resources::<BINDINGS>(
-        kernel,
-        PcuValueType::Scalar(scalar),
-        PcuValueTypeCaps::for_scalar(scalar),
-    )
-    .map_err(|_| Error::InvalidKernelSignature)?;
+    prepare_general(kernel, one_effect, false)
+}
+pub(super) fn prepare_integer(
+    kernel: &PcuDispatchKernelIr<'_>,
+    one_effect: bool,
+) -> Result<Profile, Error> {
+    prepare_general(kernel, one_effect, true)
+}
+fn prepare_general(
+    kernel: &PcuDispatchKernelIr<'_>,
+    one_effect: bool,
+    integer: bool,
+) -> Result<Profile, Error> {
+    validate_reproducibility(kernel, integer)?;
+    let scalar = scalar(kernel, integer)?;
+    let schema = if integer {
+        assess_checked_integer_map_resources::<BINDINGS>(
+            kernel,
+            PcuValueType::Scalar(scalar),
+            PcuValueTypeCaps::for_scalar(scalar),
+        )
+        .map_err(|_| Error::InvalidKernelSignature)
+    } else {
+        assess_checked_float_map_resources::<BINDINGS>(
+            kernel,
+            PcuValueType::Scalar(scalar),
+            PcuValueTypeCaps::for_scalar(scalar),
+        )
+        .map_err(|_| Error::InvalidKernelSignature)
+    }?;
     validate_typed_dispatch_value_flow(kernel).map_err(|_| Error::InvalidKernelSignature)?;
     let body = match kernel.ops {
         [
@@ -62,6 +80,19 @@ pub(super) fn prepare(
         ] => body,
         _ => return Err(Error::InvalidKernelSignature),
     };
+    // Only discarded checked Add has the independent four-wide one-effect qualification.
+    if integer
+        && one_effect
+        && scalar.bit_width() > 128
+        && body.iter().any(|operation| {
+            matches!(operation,
+                PcuDispatchOp::Data(PcuDispatchDataOp::CheckedIntegerBinary { op, .. })
+                    if *op != PcuDispatchIntegerBinaryOp::Add
+            )
+        })
+    {
+        return Err(Error::InvalidKernelSignature);
+    }
     let checked = body
         .iter()
         .filter(|op| {
@@ -70,6 +101,7 @@ pub(super) fn prepare(
                 PcuDispatchOp::Data(
                     PcuDispatchDataOp::CheckedFloatBinary { .. }
                         | PcuDispatchDataOp::CheckedFloatUnary { .. }
+                        | PcuDispatchDataOp::CheckedIntegerBinary { .. }
                 )
             )
         })
@@ -89,9 +121,19 @@ pub(super) fn prepare(
     let mut plan = Profile {
         requirements: kernel.numerical_requirements,
         scalar,
+        element_bytes: usize::from(scalar.bit_width() / 8),
+        packing_lanes: match scalar {
+            PcuScalarType::F16 | PcuScalarType::BF16 | PcuScalarType::U16 | PcuScalarType::I16 => 2,
+            PcuScalarType::F8E4M3FN
+            | PcuScalarType::F8E5M2
+            | PcuScalarType::U8
+            | PcuScalarType::I8 => 4,
+            _ => 1,
+        },
         extent: schema.logical_extent,
         declarations: [fusion_pcu::PcuBindingRef::new(0, 0); BINDINGS],
         declaration_access: [fusion_pcu::PcuBindingAccess::ReadOnly; BINDINGS],
+        argument_access: [fusion_pcu::PcuBindingAccess::ReadOnly; BINDINGS],
         declaration_count: kernel.bindings.len(),
         resources: [Resource::EMPTY; BINDINGS],
         resource_count: schema.resources().len(),
@@ -99,9 +141,47 @@ pub(super) fn prepare(
         step_count: body.len(),
         one_effect,
     };
+    detach_resources(kernel, &schema, &mut plan)?;
+    let mut registers = [u32::MAX; SOURCE_REGISTERS];
+    let mut count = 0;
+    for (ordinal, operation) in body.iter().enumerate() {
+        plan.steps[ordinal] = step(*operation, &plan, &mut registers, &mut count)?;
+        plan.steps[ordinal].arguments[7] =
+            u32::try_from(ordinal).map_err(|_| Error::InvalidKernelSignature)?;
+    }
+    Ok(plan)
+}
+
+fn validate_reproducibility(kernel: &PcuDispatchKernelIr<'_>, integer: bool) -> Result<(), Error> {
+    match kernel
+        .numerical_requirements
+        .numerical_options
+        .reproducibility
+    {
+        PcuReproducibility::Unspecified => {}
+        PcuReproducibility::PortableV1 if integer => {
+            describe_portable_v1_checked_integer_composed_map::<BINDINGS>(kernel)
+                .map_err(|_| Error::UnsupportedNumericalRequirements)?;
+        }
+        PcuReproducibility::PortableV1 => return Err(Error::UnsupportedNumericalRequirements),
+    }
+    Ok(())
+}
+
+fn detach_resources(
+    kernel: &PcuDispatchKernelIr<'_>,
+    schema: &fusion_pcu::CheckedScalarMapResourceSchema<BINDINGS>,
+    plan: &mut Profile,
+) -> Result<(), Error> {
     for (slot, binding) in kernel.bindings.iter().enumerate() {
         plan.declarations[slot] = binding.reference();
         plan.declaration_access[slot] = binding.access;
+        plan.argument_access[slot] =
+            if plan.is_integer() && binding.access == fusion_pcu::PcuBindingAccess::WriteOnly {
+                fusion_pcu::PcuBindingAccess::ReadWrite
+            } else {
+                binding.access
+            };
     }
     for (slot, resource) in schema.resources().iter().enumerate() {
         if resource.has_cross_index_read_write() {
@@ -121,22 +201,44 @@ pub(super) fn prepare(
             read_elements: resource.minimum_read_elements,
             write_elements: resource.minimum_write_elements,
         };
-        let bytes = u64::from(resource.minimum_read_elements) * u64::from(scalar.bit_width() / 8);
+        let bytes = u64::from(
+            resource
+                .minimum_read_elements
+                .max(resource.minimum_write_elements),
+        ) * u64::from(plan.scalar.bit_width() / 8);
         u32::try_from(bytes.div_ceil(4)).map_err(|_| Error::InvalidKernelSignature)?;
+        if plan.is_integer() && plan.scalar.bit_width() <= 128 {
+            u32::try_from(bytes).map_err(|_| Error::InvalidKernelSignature)?;
+        }
     }
-    let mut registers = [u32::MAX; SOURCE_REGISTERS];
-    let mut count = 0;
-    for (ordinal, operation) in body.iter().enumerate() {
-        plan.steps[ordinal] = step(*operation, &plan, &mut registers, &mut count)?;
-        plan.steps[ordinal].arguments[7] =
-            u32::try_from(ordinal).map_err(|_| Error::InvalidKernelSignature)?;
-    }
-    Ok(plan)
+    Ok(())
 }
 
-fn scalar(kernel: &PcuDispatchKernelIr<'_>) -> Result<PcuScalarType, Error> {
+fn scalar(kernel: &PcuDispatchKernelIr<'_>, integer: bool) -> Result<PcuScalarType, Error> {
     if !(2..=BINDINGS).contains(&kernel.bindings.len()) {
         return Err(Error::InvalidKernelSignature);
+    }
+    if integer {
+        return match kernel.bindings[0].value_type() {
+            Some(PcuValueType::Scalar(
+                scalar @ (PcuScalarType::U8
+                | PcuScalarType::I8
+                | PcuScalarType::U16
+                | PcuScalarType::I16
+                | PcuScalarType::U32
+                | PcuScalarType::I32
+                | PcuScalarType::U64
+                | PcuScalarType::I64
+                | PcuScalarType::U128
+                | PcuScalarType::I128
+                | PcuScalarType::U256
+                | PcuScalarType::I256
+                | PcuScalarType::U512
+                | PcuScalarType::I512),
+            )) => Ok(scalar),
+            Some(other) => Err(Error::UnsupportedValueType(other)),
+            None => Err(Error::InvalidBinding),
+        };
     }
     match kernel.bindings[0].value_type() {
         Some(PcuValueType::Scalar(
@@ -238,6 +340,9 @@ fn step(
                 _ => return Err(Error::InvalidKernelSignature),
             }
         }
+        PcuDispatchOp::Data(data @ PcuDispatchDataOp::CheckedIntegerBinary { .. }) => {
+            return integer_step(data, plan, registers, count);
+        }
         PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatBinary {
             result,
             lhs,
@@ -288,5 +393,39 @@ fn step(
         }
         _ => return Err(Error::InvalidKernelSignature),
     }
+    Ok(step)
+}
+
+fn integer_step(
+    operation: PcuDispatchDataOp,
+    plan: &Profile,
+    registers: &mut [u32; SOURCE_REGISTERS],
+    count: &mut u32,
+) -> Result<Step, Error> {
+    let PcuDispatchDataOp::CheckedIntegerBinary {
+        result,
+        lhs,
+        rhs,
+        op,
+        range_policy,
+        ..
+    } = operation
+    else {
+        return Err(Error::InvalidKernelSignature);
+    };
+    let mut step = Step::EMPTY;
+    if range_policy != plan.requirements.range_policy {
+        return Err(Error::UnsupportedNumericalRequirements);
+    }
+    step.arguments[1] = source(lhs, registers)?;
+    step.arguments[2] = source(rhs, registers)?;
+    step.arguments[0] = destination(result, registers, count)?;
+    step.function = match op {
+        PcuDispatchIntegerBinaryOp::Add => 4,
+        PcuDispatchIntegerBinaryOp::Sub => 5,
+        PcuDispatchIntegerBinaryOp::Mul => 6,
+    };
+    step.arguments[4] = u32::from(range_policy == PcuRangePolicy::Clamp);
+    step.law = PcuCheckedScalarFaultLaw::integer_binary(plan.scalar, op, range_policy);
     Ok(step)
 }

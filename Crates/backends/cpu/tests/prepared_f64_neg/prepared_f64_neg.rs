@@ -66,6 +66,8 @@ fn backends() -> std::vec::Vec<PcuCpuCheckedNeg> {
         for implementation in [
             PcuCpuImplementation::Sse2,
             PcuCpuImplementation::Avx2,
+            PcuCpuImplementation::Avx,
+            PcuCpuImplementation::Avx512,
             PcuCpuImplementation::Neon,
         ] {
             if let Ok(backend) = PcuCpuCheckedNeg::new(processor, implementation) {
@@ -619,6 +621,8 @@ fn f64_instruction_ids_are_distinct_and_typed_unified_offers_agree() {
             PcuCpuImplementation::Sse2 => 29,
             PcuCpuImplementation::Avx2 => 30,
             PcuCpuImplementation::Neon => 31,
+            PcuCpuImplementation::Avx => 40962,
+            PcuCpuImplementation::Avx512 => 40963,
         };
         for grid in [false, true] {
             for underflow in [

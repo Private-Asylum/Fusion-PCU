@@ -114,6 +114,8 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedSingleHostKernel, MetalHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         if cfg!(target_endian = "big") {
             return Err(PcuHostDispatchError::Backend(MetalError::Unsupported));
         }
@@ -300,6 +302,7 @@ pub use mixed::MetalMixedHostArgument;
 
 /// Static admitted executor with truthful one- or two-output binding arity.
 pub enum MetalPreparedHostKernel {
+    Conversion(crate::MetalPreparedConversionHostKernel),
     Single(MetalPreparedSingleHostKernel),
     DivRem(crate::MetalPreparedDivRemHostKernel),
     DivRemRoles(crate::MetalPreparedDivRemRoleHostKernel),
@@ -313,6 +316,14 @@ impl PcuHostKernelBackend for MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
+        if crate::MetalCheckedConversionPlan::assess(kernel).is_ok() {
+            return crate::MetalConversionHostBackend::new(self.clone())
+                .prepare_host_kernel(kernel)
+                .map(MetalPreparedHostKernel::Conversion)
+                .map_err(PcuHostDispatchError::Backend);
+        }
         let body = match kernel.ops {
             [fusion_pcu::PcuDispatchOp::GridStrideLoop { body, .. }, _] => *body,
             ops => ops,
@@ -361,6 +372,9 @@ impl PcuPreparedHostKernel for MetalPreparedHostKernel {
     type Error = MetalHostKernelError;
     fn call(&mut self, arguments: &mut [PcuHostArgument<'_>]) -> Result<(), Self::Error> {
         match self {
+            Self::Conversion(kernel) => kernel
+                .call(arguments)
+                .map_err(PcuHostDispatchError::Backend),
             Self::Single(kernel) => kernel.call(arguments),
             Self::DivRem(kernel) => kernel.call(arguments),
             Self::DivRemRoles(kernel) => kernel.call(arguments),
@@ -374,6 +388,7 @@ impl MetalPreparedHostKernel {
     #[must_use]
     pub const fn argument_count(&self) -> usize {
         match self {
+            Self::Conversion(_) => 2,
             Self::Single(kernel) => kernel.schema.len(),
             Self::DivRem(kernel) => kernel.argument_count(),
             Self::DivRemRoles(kernel) => kernel.argument_count(),
@@ -385,6 +400,7 @@ impl MetalPreparedHostKernel {
     #[must_use]
     pub const fn last_call_may_have_written(&self) -> bool {
         match self {
+            Self::Conversion(kernel) => kernel.last_call_may_have_written(),
             Self::Single(kernel) => kernel.last_call_may_have_written(),
             Self::DivRem(kernel) => kernel.last_call_may_have_written(),
             Self::DivRemRoles(kernel) => kernel.last_call_may_have_written(),
@@ -396,6 +412,7 @@ impl MetalPreparedHostKernel {
     #[must_use]
     pub fn last_call_completion_uncertain(&self) -> bool {
         match self {
+            Self::Conversion(kernel) => kernel.last_call_completion_uncertain(),
             Self::Single(kernel) => kernel.last_call_completion_uncertain(),
             Self::DivRem(kernel) => kernel.last_call_completion_uncertain(),
             Self::DivRemRoles(kernel) => kernel.last_call_completion_uncertain(),
@@ -411,6 +428,7 @@ impl MetalPreparedHostKernel {
         arguments: &mut [MetalMixedHostArgument<'_>],
     ) -> Result<(), MetalHostKernelError> {
         match self {
+            Self::Conversion(kernel) => kernel.call_mixed(arguments),
             Self::Single(kernel) => kernel.call_mixed(arguments),
             Self::DivRem(kernel) => kernel.call_mixed(arguments),
             Self::DivRemRoles(kernel) => kernel.call_mixed(arguments),
@@ -425,6 +443,8 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedHostKernel, MetalHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan =
             crate::MetalDivRemRolePlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         if kernel

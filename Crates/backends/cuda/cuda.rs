@@ -84,6 +84,8 @@ mod blas_policy;
 mod codegen;
 #[path = "control/control.rs"]
 mod control;
+#[path = "copy_completion/copy_completion.rs"]
+mod copy_completion;
 #[path = "device_facts/device_facts.rs"]
 mod device_facts;
 mod device_kernel;
@@ -203,6 +205,7 @@ pub use tensor::{
     CudaTensorAssessor,
     CudaOwnedTensorAssessor,
     CudaOwnedPreparedTensorGraph,
+    CudaHostedTensorInput,
     CudaTensorElementwiseHostTiming,
     CudaTensorError,
     CudaTensorExecutionError,
@@ -644,6 +647,13 @@ impl CudaRuntime {
     ///
     /// Returns an error when CUDA cannot create the event.
     pub fn create_event(&self) -> Result<CudaEventHandle, CudaError> {
+        Ok(CudaEventHandle {
+            inner: Rc::new(self.create_owned_event()?),
+        })
+    }
+
+    // Ordinary completion tokens move this owner; shared public events retain their Rc wrapper.
+    fn create_owned_event(&self) -> Result<EventInner, CudaError> {
         let mut event = ptr::null_mut();
         unsafe {
             crate::ffi::invoke_cudaEventCreateWithFlags(
@@ -652,11 +662,9 @@ impl CudaRuntime {
                 CUDA_EVENT_DISABLE_TIMING,
             )
         }?;
-        Ok(CudaEventHandle {
-            inner: Rc::new(EventInner {
-                runtime: self.clone(),
-                raw: event,
-            }),
+        Ok(EventInner {
+            runtime: self.clone(),
+            raw: event,
         })
     }
 
@@ -1159,6 +1167,7 @@ impl DeviceBuffer {
         self.allocation.bytes == 0
     }
     /// Copy bytes from host memory into this allocation.
+    /// Successful return establishes device readiness for independently ordered streams.
     ///
     /// # Errors
     ///
@@ -1270,6 +1279,7 @@ impl DeviceBuffer {
     }
     /// Copy bytes from another device allocation.
     /// Copy bytes from a different allocation belonging to the same CUDA runtime and device.
+    /// Successful return completes the copy before either allocation's access lease is released.
     ///
     /// # Errors
     ///
@@ -1372,35 +1382,6 @@ impl DeviceAccessLease {
     fn quarantine(&self) {
         self.guard.quarantine_stream();
     }
-
-    fn finish_synchronous(self, result: Result<(), CudaError>) -> Result<(), CudaError> {
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if crate::ffi::invoke_cudaDeviceSynchronize(&self.allocation.runtime).is_err() {
-                    self.retain_after_unknown_completion();
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn finish_synchronous_with(
-        self,
-        other: Self,
-        result: Result<(), CudaError>,
-    ) -> Result<(), CudaError> {
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if crate::ffi::invoke_cudaDeviceSynchronize(&self.allocation.runtime).is_err() {
-                    self.retain_after_unknown_completion();
-                    other.retain_after_unknown_completion();
-                }
-                Err(error)
-            }
-        }
-    }
 }
 
 struct StreamInner {
@@ -1443,12 +1424,7 @@ impl CudaStreamHandle {
     ///
     /// Returns an error when the event belongs to another runtime or CUDA fails to record it.
     pub fn record(&self, event: &CudaEventHandle) -> Result<(), CudaError> {
-        self.inner
-            .runtime
-            .ensure_same_runtime(&event.inner.runtime)?;
-        unsafe {
-            crate::ffi::invoke_cudaEventRecord(&self.inner.runtime, event.inner.raw, self.inner.raw)
-        }
+        event.inner.record(self)
     }
 
     /// Record a timing-enabled event after all work already queued on this stream.
@@ -1469,6 +1445,18 @@ impl CudaStreamHandle {
 struct EventInner {
     runtime: CudaRuntime,
     raw: CudaEvent,
+}
+impl EventInner {
+    fn record(&self, stream: &CudaStreamHandle) -> Result<(), CudaError> {
+        stream.inner.runtime.ensure_same_runtime(&self.runtime)?;
+        unsafe {
+            crate::ffi::invoke_cudaEventRecord(&stream.inner.runtime, self.raw, stream.inner.raw)
+        }
+    }
+
+    fn synchronize(&self) -> Result<(), CudaError> {
+        unsafe { crate::ffi::invoke_cudaEventSynchronize(&self.runtime, self.raw) }
+    }
 }
 impl Drop for EventInner {
     fn drop(&mut self) {
@@ -1755,7 +1743,7 @@ fn append_launch_resource_access_guards_readonly<'a>(
 /// Completion token for a kernel launch. Dropping it waits for completion; if CUDA cannot confirm
 /// completion, the backend leaks retained resources rather than freeing memory still in use.
 pub struct CudaCompletion {
-    event: Option<CudaEventHandle>,
+    event: Option<EventInner>,
     resources: Option<LaunchResources>,
 }
 impl CudaCompletion {
@@ -1809,7 +1797,7 @@ impl Drop for CudaCompletion {
 /// [`CudaCompletionBatch::finish`] after the final launch has been queued.
 pub struct CudaCompletionBatch {
     stream: CudaStreamHandle,
-    launch_events: Vec<CudaEventHandle>,
+    launch_events: Vec<EventInner>,
     resources: Vec<LaunchResources>,
     dependencies: Vec<CudaProducerCompletion>,
     readbacks: CudaReadbackStorage,
@@ -2215,7 +2203,7 @@ impl CudaCompletionBatch {
         let producer_runtime = completion
             .event
             .as_ref()
-            .map(|event| &event.inner.runtime)
+            .map(|event| &event.runtime)
             .or_else(|| {
                 completion
                     .resources
@@ -2341,7 +2329,7 @@ impl CudaCompletionBatch {
             return Ok(());
         }
 
-        let Some(raw_event) = completion.event().map(|event| event.inner.raw) else {
+        let Some(raw_event) = completion.event().map(|event| event.raw) else {
             // A completion with no event has already been waited successfully.
             return Ok(());
         };
@@ -2538,7 +2526,7 @@ impl Drop for CudaCompletionBatch {
 pub struct CudaBatchCompletion {
     stream: CudaStreamHandle,
     final_event: Option<CudaEventHandle>,
-    launch_events: Vec<CudaEventHandle>,
+    launch_events: Vec<EventInner>,
     resources: Vec<LaunchResources>,
     dependencies: Vec<CudaProducerCompletion>,
     readbacks: CudaReadbackStorage,
@@ -2758,10 +2746,13 @@ impl CudaProducerCompletion {
         }
     }
 
-    const fn event(&self) -> Option<&CudaEventHandle> {
+    fn event(&self) -> Option<&EventInner> {
         match self {
             Self::Launch(completion) => completion.event.as_ref(),
-            Self::Batch(completion) => completion.final_event.as_ref(),
+            Self::Batch(completion) => completion
+                .final_event
+                .as_ref()
+                .map(|event| event.inner.as_ref()),
         }
     }
 
@@ -2777,7 +2768,7 @@ impl CudaProducerCompletion {
 
     fn runtime(&self) -> Option<&CudaRuntime> {
         self.event()
-            .map(|event| &event.inner.runtime)
+            .map(|event| &event.runtime)
             .or_else(|| self.stream().map(|stream| &stream.inner.runtime))
     }
 
@@ -3050,7 +3041,7 @@ impl CudaKernel {
         let completion_event = if direct_batch {
             None
         } else {
-            Some(self.module.runtime.create_event()?)
+            Some(self.module.runtime.create_owned_event()?)
         };
         if let Some(batch) = batch.as_deref_mut()
             && let Some(timing) = &mut batch.timing
@@ -3108,7 +3099,7 @@ impl CudaKernel {
             return Err(error);
         }
         if let Some(completion_event) = completion_event {
-            if let Err(error) = stream.record(&completion_event) {
+            if let Err(error) = completion_event.record(stream) {
                 if stream.synchronize().is_err() {
                     let Some(resources) = resources.take() else {
                         return Err(CudaError::BatchPoisoned);
@@ -3603,6 +3594,191 @@ mod memory_snapshot_tests {
             Ok(())
         );
         assert!(dependencies.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU; distinct ordinary events and out-of-order owner drops"]
+    fn cuda_gpu_inline_events_retain_multiple_outstanding_launch_owners() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let image = crate::compile_cuda_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void write_word(unsigned int* value, unsigned int word) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] = word;
+}
+"#,
+        )
+        .unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"write_word").unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let first = runtime.allocate(size_of::<u32>()).unwrap();
+        let second = runtime.allocate(size_of::<u32>()).unwrap();
+        let runtime_owner = Arc::downgrade(&runtime.0);
+        let module_owner = Rc::downgrade(&module.inner);
+        let stream_owner = Rc::downgrade(&stream.inner);
+        let first_owner = Rc::downgrade(&first.allocation);
+        let first_word = 41_u32.to_ne_bytes();
+        let second_word = 42_u32.to_ne_bytes();
+        // SAFETY: the independently compiled kernel receives one exact writable u32 allocation
+        // and one aligned copied u32 value; each launch owns a distinct allocation.
+        let first_completion = unsafe {
+            kernel.launch(
+                &stream,
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                &[
+                    CudaKernelArgument::Buffer(&first),
+                    CudaKernelArgument::Bytes(&first_word),
+                ],
+            )
+        }
+        .unwrap();
+        // SAFETY: same ABI as above, with the second allocation and value.
+        let mut second_completion = unsafe {
+            kernel.launch(
+                &stream,
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                &[
+                    CudaKernelArgument::Buffer(&second),
+                    CudaKernelArgument::Bytes(&second_word),
+                ],
+            )
+        }
+        .unwrap();
+        assert_ne!(
+            first_completion.event.as_ref().unwrap().raw,
+            second_completion.event.as_ref().unwrap().raw
+        );
+        assert!(first.validate_access_available().is_err());
+        assert!(second.validate_access_available().is_err());
+        drop(kernel);
+        drop(module);
+        drop(stream);
+        drop(runtime);
+        second_completion.wait().unwrap();
+        assert!(second_completion.event.is_none());
+        let mut actual = [0_u8; size_of::<u32>()];
+        second.copy_to(&mut actual).unwrap();
+        assert_eq!(u32::from_ne_bytes(actual), 42);
+        // The earlier launch remains independently owned even though the later event completed.
+        assert!(first_owner.upgrade().is_some());
+        assert!(module_owner.upgrade().is_some());
+        assert!(stream_owner.upgrade().is_some());
+        drop(first_completion); // Drop waits and then releases its separate event and leases.
+        first.copy_to(&mut actual).unwrap();
+        assert_eq!(u32::from_ne_bytes(actual), 41);
+        drop(first);
+        assert!(first_owner.upgrade().is_none());
+        assert!(module_owner.upgrade().is_none());
+        assert!(stream_owner.upgrade().is_none());
+        drop(second_completion);
+        drop(second);
+        assert!(runtime_owner.upgrade().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU; controlled invalid-event wait followed by retained-token retry"]
+    fn cuda_gpu_inline_event_failed_wait_preserves_token_for_retry() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let image = crate::compile_cuda_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void retained_word(unsigned int* value) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) value[0] = 42u;
+}
+"#,
+        )
+        .unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"retained_word").unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let buffer = runtime.allocate(size_of::<u32>()).unwrap();
+        // SAFETY: the compiled kernel writes one u32 into an exact allocation.
+        let mut completion = unsafe {
+            kernel.launch(
+                &stream,
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                &[CudaKernelArgument::Buffer(&buffer)],
+            )
+        }
+        .unwrap();
+        // The injection never races device work and does not induce driver loss. The null event
+        // deliberately asks CUDA for a wait error; restore the real owned handle before cleanup.
+        stream.synchronize().unwrap();
+        let raw = std::mem::replace(&mut completion.event.as_mut().unwrap().raw, ptr::null_mut());
+        let result = completion.wait();
+        completion.event.as_mut().unwrap().raw = raw;
+        assert!(result.is_err());
+        assert!(completion.resources.is_some());
+        assert!(buffer.validate_access_available().is_err());
+        completion.wait().unwrap();
+        assert!(completion.event.is_none());
+        assert!(completion.resources.is_none());
+        let mut actual = [0_u8; size_of::<u32>()];
+        buffer.copy_to(&mut actual).unwrap();
+        assert_eq!(u32::from_ne_bytes(actual), 42);
+    }
+
+    #[test]
+    #[ignore = "requires native device; deterministic full-owner quarantine/drop witness"]
+    fn quarantined_inline_event_retains_launch_owners_after_producer_drop() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let image = crate::compile_cuda_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void retained_word(unsigned int *value, unsigned long long *status) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) { value[0] = 42; status[0] = ~0ULL; }
+}
+"#,
+        )
+        .unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"retained_word").unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let buffer = runtime.allocate(size_of::<u32>()).unwrap();
+        let status = runtime.allocate(size_of::<u64>()).unwrap();
+        let runtime_owner = Arc::downgrade(&runtime.0);
+        let module_owner = Rc::downgrade(&module.inner);
+        let stream_owner = Rc::downgrade(&stream.inner);
+        let allocation_owner = Rc::downgrade(&buffer.allocation);
+        let status_owner = Rc::downgrade(&status.allocation);
+        let arguments = [
+            CudaKernelArgument::Buffer(&buffer),
+            CudaKernelArgument::Buffer(&status),
+        ];
+        // SAFETY: writable u32/u64 pointers have separate exact allocations; one invocation writes both.
+        let completion = unsafe {
+            kernel
+                .launch(&stream, [1, 1, 1], [1, 1, 1], 0, &arguments)
+                .unwrap()
+        };
+        let mut producer = CudaProducerCompletion::Launch(completion);
+        // Establish real quiescence before a deterministic protocol injection. We do not induce
+        // driver loss: the same private quarantine path then models an unknown terminal result.
+        stream.synchronize().unwrap();
+        producer.quarantine_and_forget();
+        assert!(buffer.validate_access_available().is_err());
+        assert!(status.validate_access_available().is_err());
+        drop(producer);
+        drop(kernel);
+        drop(module);
+        drop(stream);
+        drop(buffer);
+        drop(status);
+        drop(runtime);
+        // This is the same owner drop as cache/session eviction: code, queue, context/loader and
+        // data owners all survive. Intentionally retained roots are not freed on unknown proof.
+        assert!(module_owner.upgrade().is_some());
+        assert!(stream_owner.upgrade().is_some());
+        assert!(allocation_owner.upgrade().is_some());
+        assert!(status_owner.upgrade().is_some());
+        assert!(runtime_owner.upgrade().is_some());
     }
 
     #[test]

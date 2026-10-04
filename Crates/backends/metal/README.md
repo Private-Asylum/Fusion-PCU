@@ -9,6 +9,14 @@ queue and resources. `MetalDiscovery` implements cold physical discovery and act
 and unsafe SDK calls reside in `ffi/ffi.rs`. Production Objective-C integration uses the typed
 objc2 bindings; no manual ABI, selector registration, retain/release, pool or legacy control route remains.
 
+## Current native qualification checkpoint
+
+Ordinary F32/F64 selected graph execution and exact graph offers are independently closed in root11 for the twelve Strict requests, Reject/Unspecified and the documented leaf bounds. Four-format raw ReLU backward also has reciprocal native proof for F16/BF16/E4M3FN/E5M2; The qualified selected backward and ordinary graph scopes remain F32/F64. A separate selected low-format admission candidate is awaiting its own native graph ownership proof.
+
+Raw Strict MSE now has reciprocal native proof through 65,535 elements. Its two-U32 terminal receipt retains the original ordered event ordinal/status and validates against the full immutable `TensorStrictFaultDomain` before private output publication. Large ordered core-oracle controls, actual malformed GPU receipts, fatal retries and old/foreign owner controls pass. Generic composed status limits for other operation families are unchanged. No native F64 floating ALU or host tensor reduction is used.
+
+The selected MSE, aggregate and exact-offer successor now has reciprocal native proof through 65,535 elements: original roles/full requests and mandatory discarded effects remain, numerical MSE receipt revision is `0x0000_0008_0000_0301` (other numerical families retain `0300`), and graph receipt revision is `0x0000_0008_0000_0401`. Earlier captured cuts retain their ten-element bound; Ordinary larger true-gradient training now has native source proof in root12: five actual inputs, eight stages, 8x128 loss, exact supplied gradient coefficient 2/1024 and MatMul inner 8, F32/F64 across all twelve Strict requests. Host, mixed and resident roles, discarded late faults, retries, retained owners and tails pass. Graph allocation/API census remains pending. Older sections below retain their captured profile descriptions and are superseded only within these exact newer scopes; no full-backend parity claim is implied.
+
 ## Typed Objective-C dependencies
 
 The macOS-only dependencies are exactly `objc2 = 0.6.4`, `objc2-foundation = 0.3.2` and
@@ -380,3 +388,74 @@ normal-role tests and strict lint pass locally; the new ordinary source, native
 publication, example and `normal_unary_roles` four-route changing-bank census await
 a separate immutable M4 qualification. Existing Portable and capacity certificates
 are unchanged. Caller Rust counters do not establish SDK heap, JIT or device costs.
+
+
+## Checked F32/F64 conversion
+
+`MetalCheckedConversionPlan` admits a typed load/conversion/store with exact F32↔F64 requirements, three underflow policies, Reject/Clamp, dense/scalar broadcast and direct/canonical grid addressing. `MetalSession::prepare_host_kernel` selects the aggregate Conversion variant. Arbitrary host slices stage; mixed typed resident resources retain actual allocation leases and are checked for session, extent, access and alias before execution. The separate U32 encoding shader uses no native F64 floating ALU.
+
+Host output publishes only after private payload/status completion. Fatal host arithmetic leaves caller output unchanged; recovered Clamp publishes useful prefix with its notice. Direct resident output can change after a fatal execution and reports possible mutation truthfully. All canonical layouts across the four host/resident input-output combinations and an independent raw integer oracle passed actual Metal native qualification. Host-only exact discovery offers preserve the numerical envelope and have unknown costs; source discovery support is distinct from the unchanged neutral owned lowering floor.
+
+These source-host and backend mixed seams do not qualify ordinary global routing, neutral owned conversion, Portable conversion, training or timings. Exact qualification reports are retained in the external validation area; independent coordinating acceptance remains separate.
+
+
+## Checked ReLU backward selected programs
+
+`MetalSession::prepare_relu_backward` provides a detached F32/F64 control that checks both operands finite, including masked upstream, classifies input positivity from exact encodings, and preserves selected gradient bits. RejectSubnormalResult checks the selected result; inactive results are canonical positive zero. The encoded kernel uses no native F64 floating arithmetic.
+
+`MetalSession::prepare_tensor_backward_program` retains the actual immutable selected source and the full numerical request. Its qualified slice contains one checked backward effect, one or two equal-shape immutable inputs, repeated operands, and either the effect or an input as selected output. Selecting an input does not discard the preceding checked effect. Actual host/resident input roles are validated before staging; completion and status checks precede output ownership. Old resident input owners remain unchanged.
+
+The native selected-program matrix covers all 24 Boundary/Strict, compound, precision and underflow tuples with Reject range and Unspecified reproducibility, both formats, four output/input profiles, mixed input roles, fatal operands, masked invalid operands, underflow ordering and actual foreign owners. Ordinary global source routing, selected discovery offers, Clamp, low formats and general training graphs remain separate gaps. Backend-local strict MatMul controls and selected programs have separate bounded native qualification, described below.
+
+
+## Ordered checked MatMul
+
+`MetalSession::prepare_strict_matmul` freezes a nonempty row-major F32/F64 2D product with Reject disposition and ordered checked multiply/add steps. The encoded arithmetic rounds and checks every scalar step, starting canonical positive zero; no native F64 floating ALU or CPU reduction is used. Diagnostic lanes represent arithmetic events rather than output cells and are validated against PCU's exact strict dependent fault domain before private output publication.
+
+`MetalSession::prepare_tensor_matmul_program` retains the actual selected source Arc and exact Strict/Checked/Reject/Unspecified request, both precision options and all three underflow policies. One repeated square input or two actual rectangular inputs may produce the effect or an input selected after the mandatory checked effect. Per-binding input shapes/counts differ lawfully from output shapes/counts. Host/resident roles are validated before staging; completion precedes ownership publication, and old input owners remain unchanged.
+
+Native detached proof covers 3×3×2 geometry against the independent core oracle; selected proof covers repeated 2×2 and rectangular 2×3 times 3×2 geometry, full requests, mixed roles, fatal/tiny cases, true foreign owners and tails. Other shapes, transposes, zero reductions, ordinary source/discovery routing, broader graph composition, Clamp, Portable, low formats, MSE/general training, allocation census and latency remain separate. These bounded backend APIs do not establish whole-provider parity.
+
+
+## Detached ordered checked SGD
+
+`MetalSession::prepare_strict_sgd` freezes a nonempty F32/F64 update with a finite immutable F32 learning rate, Reject disposition, and each of the three underflow policies. It checks gradient × rate before weight − product, with two semantic event records per cell. Exact integer conversion widens rate metadata for F64 without ambient DAZ; native encoded helpers perform tensor arithmetic. Fresh private payload/status complete and validate before an output owner escapes. Existing operands stay unchanged.
+
+The independent native oracle covers seven-cell controls across 121 edge crosses and128 random pairs, seven signed-zero/normal/extreme/subnormal rates, both formats and all three policies:10458 cases, raw per-event status plus public replay, fatal ordering and actual foreign/short owners. Strict native lint and previous regressions pass; exact source/artifact records are in the external validation area. Ordinary source/discovery routing, MSE and general training remain independent gaps; allocation census and latency are unmeasured.
+
+Public cold flat profiles reject nested borrowed grid bodies before recursive scanners. Native-qualified device-free static self-cycle tests cover direct and wrapped cycles; finite/multiple nonnested bodies remain subject to existing validators. This guard changes no warm execution or capability claim.
+
+## Selected ordered checked SGD
+
+`MetalSession::prepare_tensor_sgd_program` retains the original selected source and freezes Strict/Checked/Reject/Unspecified F32/F64 requirements and finite F32 learning-rate bits. The mandatory update executes even when its result is discarded and an actual input is selected. Repeated/reversed actual operand roles preserve input shape and publication ownership. Both precision options and all three underflow policies are qualified; no unused declaration becomes an allocation.
+
+Independent native selected proof covers672 prepared graphs across seven rates, six requests, two formats and eight output/operand profiles,2688 mixed-role result/fault comparisons and2688 operand mutations. True foreign/short owners, immutable old inputs, source ownership and destination tails are checked. Exact source, artifact and27/28 text reports have been independently verified by the coordinator. Geometry controls remain repeated2×2 and two-input2×3; other extents, broader source closures, MSE, general training, census and latency require separate qualification.
+
+A sealed `MetalSelectedNumericalTensorPlan` candidate unifies backward, Strict MatMul and Strict SGD cold metadata while preserving each leaf's exact envelope. Its prepared enum statically delegates to those leaf executors. Discovery requests borrow this sealed source/shape/policy owner; costs remain unknown and operation-family IDs are not graph cache keys. Local release strict, pure metadata/policy and genuine annotated capture checks pass. Aggregate native inventory/mixed-owner tests and ordinary facade integration remain pending independent cuts.
+
+## Bounded detached Strict MSE
+
+`prepare_strict_mse` provides independently native-qualified F32/F64 ordered subtraction, square, accumulation and final mean division through encoded checked arithmetic. Admission is Reject with three underflow policies and actual count1..=65535 in the qualified compact raw slice. A two-U32 terminal receipt replaces the earlier full event ledger; the full fault domain is retained. Private output is published only after terminal checked completion; actual input/session owners remain retained.
+
+Each backend passes4482 independent edge/random oracle cases over counts1/7/10, both formats and all policies, with exact result bits/first semantic fault and old/foreign/wrong-extent owner controls. Metal additionally checks raw records and public replay. Selected MSE now also passes an independent native single-effect cut:96 preparations,384 mixed outcomes and384 operand mutations per backend, with scalar loss versus selected-input output and mandatory discarded effects. The coordinator independently retrieved and verified all30 Metal/31 MLX reports, exact source-before/after, artifact manifests and terminal/native PASS. Its fourth-family aggregate and exact discovery offers have a separate native closure below; ordinary source routing and genuine multi-effect training remain pending. No timing or broader shape claim follows.
+
+## Sealed selected numerical aggregate
+
+The selected numerical plan retains the original source Arc and delegates authoritative whole-effect validation to the independently qualified ReLUBackward, Strict MatMul and Strict SGD leaf envelopes. Actual per-input shapes, selected output, full requirements, SGD rate bits and MatMul dimensions remain immutable. Prepared execution dispatches statically and retains each leaf's private completion and owner protocol. Discovery offers borrow the sealed plan, refuse a different request and leave costs/workspace unknown; operation-family IDs are distinct from full graph cache identity.
+
+Independent M4 aggregate native qualification covers72 preparations and288 mixed-role outcomes per backend, actual discovery boundaries, fatal discarded effects, foreign/old owners and tails. Pure2/2 and authentic annotated capture1/1 pass. Ordinary invocation support has a separate coordinator-owned source qualification; Earlier accepted aggregate cuts cover three operations. The independent fourth-family Strict MSE aggregate now passes native qualification on both backends: strict all-target checks, pure3/3, actual mixed/discovery2/2 and annotated capture1/1 (48 exact operation/request combinations). Each backend covers192 preparations/768 mixed outcomes across four families,12 exact requests,F32/F64 and effect/selected-input output. Scalar MSE output and actual operand extents remain distinct; all retained regression gates pass. Multi-effect training is not admitted through this aggregate.
+
+A separate local candidate removes the Strict MatMul/SGD/MSE refusal of BackendDefined compound permission. It retains ordered checked arithmetic and the original complete effect/request tuple. Four precision/compound permission pairs crossed with three underflow policies now pass independent native admission and exact three-family offers on both backends. Kernels retain ordered checked arithmetic and exact full metadata. MSE fourth-family exact offers now have reciprocal native proof; ordinary MSE source invocation remains a separate qualification. Earlier frozen native cuts retain their narrower Checked-only scope.
+
+
+## Generic selected graph and exact offers
+
+`MetalSelectedTensorGraphPlan::assess_program` retains the original selected program and full numerical request, freezes operation fragments and actual input roles, and uses the parent's schedule and last-use metadata. `MetalPreparedSelectedTensorGraph::execute_mixed` executes qualified leaves with resident intermediate owners. A failure retains the original parent effect and unchanged backend cause; every mandatory discarded effect and checked release precedes final publication. The selected output may be an original input after those effects.
+
+Independent native qualification covers F32/F64, twelve Strict requests (two precision permissions, two compound permissions and three underflow policies), Reject/Unspecified, direct selected nodes and one output. Controls include a seven-stage training chain, scalar loss, selected input after mandatory effects and a different four-stage branch. Constants, uniforms, fused/contracted schedules and unsupported leaves refuse cold. Existing MatMul and MSE shape bounds remain; this API does not establish full backend parity.
+
+`MetalSelectedTensorGraphRequest` exposes exact graph offers through discovery. The plan owns family `0x7100`, revision `0x0000_0008_0000_0400`; actual session identity qualifies a prepared receipt. Host-input/resident-output and resident boundaries are offered; mixed requires at least two actual unique inputs. Cost and workspace are unknown. Reciprocal native graph and offer cuts pass, with retained lower-level regressions; their source/artifact identities are recorded in the external backend plans. Ordinary annotated graph integration is independently closed in root11, including both native source gates, all twelve numerical requests and mandatory effect/ownership controls. The coordinator separately audited its unchanged source/artifact ledgers and all 64 conversion census rows; no generic graph allocation census follows from that conversion benchmark.
+
+Execution currently allocates a Rust slot table, searches the small external binding list and creates native leaf owners. Metal additionally copies every resident external input through a prepared device-local carrier control into a fresh private owner; MLX retains immutable encoded array owners. Resident graph inputs therefore do not imply zero-copy execution. Before introducing shared Metal resource wrappers, overlap checks must use backing storage identity and preserve alias extent/quarantine laws. No zero-allocation, scratch-reuse or statistical timing claim follows from correctness. Matched ordinary annotated/selected graph/native controls and a separate allocation census must qualify later optimizations.
+
+Four low float formats already have encoded unary/binary leaf paths, but selected backward and this generic graph still admit F32/F64 only. Four-format raw backward and compact raw MSE through65535 now have reciprocal native proof. Selected/ordinary low-format backward and ordinary larger MSE remain separately pending; selected MSE and exact offers now have reciprocal native closure. Older sections' pending claims describe their captured API/profile and are superseded only where an exact newer proof above or in the external plans applies.

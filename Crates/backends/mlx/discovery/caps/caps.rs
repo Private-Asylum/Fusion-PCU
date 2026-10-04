@@ -45,6 +45,7 @@ const TYPES: PcuValueTypeCaps = PcuValueTypeCaps::for_scalar(PcuScalarType::U8)
     .union(PcuValueTypeCaps::for_scalar(PcuScalarType::F256))
     .union(PcuValueTypeCaps::SCALAR_VALUES);
 const INSTRUCTIONS: PcuDispatchOpCaps = PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY
+    .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
     .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
     .union(PcuDispatchOpCaps::ALU_CHECKED_INTEGER_BINARY)
     .union(PcuDispatchOpCaps::ALU_CHECKED_DIV_REM)
@@ -133,12 +134,14 @@ const SCALAR: PcuDispatchScalarAluSupport = PcuDispatchScalarAluSupport::empty()
     .with(
         PcuScalarType::F32,
         PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY
-            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY),
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT),
     )
     .with(
         PcuScalarType::F64,
         PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY
-            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY),
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+            .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT),
     );
 const POLICY: PcuDispatchPolicyCaps =
     PcuDispatchPolicyCaps::SERIAL.union(PcuDispatchPolicyCaps::ORDERED_SUBMISSION);
@@ -238,6 +241,7 @@ mod tests {
                     arithmetic,
                     PcuDispatchOpCaps::ALU_CHECKED_FLOAT_UNARY
                         .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_BINARY)
+                        .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT)
                 );
             } else if matches!(scalar, PcuScalarType::F128 | PcuScalarType::F256) {
                 assert_eq!(arithmetic, PcuDispatchOpCaps::empty());

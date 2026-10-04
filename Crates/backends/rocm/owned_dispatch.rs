@@ -30,7 +30,8 @@ const fn validate_batch_fault_semantics(
 }
 
 pub fn kernel_uses_checked_arithmetic(kernel: &PcuDispatchKernelIr<'_>) -> bool {
-    ops_use_checked_arithmetic(kernel.ops)
+    // Unadmitted nested regions conservatively refuse batching without recursive scans.
+    crate::codegen::lower::has_nested_regions(kernel.ops) || ops_use_checked_arithmetic(kernel.ops)
 }
 
 fn validate_dispatch_requirements(

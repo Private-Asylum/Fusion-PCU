@@ -1,7 +1,8 @@
-//! Cold ten-primitive checked integer plan; existing primitive profiles remain first.
+//! Cold fourteen-carrier checked integer plan; existing primitive profiles remain first.
 #[rustfmt::skip]
 use fusion_pcu::{
     assess_checked_integer_map_resources,
+    describe_portable_v1_checked_integer_composed_map,
     PcuCheckedInteger,
     PcuDispatchDataOp,
     PcuDispatchKernelIr,
@@ -26,13 +27,7 @@ use super::{
 };
 
 pub fn prepare<T: PcuCheckedInteger>(kernel: &PcuDispatchKernelIr<'_>) -> Result<Plan, Error> {
-    if kernel
-        .numerical_requirements
-        .numerical_options
-        .reproducibility
-        != PcuReproducibility::Unspecified
-        || !(2..=BINDINGS).contains(&kernel.bindings.len())
-    {
+    if !(2..=BINDINGS).contains(&kernel.bindings.len()) {
         return Err(Error::UnsupportedProfile);
     }
     let ordinal = match T::TYPE {
@@ -46,14 +41,29 @@ pub fn prepare<T: PcuCheckedInteger>(kernel: &PcuDispatchKernelIr<'_>) -> Result
         PcuScalarType::U64 => 7,
         PcuScalarType::I128 => 8,
         PcuScalarType::U128 => 9,
+        PcuScalarType::I256 => 10,
+        PcuScalarType::U256 => 11,
+        PcuScalarType::I512 => 12,
+        PcuScalarType::U512 => 13,
         _ => return Err(Error::UnsupportedProfile),
     };
-    let descriptor = assess_checked_integer_map_resources::<BINDINGS>(
-        kernel,
-        PcuValueType::Scalar(T::TYPE),
-        PcuValueTypeCaps::for_scalar(T::TYPE),
-    )
-    .map_err(Error::InvalidIntegerResources)?;
+    let portable = kernel
+        .numerical_requirements
+        .numerical_options
+        .reproducibility
+        == PcuReproducibility::PortableV1;
+    let descriptor = if portable {
+        // Independent cold eligibility; the warm exact integer interpreter is unchanged.
+        describe_portable_v1_checked_integer_composed_map::<BINDINGS>(kernel)
+            .map_err(|_| Error::UnsupportedProfile)?
+    } else {
+        assess_checked_integer_map_resources::<BINDINGS>(
+            kernel,
+            PcuValueType::Scalar(T::TYPE),
+            PcuValueTypeCaps::for_scalar(T::TYPE),
+        )
+        .map_err(Error::InvalidIntegerResources)?
+    };
     let body = crate::host::validated_region(kernel).map_err(|_| Error::UnsupportedProfile)?;
     if body.len() > STEPS {
         return Err(Error::UnsupportedProfile);
@@ -63,7 +73,12 @@ pub fn prepare<T: PcuCheckedInteger>(kernel: &PcuDispatchKernelIr<'_>) -> Result
         kernel,
         descriptor,
         body,
-        (T::TYPE, 19712 + ordinal, T::HOST_SIZE, execute),
+        (
+            T::TYPE,
+            if portable { 20992 } else { 19712 } + ordinal,
+            T::HOST_SIZE,
+            execute,
+        ),
         step,
     )
 }

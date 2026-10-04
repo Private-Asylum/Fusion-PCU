@@ -9,6 +9,7 @@
 use crate::{
     describe_portable_v1_integer_div_rem_map,
     describe_portable_v1_integer_map,
+    describe_portable_v1_checked_integer_composed_map,
     describe_portable_v1_map,
     describe_portable_v1_unary_map,
     PcuDispatchKernelIr,
@@ -23,6 +24,9 @@ pub(super) fn validate_invocation_contract(
     if options.reproducibility == PcuReproducibility::Unspecified
         || describe_portable_v1_map(kernel).is_ok()
         || describe_portable_v1_integer_map(kernel).is_ok()
+        // This is cold eligibility for the currently bounded provider family,
+        // never backend admission or a universal PCU binding-count limit.
+        || describe_portable_v1_checked_integer_composed_map::<4>(kernel).is_ok()
         || describe_portable_v1_integer_div_rem_map(kernel).is_ok()
         || describe_portable_v1_unary_map(kernel).is_ok()
     {

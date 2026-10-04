@@ -831,8 +831,12 @@ fn fill(lhs: &mut [f32], rhs: &mut [f32], job: u64) {
         let phase = f32::from(u16::try_from(job % 97).expect("phase fits")) * 0.125;
         // Four disjoint 16-bit chunks in the first four exact f32 values distinguish every job
         // counter; the fractional lane term keeps the remaining payload nonuniform.
-        *left = job_chunk + lane * 0.0625;
-        *right = if index % 3 == 0 { phase } else { -phase };
+        *left = lane.mul_add(0.0625, job_chunk);
+        *right = if index.is_multiple_of(3) {
+            phase
+        } else {
+            -phase
+        };
     }
 }
 

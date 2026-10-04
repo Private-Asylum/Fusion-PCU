@@ -213,14 +213,19 @@ impl PcuImplementationOffers<PcuDispatchKernelIr<'_>> for PcuCpuHostOffers {
             PcuCpuPreparedHost::I512(prepared) => prepared.local_id(),
             PcuCpuPreparedHost::U512(prepared) => prepared.local_id(),
         };
-        let revision = if (1024..=1087).contains(&local_id)
+        let revision = if (1024..=1151).contains(&local_id)
             || (2048..=2335).contains(&local_id)
+            || (2432..=2463).contains(&local_id)
+            || (2560..=2591).contains(&local_id)
             || (4096..=4383).contains(&local_id)
+            || (4480..=4511).contains(&local_id)
+            || (4608..=4639).contains(&local_id)
             || (17408..=17413).contains(&local_id)
             || (17920..=17943).contains(&local_id)
             || (18688..=18693).contains(&local_id)
             || (19456..=19480).contains(&local_id)
-            || (19712..=19721).contains(&local_id)
+            || (19712..=19725).contains(&local_id)
+            || (20992..=21005).contains(&local_id)
         {
             1
         } else {

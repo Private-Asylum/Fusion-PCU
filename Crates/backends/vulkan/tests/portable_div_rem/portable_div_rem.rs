@@ -421,67 +421,73 @@ fn portable_offer<T: PcuCheckedIntegerDivision>(
 ) {
     macro_rules! visit {
         ($bindings:ident,$ir:ident) => {{
-            let bindings = source::$bindings::<T>();
-            let builder = source::$ir::<T, 5>(&bindings).unwrap();
-            let kernel = builder.ir();
-            let request = pcu_facade::PcuImplementationRequest {
-                device: backend.device_identity().unwrap(),
-                executor: pcu_facade::PcuExecutorId(0),
-                operation: &kernel,
-                requirements: kernel.numerical_requirements,
-                boundary: pcu_facade::PcuCostBoundary::Host,
-            };
-            let mut output = [None];
-            assert_eq!(
-                pcu_facade::PcuImplementationOffers::implementation_offers(
-                    backend,
-                    &request,
-                    &mut output
-                )
-                .unwrap(),
-                1
-            );
-            let offer = output[0].unwrap();
-            assert_eq!(
-                (offer.implementation.local_id, offer.implementation.revision),
-                (id, 1)
-            );
-            assert_eq!(offer.requirements, request.requirements);
-            let mut mismatch = pcu_facade::PcuImplementationRequest {
-                device: request.device,
-                executor: request.executor,
-                operation: request.operation,
-                requirements: request.requirements,
-                boundary: request.boundary,
-            };
-            mismatch.requirements.numerical_options.reproducibility =
-                pcu_facade::PcuReproducibility::Unspecified;
-            assert_eq!(
-                pcu_facade::PcuImplementationOffers::implementation_offers(
-                    backend,
-                    &mismatch,
-                    &mut []
-                )
-                .unwrap(),
-                0
-            );
-            let mut bad = kernel;
-            bad.numerical_requirements.range_policy = pcu_facade::PcuRangePolicy::Clamp;
-            assert!(backend.prepare_host_kernel(&bad).is_err());
-            let invalid = pcu_facade::PcuImplementationRequest {
-                operation: &bad,
-                requirements: bad.numerical_requirements,
-                ..request
-            };
-            assert_eq!(
-                pcu_facade::PcuImplementationOffers::implementation_offers(
-                    backend,
-                    &invalid,
-                    &mut []
-                )
-                .unwrap(),
-                0
-            );
+            fn case<T: PcuCheckedIntegerDivision>(
+                backend: &fusion_pcu_vulkan::PcuVulkanBackend,
+                id: u32,
+            ) {
+                let bindings = source::$bindings::<T>();
+                let builder = source::$ir::<T, 5>(&bindings).unwrap();
+                let kernel = builder.ir();
+                let request = pcu_facade::PcuImplementationRequest {
+                    device: backend.device_identity().unwrap(),
+                    executor: pcu_facade::PcuExecutorId(0),
+                    operation: &kernel,
+                    requirements: kernel.numerical_requirements,
+                    boundary: pcu_facade::PcuCostBoundary::Host,
+                };
+                let mut output = [None];
+                assert_eq!(
+                    pcu_facade::PcuImplementationOffers::implementation_offers(
+                        backend,
+                        &request,
+                        &mut output
+                    )
+                    .unwrap(),
+                    1
+                );
+                let offer = output[0].unwrap();
+                assert_eq!(
+                    (offer.implementation.local_id, offer.implementation.revision),
+                    (id, 1)
+                );
+                assert_eq!(offer.requirements, request.requirements);
+                let mut mismatch = pcu_facade::PcuImplementationRequest {
+                    device: request.device,
+                    executor: request.executor,
+                    operation: request.operation,
+                    requirements: request.requirements,
+                    boundary: request.boundary,
+                };
+                mismatch.requirements.numerical_options.reproducibility =
+                    pcu_facade::PcuReproducibility::Unspecified;
+                assert_eq!(
+                    pcu_facade::PcuImplementationOffers::implementation_offers(
+                        backend,
+                        &mismatch,
+                        &mut []
+                    )
+                    .unwrap(),
+                    0
+                );
+                let mut bad = kernel;
+                bad.numerical_requirements.range_policy = pcu_facade::PcuRangePolicy::Clamp;
+                assert!(backend.prepare_host_kernel(&bad).is_err());
+                let invalid = pcu_facade::PcuImplementationRequest {
+                    operation: &bad,
+                    requirements: bad.numerical_requirements,
+                    ..request
+                };
+                assert_eq!(
+                    pcu_facade::PcuImplementationOffers::implementation_offers(
+                        backend,
+                        &invalid,
+                        &mut []
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+            case::<T>(backend, id);
         }};
     }
     visit!(repeated_bindings, repeated_ir);

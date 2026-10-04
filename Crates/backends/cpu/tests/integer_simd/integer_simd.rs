@@ -10,7 +10,11 @@ use fusion_pcu_cpu::{PcuCpuProcessor,PcuCpuImplementation,PcuCpuCheckedInteger,P
 use pcu_facade::{global,PcuHostKernelBackend,PcuPreparedHostKernel,PcuHostArgument,PcuBindingRef,PcuDispatchIntegerBinaryOp,PcuRangePolicy};
 fn instruction() -> PcuCpuImplementation {
     let p = PcuCpuProcessor::detect();
-    if p.features().sse2 {
+    if p.features().avx512f && p.features().avx512bw {
+        PcuCpuImplementation::Avx512
+    } else if p.features().avx2 {
+        PcuCpuImplementation::Avx2
+    } else if p.features().sse2 {
         PcuCpuImplementation::Sse2
     } else {
         assert!(p.features().neon);
@@ -18,82 +22,94 @@ fn instruction() -> PcuCpuImplementation {
     }
 }
 fn width<T: native::Native>() {
-    let isa = instruction();
-    let backend =
-        PcuCpuCheckedInteger::<T>::with_implementation(PcuCpuProcessor::detect(), isa).unwrap();
-    macro_rules! operation {
-        ($entry:ident,$ir:ident,$bindings:ident,$op:ident,$range:ident) => {{
-            let bindings = source::$bindings::<T>();
-            let builder = source::$ir::<T, 65>(&bindings).unwrap();
-            let mut plan = backend.prepare_host_kernel(&builder.ir()).unwrap();
-            assert_eq!(plan.implementation(), isa);
-            assert!((1024..=1087).contains(&plan.local_id()));
-            assert_eq!(plan.implementation_revision(), 1);
-            let mut left = [T::small(10); 65];
-            let right = [T::small(2); 65];
-            let sentinel = T::small(77);
-            for index in [0, 1, 7, 8, 15, 16, 31, 32, 63, 64] {
-                left.fill(T::small(10));
-                left[index] = if PcuDispatchIntegerBinaryOp::$op == PcuDispatchIntegerBinaryOp::Add
-                {
-                    T::maximum()
-                } else {
-                    T::minimum()
-                };
-                let mut expected = [sentinel; 68];
-                let notice = native::execute::<T, 65>(
-                    &left,
-                    &right,
-                    &mut expected,
-                    PcuDispatchIntegerBinaryOp::$op,
-                    PcuRangePolicy::$range,
-                );
-                let mut output = [sentinel; 68];
-                let result = plan
-                    .call(&mut [
-                        PcuHostArgument::read(PcuBindingRef::new(0, 0), &left),
-                        PcuHostArgument::read(PcuBindingRef::new(0, 1), &right),
-                        PcuHostArgument::read_write(PcuBindingRef::new(0, 2), &mut output),
-                    ])
-                    .map_err(|error| match error {
-                        PcuCpuCheckedIntegerError::Fault(f) => f,
-                        other => panic!("unexpected typed SIMD{other:?}"),
-                    });
-                assert_eq!(result, notice);
-                assert_eq!(output, expected);
-                output.fill(sentinel);
-                assert_eq!(
-                    source::$entry::<T, 65>(&left, &right, &mut output)
-                        .map_err(|error| error.arithmetic_fault().unwrap()),
-                    notice
-                );
-                assert_eq!(output, expected);
-                let saved = output;
-                assert!(
-                    plan.call(&mut [
-                        PcuHostArgument::read(PcuBindingRef::new(0, 0), &left[..64]),
-                        PcuHostArgument::read(PcuBindingRef::new(0, 1), &right),
-                        PcuHostArgument::read_write(PcuBindingRef::new(0, 2), &mut output)
-                    ])
-                    .is_err()
-                );
-                assert_eq!(output, saved);
-                left.fill(T::small(10));
-                source::$entry::<T, 65>(&left, &right, &mut output).unwrap();
-                assert_eq!(output[65..], [sentinel; 3]);
-            }
-        }};
+    for isa in [
+        PcuCpuImplementation::Sse2,
+        PcuCpuImplementation::Avx2,
+        PcuCpuImplementation::Avx512,
+        PcuCpuImplementation::Neon,
+    ] {
+        if PcuCpuProcessor::detect().require(isa).is_err()
+            || (isa == PcuCpuImplementation::Avx512
+                && !PcuCpuProcessor::detect().features().avx512bw)
+        {
+            continue;
+        }
+        let backend =
+            PcuCpuCheckedInteger::<T>::with_implementation(PcuCpuProcessor::detect(), isa).unwrap();
+        macro_rules! operation {
+            ($entry:ident,$ir:ident,$bindings:ident,$op:ident,$range:ident) => {{
+                let bindings = source::$bindings::<T>();
+                let builder = source::$ir::<T, 65>(&bindings).unwrap();
+                let mut plan = backend.prepare_host_kernel(&builder.ir()).unwrap();
+                assert_eq!(plan.implementation(), isa);
+                assert!((1024..=1151).contains(&plan.local_id()));
+                assert_eq!(plan.implementation_revision(), 1);
+                let mut left = [T::small(10); 65];
+                let right = [T::small(2); 65];
+                let sentinel = T::small(77);
+                for index in [0, 1, 7, 8, 15, 16, 31, 32, 63, 64] {
+                    left.fill(T::small(10));
+                    left[index] =
+                        if PcuDispatchIntegerBinaryOp::$op == PcuDispatchIntegerBinaryOp::Add {
+                            T::maximum()
+                        } else {
+                            T::minimum()
+                        };
+                    let mut expected = [sentinel; 68];
+                    let notice = native::execute::<T, 65>(
+                        &left,
+                        &right,
+                        &mut expected,
+                        PcuDispatchIntegerBinaryOp::$op,
+                        PcuRangePolicy::$range,
+                    );
+                    let mut output = [sentinel; 68];
+                    let result = plan
+                        .call(&mut [
+                            PcuHostArgument::read(PcuBindingRef::new(0, 0), &left),
+                            PcuHostArgument::read(PcuBindingRef::new(0, 1), &right),
+                            PcuHostArgument::read_write(PcuBindingRef::new(0, 2), &mut output),
+                        ])
+                        .map_err(|error| match error {
+                            PcuCpuCheckedIntegerError::Fault(f) => f,
+                            other => panic!("unexpected typed SIMD{other:?}"),
+                        });
+                    assert_eq!(result, notice);
+                    assert_eq!(output, expected);
+                    output.fill(sentinel);
+                    assert_eq!(
+                        source::$entry::<T, 65>(&left, &right, &mut output)
+                            .map_err(|error| error.arithmetic_fault().unwrap()),
+                        notice
+                    );
+                    assert_eq!(output, expected);
+                    let saved = output;
+                    assert!(
+                        plan.call(&mut [
+                            PcuHostArgument::read(PcuBindingRef::new(0, 0), &left[..64]),
+                            PcuHostArgument::read(PcuBindingRef::new(0, 1), &right),
+                            PcuHostArgument::read_write(PcuBindingRef::new(0, 2), &mut output)
+                        ])
+                        .is_err()
+                    );
+                    assert_eq!(output, saved);
+                    left.fill(T::small(10));
+                    source::$entry::<T, 65>(&left, &right, &mut output).unwrap();
+                    assert_eq!(output[65..], [sentinel; 3]);
+                }
+            }};
+        }
+        operation!(add, add_ir, add_bindings, Add, Reject);
+        operation!(sub, sub_ir, sub_bindings, Sub, Reject);
+        operation!(add_clamp, add_clamp_ir, add_clamp_bindings, Add, Clamp);
+        operation!(sub_clamp, sub_clamp_ir, sub_clamp_bindings, Sub, Clamp);
+        let left = [T::small(10); 65];
+        let right = T::small(2);
+        let mut output = [T::small(77); 68];
+        source::broadcast::<T, 65>(&left, &right, &mut output).unwrap();
+        assert_eq!(output[..65], [T::small(12); 65]);
+        assert_eq!(output[65..], [T::small(77); 3]);
     }
-    operation!(add, add_ir, add_bindings, Add, Reject);
-    operation!(sub, sub_ir, sub_bindings, Sub, Reject);
-    operation!(add_clamp, add_clamp_ir, add_clamp_bindings, Add, Clamp);
-    operation!(sub_clamp, sub_clamp_ir, sub_clamp_bindings, Sub, Clamp);
-    let left = [T::small(10); 65];
-    let right = T::small(2);
-    let mut output = [T::small(77); 68];
-    source::broadcast::<T, 65>(&left, &right, &mut output).unwrap();
-    assert_eq!(output[..65], [T::small(12); 65]);
-    assert_eq!(output[65..], [T::small(77); 3]);
 }
 #[test]
 fn native_eight_public_source_transactions() {
@@ -120,9 +136,17 @@ fn explicit_requests_never_substitute() {
     ));
     let p = PcuCpuProcessor::detect();
     assert!(matches!(
-        PcuCpuCheckedInteger::<u32>::with_implementation(p, PcuCpuImplementation::Avx2),
+        PcuCpuCheckedInteger::<u32>::with_implementation(p, PcuCpuImplementation::Avx),
         Err(PcuCpuCheckedIntegerError::UnsupportedProfile)
     ));
+    for isa in [PcuCpuImplementation::Avx2, PcuCpuImplementation::Avx512] {
+        if p.require(isa).is_ok() && (isa != PcuCpuImplementation::Avx512 || p.features().avx512bw)
+        {
+            assert!(PcuCpuCheckedInteger::<u32>::with_implementation(p, isa).is_ok());
+        } else {
+            assert!(PcuCpuCheckedInteger::<u32>::with_implementation(p, isa).is_err());
+        }
+    }
     let native = PcuCpuCheckedInteger::<u32>::with_implementation(p, instruction()).unwrap();
     let bindings = source::mul_bindings::<u32>();
     let builder = source::mul_ir::<u32, 65>(&bindings).unwrap();
@@ -219,7 +243,14 @@ fn cold_width<T: native::Native>() {
                             .numerical_options
                             .reproducibility = PcuReproducibility::PortableV1;
                         let portable = typed.prepare_host_kernel(&kernel).unwrap();
-                        assert!((4224..=4383).contains(&portable.local_id()));
+                        let ids = match portable.implementation() {
+                            PcuCpuImplementation::Sse2 => 4224..=4255,
+                            PcuCpuImplementation::Neon => 4352..=4383,
+                            PcuCpuImplementation::Avx2 => 4480..=4511,
+                            PcuCpuImplementation::Avx512 => 4608..=4639,
+                            _ => panic!("expected the selected SIMD implementation"),
+                        };
+                        assert!(ids.contains(&portable.local_id()));
                         assert_eq!(portable.implementation(), plan.implementation());
                     }
                 }

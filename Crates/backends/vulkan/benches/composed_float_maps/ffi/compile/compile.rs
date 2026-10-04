@@ -6,6 +6,26 @@ use super::{
     PcuScalarType,
 };
 
+const fn is_integer(scalar: PcuScalarType) -> bool {
+    matches!(
+        scalar,
+        PcuScalarType::U8
+            | PcuScalarType::I8
+            | PcuScalarType::U16
+            | PcuScalarType::I16
+            | PcuScalarType::U32
+            | PcuScalarType::I32
+            | PcuScalarType::U64
+            | PcuScalarType::I64
+            | PcuScalarType::U128
+            | PcuScalarType::I128
+            | PcuScalarType::U256
+            | PcuScalarType::I256
+            | PcuScalarType::U512
+            | PcuScalarType::I512
+    )
+}
+
 fn source(
     policy: u32,
     range: u32,
@@ -15,6 +35,9 @@ fn source(
 ) -> NativeResult<String> {
     if policy > 2 || range > 1 || extent == 0 {
         return Err("native unsupported policy/range/extent".into());
+    }
+    if is_integer(scalar) {
+        return integer_source(policy, range, scalar, extent, one_effect);
     }
     let (template, format, wide) = match scalar {
         PcuScalarType::F32 => (
@@ -53,7 +76,7 @@ fn source(
         .split_once("void main(){")
         .ok_or("native template main absent")?
         .0;
-    // Preserve the disclosed integer arithmetic helpers, but construct the fixed
+    // Preserve the disclosed floating-bit arithmetic helpers, but construct the fixed
     // source program directly. No PCU IR/profile or SPIR-V rewriting is used here.
     let mut source =
         format!("#version 450\nconst uint EXTENT={extent};\nconst uint FORMAT={format};\n");
@@ -105,6 +128,35 @@ void main() {{
 "
     )?;
     Ok(source)
+}
+
+fn integer_source(
+    _policy: u32,
+    range: u32,
+    scalar: PcuScalarType,
+    extent: u32,
+    one_effect: bool,
+) -> NativeResult<String> {
+    if !is_integer(scalar) {
+        return Err("integer composed scalar".into());
+    }
+    let bits = scalar.bit_width();
+    let signed = matches!(
+        scalar,
+        PcuScalarType::I8
+            | PcuScalarType::I16
+            | PcuScalarType::I32
+            | PcuScalarType::I64
+            | PcuScalarType::I128
+            | PcuScalarType::I256
+            | PcuScalarType::I512
+    );
+    Ok(format!(
+        "#version 450\nconst uint BITS={bits}u;\nconst int L={};\nconst bool SIGNED={signed};\nconst uint EXTENT={extent}u;\nconst bool CLAMP={};\nconst bool ONE={one_effect};\n{}",
+        bits.div_ceil(32),
+        range == 1,
+        include_str!("../../../composed_integer_maps/native/arithmetic.comp")
+    ))
 }
 
 pub fn shader(

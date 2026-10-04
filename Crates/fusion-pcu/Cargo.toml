@@ -18,8 +18,9 @@ crate-type = ["rlib"]
 path = "fusion-pcu.rs"
 
 [features]
-default = []
-insights = ["fusion-pcu-core/insights"]
+default = ["embedded-vulkan-composed"]
+embedded-vulkan-composed = ["fusion-pcu-vulkan?/embedded-composed"]
+insights = ["fusion-pcu-core/insights", "fusion-pcu-vulkan?/insights"]
 std = ["fusion-pcu-core/std"]
 hosted = ["std"]
 tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor", "fusion-pcu-cuda?/tensor", "fusion-pcu-cpu?/tensor", "fusion-pcu-vulkan?/tensor", "fusion-pcu-metal?/tensor"]
@@ -86,6 +87,16 @@ required-features = ["cpu"]
 [[example]]
 name = "vulkan-transform"
 path = "examples/vulkan-transform/vulkan-transform.rs"
+required-features = ["vulkan"]
+
+[[example]]
+name = "vulkan-shader-cache"
+path = "examples/vulkan-shader-cache/vulkan-shader-cache.rs"
+required-features = ["vulkan"]
+
+[[test]]
+name = "vulkan_shader_cache"
+path = "tests/vulkan_shader_cache/vulkan_shader_cache.rs"
 required-features = ["vulkan"]
 
 [[example]]
@@ -162,3 +173,14 @@ required-features = ["std", "tensor"]
 name = "mlx_checked_source"
 path = "tests/mlx_checked_source/mlx_checked_source.rs"
 required-features = ["mlx"]
+
+[[bench]]
+name = "apple_conversion"
+path = "benches/apple_conversion/apple_conversion.rs"
+harness = false
+required-features = ["mlx", "metal"]
+
+[[example]]
+name = "selected-numerical"
+path = "examples/selected-numerical/selected-numerical.rs"
+required-features = ["std", "tensor"]

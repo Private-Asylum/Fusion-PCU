@@ -123,6 +123,12 @@ struct Session {
 /// One explicit MLX GPU stream. Clones retain exact affinity and stay thread-confined.
 #[derive(Clone)]
 pub struct MlxSession(Rc<Session>);
+#[path = "relu_backward/relu_backward.rs"]
+mod relu_backward;
+pub use relu_backward::MlxPreparedReluBackward;
+#[path = "conversion/conversion.rs"]
+mod conversion;
+pub use conversion::MlxPreparedFloatConversion;
 
 /// Observable materialization state; MLX's internal allocator/cache is still delegated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -823,3 +829,51 @@ pub use tensor_binary::MlxPreparedTensorBinaryProgram;
 mod tensor_integer;
 #[cfg(feature = "tensor")]
 pub use tensor_integer::MlxPreparedTensorIntegerProgram;
+
+#[cfg(feature = "tensor")]
+#[path = "tensor_backward/tensor_backward.rs"]
+mod tensor_backward;
+#[cfg(feature = "tensor")]
+pub use tensor_backward::MlxPreparedTensorBackwardProgram;
+
+#[cfg(feature = "tensor")]
+#[path = "strict_matmul/strict_matmul.rs"]
+mod strict_matmul;
+#[cfg(feature = "tensor")]
+pub use strict_matmul::MlxPreparedStrictMatMul;
+
+#[cfg(feature = "tensor")]
+#[path = "tensor_matmul/tensor_matmul.rs"]
+mod tensor_matmul;
+#[cfg(feature = "tensor")]
+pub use tensor_matmul::MlxPreparedTensorMatMulProgram;
+
+#[cfg(feature = "tensor")]
+#[path = "strict_sgd/strict_sgd.rs"]
+mod strict_sgd;
+#[cfg(feature = "tensor")]
+pub use strict_sgd::MlxPreparedStrictSgd;
+
+#[cfg(feature = "tensor")]
+#[path = "tensor_sgd/tensor_sgd.rs"]
+mod tensor_sgd;
+#[cfg(feature = "tensor")]
+pub use tensor_sgd::MlxPreparedTensorSgdProgram;
+
+#[cfg(feature = "tensor")]
+#[path = "selected_numerical/selected_numerical.rs"]
+mod selected_numerical;
+#[cfg(feature = "tensor")]
+pub use selected_numerical::{MlxSelectedNumericalTensorPlan,MlxPreparedSelectedNumericalTensorProgram,MlxSelectedNumericalTensorOperation};
+
+#[cfg(feature="tensor")]
+#[path="strict_mse/strict_mse.rs"]
+mod strict_mse;
+#[cfg(feature="tensor")]
+pub use strict_mse::MlxPreparedStrictMse;
+
+#[cfg(feature="tensor")]
+#[path="tensor_mse/tensor_mse.rs"]
+mod tensor_mse;
+#[cfg(feature="tensor")]
+pub use tensor_mse::MlxPreparedTensorMseProgram;

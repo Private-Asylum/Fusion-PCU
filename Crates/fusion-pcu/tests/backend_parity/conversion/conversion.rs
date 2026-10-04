@@ -17,6 +17,10 @@ use super::support::{
     POLICY_LOCK,
 };
 
+#[cfg(all(feature = "tensor", any(feature = "metal", feature = "mlx")))]
+#[path = "mixed/mixed.rs"]
+mod mixed;
+
 #[pcu(invocations = N)]
 fn narrow<const N: usize>(input: &[f64; N], output: &mut [f32]) {
     let id = pcu::context::global_invocation_id();
@@ -192,6 +196,8 @@ pub fn verify(backend: global::PcuBackendChoice) {
                     global::clear_thread_cache().unwrap();
                     finite_rounding();
                     exceptional_ranges(float_underflow);
+                    #[cfg(all(feature = "tensor", any(feature = "metal", feature = "mlx")))]
+                    mixed::verify(backend);
                 }
             }
         }

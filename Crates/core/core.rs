@@ -831,6 +831,10 @@ pub enum PcuParameterValue {
     BF16(u16),
     F32(u32),
     F64(u64),
+    /// Exact E4M3FN payload, including signed zero and NaN encodings.
+    F8E4M3FN(u8),
+    /// Exact E5M2 payload, including signed zero, infinities and NaN encodings.
+    F8E5M2(u8),
 }
 
 impl PcuParameterValue {
@@ -860,6 +864,18 @@ impl PcuParameterValue {
     #[must_use]
     pub const fn from_u4_bits(bits: u8) -> Self {
         Self::U4(bits & 0x0f)
+    }
+
+    /// Preserves every raw E4M3FN bit pattern without numeric conversion.
+    #[must_use]
+    pub const fn from_f8_e4m3fn_bits(bits: u8) -> Self {
+        Self::F8E4M3FN(bits)
+    }
+
+    /// Preserves every raw E5M2 bit pattern without numeric conversion.
+    #[must_use]
+    pub const fn from_f8_e5m2_bits(bits: u8) -> Self {
+        Self::F8E5M2(bits)
     }
 
     #[must_use]
@@ -910,6 +926,8 @@ impl PcuParameterValue {
             Self::BF16(_) => PcuValueType::bf16(),
             Self::F32(_) => PcuValueType::f32(),
             Self::F64(_) => PcuValueType::f64(),
+            Self::F8E4M3FN(_) => PcuValueType::Scalar(PcuScalarType::F8E4M3FN),
+            Self::F8E5M2(_) => PcuValueType::Scalar(PcuScalarType::F8E5M2),
         }
     }
 
@@ -993,6 +1011,24 @@ impl PcuParameterValue {
     pub const fn as_u64(self) -> Option<u64> {
         match self {
             Self::U64(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns the exact E4M3FN bits only for that scalar identity.
+    #[must_use]
+    pub const fn as_f8_e4m3fn_bits(self) -> Option<u8> {
+        match self {
+            Self::F8E4M3FN(bits) => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// Returns the exact E5M2 bits only for that scalar identity.
+    #[must_use]
+    pub const fn as_f8_e5m2_bits(self) -> Option<u8> {
+        match self {
+            Self::F8E5M2(bits) => Some(bits),
             _ => None,
         }
     }
@@ -1335,6 +1371,51 @@ mod tests {
         assert_eq!(signed.as_i64(), Some(-9));
         assert_eq!(unsigned.as_u64(), Some(42));
         assert_eq!(float.as_f64(), Some(3.5));
+    }
+
+    #[test]
+    fn raw_fp8_parameters_preserve_all_bits_and_require_exact_scalar_tags() {
+        #[rustfmt::skip]
+        use crate::{
+            PcuInvocationParameters,
+            PcuParameter,
+            PcuParameterBinding,
+            PcuParameterSlot,
+        };
+
+        for bits in u8::MIN..=u8::MAX {
+            let e4 = PcuParameterValue::from_f8_e4m3fn_bits(bits);
+            let e5 = PcuParameterValue::from_f8_e5m2_bits(bits);
+            assert_eq!(e4.as_f8_e4m3fn_bits(), Some(bits));
+            assert_eq!(e5.as_f8_e5m2_bits(), Some(bits));
+            assert_eq!(e4.as_f8_e5m2_bits(), None);
+            assert_eq!(e5.as_f8_e4m3fn_bits(), None);
+            for value in [e4, e5] {
+                for scalar in PcuScalarType::ALL {
+                    assert_eq!(
+                        value.matches_type(PcuValueType::Scalar(scalar)),
+                        scalar == value.value_type().scalar_type(),
+                    );
+                }
+                let slot = PcuParameterSlot(0);
+                let bindings = [PcuParameterBinding::new(slot, value)];
+                let parameters = PcuInvocationParameters {
+                    bindings: &bindings,
+                };
+                let declaration = [PcuParameter::anonymous(slot, value.value_type())];
+                assert!(parameters.validate_against(&declaration));
+                assert_eq!(parameters.value(slot), Some(value));
+                let wrong = [PcuParameter::anonymous(slot, PcuValueType::u8())];
+                assert!(!parameters.validate_against(&wrong));
+                let immediate = crate::model::PcuOperand::Immediate(value);
+                let crate::model::PcuOperand::Immediate(retained) = immediate else {
+                    panic!("command immediate must retain its scalar payload");
+                };
+                assert_eq!(retained, value);
+            }
+        }
+        assert_eq!(PcuParameterValue::U8(0).as_f8_e4m3fn_bits(), None);
+        assert_eq!(PcuParameterValue::U8(0).as_f8_e5m2_bits(), None);
     }
 
     #[test]

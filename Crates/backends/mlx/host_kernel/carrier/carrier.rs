@@ -83,6 +83,7 @@ impl MlxCarrierPlan {
     /// # Errors
     /// Rejects noncopy schemas, narrow packed types, Portable, unsafe geometry or oversized spans.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let unsupported = || MlxError::InvalidRequest("unsupported exact MLX carrier map".into());
         if kernel
             .numerical_requirements
@@ -174,6 +175,8 @@ impl MlxSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MlxPreparedCarrierHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCarrierPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         self.prepare_carrier_plan(plan)
             .map_err(PcuHostDispatchError::Backend)
@@ -189,6 +192,8 @@ impl MlxSession {
         kernel: &PcuDispatchKernelIr<'_>,
         input_extents: &[usize],
     ) -> Result<MlxPreparedCarrierHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCarrierPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         let extent = plan
             .assess_input_extents(input_extents)

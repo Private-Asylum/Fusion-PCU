@@ -303,11 +303,29 @@ fn native_ids_preserve_simd_neg_and_close_all_scalar_unary_forms() {
                                             PcuFloatUnderflowPolicy::IeeeAfterRounding
                                         };
                                 }
-                                assert!(
-                                    PcuCpuHostBackend::scalar()
-                                        .prepare_host_kernel(&kernel)
-                                        .is_err()
-                                );
+                                let prepared =
+                                    PcuCpuHostBackend::scalar().prepare_host_kernel(&kernel);
+                                if !change_range
+                                    && op == PcuDispatchFloatUnaryOp::Neg
+                                    && range == PcuRangePolicy::Reject
+                                    && !broadcast
+                                {
+                                    // Preserve the optimized Neg profile's explicit typed
+                                    // header refusal; generic fallback must not erase it.
+                                    assert!(matches!(
+                                        prepared,
+                                        Err(PcuCpuHostError::Neg(
+                                            fusion_pcu_cpu::PcuCpuPreparedNegError::HeaderUnderflowMismatch
+                                        ))
+                                    ));
+                                } else {
+                                    // Unsupported canonical forms may use the complete
+                                    // composed profile with operation-local policies.
+                                    assert!(matches!(
+                                        prepared,
+                                        Ok(PcuCpuPreparedHost::Composed(_))
+                                    ));
+                                }
                             }
                         });
                     }

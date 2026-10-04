@@ -58,6 +58,7 @@ impl MlxCheckedMapPlan {
         kernel: &PcuDispatchKernelIr<'_>,
         scalar: PcuScalarType,
     ) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if kernel
             .numerical_requirements
             .numerical_options

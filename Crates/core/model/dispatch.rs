@@ -659,6 +659,22 @@ impl PcuDispatchKernelIr<'_> {
         flags
     }
 
+    /// Detect nested grid regions without recursively traversing borrowed IR.
+    ///
+    /// Flat-map providers and validators must reject these before recursive
+    /// capability or type scans. This also detects a cyclic grid body after
+    /// inspecting only its immediate children. It is not complete validation
+    /// or a universal prohibition on richer future execution profiles.
+    #[must_use]
+    pub fn has_nested_grid_stride_loop(&self) -> bool {
+        self.ops.iter().any(|operation| match operation {
+            PcuDispatchOp::GridStrideLoop { body, .. } => body
+                .iter()
+                .any(|child| matches!(child, PcuDispatchOp::GridStrideLoop { .. })),
+            _ => false,
+        })
+    }
+
     /// Returns the value/type support floor derived from the kernel's typed interface and
     /// constants, plus any explicitly requested capabilities.
     #[must_use]

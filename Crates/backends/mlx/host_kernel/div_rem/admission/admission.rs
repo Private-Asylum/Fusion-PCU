@@ -50,6 +50,8 @@ impl PcuHostKernelBackend for MlxCheckedDivRemBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         self.prepare_host_kernel_with_input_extents_internal(kernel, None)
     }
 }
@@ -67,6 +69,8 @@ impl MlxCheckedDivRemBackend {
         kernel: &PcuDispatchKernelIr<'_>,
         input_extents: &[usize],
     ) -> Result<MlxPreparedDivRemHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         self.prepare_host_kernel_with_input_extents_internal(kernel, Some(input_extents))
     }
     fn prepare_host_kernel_with_input_extents_internal(
@@ -74,6 +78,8 @@ impl MlxCheckedDivRemBackend {
         kernel: &PcuDispatchKernelIr<'_>,
         input_extents: Option<&[usize]>,
     ) -> Result<MlxPreparedDivRemHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCheckedDivRemPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         let mut extents = [plan.element_count(); 2];
         if let Some(actual) = input_extents {

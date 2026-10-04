@@ -31,6 +31,7 @@ use super::{
 };
 /// Frozen checked MLX dispatch selected once during preparation, with truthful unique input roles.
 pub enum MlxPreparedDispatchKernel {
+    Conversion(crate::MlxPreparedConversionHostKernel),
     Carrier(MlxPreparedCarrierHostKernel),
     Transport(MlxPreparedTransportHostKernel),
     Composed(MlxPreparedCheckedMapHostKernel),
@@ -70,6 +71,7 @@ impl MlxPreparedDispatchKernel {
     #[must_use]
     pub fn input_bindings(&self) -> &[PcuBindingRef] {
         match self {
+            Self::Conversion(kernel) => kernel.input_bindings(),
             Self::Carrier(kernel) => kernel.input_bindings(),
             Self::Composed(kernel) => kernel.input_bindings(),
             Self::Transport(kernel) => kernel.plan().input_bindings(),
@@ -88,6 +90,10 @@ impl MlxPreparedDispatchKernel {
             },
             Self::Transport(kernel) => MlxDispatchOutputLayout::Transport {
                 outputs: kernel.output_layout(),
+            },
+            Self::Conversion(kernel) => MlxDispatchOutputLayout::Single {
+                binding: kernel.output_binding(),
+                byte_len: kernel.output_byte_len(),
             },
             Self::Carrier(kernel) => MlxDispatchOutputLayout::Single {
                 binding: kernel.output_binding(),
@@ -118,6 +124,7 @@ impl MlxPreparedDispatchKernel {
     #[must_use]
     pub const fn scalar_type(&self) -> PcuScalarType {
         match self {
+            Self::Conversion(kernel) => kernel.scalar_type(),
             Self::Carrier(kernel) => kernel.scalar_type(),
             Self::Composed(kernel) => kernel.plan().value_type().scalar_type(),
             Self::Transport(kernel) => kernel.plan().scalar_type(),
@@ -127,6 +134,17 @@ impl MlxPreparedDispatchKernel {
             Self::DivRem(kernel) => kernel.scalar_type(),
             Self::DivRemRoles(kernel) => kernel.scalar_type(),
         }
+    }
+    /// Exact input type for one actual resource; conversion outputs can have a different type.
+    #[must_use]
+    pub fn input_scalar_type(&self, binding: PcuBindingRef) -> Option<PcuScalarType> {
+        if !self.input_bindings().contains(&binding) {
+            return None;
+        }
+        Some(match self {
+            Self::Conversion(kernel) => kernel.source_scalar_type(),
+            _ => self.scalar_type(),
+        })
     }
     /// Safe unique-input byte/resident seam; variants retain their real arity and exact schema.
     ///
@@ -166,6 +184,7 @@ impl MlxPreparedDispatchKernel {
                     )),
                 }
             }
+            Self::Conversion(kernel) => kernel.execute_inputs(inputs),
             Self::Binary(kernel) => kernel.execute_inputs(inputs),
             Self::Integer(kernel) => kernel.execute_inputs(inputs),
             Self::DivRem(kernel) => {
@@ -212,6 +231,7 @@ impl MlxPreparedDispatchKernel {
     #[must_use]
     pub const fn last_call_may_have_written(&self) -> bool {
         match self {
+            Self::Conversion(kernel) => kernel.last_call_may_have_written(),
             Self::Carrier(kernel) => kernel.last_call_may_have_written(),
             Self::Composed(kernel) => kernel.last_call_may_have_written(),
             Self::Transport(kernel) => kernel.last_call_may_have_written(),
@@ -225,6 +245,7 @@ impl MlxPreparedDispatchKernel {
     #[must_use]
     pub fn last_call_completion_uncertain(&self) -> bool {
         match self {
+            Self::Conversion(kernel) => kernel.last_call_completion_uncertain(),
             Self::Carrier(kernel) => kernel.last_call_completion_uncertain(),
             Self::Composed(kernel) => kernel.last_call_completion_uncertain(),
             Self::Transport(kernel) => kernel.last_call_completion_uncertain(),
@@ -240,6 +261,9 @@ impl PcuPreparedHostKernel for MlxPreparedDispatchKernel {
     type Error = MlxHostKernelError;
     fn call(&mut self, arguments: &mut [PcuHostArgument<'_>]) -> Result<(), Self::Error> {
         match self {
+            Self::Conversion(kernel) => kernel
+                .call(arguments)
+                .map_err(fusion_pcu::PcuHostDispatchError::Backend),
             Self::Carrier(kernel) => kernel.call(arguments),
             Self::Composed(kernel) => kernel.call(arguments),
             Self::Transport(kernel) => kernel.call(arguments),

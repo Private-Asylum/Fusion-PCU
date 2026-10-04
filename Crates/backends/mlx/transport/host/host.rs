@@ -49,6 +49,8 @@ impl PcuHostKernelBackend for MlxTransportHostBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
             kernel.bindings.first().map(|b| b.binding_type)
         else {

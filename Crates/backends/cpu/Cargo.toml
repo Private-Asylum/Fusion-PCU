@@ -516,3 +516,14 @@ name = "unary_roles"
 path = "benches/unary_roles/unary_roles.rs"
 harness = false
 required-features = ["source-unary"]
+
+[[test]]
+name = "wide_composed"
+path = "tests/wide_composed/wide_composed.rs"
+required-features = ["source-composed"]
+
+[[bench]]
+name = "wide_composed"
+path = "benches/wide_composed/wide_composed.rs"
+harness = false
+required-features = ["source-composed"]

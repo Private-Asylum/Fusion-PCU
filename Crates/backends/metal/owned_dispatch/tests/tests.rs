@@ -196,8 +196,10 @@ mod native {
         let mut bytes = vec![0; usize::try_from(resource.size_bytes()).unwrap()];
         provider.transfer_from(resource, 0, &mut bytes).unwrap();
         bytes
-            .chunks_exact(4)
-            .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_ne_bytes(*bytes))
             .collect()
     }
     fn bind(

@@ -73,6 +73,8 @@ impl PcuHostKernelBackend for MetalDivRemHostBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         crate::admission::require_scalar_numerics(kernel).map_err(PcuHostDispatchError::Backend)?;
         if kernel.numerical_requirements.range_policy != PcuRangePolicy::Reject {
             return Err(PcuHostDispatchError::Backend(MetalError::Unsupported));

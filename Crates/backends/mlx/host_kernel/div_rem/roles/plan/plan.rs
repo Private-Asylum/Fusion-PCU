@@ -39,6 +39,7 @@ impl MlxCheckedDivRemRolePlan {
     /// # Errors
     /// Rejects unsupported types, malformed SSA, extents, Clamp and ineligible Portable requests.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let invalid = || MlxError::InvalidRequest("unsupported MLX DivRem role profile".into());
         if cfg!(target_endian = "big") || kernel.entry.logical_shape[1..] != [1, 1] {
             return Err(invalid());

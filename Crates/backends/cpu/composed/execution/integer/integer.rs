@@ -34,6 +34,10 @@ pub const fn select(scalar: PcuScalarType) -> Option<Executable> {
         PcuScalarType::U64 => Some(execute::<u64>),
         PcuScalarType::I128 => Some(execute::<i128>),
         PcuScalarType::U128 => Some(execute::<u128>),
+        PcuScalarType::I256 => Some(execute::<fusion_pcu::PcuI256>),
+        PcuScalarType::U256 => Some(execute::<fusion_pcu::PcuU256>),
+        PcuScalarType::I512 => Some(execute::<fusion_pcu::PcuI512>),
+        PcuScalarType::U512 => Some(execute::<fusion_pcu::PcuU512>),
         _ => None,
     }
 }

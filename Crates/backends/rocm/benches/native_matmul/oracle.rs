@@ -27,6 +27,7 @@ scalar!(f32, "f32", f32_integer);
 scalar!(f64, "f64", f64::from);
 pub type MatrixInputs<T, const R: usize, const K: usize, const C: usize> =
     (Box<[[T; K]; R]>, Box<[[T; C]; K]>);
+#[allow(clippy::unnecessary_box_returns)] // Cold fixed matrices stay on the heap to bound stack use.
 fn matrix<T: Scalar, const R: usize, const C: usize>() -> Box<[[T; C]; R]> {
     // Construct only a single row on the stack. Vec repeats that row directly into heap storage.
     vec![[T::default(); C]; R]

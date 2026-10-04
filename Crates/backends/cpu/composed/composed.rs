@@ -58,7 +58,7 @@ impl PcuCpuComposedMapError {
     }
 }
 
-/// Explicit six-format composed CPU preparation, available with `std` or `tensor` allocation.
+/// Explicit six-format float preparation, available with `std` or `tensor` allocation.
 ///
 /// This is an Unspecified-reproducibility checked scalar profile. It supports two to
 /// four declarations and one or more checked operations, at most 64 detached steps.
@@ -140,6 +140,11 @@ type Executable = fn(
 
 /// Owned cold program and private output state, independent of the temporary dispatch IR.
 ///
+/// Exact fourteen-width integer composition separately supports Unspecified and
+/// `PortableV1` requests; portable instructions must match their header range policy
+/// and have no cross-index read/write dependencies. Float composition retains its
+/// separately admitted Unspecified profile. No portable float support is inferred.
+///
 /// Cloning duplicates the cold program/scratch allocation. Calls never clone, allocate,
 /// lower IR or discover an ISA. All loads/stores execute in logical lane and program order.
 /// Every public output is committed only after the entire call is fatal-free; complete
@@ -217,6 +222,10 @@ pub fn prepare_erased(
         PcuScalarType::U64 => compile::integer::prepare::<u64>(kernel),
         PcuScalarType::I128 => compile::integer::prepare::<i128>(kernel),
         PcuScalarType::U128 => compile::integer::prepare::<u128>(kernel),
+        PcuScalarType::I256 => compile::integer::prepare::<fusion_pcu::PcuI256>(kernel),
+        PcuScalarType::U256 => compile::integer::prepare::<fusion_pcu::PcuU256>(kernel),
+        PcuScalarType::I512 => compile::integer::prepare::<fusion_pcu::PcuI512>(kernel),
+        PcuScalarType::U512 => compile::integer::prepare::<fusion_pcu::PcuU512>(kernel),
         _ => Err(PcuCpuComposedMapError::UnsupportedProfile),
     }
 }

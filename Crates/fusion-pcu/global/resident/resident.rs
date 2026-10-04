@@ -25,6 +25,8 @@ use crate::{
     PcuMemoryProvider,
 };
 use super::PcuExecutionError;
+#[cfg(all(feature = "tensor", feature = "cuda", target_endian = "little"))]
+pub(in crate::global) use graph::HostStagingInput;
 use super::PcuArgumentError;
 use std::rc::Rc;
 #[cfg(all(feature = "cuda", feature = "tensor"))]
@@ -310,6 +312,17 @@ mod graph {
         #[cfg(feature = "cuda")]
         Cuda(fusion_pcu_cuda::CudaOwnedPreparedTensorGraph),
     }
+    #[cfg(all(feature = "cuda", target_endian = "little"))]
+    impl Prepared {
+        /// Cold structural permission; this does not promise retained dispatch-cache entries.
+        pub(in crate::global) const fn supports_host_staging(&self) -> bool {
+            match self {
+                Self::Cuda(prepared) => prepared.supports_host_staging(),
+                #[cfg(feature = "rocm")]
+                Self::Rocm(_) => false,
+            }
+        }
+    }
     pub(in crate::global) enum Memory {
         #[cfg(feature = "rocm")]
         Rocm(fusion_pcu_rocm::RocmMemoryProvider),
@@ -333,6 +346,15 @@ mod graph {
         Rocm(fusion_pcu_rocm::RocmTensorInputRef<'a>),
         #[cfg(feature = "cuda")]
         Cuda(fusion_pcu_cuda::CudaTensorInputRef<'a>),
+    }
+    /// Borrowed, initialized host bytes and their retained staging allocation.
+    /// The provider copies these bytes into its own endpoint before enqueuing work.
+    #[cfg(all(feature = "cuda", target_endian = "little"))]
+    pub(in crate::global) struct HostStagingInput<'a> {
+        pub value: ValueId,
+        pub resource: &'a Resource,
+        pub shape: &'a [usize],
+        pub bytes: &'a [u8],
     }
     impl Memory {
         pub(in crate::global) fn transfer_to(
@@ -426,6 +448,48 @@ mod graph {
         }
     }
     impl Assessor<'_> {
+        /// Attempt a provider-owned same-stream upload for an existing host-only schedule.
+        /// None declines before work; an error must never trigger a second execution.
+        #[cfg(all(feature = "cuda", target_endian = "little"))]
+        pub(in crate::global) fn execute_host_staged_output<T: PcuScalar, const N: usize>(
+            &self,
+            prepared: &Prepared,
+            inputs: &[HostStagingInput<'_>],
+            pool: PcuMemoryPoolId,
+            memory: &mut Memory,
+        ) -> Result<Option<DeviceTensor<T>>, PcuExecutionError> {
+            match (self, prepared, memory) {
+                (Self::Cuda(assessor), Prepared::Cuda(prepared), Memory::Cuda(memory)) => {
+                    if inputs.len() > N {
+                        return Err(PcuExecutionError::InvalidTensorSourcePlan);
+                    }
+                    let mut bindings: SmallVec<[fusion_pcu_cuda::CudaHostedTensorInput<'_>; N]> =
+                        SmallVec::new();
+                    for input in inputs {
+                        #[allow(irrefutable_let_patterns)]
+                        let Resource::Cuda(resource) = input.resource else {
+                            return Err(mismatch());
+                        };
+                        bindings.push(fusion_pcu_cuda::CudaHostedTensorInput {
+                            value: input.value,
+                            resource,
+                            shape: input.shape,
+                            source: input.bytes,
+                        });
+                    }
+                    assessor
+                        .execute_owned_program_output_from_host_staging::<T, _, N>(
+                            prepared, &bindings, pool, memory,
+                        )
+                        .map(|output| output.map(DeviceTensor::Cuda))
+                        .map_err(PcuExecutionError::from)
+                }
+                #[cfg(feature = "rocm")]
+                (Self::Rocm(_), Prepared::Rocm(_), Memory::Rocm(_)) => Ok(None),
+                #[cfg(feature = "rocm")]
+                _ => Err(mismatch()),
+            }
+        }
         pub(in crate::global) fn prepare_shared_owned_program(
             &self,
             program: Arc<TensorOwnedSelectedProgram>,
@@ -525,6 +589,59 @@ mod graph {
                     assessor
                         .execute_owned_program_output_from_inputs(prepared, &bindings, pool, memory)
                         .map(DeviceTensor::Cuda)
+                        .map_err(PcuExecutionError::from)
+                }
+                #[cfg(all(feature = "rocm", feature = "cuda"))]
+                _ => Err(mismatch()),
+            }
+        }
+        pub(in crate::global) fn execute_owned_program_outputs_from_inputs<
+            T: PcuScalar,
+            const M: usize,
+        >(
+            &self,
+            prepared: &Prepared,
+            inputs: &[(ValueId, &InputRef<'_>)],
+            pool: PcuMemoryPoolId,
+            memory: &mut Memory,
+        ) -> Result<[DeviceTensor<T>; M], PcuExecutionError> {
+            match (self, prepared, memory) {
+                #[cfg(feature = "rocm")]
+                (Self::Rocm(assessor), Prepared::Rocm(prepared), Memory::Rocm(memory)) => {
+                    let mut bindings: SmallVec<
+                        [(ValueId, &fusion_pcu_rocm::RocmTensorInputRef<'_>); 8],
+                    > = SmallVec::new();
+                    for &(id, input) in inputs {
+                        #[allow(irrefutable_let_patterns)]
+                        let InputRef::Rocm(input) = input else {
+                            return Err(mismatch());
+                        };
+                        bindings.push((id, input));
+                    }
+                    assessor
+                        .execute_owned_program_output_array_from_inputs::<T, _, M>(
+                            prepared, &bindings, pool, memory,
+                        )
+                        .map(|outputs| outputs.map(DeviceTensor::Rocm))
+                        .map_err(PcuExecutionError::from)
+                }
+                #[cfg(feature = "cuda")]
+                (Self::Cuda(assessor), Prepared::Cuda(prepared), Memory::Cuda(memory)) => {
+                    let mut bindings: SmallVec<
+                        [(ValueId, &fusion_pcu_cuda::CudaTensorInputRef<'_>); 8],
+                    > = SmallVec::new();
+                    for &(id, input) in inputs {
+                        #[allow(irrefutable_let_patterns)]
+                        let InputRef::Cuda(input) = input else {
+                            return Err(mismatch());
+                        };
+                        bindings.push((id, input));
+                    }
+                    assessor
+                        .execute_owned_program_output_array_from_inputs::<T, _, M>(
+                            prepared, &bindings, pool, memory,
+                        )
+                        .map(|outputs| outputs.map(DeviceTensor::Cuda))
                         .map_err(PcuExecutionError::from)
                 }
                 #[cfg(all(feature = "rocm", feature = "cuda"))]

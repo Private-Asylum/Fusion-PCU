@@ -20,6 +20,46 @@ use crate::{
 const IEEE: Underflow = Underflow::IeeeAfterRounding;
 
 #[test]
+fn single_element_mean_cannot_introduce_a_new_fault() {
+    for scalar in [Scalar::F32, Scalar::F64] {
+        for policy in [
+            IEEE,
+            Underflow::AllowGradualUnderflow,
+            Underflow::RejectSubnormalResult,
+        ] {
+            let domain = Domain::mse(scalar, 1, policy).unwrap();
+            let mean = domain.location(3).unwrap();
+            assert_eq!(mean.step, Step::Divide);
+            for kind in [
+                Kind::InvalidFloatingOperand,
+                Kind::DivideByZero,
+                Kind::ArithmeticOverflow,
+                Kind::ArithmeticUnderflow,
+            ] {
+                for recovered in [false, true] {
+                    assert!(!domain.allows(mean, kind, recovered));
+                    assert!(!domain.accepts(PcuExecutionFault {
+                        invocation_id: 3,
+                        kind,
+                        recovered,
+                    }));
+                }
+            }
+            // Larger means can still round an admitted sum to a tiny result.
+            let larger = Domain::mse(scalar, 2, policy).unwrap();
+            assert_eq!(
+                larger.allows(
+                    larger.location(6).unwrap(),
+                    Kind::ArithmeticUnderflow,
+                    false
+                ),
+                !matches!(policy, Underflow::AllowGradualUnderflow)
+            );
+        }
+    }
+}
+
+#[test]
 fn ordered_domains_are_not_output_or_launch_sizes() {
     let matmul = Domain::matmul(Scalar::F32, 6, 4, IEEE).unwrap();
     assert_eq!(matmul.event_extent(), 48);
@@ -216,14 +256,12 @@ fn empty_arithmetic_domains_have_no_reportable_fault_positions() {
     let b = graph.constant_typed(Tensor::<f32>::new([0, 3], [].to_vec()).unwrap());
     let output = graph.matmul_typed(a, b).unwrap();
     let execution = graph.evaluate_checked(&[]).unwrap();
-    assert!(
-        execution
-            .value_typed::<f32>(output.erase())
-            .unwrap()
-            .data()
-            .iter()
-            .all(|value| value.to_bits() == 0)
-    );
+    assert!(execution
+        .value_typed::<f32>(output.erase())
+        .unwrap()
+        .data()
+        .iter()
+        .all(|value| value.to_bits() == 0));
 }
 
 #[test]

@@ -16,7 +16,12 @@ publish.workspace = true
 crate-type = ["rlib"]
 path = "spirv.rs"
 
+[features]
+default = ["embedded-composed"]
+embedded-composed = []
+
 [dependencies]
+sha2.workspace = true
 fusion-pcu-core.workspace = true
 
 [lints]

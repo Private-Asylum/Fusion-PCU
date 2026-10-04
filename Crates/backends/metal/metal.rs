@@ -6,6 +6,12 @@
 
 extern crate fusion_pcu_core as fusion_pcu;
 
+#[path = "conversion/conversion.rs"]
+mod conversion;
+pub use conversion::{
+    MetalCheckedConversionPlan, MetalConversionHostBackend, MetalPreparedConversionHostKernel,
+};
+
 #[path = "admission/admission.rs"]
 mod admission;
 #[rustfmt::skip]
@@ -80,6 +86,8 @@ pub use runtime::{
     MetalPreparedF32Binary,
     MetalPreparedF64Binary,
     MetalPreparedFloatBinary,
+    MetalPreparedFloatConversion,
+    MetalPreparedReluBackward,
     MetalSession,
 };
 
@@ -104,6 +112,8 @@ pub use tensor::{
     MetalTensorOwner,
     MetalPreparedTensorProgram,
     MetalTensorBinaryPlan,
+    MetalTensorBackwardPlan,
+    MetalPreparedTensorBackwardProgram,
     MetalPreparedTensorBinaryProgram,
 };
 
@@ -136,3 +146,36 @@ pub use runtime::composed::{
     MetalPreparedCheckedMapKernel,
     MetalPreparedCheckedMapHostKernel,
 };
+
+#[cfg(feature = "tensor")]
+pub use runtime::MetalPreparedStrictMatMul;
+
+#[cfg(feature = "tensor")]
+pub use tensor::{MetalTensorMatMulPlan, MetalPreparedTensorMatMulProgram};
+
+#[cfg(feature = "tensor")]
+pub use runtime::MetalPreparedStrictSgd;
+
+#[path = "dispatch_shape/dispatch_shape.rs"]
+mod dispatch_shape;
+
+#[cfg(feature = "tensor")]
+pub use tensor::{MetalTensorSgdPlan, MetalPreparedTensorSgdProgram};
+
+#[cfg(feature = "tensor")]
+pub use tensor::{MetalSelectedNumericalTensorPlan,MetalPreparedSelectedNumericalTensorProgram,MetalSelectedNumericalTensorOperation};
+
+#[cfg(feature = "tensor")]
+pub use discovery::MetalSelectedNumericalTensorRequest;
+
+#[cfg(feature="tensor")]
+pub use runtime::MetalPreparedStrictMse;
+
+#[cfg(feature="tensor")]
+pub use tensor::{MetalTensorMsePlan,MetalPreparedTensorMseProgram};
+
+#[cfg(feature="tensor")]
+pub use tensor::{MetalSelectedTensorGraphPlan, MetalPreparedSelectedTensorGraph, MetalTensorGraphError};
+
+#[cfg(feature="tensor")]
+pub use discovery::MetalSelectedTensorGraphRequest;

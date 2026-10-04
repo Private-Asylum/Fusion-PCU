@@ -174,3 +174,8 @@ fn native_inspection_rejects_unproved_profiles() {
     let sum = graph.add(a, uniform).unwrap();
     assert!(lower(&graph, sum).is_err());
 }
+
+#[path = "producer_control.rs"]
+mod producer_control;
+#[path = "raw_literals.rs"]
+mod raw_literals;

@@ -1,5 +1,9 @@
 //! Typed Objective-C ownership and all foreign/shared-memory operations live here.
 
+#[path = "rust/publication/publication.rs"]
+mod publication;
+pub use publication::SharedPrefixCopy;
+
 #[cfg(feature = "api-census")]
 #[path = "rust/census/census.rs"]
 mod census;
@@ -81,6 +85,8 @@ mod native {
         MTLDevice,
         MTLLibrary,
         MTLResourceOptions,
+        MTLResource,
+        MTLStorageMode,
         MTLSize,
     };
     #[rustfmt::skip]
@@ -341,6 +347,35 @@ mod native {
     }
 
     impl Buffer {
+        // The runtime has proved originating session quiescence and holds an
+        // exclusive destination lease. All fallible checks precede publication.
+        #[allow(
+            clippy::needless_pass_by_ref_mut,
+            reason = "The exclusive borrow is carried by SharedPrefixCopy and authorizes foreign-memory writes even though Rust owner fields are unchanged."
+        )]
+        pub fn prepare_shared_prefix_copy<'a>(
+            &'a self,
+            output: &'a mut Self,
+            bytes: usize,
+        ) -> Result<super::SharedPrefixCopy<'a>, MetalError> {
+            if bytes > self.bytes
+                || bytes > output.bytes
+                || bytes > self.object.length()
+                || bytes > output.object.length()
+            {
+                return Err(MetalError::InvalidExtent);
+            }
+            if self.object.storageMode() != MTLStorageMode::Shared
+                || output.object.storageMode() != MTLStorageMode::Shared
+            {
+                return Err(MetalError::Unsupported);
+            }
+            Ok(super::SharedPrefixCopy::new(
+                self.object.contents().cast(),
+                output.object.contents().cast(),
+                bytes,
+            ))
+        }
         pub fn write_bytes(&self, offset: usize, bytes: &[u8]) -> Result<(), MetalError> {
             if offset
                 .checked_add(bytes.len())
@@ -595,6 +630,14 @@ mod unavailable {
         }
     }
     impl Buffer {
+        #[allow(clippy::unused_self)] // Exact unavailable-platform publication protocol.
+        pub fn prepare_shared_prefix_copy<'a>(
+            &'a self,
+            _: &'a mut Self,
+            _: usize,
+        ) -> Result<super::SharedPrefixCopy<'a>, MetalError> {
+            Err(MetalError::Unsupported)
+        }
         pub fn write_bytes(&self, _: usize, _: &[u8]) -> Result<(), MetalError> {
             Err(MetalError::Unsupported)
         }

@@ -259,3 +259,102 @@ fn ordinary_requested_gradient_does_not_compute_overflowing_unrequested_derivati
     );
     crate::global::use_defaults().unwrap();
 }
+
+#[crate::pcu(crate_path = crate, flag(strict))]
+#[allow(clippy::type_complexity)] // The frontend must see the three explicit owner roles.
+fn train_two(
+    input: &[f64; 1],
+    first: &[f64; 1],
+    second: &[f64; 1],
+    target: &[f64; 1],
+) -> Result<
+    (
+        crate::PcuTensor<f64>,
+        crate::PcuTensor<f64>,
+        crate::PcuTensor<f64>,
+    ),
+    PcuExecutionError,
+> {
+    let hidden = pcu::mul(input, first);
+    let prediction = pcu::mul(&hidden, second);
+    let loss = pcu::mean_squared_error(&prediction, target);
+    let (second_gradient, first_gradient) = pcu::gradients(&loss, (second, first));
+    let updated_first = pcu::sgd_update(first, &first_gradient, 0.001_953_125_f32);
+    let updated_second = pcu::sgd_update(second, &second_gradient, 0.001_953_125_f32);
+    (updated_first, updated_second, loss)
+}
+
+#[test]
+fn authentic_tuple_training_captures_one_shared_reverse_pass() {
+    let (mut capture, inputs) =
+        PcuTensorGraphCapture::new::<f64, 4>([PcuSourceShape::FixedArray { length: 1 }; 4])
+            .unwrap();
+    let outputs = train_two::__pcu_capture_entry(&mut capture, inputs).unwrap();
+    assert_eq!(capture.gradient_sets.len(), 1);
+    // Four inputs, two forward multiplies, MSE, six shared reverse nodes,
+    // then the two requested weight updates. No derivative of the sample.
+    assert_eq!(capture.graph.nodes().len(), 15);
+    let before = capture.graph.nodes().len();
+    let loss = outputs[2];
+    let gradients = capture.gradients(loss, [inputs[2], inputs[1]]).unwrap();
+    assert_eq!(capture.graph.nodes().len(), before);
+    assert_eq!(gradients[0].capture_id, capture.capture_id);
+    assert_eq!(gradients[1].capture_id, capture.capture_id);
+    let (graph, outputs) = capture.finish_outputs(outputs).unwrap();
+    let execution = graph
+        .evaluate_checked(&[
+            (
+                inputs[0].value.erase(),
+                crate::dialect::tensor::TensorValue::F64(
+                    crate::dialect::tensor::Tensor::new([1], alloc::vec![2.0]).unwrap(),
+                ),
+            ),
+            (
+                inputs[1].value.erase(),
+                crate::dialect::tensor::TensorValue::F64(
+                    crate::dialect::tensor::Tensor::new([1], alloc::vec![3.0]).unwrap(),
+                ),
+            ),
+            (
+                inputs[2].value.erase(),
+                crate::dialect::tensor::TensorValue::F64(
+                    crate::dialect::tensor::Tensor::new([1], alloc::vec![4.0]).unwrap(),
+                ),
+            ),
+            (
+                inputs[3].value.erase(),
+                crate::dialect::tensor::TensorValue::F64(
+                    crate::dialect::tensor::Tensor::new([1], alloc::vec![1.0]).unwrap(),
+                ),
+            ),
+        ])
+        .unwrap();
+    assert_eq!(
+        execution.value_typed::<f64>(outputs[0]).unwrap().data(),
+        &[2.28125]
+    );
+    assert_eq!(
+        execution.value_typed::<f64>(outputs[1]).unwrap().data(),
+        &[3.460_937_5]
+    );
+    assert_eq!(
+        execution.value_typed::<f64>(outputs[2]).unwrap().data(),
+        &[529.0]
+    );
+}
+
+#[test]
+fn grouped_capture_preflights_all_targets_without_populating_cache() {
+    let (mut capture, [prediction, target, disconnected]) =
+        PcuTensorGraphCapture::new::<f32, 3>([shape(1, 1); 3]).unwrap();
+    let loss = capture.mean_squared_error(prediction, target).unwrap();
+    let (_, [foreign]) = PcuTensorGraphCapture::new::<f32, 1>([shape(1, 1)]).unwrap();
+    let before = capture.graph.nodes().len();
+    for targets in [[prediction, foreign], [prediction, disconnected]] {
+        assert!(capture.gradients(loss, targets).is_err());
+        assert_eq!(capture.graph.nodes().len(), before);
+        assert!(capture.gradient_sets.is_empty());
+    }
+    assert!(capture.gradients(loss, [prediction, target]).is_ok());
+    assert_eq!(capture.gradient_sets.len(), 1);
+}

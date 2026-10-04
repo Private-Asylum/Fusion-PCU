@@ -502,7 +502,7 @@ pub fn run_case<
 
         // Pair the two native handle configurations on the same fresh inputs, alternating route
         // order to avoid making the explicit stream control systematically second.
-        for explicit_first in [sample % 2 == 1, sample % 2 == 0] {
+        for explicit_first in [sample % 2 == 1, sample.is_multiple_of(2)] {
             if explicit_first {
                 let start = Instant::now();
                 let output = P::native_call::<R, K, C>(

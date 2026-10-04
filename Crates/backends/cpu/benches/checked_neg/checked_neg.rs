@@ -31,6 +31,8 @@ fn compare<const N: usize>(criterion: &mut Criterion) {
         PcuCpuImplementation::Scalar,
         PcuCpuImplementation::Sse2,
         PcuCpuImplementation::Avx2,
+        PcuCpuImplementation::Avx,
+        PcuCpuImplementation::Avx512,
         PcuCpuImplementation::Neon,
     ] {
         let Ok(backend) = PcuCpuCheckedNeg::new(processor, implementation) else {

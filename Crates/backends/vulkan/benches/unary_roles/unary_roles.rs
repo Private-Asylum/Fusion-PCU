@@ -181,6 +181,13 @@ fn reject_ieeeafterrounding<T: oracle::Native>(
         false,
         false
     );
+    reject_ieeeafterrounding_grid::<T>(criterion, requirements);
+    reject_ieeeafterrounding_broadcast::<T>(criterion, requirements);
+}
+fn reject_ieeeafterrounding_grid<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -203,6 +210,11 @@ fn reject_ieeeafterrounding<T: oracle::Native>(
         true,
         false
     );
+}
+fn reject_ieeeafterrounding_broadcast<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -252,6 +264,13 @@ fn reject_allowgradualunderflow<T: oracle::Native>(
         false,
         false
     );
+    reject_allowgradualunderflow_grid::<T>(criterion, requirements);
+    reject_allowgradualunderflow_broadcast::<T>(criterion, requirements);
+}
+fn reject_allowgradualunderflow_grid<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -274,6 +293,11 @@ fn reject_allowgradualunderflow<T: oracle::Native>(
         true,
         false
     );
+}
+fn reject_allowgradualunderflow_broadcast<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -323,6 +347,13 @@ fn reject_rejectsubnormalresult<T: oracle::Native>(
         false,
         false
     );
+    reject_rejectsubnormalresult_grid::<T>(criterion, requirements);
+    reject_rejectsubnormalresult_broadcast::<T>(criterion, requirements);
+}
+fn reject_rejectsubnormalresult_grid<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -345,6 +376,11 @@ fn reject_rejectsubnormalresult<T: oracle::Native>(
         true,
         false
     );
+}
+fn reject_rejectsubnormalresult_broadcast<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -394,6 +430,13 @@ fn clamp_ieeeafterrounding<T: oracle::Native>(
         false,
         false
     );
+    clamp_ieeeafterrounding_grid::<T>(criterion, requirements);
+    clamp_ieeeafterrounding_broadcast::<T>(criterion, requirements);
+}
+fn clamp_ieeeafterrounding_grid<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -416,6 +459,11 @@ fn clamp_ieeeafterrounding<T: oracle::Native>(
         true,
         false
     );
+}
+fn clamp_ieeeafterrounding_broadcast<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -465,6 +513,13 @@ fn clamp_allowgradualunderflow<T: oracle::Native>(
         false,
         false
     );
+    clamp_allowgradualunderflow_grid::<T>(criterion, requirements);
+    clamp_allowgradualunderflow_broadcast::<T>(criterion, requirements);
+}
+fn clamp_allowgradualunderflow_grid<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -487,6 +542,11 @@ fn clamp_allowgradualunderflow<T: oracle::Native>(
         true,
         false
     );
+}
+fn clamp_allowgradualunderflow_broadcast<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -536,6 +596,13 @@ fn clamp_rejectsubnormalresult<T: oracle::Native>(
         false,
         false
     );
+    clamp_rejectsubnormalresult_grid::<T>(criterion, requirements);
+    clamp_rejectsubnormalresult_broadcast::<T>(criterion, requirements);
+}
+fn clamp_rejectsubnormalresult_grid<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,
@@ -558,6 +625,11 @@ fn clamp_rejectsubnormalresult<T: oracle::Native>(
         true,
         false
     );
+}
+fn clamp_rejectsubnormalresult_broadcast<T: oracle::Native>(
+    criterion: &mut Criterion,
+    requirements: PcuImplementationRequirements,
+) {
     shape!(
         T,
         criterion,

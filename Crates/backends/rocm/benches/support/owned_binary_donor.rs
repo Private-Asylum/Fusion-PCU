@@ -399,7 +399,7 @@ fn run_case(
     for sample in 0..PAIRED_SAMPLES {
         let job = u64::try_from(sample + 4)?;
         inputs.refresh(job, elements)?;
-        if sample % 2 == 0 {
+        if sample.is_multiple_of(2) {
             paired_source[sample] = inputs.run_source(profile)?;
             inputs.refresh(job, elements)?;
             paired_native[sample] = inputs.run_native(&kernel, &stream, grid)?;
@@ -481,7 +481,7 @@ fn fill(donor: &mut [f32], other: &mut [f32], job: u64) {
         let donor_job = f32::from(u16::try_from((job >> shift) & 0xffff).expect("chunk fits"));
         let other_job = f32::from(u16::try_from((job >> peer_shift) & 0xffff).expect("chunk fits"));
         *donor_value = 1.0 + lane + donor_job / 65_536.0;
-        *other_value = 2.0 + lane * 0.5 + other_job / 65_536.0;
+        *other_value = lane.mul_add(0.5, 2.0) + other_job / 65_536.0;
     }
 }
 

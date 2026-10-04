@@ -3,6 +3,10 @@
 //! This module is a compiler target, not a device runner. Vulkan, `OpenCL`, or any other runtime
 //! may consume the generated words elsewhere; this backend only lowers PCU dispatch IR into
 //! backend-neutral SPIR-V module bytes.
+//! The default `embedded-composed` feature includes GLSL-derived composed helper words.
+//! Disable it to supply exact validated borrowed template packages through the cold emitter;
+//! the compiler remains `no_std` and performs no filesystem IO. Other helper families retain
+//! their current embedded source until separately migrated.
 
 #![no_std]
 
@@ -23,10 +27,20 @@ mod composed;
 #[rustfmt::skip]
 pub use composed::{
     lower_composed_float_to_spirv,
+    lower_composed_integer_to_spirv,
+    lower_composed_integer_with_template,
+    validate_composed_integer_map,
+    validate_one_effect_integer_map,
+    lower_one_effect_integer_to_spirv,
+    lower_composed_float_with_template,
+    PcuSpirvComposedTemplateFamily,
+    PcuSpirvComposedTemplateData,
+    PcuSpirvComposedTemplate,
+    PCU_COMPOSED_TEMPLATE_REVISION,
     lower_one_effect_float_to_spirv,
     validate_composed_float_map,
     validate_one_effect_float_map,
-    PcuSpirvComposedFloatProfile,
+    PcuSpirvComposedProfile,
     PcuSpirvComposedResource,
 };
 
@@ -94,3 +108,6 @@ pub use checked_compound::{
     PcuSpirvCompoundOperation,
     PcuSpirvCompoundProfile,
 };
+
+#[cfg(feature = "embedded-composed")]
+pub use composed::embedded_composed_template;

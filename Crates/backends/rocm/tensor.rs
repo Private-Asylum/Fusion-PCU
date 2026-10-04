@@ -35,8 +35,14 @@ pub use relu_backward::lower_relu_backward_to_hip_source;
 use native_sgd::SgdUpdateMode;
 #[path = "tensor/literal/literal.rs"]
 mod literal;
+#[cfg(test)]
+#[path = "tensor/low_literals/low_literals.rs"]
+mod low_literals;
 #[path = "tensor/owned_scratch/owned_scratch.rs"]
 mod owned_scratch;
+#[path = "tensor/output_array/output_array.rs"]
+mod output_array;
+
 #[path = "tensor/pointwise.rs"]
 mod pointwise;
 #[path = "tensor/strict_matmul/strict_matmul.rs"]
@@ -2574,6 +2580,7 @@ impl<'session> RocmTensorAssessor<'session> {
         if !is_checked_float_type(T::TYPE)
             && !prepared.data.transport_only_inputs
             && !is_checked_integer_scalar(T::TYPE)
+            && !is_raw_float_type(T::TYPE)
         {
             return Err(RocmTensorExecutionError::UnsupportedScalarType(T::TYPE));
         }
@@ -4262,7 +4269,11 @@ impl<'session> RocmTensorAssessor<'session> {
                     resources[index] = Some(upload_tensor(memory, pool, tensor)?);
                 }
                 OpDescriptor::Constant(tensor) => {
-                    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+                    if node.scalar_type == fusion_pcu::PcuScalarType::F64
+                        || is_low_float_type(node.scalar_type)
+                        || is_raw_float_type(node.scalar_type)
+                        || is_checked_integer_scalar(node.scalar_type)
+                    {
                         if let Some(batch) = batch.as_deref_mut() {
                             tensor_flush_batch!(batch, timings, false)?;
                         }
@@ -4273,7 +4284,7 @@ impl<'session> RocmTensorAssessor<'session> {
                             {
                                 scratch.lease(index)?
                             } else {
-                                literal::upload_f64(
+                                literal::upload_dense(
                                     node,
                                     plan.physical_layout(node.value)?,
                                     tensor_output_view(output_bank, fresh_outputs, node.value)
@@ -4325,7 +4336,11 @@ impl<'session> RocmTensorAssessor<'session> {
                     }
                 }
                 OpDescriptor::Uniform { value } => {
-                    if node.scalar_type == fusion_pcu::PcuScalarType::F64 {
+                    if node.scalar_type == fusion_pcu::PcuScalarType::F64
+                        || is_low_float_type(node.scalar_type)
+                        || is_raw_float_type(node.scalar_type)
+                        || is_checked_integer_scalar(node.scalar_type)
+                    {
                         if let Some(batch) = batch.as_deref_mut() {
                             tensor_flush_batch!(batch, timings, false)?;
                         }
@@ -4336,7 +4351,7 @@ impl<'session> RocmTensorAssessor<'session> {
                             {
                                 scratch.lease(index)?
                             } else {
-                                literal::upload_f64(
+                                literal::upload_dense(
                                     node,
                                     plan.physical_layout(node.value)?,
                                     tensor_output_view(output_bank, fresh_outputs, node.value)
@@ -7505,12 +7520,25 @@ fn prepare_owned_graph_data<A: TensorOperationAssessor>(
                 matches!(
                     node.op,
                     OpDescriptor::Input
+                        | OpDescriptor::Constant(_)
+                        | OpDescriptor::Uniform { .. }
                         | OpDescriptor::Add { .. }
                         | OpDescriptor::Sub { .. }
                         | OpDescriptor::Mul { .. }
                 )
             });
-        if !is_checked_float_type(scalar_type) && !transport_only_inputs && !integer_profile {
+        let raw_float_profile = is_raw_float_type(scalar_type)
+            && nodes.iter().all(|node| {
+                matches!(
+                    node.op,
+                    OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+                )
+            });
+        if !is_checked_float_type(scalar_type)
+            && !transport_only_inputs
+            && !integer_profile
+            && !raw_float_profile
+        {
             return Err(RocmTensorExecutionError::UnsupportedScalarType(scalar_type));
         }
     }
@@ -8485,6 +8513,15 @@ const fn is_checked_float_binary_node(node: NodeDescriptor<'_>) -> bool {
         )
 }
 
+// IEEE 754 binary128 and binary256 encodings are transport-only here.
+// Admitting immutable bits does not authorize arithmetic, conversion or PortableV1.
+const fn is_raw_float_type(scalar_type: fusion_pcu::PcuScalarType) -> bool {
+    matches!(
+        scalar_type,
+        fusion_pcu::PcuScalarType::F128 | fusion_pcu::PcuScalarType::F256
+    )
+}
+
 const fn is_low_float_type(scalar_type: fusion_pcu::PcuScalarType) -> bool {
     matches!(
         scalar_type,
@@ -8754,11 +8791,39 @@ const fn rocm_supports_operand_representation(
         return matches!(representation, TensorOperandRepresentation::Dense)
             && is_transport_scalar(node.scalar_type);
     }
+    if is_checked_integer_scalar(node.scalar_type) {
+        return matches!(representation, TensorOperandRepresentation::Dense)
+            && matches!(
+                node.numerical_options.reproducibility,
+                fusion_pcu::PcuReproducibility::Unspecified
+            )
+            && matches!(
+                node.op,
+                OpDescriptor::Constant(_)
+                    | OpDescriptor::Uniform { .. }
+                    | OpDescriptor::Add { .. }
+                    | OpDescriptor::Sub { .. }
+                    | OpDescriptor::Mul { .. }
+            );
+    }
+    if is_raw_float_type(node.scalar_type) {
+        return matches!(representation, TensorOperandRepresentation::Dense)
+            && matches!(
+                node.numerical_options.reproducibility,
+                fusion_pcu::PcuReproducibility::Unspecified
+            )
+            && matches!(
+                node.op,
+                OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+            );
+    }
     if is_low_float_type(node.scalar_type) {
         return matches!(representation, TensorOperandRepresentation::Dense)
             && matches!(
                 node.op,
-                OpDescriptor::Add { .. }
+                OpDescriptor::Constant(_)
+                    | OpDescriptor::Uniform { .. }
+                    | OpDescriptor::Add { .. }
                     | OpDescriptor::Sub { .. }
                     | OpDescriptor::Mul { .. }
                     | OpDescriptor::Div { .. }
@@ -8778,6 +8843,7 @@ const fn rocm_supports_operand_representation(
             node.op,
             OpDescriptor::Input
                 | OpDescriptor::MatMul { .. }
+                | OpDescriptor::MeanSquaredError { .. }
                 | OpDescriptor::Add { .. }
                 | OpDescriptor::Sub { .. }
                 | OpDescriptor::Mul { .. }
@@ -8786,7 +8852,6 @@ const fn rocm_supports_operand_representation(
                 | OpDescriptor::ReluBackward { .. }
                 | OpDescriptor::Constant(_)
                 | OpDescriptor::Uniform { .. }
-                | OpDescriptor::MeanSquaredError { .. }
         ),
         TensorOperandRepresentation::UniformScalar => {
             // Checked kernels load dense operands by invocation ID; they have no scalar binding profile.
@@ -8919,6 +8984,9 @@ fn assess_tensor_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperatio
     if is_checked_integer_scalar(node.scalar_type) {
         return assess_checked_integer_node(graph, node);
     }
+    if is_raw_float_type(node.scalar_type) {
+        return literal::raw_float::assess(graph, node);
+    }
     if is_low_float_type(node.scalar_type) {
         return assess_low_float_node(graph, node);
     }
@@ -8971,6 +9039,29 @@ fn assess_f64_pointwise_or_literal_node(
 }
 
 fn assess_low_float_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+    if matches!(
+        node.op,
+        OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+    ) {
+        let count = node
+            .shape
+            .iter()
+            .try_fold(1_usize, |n, &d| n.checked_mul(d));
+        if !count.is_some_and(|n| n > 0 && u32::try_from(n).is_ok()) {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::Shape,
+            };
+        }
+        if graph.node(node.value).ok() != Some(node) {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::Operation,
+            };
+        }
+        return TensorOperationSupport::Supported {
+            route: TensorExecutionRoute::Native,
+            workspace_bytes: Some(0),
+        };
+    }
     let operands = match node.op {
         OpDescriptor::Add { left, right }
         | OpDescriptor::Sub { left, right }
@@ -9003,6 +9094,8 @@ fn assess_low_float_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOpera
             || !matches!(
                 operand.op,
                 OpDescriptor::Input
+                    | OpDescriptor::Constant(_)
+                    | OpDescriptor::Uniform { .. }
                     | OpDescriptor::Add { .. }
                     | OpDescriptor::Sub { .. }
                     | OpDescriptor::Mul { .. }
@@ -9022,6 +9115,29 @@ fn assess_low_float_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOpera
 }
 
 fn assess_checked_integer_node(graph: &Graph, node: NodeDescriptor<'_>) -> TensorOperationSupport {
+    if matches!(
+        node.op,
+        OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+    ) {
+        let count = node
+            .shape
+            .iter()
+            .try_fold(1_usize, |n, &d| n.checked_mul(d));
+        if !count.is_some_and(|n| n > 0 && u32::try_from(n).is_ok()) {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::Shape,
+            };
+        }
+        if graph.node(node.value).ok() != Some(node) {
+            return TensorOperationSupport::Unsupported {
+                reason: TensorUnsupportedReason::Operation,
+            };
+        }
+        return TensorOperationSupport::Supported {
+            route: TensorExecutionRoute::Native,
+            workspace_bytes: Some(0),
+        };
+    }
     let operands = match node.op {
         OpDescriptor::Add { left, right }
         | OpDescriptor::Sub { left, right }
@@ -9053,6 +9169,8 @@ fn assess_checked_integer_node(graph: &Graph, node: NodeDescriptor<'_>) -> Tenso
             || !matches!(
                 operand.op,
                 OpDescriptor::Input
+                    | OpDescriptor::Constant(_)
+                    | OpDescriptor::Uniform { .. }
                     | OpDescriptor::Add { .. }
                     | OpDescriptor::Sub { .. }
                     | OpDescriptor::Mul { .. }
@@ -11195,6 +11313,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires native device; private scratch exclusivity, ownership and terminal retry"]
+    #[allow(clippy::cognitive_complexity)] // Exhaustive typed fault/ownership matrix retains its exact witnesses.
     fn owned_private_scratch_is_exclusive_and_retries_after_terminal_fault() {
         let (_discovery, session) = rocm_test_session();
         let pool = PcuMemoryPoolId(0x4352_0180);
@@ -12151,6 +12270,7 @@ mod tests {
                 assert_eq!(
                     rocm_supports_operand_representation(node, TensorOperandRepresentation::Dense),
                     is_transport_input
+                        || (value == sum && super::is_checked_integer_scalar(scalar_type))
                         || (value == sum
                             && matches!(
                                 scalar_type,
@@ -12402,3 +12522,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tensor/integer_literals/integer_literals.rs"]
+mod integer_literals;

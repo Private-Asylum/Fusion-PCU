@@ -1,0 +1,5 @@
+error: PCU tensor literal payloads require `const { ... }`; runtime values must remain input bindings and cannot be frozen into the prepared cache
+ --> tests/ui/immutable_literal_runtime.rs:4:19
+  |
+4 |     pcu::constant(input)
+  |                   ^^^^^

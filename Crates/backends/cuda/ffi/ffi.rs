@@ -503,7 +503,8 @@ pub unsafe fn invoke_cudaEventDestroy(
 /// Invoke the declared `cudaEventSynchronize` ABI using the retained selected runtime.
 ///
 /// # Safety
-/// Any result pointers must address writable storage of the declared pointee type. All handles must belong to the selected device/context and remain live for this call.
+/// A non-null event must belong to the selected device/context and remain live for this call.
+/// A null event is permitted for the SDK-defined invalid-resource-handle diagnostic.
 #[allow(non_snake_case)] // Preserve SDK operation names at the private FFI boundary.
 pub unsafe fn invoke_cudaEventSynchronize(
     runtime: &CudaRuntime,

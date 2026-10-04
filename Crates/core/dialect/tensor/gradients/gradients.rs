@@ -284,15 +284,33 @@ pub(super) fn backward_mse_for(
     target: ValueId,
 ) -> Result<ValueId, TensorError> {
     graph.shape(target)?;
-    let gradients = build_backward_mse(graph, loss, Some(target))?;
+    let gradients = build_backward_mse(graph, loss, Some(core::slice::from_ref(&target)))?;
     gradients[target.index].ok_or(TensorError::UnsupportedGradient(target))
+}
+
+pub(super) fn backward_mse_for_targets(
+    graph: &mut Graph,
+    loss: ValueId,
+    targets: &[ValueId],
+) -> Result<Vec<ValueId>, TensorError> {
+    if targets.is_empty() {
+        return Err(TensorError::EmptyOutputs);
+    }
+    for &target in targets {
+        graph.shape(target)?;
+    }
+    let gradients = build_backward_mse(graph, loss, Some(targets))?;
+    targets
+        .iter()
+        .map(|&target| gradients[target.index].ok_or(TensorError::UnsupportedGradient(target)))
+        .collect()
 }
 
 // Validate the entire forward closure before mutation, then select derivative paths.
 fn derivative_dependencies(
     graph: &Graph,
     loss: ValueId,
-    target: Option<ValueId>,
+    targets: Option<&[ValueId]>,
 ) -> Result<Vec<bool>, TensorError> {
     let original_len = graph.nodes.len();
     let root = graph
@@ -328,14 +346,16 @@ fn derivative_dependencies(
     // Only propagate derivatives through values depending on the requested target.
     // Forward checked effects stay in the graph. Derivatives never requested by
     // the consumer are not source effects and must not be manufactured or fault.
-    if let Some(target) = target {
-        if !visited[target.index] {
-            return Err(TensorError::UnsupportedGradient(target));
-        }
+    if let Some(targets) = targets {
         let mut needed = vec![false; original_len];
-        needed[target.index] = true;
-        for index in (target.index + 1)..=loss.index {
-            needed[index] = operands(&graph.nodes[index].op).any(|id| needed[id.index]);
+        for &target in targets {
+            if !visited[target.index] {
+                return Err(TensorError::UnsupportedGradient(target));
+            }
+            needed[target.index] = true;
+        }
+        for index in 0..=loss.index {
+            needed[index] |= operands(&graph.nodes[index].op).any(|id| needed[id.index]);
         }
         Ok(needed)
     } else {
@@ -346,12 +366,12 @@ fn derivative_dependencies(
 fn build_backward_mse(
     graph: &mut Graph,
     loss: ValueId,
-    target: Option<ValueId>,
+    targets: Option<&[ValueId]>,
 ) -> Result<Vec<Option<ValueId>>, TensorError> {
     let original_len = graph.nodes.len();
-    let needed = derivative_dependencies(graph, loss, target)?;
+    let needed = derivative_dependencies(graph, loss, targets)?;
     let mut gradients = vec![None; original_len];
-    if target.is_some_and(|target| target != loss) {
+    if targets.is_some_and(|targets| !targets.contains(&loss)) {
         // The supported root MSE has an implicit scalar cotangent of one. Its
         // derivative rule computes 2/n directly, so a separate Uniform(1)
         // would be dead storage, not a consumed arithmetic operand.

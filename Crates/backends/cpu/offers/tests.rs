@@ -267,6 +267,8 @@ fn detected_instruction_offers_have_distinct_implementation_identities() {
         (PcuCpuImplementation::Scalar, 0),
         (PcuCpuImplementation::Sse2, 1),
         (PcuCpuImplementation::Avx2, 2),
+        (PcuCpuImplementation::Avx, 40960),
+        (PcuCpuImplementation::Avx512, 40961),
         (PcuCpuImplementation::Neon, 3),
     ] {
         let Ok(backend) = PcuCpuCheckedNeg::new(processor, implementation) else {

@@ -16,6 +16,12 @@ use fusion_pcu_mlx::{
     MlxSession,
     MlxTensorBinaryRequest,
     MlxTensorIntegerRequest,
+    MlxSelectedNumericalTensorPlan,
+    MlxSelectedNumericalTensorRequest,
+    MlxPreparedSelectedNumericalTensorProgram,
+    MlxSelectedTensorGraphPlan,
+    MlxPreparedSelectedTensorGraph,
+    MlxSelectedTensorGraphRequest,
 };
 #[rustfmt::skip]
 use crate::{
@@ -42,11 +48,13 @@ pub(super) enum Plan {
     Leaf,
     Binary,
     Integer,
+    Numerical(MlxSelectedNumericalTensorPlan),
+    Graph(MlxSelectedTensorGraphPlan),
 }
 
 impl Plan {
     pub(super) fn assess(
-        program: &TensorOwnedSelectedProgram,
+        program: &Arc<TensorOwnedSelectedProgram>,
         requirements: PcuImplementationRequirements,
     ) -> Result<Self, PcuExecutionError> {
         if MlxCheckedTensorPlan::assess_program(program, requirements).is_ok() {
@@ -55,8 +63,16 @@ impl Plan {
         if MlxCheckedTensorBinaryPlan::assess_program(program, requirements).is_ok() {
             return Ok(Self::Binary);
         }
-        MlxCheckedTensorIntegerPlan::assess_program(program, requirements)
-            .map(|_| Self::Integer)
+        if MlxCheckedTensorIntegerPlan::assess_program(program, requirements).is_ok() {
+            return Ok(Self::Integer);
+        }
+        if let Ok(plan) =
+            MlxSelectedNumericalTensorPlan::assess_program(Arc::clone(program), requirements)
+        {
+            return Ok(Self::Numerical(plan));
+        }
+        MlxSelectedTensorGraphPlan::assess_program(Arc::clone(program), requirements)
+            .map(Self::Graph)
             .map_err(|reason| super::map_error(MlxError::Unsupported(reason)))
     }
 
@@ -90,6 +106,20 @@ impl Plan {
                 requirements,
                 &MlxTensorIntegerRequest { program },
             ),
+            Self::Graph(plan) => offered(
+                inventory,
+                device,
+                boundary,
+                requirements,
+                &MlxSelectedTensorGraphRequest { plan },
+            ),
+            Self::Numerical(plan) => offered(
+                inventory,
+                device,
+                boundary,
+                requirements,
+                &MlxSelectedNumericalTensorRequest { plan },
+            ),
         }
     }
 
@@ -109,6 +139,28 @@ impl Plan {
             Self::Integer => session
                 .prepare_tensor_integer_program(program, requirements)
                 .map(Program::Integer),
+            Self::Graph(plan) => {
+                if plan.requirements() != requirements
+                    || !Arc::ptr_eq(&plan.program_owner(), &program)
+                {
+                    return Err(PcuExecutionError::InvalidTensorSourcePlan);
+                }
+                let shape = Rc::from(plan.shape());
+                session
+                    .prepare_selected_tensor_graph(plan)
+                    .map(|program| Program::Graph { program, shape })
+            }
+            Self::Numerical(plan) => {
+                if plan.requirements() != requirements
+                    || !Arc::ptr_eq(&plan.program_owner(), &program)
+                {
+                    return Err(PcuExecutionError::InvalidTensorSourcePlan);
+                }
+                let shape = Rc::from(plan.shape());
+                session
+                    .prepare_selected_numerical_tensor_program(plan)
+                    .map(|program| Program::Numerical { program, shape })
+            }
         }
         .map_err(super::map_error)
     }
@@ -149,10 +201,21 @@ where
     Ok(offer)
 }
 
+#[allow(clippy::large_enum_variant)]
+// Retained cold cache entries are borrowed on warm calls. Boxing would add a
+// separate allocation and pointer indirection to the numerical execution path.
 pub(super) enum Program {
     Leaf(MlxPreparedCheckedProgram),
     Binary(MlxPreparedTensorBinaryProgram),
     Integer(MlxPreparedTensorIntegerProgram),
+    Graph {
+        program: MlxPreparedSelectedTensorGraph,
+        shape: Rc<[usize]>,
+    },
+    Numerical {
+        program: MlxPreparedSelectedNumericalTensorProgram,
+        shape: Rc<[usize]>,
+    },
 }
 
 impl Program {
@@ -161,6 +224,8 @@ impl Program {
             Self::Leaf(program) => program.implementation_id(),
             Self::Binary(program) => program.implementation_id(),
             Self::Integer(program) => program.implementation_id(),
+            Self::Numerical { program, .. } => program.implementation_id(),
+            Self::Graph { program, .. } => program.implementation_id(),
         }
     }
 
@@ -169,6 +234,7 @@ impl Program {
             Self::Leaf(program) => program.plan().shape_owner(),
             Self::Binary(program) => program.plan().shape_owner(),
             Self::Integer(program) => program.plan().shape_owner(),
+            Self::Numerical { shape, .. } | Self::Graph { shape, .. } => Rc::clone(shape),
         }
     }
 
@@ -180,6 +246,36 @@ impl Program {
             Self::Leaf(program) => program.execute_mixed(inputs),
             Self::Binary(program) => program.execute_mixed(inputs),
             Self::Integer(program) => program.execute_mixed(inputs),
+            Self::Graph { program, .. } => {
+                return program.execute_mixed(inputs).map_err(|error| {
+                    match (error.effect, error.cause) {
+                        (Some(effect), MlxError::Arithmetic(fault)) => {
+                            let plan = program.plan();
+                            super::super::fault::numerical(
+                                plan.program(),
+                                effect,
+                                plan.requirements(),
+                                fault,
+                            )
+                        }
+                        (_, other) => super::map_error(other),
+                    }
+                });
+            }
+            Self::Numerical { program, .. } => {
+                return program.execute_mixed(inputs).map_err(|error| match error {
+                    MlxError::Arithmetic(fault) => {
+                        let plan = program.plan();
+                        super::super::fault::numerical(
+                            plan.program(),
+                            plan.effect(),
+                            plan.requirements(),
+                            fault,
+                        )
+                    }
+                    other => super::map_error(other),
+                });
+            }
         }
         .map_err(super::map_error)
     }

@@ -104,6 +104,34 @@ impl State {
         })
     }
 
+    /// Validate an existing bank without allocation or device work before pending uploads.
+    pub(super) fn preflight_initialized(
+        &self,
+        runtime: &CudaRuntime,
+        pool: PcuMemoryPoolId,
+        inputs: &[&Resource],
+    ) -> Result<bool, Error> {
+        let banks = self.banks.try_borrow().map_err(|_| Error::ScratchBusy)?;
+        let Some(bank) = banks
+            .iter()
+            .find(|bank| bank.pool == pool && bank.runtime.same_instance(runtime))
+        else {
+            return Ok(false);
+        };
+        if bank.poisoned {
+            return Err(Error::ScratchMismatch);
+        }
+        bank.validate_available()?;
+        if bank
+            .physical
+            .iter()
+            .any(|scratch| inputs.iter().any(|input| scratch.may_overlap(input)))
+        {
+            return Err(Error::ScratchMismatch);
+        }
+        Ok(true)
+    }
+
     /// Cold binding initializes a bank once. The mapped mutable borrow excludes every alias of
     /// this exact preparation until terminal completion and fault handling have finished.
     pub(super) fn bind<'a, P>(
@@ -176,7 +204,13 @@ impl Plan {
         for &index in &self.literals {
             let node = view.node(index)?;
             let layout = view.physical_layout(node.value)?;
-            let resource = if node.scalar_type == PcuScalarType::F64 {
+            let resource = if super::is_checked_integer_scalar(node.scalar_type) {
+                super::literal::upload_integer(node, layout, None, pool, memory)?
+            } else if super::is_low_float_type(node.scalar_type) {
+                super::literal::upload_low_float(node, layout, None, pool, memory)?
+            } else if super::is_raw_float_type(node.scalar_type) {
+                super::literal::upload_raw_float(node, layout, None, pool, memory)?
+            } else if node.scalar_type == PcuScalarType::F64 {
                 super::literal::upload_f64(node, layout, None, pool, memory)?
             } else {
                 match node.op {

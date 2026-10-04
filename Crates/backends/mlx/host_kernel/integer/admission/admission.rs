@@ -56,6 +56,7 @@ impl MlxCheckedIntegerPlan {
     /// Rejects unsupported type/profile, Portable, policy mismatch, malformed schema or extent.
     #[allow(clippy::too_many_lines)] // One cold typed/schema/role admission; no native work occurs here.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let invalid = || MlxError::InvalidRequest("unsupported MLX checked integer profile".into());
         if cfg!(target_endian = "big")
             || kernel.entry.logical_shape[1..] != [1, 1]
@@ -236,6 +237,8 @@ impl PcuHostKernelBackend for MlxCheckedIntegerBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCheckedIntegerPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         self.prepare_plan(plan, None)
     }
@@ -251,6 +254,8 @@ impl MlxCheckedIntegerBackend {
         kernel: &PcuDispatchKernelIr<'_>,
         extents: &[usize],
     ) -> Result<MlxPreparedIntegerHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCheckedIntegerPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         let full = plan
             .assess_input_extents(extents)

@@ -142,21 +142,27 @@ fn case<T: Format, const N: usize>(
     }
     #[cfg(not(feature = "allocation-census"))]
     assert!(host(&invalid, &mut stage, &mut output).is_err());
-    assert!(stage
-        .iter()
-        .chain(&output)
-        .all(|value| value.bits() == T::sentinel().bits()));
-    assert!(prepared
-        .call(&mut [
-            PcuHostArgument::read_write(PcuBindingRef::new(0, 0), &mut stage),
-            PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
-            PcuHostArgument::read(PcuBindingRef::new(0, 2), &invalid),
-        ])
-        .is_err());
-    assert!(stage
-        .iter()
-        .chain(&output)
-        .all(|value| value.bits() == T::sentinel().bits()));
+    assert!(
+        stage
+            .iter()
+            .chain(&output)
+            .all(|value| value.bits() == T::sentinel().bits())
+    );
+    assert!(
+        prepared
+            .call(&mut [
+                PcuHostArgument::read_write(PcuBindingRef::new(0, 0), &mut stage),
+                PcuHostArgument::read_write(PcuBindingRef::new(0, 1), &mut output),
+                PcuHostArgument::read(PcuBindingRef::new(0, 2), &invalid),
+            ])
+            .is_err()
+    );
+    assert!(
+        stage
+            .iter()
+            .chain(&output)
+            .all(|value| value.bits() == T::sentinel().bits())
+    );
     native.upload(0, &invalid);
     assert_eq!(
         native.submit(0),
@@ -317,7 +323,17 @@ fn case<T: Format, const N: usize>(
                     ),
                     (64, 192, 64, 64, 64)
                 );
-                eprintln!("handwritten-native-sdk/{:?}/{:?}/{:?}/{:?}/{:?}/{}/{kind}/{N}/64-changing-calls: {direct:?}", ir.numerical_requirements.numerical_mode, ir.numerical_requirements.numerical_options.precision, ir.numerical_requirements.numerical_options.compound_arithmetic, ir.numerical_requirements.float_underflow, ir.numerical_requirements.range_policy, T::LABEL);
+                eprintln!(
+                    "handwritten-native-sdk/{:?}/{:?}/{:?}/{:?}/{:?}/{}/{kind}/{N}/64-changing-calls: {direct:?}",
+                    ir.numerical_requirements.numerical_mode,
+                    ir.numerical_requirements.numerical_options.precision,
+                    ir.numerical_requirements
+                        .numerical_options
+                        .compound_arithmetic,
+                    ir.numerical_requirements.float_underflow,
+                    ir.numerical_requirements.range_policy,
+                    T::LABEL
+                );
                 assert_eq!(
                     (
                         api.event_creates,

@@ -20,7 +20,11 @@ fn score(_: &global::PcuInvocationCandidate<'_>) -> i128 {
     0
 }
 fn implementation(processor: PcuCpuProcessor) -> PcuCpuImplementation {
-    if processor.features().sse2 {
+    if processor.features().avx512f && processor.features().avx512bw {
+        PcuCpuImplementation::Avx512
+    } else if processor.features().avx2 {
+        PcuCpuImplementation::Avx2
+    } else if processor.features().sse2 {
         PcuCpuImplementation::Sse2
     } else {
         assert!(processor.features().neon);

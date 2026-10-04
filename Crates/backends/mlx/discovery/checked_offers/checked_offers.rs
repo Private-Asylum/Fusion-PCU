@@ -43,13 +43,16 @@ impl PcuImplementationOffers<PcuDispatchKernelIr<'_>> for MlxDiscovery {
                 "checked offer executor/numerical envelope mismatch".into(),
             ));
         }
+        crate::dispatch_shape::require_non_nested(request.operation)?;
         validate_typed_dispatch_value_flow(request.operation)
             .map_err(|_| MlxError::InvalidRequest("checked offer malformed typed SSA".into()))?;
         if request.boundary != PcuCostBoundary::Host {
             return Ok(0);
         }
         let (local_id, revision) =
-            if let Ok(plan) = crate::MlxCarrierPlan::assess(request.operation) {
+            if let Ok(plan) = crate::MlxCheckedConversionPlan::assess(request.operation) {
+                (plan.implementation_local_id(), 0x0003_0020_0003_1800)
+            } else if let Ok(plan) = crate::MlxCarrierPlan::assess(request.operation) {
                 (plan.implementation_local_id(), 0x0003_0020_0003_0400)
             } else if let Ok(plan) = crate::MlxCheckedUnaryPlan::assess(request.operation) {
                 let Some(identity) = unary_identity(plan) else {

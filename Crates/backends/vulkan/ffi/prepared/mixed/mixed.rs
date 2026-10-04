@@ -85,15 +85,15 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
         let resources = self.resources.as_ref().ok_or(PcuVulkanError::Quarantined)?;
         vk_try("reset mixed compute fence", unsafe {
             // SAFETY: Every prior compute or transfer is terminal; this fence is nonpending.
-            self.device.device.reset_fences(&[resources.fence])
+            vk_api_owner!(
+                self.device,
+                ResetFences,
+                self.device.device.reset_fences(&[resources.fence])
+            )
         })?;
-        if let Err(error) = submit_and_wait_measured(
-            &self.device.device,
-            self.device.queue,
-            resources.command,
-            resources.fence,
-            None,
-        ) {
+        if let Err(error) =
+            submit_and_wait_measured(&self.device, resources.command, resources.fence, None)
+        {
             if matches!(error, PcuVulkanError::CompletionUnknown) {
                 self.quarantine(state);
             }

@@ -8,6 +8,12 @@
 
 extern crate fusion_pcu_core as fusion_pcu;
 
+#[path = "conversion/conversion.rs"]
+mod conversion;
+pub use conversion::{
+    MlxCheckedConversionPlan, MlxConversionHostBackend, MlxPreparedConversionHostKernel,
+};
+
 #[path = "discovery/discovery.rs"]
 mod discovery;
 pub use discovery::MlxDiscovery;
@@ -89,6 +95,7 @@ pub use runtime::{
     MlxGpuBackend,
     MlxRuntime,
     MlxSession,
+    MlxPreparedFloatConversion,
 };
 #[cfg(feature = "benchmark-control")]
 pub use runtime::MlxNativeMatmulControl;
@@ -168,3 +175,65 @@ pub use composed::{
     MlxComposedHostBackend,
     MlxPreparedCheckedMapHostKernel,
 };
+
+pub use runtime::MlxPreparedReluBackward;
+
+#[cfg(feature = "tensor")]
+#[path = "admission/backward_tensor/backward_tensor.rs"]
+mod backward_tensor;
+#[cfg(feature = "tensor")]
+pub use backward_tensor::MlxCheckedTensorBackwardPlan;
+
+#[cfg(feature = "tensor")]
+pub use runtime::MlxPreparedTensorBackwardProgram;
+
+#[cfg(feature = "tensor")]
+pub use runtime::MlxPreparedStrictMatMul;
+
+#[cfg(feature = "tensor")]
+#[path = "admission/matmul_tensor/matmul_tensor.rs"]
+mod matmul_tensor;
+#[cfg(feature = "tensor")]
+pub use matmul_tensor::MlxCheckedTensorMatMulPlan;
+#[cfg(feature = "tensor")]
+pub use runtime::MlxPreparedTensorMatMulProgram;
+
+#[cfg(feature = "tensor")]
+pub use runtime::MlxPreparedStrictSgd;
+
+#[path = "dispatch_shape/dispatch_shape.rs"]
+mod dispatch_shape;
+
+#[cfg(feature = "tensor")]
+#[path = "admission/sgd_tensor/sgd_tensor.rs"]
+mod sgd_tensor;
+#[cfg(feature = "tensor")]
+pub use sgd_tensor::MlxCheckedTensorSgdPlan;
+#[cfg(feature = "tensor")]
+pub use runtime::MlxPreparedTensorSgdProgram;
+
+#[cfg(feature = "tensor")]
+pub use runtime::{MlxSelectedNumericalTensorPlan,MlxPreparedSelectedNumericalTensorProgram,MlxSelectedNumericalTensorOperation};
+
+#[cfg(feature = "tensor")]
+pub use discovery::MlxSelectedNumericalTensorRequest;
+
+#[cfg(feature="tensor")]
+pub use runtime::MlxPreparedStrictMse;
+
+#[cfg(feature="tensor")]
+#[path="admission/mse_tensor/mse_tensor.rs"]
+mod mse_tensor;
+#[cfg(feature="tensor")]
+pub use mse_tensor::MlxCheckedTensorMsePlan;
+#[cfg(feature="tensor")]
+pub use runtime::MlxPreparedTensorMseProgram;
+
+#[cfg(feature="tensor")]
+#[path="runtime/selected_graph/selected_graph.rs"]
+mod selected_graph;
+#[cfg(feature="tensor")]
+pub use selected_graph::{MlxSelectedTensorGraphPlan, MlxPreparedSelectedTensorGraph, MlxTensorGraphError};
+
+#[cfg(feature="tensor")]
+pub use discovery::MlxSelectedTensorGraphRequest;

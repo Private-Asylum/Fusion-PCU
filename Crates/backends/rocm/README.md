@@ -818,9 +818,20 @@ including signed/unsigned128/256/512, through ordinary generic `#[pcu]`.
 Boundary/Strict and explicit compound/precision permissions retain exact
 rejecting scalar arithmetic. Both real GPUs qualify changing host/resident/mixed
 inputs, consuming identity, retained escaped owners, earliest fatal range error,
-private failure preserving inputs/siblings and fresh retry. Integer Uniform,
-tensor Clamp/Portable, low4 tensor math and wider floating arithmetic remain
-separate unadmitted contracts.
+private failure preserving inputs/siblings and fresh retry. Tensor Clamp/Portable,
+low4 tensor math and wider floating arithmetic remain separate unadmitted
+contracts.
+
+Dense integer tensor Constant and Uniform producers now preserve all14 carriers
+through canonical bit encoding, retained non-output scratch and fresh initialized
+escaping literal outputs. Separate source `f1d7465e` qualifies224 profiles and672
+graph/source/handwritten HIP route keys atN65/4096 under both modes and existing
+compound/precision permissions, with Reject/Unspecified/IEEE. Literal mutation,
+consumption, original replay and cache/plan-drop lifetimes pass. The source uses
+explicit dense input banks; it does not author graph literals. Ordered SDK phases
+preserve Add-before-Mul fault order, including competing invocation faults. Its
+separate672-key census reports PCU owning allocations and proves zero warm Rust
+heap only for the preallocated independent SDK control; no timing is inferred.
 
 The canonical `wide_tensor` target pairs genuine source, prepared single-output
 graph and identical native kernels with matched fresh output/private8B status.
@@ -832,3 +843,26 @@ cached-sentinel oracle are included in this census. Current status allocation
 per owned call is an explicit retention optimization gap. No statistical
 speedup is claimed; exact proof/provenance lives in the ignored outer
 `plans/.pcu-validation/2026-10-01/rocm-cuda-wide-tensor/final-matched` archive.
+
+Requested Portable checked integer composition now admits all fourteen integer
+carriers through the neutral descriptor, within the existing four-resource direct/grid
+map bounds. The separate ten-width native source certificate covers staged
+Add/store/reload/Mul/Sub and discarded Add, full numerical headers, Reject/Clamp,
+complete prefix bits, tails, rollback and retry. The frozen primary arithmetic capture
+passes; its separate warm census diagnosed one 32-byte Rust event wrapper allocation
+and free per call, with unchanged device allocation/module/symbol counts. The separate private
+move-only completion owner certificate passes eight lifetime witnesses and all960
+64-changing-call profiles with zero Rust heap and identical complete HIP count vectors;
+public cloneable/timing events retain shared ownership, and events are not pooled.
+
+The separate genuine `integer_tensor_producers` target qualifies inline-const
+`pcu::constant` and `pcu::uniform_like` source alongside explicit graph and
+independent ordered HIP controls: all fourteen integer widths, N65/N4096 and
+eight numerical headers under Reject/Unspecified/IEEE. Both 672-key semantic
+and separate changing-call census gates pass, including zero-selected-input
+literals, mutable output escape/replay/cache clear and exact mixed-stage faults.
+Source uses three Rust allocations/frees per call, graph six and SDK zero;
+immutable source producers reduce warm H2D copies from three to one compared
+with the older input-bank source. Actual zero-argument signatures, Portable/Clamp
+graph widening and latency remain separate gates. Failed predecessor and
+qualified shared empty-binding successor retain distinct certificates.

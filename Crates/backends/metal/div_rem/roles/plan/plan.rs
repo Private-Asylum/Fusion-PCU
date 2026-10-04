@@ -34,6 +34,7 @@ impl MetalDivRemRolePlan {
     /// # Errors
     /// Rejects unsupported types, malformed SSA, extents, Clamp and ineligible Portable requests.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let invalid = || MetalError::Unsupported;
         if cfg!(target_endian = "big") || kernel.entry.logical_shape[1..] != [1, 1] {
             return Err(invalid());
@@ -172,6 +173,7 @@ fn checked_bytes(scalar: PcuScalarType, count: usize) -> Result<usize, MetalErro
     Ok(bytes)
 }
 fn validate_reproducibility(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), MetalError> {
+    crate::dispatch_shape::require_non_nested(kernel)?;
     if kernel
         .numerical_requirements
         .numerical_options

@@ -72,6 +72,12 @@ macro_rules! prepared_types {
         impl CpuPrepared {
             pub(super) fn prepare(program: &TensorOwnedSelectedProgram, scalar: PcuScalarType) -> Result<Self, PcuExecutionError> {
                 if program.output_values().len() != 1 {
+                    return Err(PcuExecutionError::TensorBuild(TensorError::DataLength { expected: 1, actual: program.output_values().len() }));
+                }
+                Self::prepare_outputs(program, scalar)
+            }
+            pub(super) fn prepare_outputs(program: &TensorOwnedSelectedProgram, scalar: PcuScalarType) -> Result<Self, PcuExecutionError> {
+                if program.output_values().is_empty() {
                     return Err(PcuExecutionError::TensorBuild(TensorError::DataLength {
                         expected: 1,
                         actual: program.output_values().len(),
@@ -83,6 +89,12 @@ macro_rules! prepared_types {
                         value: program.output_values()[0], scalar_type,
                     }),
                 }.map_err(PcuExecutionError::TensorBuild)
+            }
+            pub(super) fn output_shapes(&self) -> Vec<std::rc::Rc<[usize]>> {
+                match self { $( Self::$variant(prepared) => prepared.output_bindings().iter().map(|binding| std::rc::Rc::from(binding.shape.as_slice())).collect(), )+ }
+            }
+            pub(super) fn execute_outputs<T: PcuScalar, const M: usize>(&mut self, inputs: &[&[T]]) -> Result<[Vec<T>; M], PcuExecutionError> {
+                match self { $( Self::$variant(prepared) => execute_outputs(prepared, inputs), )+ }
             }
             pub(super) fn output_shape(&self) -> &[usize] {
                 match self { $( Self::$variant(prepared) => &prepared.output_bindings()[0].shape, )+ }
@@ -149,4 +161,42 @@ fn execute<T: PcuScalar, U: PcuScalar>(
     // the retained workspace is reused; no native address or uninitialized representation exists.
     let output = unsafe { slice::from_raw_parts(output.as_ptr().cast::<T>(), output.len()) };
     Ok(output.to_vec())
+}
+
+fn execute_outputs<T: PcuScalar, U: PcuScalar, const M: usize>(
+    prepared: &mut impl CpuGraph<U>,
+    inputs: &[&[T]],
+) -> Result<[Vec<T>; M], PcuExecutionError> {
+    if prepared.output_bindings().len() != M {
+        return Err(PcuExecutionError::TensorBuild(TensorError::DataLength {
+            expected: M,
+            actual: prepared.output_bindings().len(),
+        }));
+    }
+    if TypeId::of::<T>() != TypeId::of::<U>() {
+        return Err(PcuExecutionError::TensorBuild(
+            TensorError::ScalarTypeMismatch {
+                value: prepared.output_bindings()[0].value,
+                expected: U::TYPE,
+                actual: T::TYPE,
+            },
+        ));
+    }
+    // SAFETY: Exact TypeId equality proves identical scalar types and reference layouts.
+    let inputs = unsafe { slice::from_raw_parts(inputs.as_ptr().cast::<&[U]>(), inputs.len()) };
+    prepared
+        .execute(inputs)
+        .map_err(PcuExecutionError::TensorBuild)?;
+    let mut outputs: [Option<Vec<T>>; M] = core::array::from_fn(|_| None);
+    for (index, output) in outputs.iter_mut().enumerate() {
+        let values = prepared.output(index).ok_or_else(|| {
+            PcuExecutionError::TensorBuild(TensorError::UnknownValue(
+                prepared.output_bindings()[index].value,
+            ))
+        })?;
+        // SAFETY: The exact TypeId check above proves U and T have identical validity and layout.
+        let values = unsafe { slice::from_raw_parts(values.as_ptr().cast::<T>(), values.len()) };
+        *output = Some(values.to_vec());
+    }
+    Ok(outputs.map(|output| output.expect("every output copied after successful execution")))
 }

@@ -38,6 +38,7 @@ fn profile<T: Format>() {
     const SMALL: usize = 65;
     let (_, backend, _) = selection::selected_device();
     macro_rules! operation {($module:ident,$op:expr)=>{{
+    fn case<T: Format>(backend: &fusion_pcu_rocm::RocmOwnedDispatchBackend) {
     for policy in [PcuFloatUnderflowPolicy::IeeeAfterRounding,PcuFloatUnderflowPolicy::RejectSubnormalResult,PcuFloatUnderflowPolicy::AllowGradualUnderflow] {
         let mut left=Vec::with_capacity(N);let mut right=Vec::with_capacity(N);let mut expected=Vec::with_capacity(N);let mut witnesses=Vec::new();
         for index in 0..N {
@@ -105,6 +106,8 @@ fn profile<T: Format>() {
     global::configure(global::PcuExecutionPolicy{backend:global::PcuBackendChoice::Rocm,device:Some(0),block_size:256,numerical_mode:fusion_pcu::PcuNumericalMode::Strict,
         numerical_options:fusion_pcu::PcuNumericalOptions{compound_arithmetic:fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined,precision:fusion_pcu::PcuPrecisionPolicy::BackendOptimized,..Default::default()},..Default::default()}).unwrap();
     source::$module::portable::<T,SMALL>(&left,&left,&mut output).unwrap();oracle::verify(&expected,&output);selected();
+ }
+ case::<T>(&backend);
  }};}
     operation!(add, 0);
     operation!(sub, 1);

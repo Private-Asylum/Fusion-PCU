@@ -36,6 +36,7 @@ pub struct MetalTransportPlan {
 
 impl MetalTransportPlan {
     pub(crate) fn assess_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
             kernel.bindings.first().map(|binding| binding.binding_type)
         else {
@@ -56,6 +57,7 @@ impl MetalTransportPlan {
         kernel: &PcuDispatchKernelIr<'_>,
         scalar: PcuScalarType,
     ) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if matches!(
             scalar,
             PcuScalarType::Bool | PcuScalarType::I4 | PcuScalarType::U4

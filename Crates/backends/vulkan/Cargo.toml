@@ -17,9 +17,11 @@ crate-type = ["rlib"]
 path = "vulkan.rs"
 
 [features]
-default = []
+default = ["embedded-composed"]
+embedded-composed = ["fusion-pcu-spirv?/embedded-composed"]
 hosted = ["dep:ash", "dep:fusion-pcu-spirv"]
 tensor = ["hosted", "fusion-pcu-core/tensor"]
+insights = ["fusion-pcu-core/insights"]
 
 [dependencies]
 fusion-pcu-core.workspace = true
@@ -460,3 +462,88 @@ name = "ordered_transport"
 path = "benches/ordered_transport/ordered_transport.rs"
 harness = false
 required-features = ["hosted"]
+
+[[test]]
+name = "shader_artifacts"
+path = "tests/shader_artifacts/shader_artifacts.rs"
+required-features = ["hosted"]
+
+[[example]]
+name = "shader-artifacts"
+path = "examples/shader_artifacts/shader_artifacts.rs"
+required-features = ["hosted"]
+
+[[example]]
+name = "export-shader-packages"
+path = "examples/export_shader_packages/export_shader_packages.rs"
+required-features = ["hosted", "embedded-composed"]
+
+[[example]]
+name = "shader-packages"
+path = "examples/shader_packages/shader_packages.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "shader_packages"
+path = "tests/shader_packages/shader_packages.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "shader_cache"
+path = "benches/shader_cache/shader_cache.rs"
+harness = false
+required-features = ["hosted"]
+
+[[test]]
+name = "wide_composed"
+path = "tests/wide_composed/wide_composed.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "portable_wide_composed"
+path = "tests/portable_wide_composed/portable_wide_composed.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "composed_integer_maps"
+path = "benches/composed_integer_maps/composed_integer_maps.rs"
+harness = false
+required-features = ["hosted"]
+
+[[test]]
+name = "narrow_composed"
+path = "tests/narrow_composed/narrow_composed.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "portable_narrow_composed"
+path = "tests/portable_narrow_composed/portable_narrow_composed.rs"
+required-features = ["hosted"]
+
+[[test]]
+name = "api_insights"
+path = "tests/api_insights/api_insights.rs"
+required-features = ["hosted", "insights", "embedded-composed"]
+
+[[test]]
+name = "wide_discarded"
+path = "tests/wide_discarded/wide_discarded.rs"
+required-features = ["hosted"]
+
+[[bench]]
+name = "low_tensor_producers"
+path = "benches/low_tensor_producers/low_tensor_producers.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "raw_float_producers"
+path = "benches/raw_float_producers/raw_float_producers.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "raw_integer_producers"
+path = "benches/raw_integer_producers/raw_integer_producers.rs"
+harness = false
+required-features = ["tensor"]

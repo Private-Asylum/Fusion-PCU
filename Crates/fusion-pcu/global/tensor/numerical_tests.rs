@@ -4,6 +4,8 @@ extern crate std;
 
 #[path = "numerical_tests/identity/identity.rs"]
 mod identity;
+#[path = "numerical_tests/scalar/scalar.rs"]
+mod scalar;
 
 macro_rules! low_binary_helper {
     ($name:ident, $operation:ident) => {

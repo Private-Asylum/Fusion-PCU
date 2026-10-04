@@ -171,25 +171,31 @@ fn width<T: PcuScalar>(backend: &PcuVulkanBackend, requirements: PcuImplementati
             range_policy: pcu_facade::PcuRangePolicy::Clamp,
             ..requirements
         };
-        shape!(
-            T,
-            backend,
-            local,
-            clamped_ordered,
-            clamped_ordered_ir,
-            clamped_ordered_bindings,
-            false
-        );
-        shape!(
-            T,
-            backend,
-            local,
-            clamped_grid,
-            clamped_grid_ir,
-            clamped_grid_bindings,
-            true
-        );
+        clamped_width::<T>(backend, local);
     }
+}
+fn clamped_width<T: PcuScalar>(
+    backend: &PcuVulkanBackend,
+    requirements: PcuImplementationRequirements,
+) {
+    shape!(
+        T,
+        backend,
+        requirements,
+        clamped_ordered,
+        clamped_ordered_ir,
+        clamped_ordered_bindings,
+        false
+    );
+    shape!(
+        T,
+        backend,
+        requirements,
+        clamped_grid,
+        clamped_grid_ir,
+        clamped_grid_bindings,
+        true
+    );
 }
 #[test]
 #[ignore = "requires an actual Vulkan compute device; genuine ordinary and prepared transport"]

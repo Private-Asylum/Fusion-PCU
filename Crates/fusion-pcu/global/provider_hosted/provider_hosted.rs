@@ -239,6 +239,8 @@ pub(super) struct Preparation {
     affinity: Option<ResidentAffinity>,
     #[cfg(feature = "mlx")]
     mlx_inputs: MlxInputLayout,
+    #[cfg(feature = "vulkan")]
+    vulkan_shaders: Option<super::vulkan::PcuVulkanShaderOptions>,
 }
 
 impl Preparation {
@@ -249,6 +251,8 @@ impl Preparation {
             affinity: None,
             #[cfg(feature = "mlx")]
             mlx_inputs: MlxInputLayout::new(),
+            #[cfg(feature = "vulkan")]
+            vulkan_shaders: None,
         }
     }
     pub(super) const fn numerical_requirements(&self) -> crate::PcuImplementationRequirements {
@@ -350,6 +354,12 @@ impl Preparation {
                     continue;
                 }
             };
+            #[cfg(feature = "vulkan")]
+            if let Session::Vulkan(backend) = &session
+                && let Some(options) = &self.vulkan_shaders
+            {
+                options.apply(backend);
+            }
             let prepared = prepare_session(
                 &session,
                 kernel,
@@ -543,6 +553,9 @@ fn with_entry<R>(
 
             // Policy locks and environment inspection are cold-path work only. A warm entry stays
             // pinned to its prepared runtime even if process environment variables later change.
+            #[cfg(feature = "vulkan")]
+            let (policy_snapshot, vulkan_shaders) = policy::snapshot_with_vulkan_shaders()?;
+            #[cfg(not(feature = "vulkan"))]
             let policy_snapshot = policy::snapshot()?;
             let policy = policy_snapshot.policy;
             if let Some(root) = affinity {
@@ -566,6 +579,10 @@ fn with_entry<R>(
             };
             if let Some(preparation) = context.shared.as_mut() {
                 preparation.affinity = affinity.map(affinity::retain);
+                #[cfg(feature = "vulkan")]
+                {
+                    preparation.vulkan_shaders = Some(vulkan_shaders);
+                }
                 #[cfg(feature = "mlx")]
                 {
                     preparation.mlx_inputs = layout.mlx_inputs;

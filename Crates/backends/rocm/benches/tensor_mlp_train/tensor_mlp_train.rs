@@ -2,8 +2,14 @@
 
 extern crate pcu_facade as fusion_pcu;
 
+#[path = "../strict_matmul/activity.rs"]
+mod activity;
 #[path = "../../examples/support/reference/reference.rs"]
 mod reference;
+#[path = "source/source.rs"]
+mod source;
+#[path = "source_driver/source_driver.rs"]
+mod source_driver;
 #[path = "../support/support.rs"]
 mod support;
 
@@ -116,7 +122,11 @@ fn values(count: usize, modulus: usize, scale: f32, shift: i32) -> Vec<f32> {
 }
 
 fn bench(c: &mut Criterion) {
-    run(c).expect("ROCm MLP training benchmark failed");
+    if std::env::var_os("FUSION_PCU_MLP_LEGACY").is_some() {
+        run(c).expect("ROCm legacy MLP training benchmark failed");
+    } else {
+        source_driver::run(c).expect("ROCm source MLP training benchmark failed");
+    }
 }
 
 fn configured_batch() -> Result<usize, Box<dyn Error>> {

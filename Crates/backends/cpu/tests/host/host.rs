@@ -258,7 +258,7 @@ fn unified_schema_errors_retain_details_and_leave_output_unchanged() {
 }
 
 #[test]
-fn unified_valid_clamp_and_broader_integer_profiles_have_zero_offers() {
+fn unified_requires_exact_headers_and_admits_unused_readonly_integer_declarations() {
     let backend = PcuCpuHostBackend::scalar();
     let identity = PcuDeviceIdentity::from_device_ref(PcuObjectRef {
         provider: PcuProviderId(3),
@@ -291,6 +291,7 @@ fn unified_valid_clamp_and_broader_integer_profiles_have_zero_offers() {
         },
         boundary: PcuCostBoundary::Host,
     };
+    // The request permits Clamp but the unchanged IR header still requires Reject.
     assert_eq!(offers.implementation_offers(&request, &mut []), Ok(0));
     let mut malformed_ops = ops.clone();
     if let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary { value, .. }) =
@@ -334,5 +335,19 @@ fn unified_valid_clamp_and_broader_integer_profiles_have_zero_offers() {
         requirements: PcuImplementationRequirements::default(),
         ..request
     };
-    assert_eq!(offers.implementation_offers(&request, &mut []), Ok(0));
+    // Resource-role admission permits an unused read-only declaration without a read span.
+    assert_eq!(offers.implementation_offers(&request, &mut []), Ok(1));
+    let mut prepared = backend.prepare_host_kernel(&broader).unwrap();
+    let left = [1_u64, 2, 3];
+    let right = [4_u64, 5, 6];
+    let mut output = [77_u64; 4];
+    prepared
+        .call(&mut [
+            PcuHostArgument::read(PcuBindingRef::new(0, 0), &left),
+            PcuHostArgument::read(PcuBindingRef::new(0, 1), &right),
+            PcuHostArgument::read_write(PcuBindingRef::new(0, 2), &mut output),
+            PcuHostArgument::read(PcuBindingRef::new(0, 3), &[] as &[u64]),
+        ])
+        .unwrap();
+    assert_eq!(output, [5, 7, 9, 77]);
 }

@@ -11,16 +11,60 @@ use fusion_pcu::{
 
 /// Legacy value ALU opcodes have no explicit permission to suppress numerical faults.
 pub fn checked_numeric_contract(kernel: &PcuDispatchKernelIr<'_>) -> bool {
-    (kernel
-        .numerical_requirements
-        .numerical_options
-        .reproducibility
-        != fusion_pcu::PcuReproducibility::PortableV1
-        || fusion_pcu::describe_portable_v1_map(kernel).is_ok()
-        || fusion_pcu::describe_portable_v1_integer_map(kernel).is_ok()
-        || fusion_pcu::describe_portable_v1_integer_div_rem_map(kernel).is_ok()
-        || fusion_pcu::describe_portable_v1_unary_map(kernel).is_ok())
+    supported_control_shape(kernel.ops)
+        && (kernel
+            .numerical_requirements
+            .numerical_options
+            .reproducibility
+            != fusion_pcu::PcuReproducibility::PortableV1
+            || fusion_pcu::describe_portable_v1_map(kernel).is_ok()
+            || fusion_pcu::describe_portable_v1_integer_map(kernel).is_ok()
+            || fusion_pcu::describe_portable_v1_integer_div_rem_map(kernel).is_ok()
+            || fusion_pcu::describe_portable_v1_unary_map(kernel).is_ok()
+            || portable_integer_composed_contract(kernel))
         && checked_ops(kernel.ops)
+}
+
+/// Borrowed public IR may contain cycles; inspect only the supported outer body.
+pub fn supported_control_shape(ops: &[PcuDispatchOp<'_>]) -> bool {
+    let body = match ops {
+        [
+            PcuDispatchOp::GridStrideLoop { body, .. },
+            PcuDispatchOp::Control(fusion_pcu::PcuDispatchControlOp::Return),
+        ] => *body,
+        _ => ops,
+    };
+    !body
+        .iter()
+        .any(|op| matches!(op, PcuDispatchOp::GridStrideLoop { .. }))
+}
+
+/// Independently bounded provider opt-in; neutral eligibility alone grants no execution.
+pub fn portable_integer_composed_contract(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    fusion_pcu::describe_portable_v1_checked_integer_composed_map::<4>(kernel).is_ok_and(|schema| {
+        matches!(
+            schema.value_type,
+            PcuValueType::Scalar(
+                PcuScalarType::I8
+                    | PcuScalarType::U8
+                    | PcuScalarType::I16
+                    | PcuScalarType::U16
+                    | PcuScalarType::I32
+                    | PcuScalarType::U32
+                    | PcuScalarType::I64
+                    | PcuScalarType::U64
+                    | PcuScalarType::I128
+                    | PcuScalarType::U128
+                    | PcuScalarType::I256
+                    | PcuScalarType::U256
+                    | PcuScalarType::I512
+                    | PcuScalarType::U512
+            )
+        ) && !schema
+            .resources()
+            .iter()
+            .any(|resource| resource.has_cross_index_read_write())
+    })
 }
 
 fn checked_ops(ops: &[PcuDispatchOp<'_>]) -> bool {

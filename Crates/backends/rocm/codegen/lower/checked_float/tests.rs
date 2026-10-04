@@ -315,6 +315,7 @@ fn checked_float64_routes_through_integer_only_binary64_helper() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)] // Exhaustive typed fault/ownership matrix retains its exact witnesses.
 fn checked_float_uses_bit_integer_rounding_and_fault_word_tags() {
     for (op, op_tag) in [
         (PcuDispatchFloatBinaryOp::Add, "0u"),

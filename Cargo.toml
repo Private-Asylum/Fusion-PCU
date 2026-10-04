@@ -59,7 +59,7 @@ syn = { version = "2.0.108", features = ["full"] }
 smallvec = { version = "1", features = ["const_generics"] }
 libloading = "0.8"
 libc = "0.2"
-sha2 = "=0.10.9"
+sha2 = { version = "=0.10.9", default-features = false }
 criterion = "0.7"
 bytemuck = "1.25"
 trybuild = "1.0"

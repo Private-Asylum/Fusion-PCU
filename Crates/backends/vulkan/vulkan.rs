@@ -14,7 +14,60 @@
 //! Constant/Uniform leaf APIs do not imply ordinary uniform source or tensor arithmetic support.
 //! External memory is not imported.
 
+#![cfg_attr(not(feature = "hosted"), no_std)]
+
 extern crate fusion_pcu_core as fusion_pcu;
+
+#[cfg(feature = "hosted")]
+macro_rules! vk_api_cold {
+    ($point:ident, $operation:expr) => {{
+        #[cfg(feature = "insights")]
+        crate::api_insights::count_attached(crate::PcuVulkanApiPoint::$point);
+        $operation
+    }};
+}
+#[cfg(feature = "hosted")]
+macro_rules! vk_api_retained {
+    ($ledger:expr, $point:ident, $operation:expr) => {{
+        #[cfg(feature = "insights")]
+        crate::api_insights::count_retained(($ledger).as_deref(), crate::PcuVulkanApiPoint::$point);
+        $operation
+    }};
+}
+#[cfg(feature = "hosted")]
+macro_rules! vk_api_owner {
+    ($owner:expr, $point:ident, $operation:expr) => {{
+        #[cfg(feature = "insights")]
+        $owner.count_api(crate::PcuVulkanApiPoint::$point);
+        $operation
+    }};
+}
+
+// Handle transfer must release diagnostic ownership before forgetting the temporary guard.
+#[cfg(feature = "hosted")]
+macro_rules! vk_transfer_guards {
+    ($($guard:ident),+ $(,)?) => {{
+        $(
+            #[cfg(feature = "insights")]
+            let mut $guard = $guard;
+            #[cfg(feature = "insights")]
+            drop($guard.api_insights.take());
+            core::mem::forget($guard);
+        )+
+    }};
+}
+
+#[cfg(all(feature = "hosted", feature = "insights"))]
+#[path = "api_insights/api_insights.rs"]
+mod api_insights;
+#[cfg(all(feature = "hosted", feature = "insights"))]
+#[rustfmt::skip]
+pub use api_insights::{
+    PcuVulkanApiInsights,
+    PcuVulkanApiPoint,
+    PcuVulkanCountOnlyClock,
+    with_api_insights_scope,
+};
 
 #[cfg(feature = "hosted")]
 #[path = "arguments/arguments.rs"]
@@ -102,3 +155,27 @@ pub use crate::{
         PcuVulkanResourceAddressingModel,
     },
 };
+
+#[cfg(feature = "hosted")]
+#[path = "shader_artifact/shader_artifact.rs"]
+mod shader_artifact;
+#[cfg(feature = "hosted")]
+#[rustfmt::skip]
+pub use shader_artifact::{
+    PcuVulkanShaderCachePolicy,
+    PcuVulkanShaderCacheStats,
+    PcuVulkanShaderDiskConfig,
+    PcuVulkanShaderArtifactKey,
+    PcuVulkanShaderArtifactError,
+    load_shader_artifact,
+    write_shader_artifact,
+    unload_shader_artifact,
+};
+
+#[cfg(feature = "hosted")]
+#[path = "shader_source/shader_source.rs"]
+mod shader_source;
+#[cfg(feature = "hosted")]
+pub use shader_source::PcuVulkanShaderSource;
+#[cfg(all(feature = "hosted", feature = "embedded-composed"))]
+pub use shader_source::write_composed_shader_package;

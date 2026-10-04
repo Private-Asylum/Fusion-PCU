@@ -47,8 +47,11 @@ pub fn declares_owned_tensor_return(output: &ReturnType) -> bool {
         return false;
     };
     matches!(arguments.args.first(), Some(syn::GenericArgument::Type(ty))
-        if matches!(super::transparent_type(ty), Type::Path(owner)
-            if owner.path.segments.last().is_some_and(|segment| segment.ident == "PcuTensor")))
+    if match super::transparent_type(ty) {
+        Type::Path(owner) => owner.path.segments.last().is_some_and(|segment| segment.ident == "PcuTensor"),
+        Type::Tuple(tuple) => tuple.elems.iter().any(|ty| matches!(super::transparent_type(ty), Type::Path(owner) if owner.path.segments.last().is_some_and(|segment| segment.ident == "PcuTensor"))),
+        _ => false,
+    })
 }
 
 /// Expand a homogeneous scalar composition over slices, fixed arrays, or fixed matrices.
@@ -124,9 +127,10 @@ pub fn expand_owned_return_with_policies(
     source_names.extend(input_idents.iter().cloned());
     source_names.extend(const_args.iter().cloned());
     source_names.extend(type_args.iter().cloned());
+    let hygiene_anchor = input_idents.first().unwrap_or(&function.sig.ident);
     let capture_ident = fresh_ident(
         "__pcu_capture",
-        &input_idents[0],
+        hygiene_anchor,
         &source_names.iter().collect::<Vec<_>>(),
     );
     let parsed = parse_program(
@@ -142,23 +146,23 @@ pub fn expand_owned_return_with_policies(
     generated_reserved.push(&capture_ident);
     let wrapper_marker = fresh_ident(
         "__PcuOwnedCaptureMarker",
-        &input_idents[0],
+        hygiene_anchor,
         &generated_reserved,
     );
     generated_reserved.push(&wrapper_marker);
     let site_ident = fresh_ident(
         "__PCU_OWNED_TENSOR_SITE",
-        &input_idents[0],
+        hygiene_anchor,
         &generated_reserved,
     );
     generated_reserved.push(&site_ident);
-    let source_ident = fresh_ident("__pcu_owned_source", &input_idents[0], &generated_reserved);
+    let source_ident = fresh_ident("__pcu_owned_source", hygiene_anchor, &generated_reserved);
     generated_reserved.push(&source_ident);
     let entry_capture_ident =
-        fresh_ident("__pcu_entry_capture", &input_idents[0], &generated_reserved);
+        fresh_ident("__pcu_entry_capture", hygiene_anchor, &generated_reserved);
     let capture_marker = fresh_ident(
         "__PcuCaptureRecursionMarker",
-        &input_idents[0],
+        hygiene_anchor,
         &generated_reserved,
     );
     let emission = OwnedEmission {
@@ -215,6 +219,9 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
         numerical_options,
     } = emission;
     let input_count = parameters.len();
+    let output_count = owned_return_arity(&function.sig.output);
+    let tuple_output = output_count.is_some();
+    let output_count = output_count.unwrap_or(1);
     // Signature validation guarantees the concrete scalar and matching input profile.
     let scalar = owned_return_scalar(&function.sig.output).expect("validated owned scalar");
     let consumed_parameter = parameters
@@ -265,6 +272,8 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
             "call_consumed_pair_tensor_capture"
         } else if mixed_consumed_parameters {
             "call_mixed_consumed_tensor_capture"
+        } else if tuple_output {
+            "call_owned_tensors_capture"
         } else {
             "call_owned_tensor_capture"
         }
@@ -465,9 +474,27 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
             }
         }
     });
+    let capture_output_type = if tuple_output {
+        quote! { [#input_type; #output_count] }
+    } else {
+        input_type.clone()
+    };
+    let call_generics = if tuple_output {
+        quote! { ::<#scalar, #input_count, #output_count, _> }
+    } else {
+        quote! {}
+    };
+    let output_indices = (0..output_count)
+        .map(|index| format_ident!("__pcu_output_{index}"))
+        .collect::<Vec<_>>();
+    let wrapper_result = if tuple_output {
+        quote! { .map(|[#(#output_indices),*]| (#(#output_indices,)*)) }
+    } else {
+        quote! {}
+    };
     let capture_body = &parsed.statements;
     let output_tokens = &parsed.output;
-    let float_policy_scalar_check = if underflow_flag.is_some() {
+    let float_policy_scalar_check = if underflow_flag.is_some() && !parameters.is_empty() {
         let parameter = parameters.first().expect("owned helper has an input");
         let value = &parameter.ident;
         let value = match parameter.mode {
@@ -506,6 +533,28 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
         },
         None => quote! { ::core::option::Option::None },
     };
+    let final_output = if underflow_flag.is_some() && parameters.is_empty() && tuple_output {
+        quote! {
+            let __pcu_checked_outputs = #output_tokens;
+            for __pcu_checked_output in __pcu_checked_outputs {
+                #capture_ident.require_float_underflow_policy(__pcu_checked_output)?;
+            }
+            ::core::result::Result::Ok(__pcu_checked_outputs)
+        }
+    } else if underflow_flag.is_some() && parameters.is_empty() {
+        let output_ident = fresh_ident(
+            "__pcu_checked_output",
+            &function.sig.ident,
+            &source_binding_names(function).iter().collect::<Vec<_>>(),
+        );
+        quote! {
+            let #output_ident = #output_tokens;
+            #capture_ident.require_float_underflow_policy(#output_ident)?;
+            ::core::result::Result::Ok(#output_ident)
+        }
+    } else {
+        quote! { ::core::result::Result::Ok(#output_tokens) }
+    };
     quote! {
         #(#wrapper_attrs)*
         // The wrapper must inspect every source argument to preserve its metadata, including
@@ -518,12 +567,12 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
             static #site_ident: #companion_crate_path::global::PcuHostCallSite =
                 #companion_crate_path::global::PcuHostCallSite::new();
             #source_setup
-            #companion_crate_path::global::#call_entry(
+            #companion_crate_path::global::#call_entry #call_generics(
                 &#site_ident,
                 ::core::any::TypeId::of::<#marker_type>(),
                 #entry_arguments,
                 #function_ident::__pcu_capture_entry #capture_generic_args,
-            )
+            ) #wrapper_result
         }
 
         #[doc(hidden)]
@@ -537,7 +586,7 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
             pub fn __pcu_capture_entry #generic_declaration (
                 #entry_capture_ident: &mut #companion_crate_path::global::PcuTensorGraphCapture,
                 __pcu_inputs: [#input_type; #input_count],
-            ) -> ::core::result::Result<#input_type, #companion_crate_path::PcuExecutionError> #where_clause {
+            ) -> ::core::result::Result<#capture_output_type, #companion_crate_path::PcuExecutionError> #where_clause {
                 __pcu_capture #capture_generic_args (#entry_capture_ident, #(#capture_values),*)
             }
 
@@ -549,7 +598,7 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
             pub fn __pcu_capture #generic_declaration (
                 #capture_ident: &mut #companion_crate_path::global::PcuTensorGraphCapture,
                 #(#capture_parameters),*
-            ) -> ::core::result::Result<#input_type, #companion_crate_path::PcuExecutionError> #where_clause {
+            ) -> ::core::result::Result<#capture_output_type, #companion_crate_path::PcuExecutionError> #where_clause {
                 let __pcu_capture_result = #capture_ident.with_marker(
                     ::core::any::TypeId::of::<#capture_marker_type>(),
                     |#capture_ident| #capture_ident.with_numerical_mode(
@@ -559,13 +608,13 @@ fn emit_owned_items(emission: &OwnedEmission<'_>) -> proc_macro2::TokenStream {
                         |#capture_ident| #capture_ident.with_float_underflow_policy(
                         #float_policy,
                         |#capture_ident| (|| -> ::core::result::Result<
-                            #input_type,
+                            #capture_output_type,
                             #companion_crate_path::PcuExecutionError,
                         > {
                             #float_policy_scalar_check
                             #(#input_shape_checks)*
                             #(#capture_body)*
-                            ::core::result::Result::Ok(#output_tokens)
+                            #final_output
                         })(),
                         ),
                         ),
@@ -632,10 +681,10 @@ fn validate_owned_function(
         .iter()
         .map(|parameter| parameter.ident.clone())
         .collect::<Vec<_>>();
-    if function.sig.inputs.is_empty() || function.sig.inputs.len() > 32 {
+    if function.sig.inputs.len() > 32 {
         return Err(Error::new_spanned(
             &function.sig.inputs,
-            "owned tensor compositions require between 1 and 32 inputs with one homogeneous PCU scalar type",
+            "owned tensor compositions accept at most 32 inputs with one homogeneous PCU scalar type",
         ));
     }
     let scalar = owned_return_scalar(&function.sig.output).expect("validated owned scalar");
@@ -644,6 +693,12 @@ fn validate_owned_function(
         .iter()
         .any(|parameter| parameter.mode == SourceMode::ConsumedResident)
     {
+        if owned_return_arity(&function.sig.output).is_some() {
+            return Err(Error::new_spanned(
+                &function.sig.inputs,
+                "tuple owned tensor returns currently require borrowed inputs; consumed owners are unsupported",
+            ));
+        }
         let owners = parameters
             .iter()
             .filter(|parameter| parameter.mode == SourceMode::ConsumedResident)
@@ -710,19 +765,19 @@ fn validate_owned_signature(function: &ItemFn) -> Result<Vec<syn::ConstParam>, E
     if !valid_scalar || !valid_scalar_where_clause(&function.sig.generics) {
         return Err(Error::new_spanned(
             &function.sig.output,
-            "owned tensor composition must return a homogeneous scalar owner or a homogeneous `T: PcuScalar` owner",
+            "owned tensor composition must return a scalar owner or a nonempty tuple of owners with one homogeneous scalar type (including `T: PcuScalar`)",
         ));
     }
     Ok(const_params)
 }
 
-// These declared arithmetic traits inherit PcuScalar. Accepting that ordinary
+// These declared arithmetic/storage traits inherit PcuScalar. Accepting that ordinary
 // Rust bound does not imply an operation or provider supports every member type.
 fn scalar_bound(bound: &syn::TypeParamBound) -> bool {
     matches!(bound, syn::TypeParamBound::Trait(bound)
     if bound.path.segments.last().is_some_and(|segment| matches!(
         segment.ident.to_string().as_str(),
-        "PcuScalar" | "PcuCheckedFloat" | "PcuClampedFloat"
+        "PcuScalar" | "TensorElement" | "PcuCheckedFloat" | "PcuClampedFloat"
             | "PcuCheckedInteger" | "PcuCheckedIntegerDivision"
             | "PcuClampedInteger" | "PcuWrappingInteger"
     )))
@@ -947,6 +1002,8 @@ enum Value {
 }
 
 enum Operation {
+    Constant(Expr),
+    UniformLike(Expr),
     Identity,
     Relu,
     Add,
@@ -1002,23 +1059,58 @@ fn parse_program(
             "an owned tensor result cannot return a reference",
         ));
     }
-    let output = state.lower(expression)?;
-    match &output {
-        Value::Input(index) if input_modes[*index] != SourceMode::ConsumedResident => {
+    let expressions = if let Some(arity) = owned_return_arity(&function.sig.output) {
+        let Expr::Tuple(tuple) = unwrap_transparent(expression)? else {
             return Err(Error::new_spanned(
                 expression,
-                "an owned tensor result cannot return a borrowed input",
+                "tuple owned tensor returns require a tuple of owned values",
             ));
-        }
-        Value::BorrowedInput(_) | Value::BorrowAlias { .. } => {
+        };
+        if tuple.elems.len() != arity {
             return Err(Error::new_spanned(
-                expression,
-                "an owned tensor result cannot return a borrowed value",
+                tuple,
+                "owned tensor return tuple arity does not match the signature",
             ));
         }
-        Value::Input(_) | Value::OwnerAlias { .. } => {}
+        tuple.elems.iter().collect::<Vec<_>>()
+    } else {
+        vec![expression]
+    };
+    let mut outputs = Vec::new();
+    let mut returned_owners = Vec::new();
+    for expression in expressions {
+        let output = state.lower(expression)?;
+        match &output {
+            Value::Input(index) if input_modes[*index] != SourceMode::ConsumedResident => {
+                return Err(Error::new_spanned(
+                    expression,
+                    "an owned tensor result cannot return a borrowed input",
+                ));
+            }
+            Value::BorrowedInput(_) | Value::BorrowAlias { .. } => {
+                return Err(Error::new_spanned(
+                    expression,
+                    "an owned tensor result cannot return a borrowed value",
+                ));
+            }
+            Value::OwnerAlias { owner_id, .. } => {
+                if returned_owners.contains(owner_id) {
+                    return Err(Error::new_spanned(
+                        expression,
+                        "an owned tensor cannot be moved into multiple return tuple positions",
+                    ));
+                }
+                returned_owners.push(*owner_id);
+            }
+            Value::Input(_) => {}
+        }
+        outputs.push(value_tokens(&output, inputs, input_modes, false));
     }
-    let output = value_tokens(&output, inputs, input_modes, false);
+    let output = if owned_return_arity(&function.sig.output).is_some() {
+        quote! { [#(#outputs),*] }
+    } else {
+        outputs.remove(0)
+    };
     Ok(CapturedProgram {
         statements: state.emitted,
         output,
@@ -1068,6 +1160,9 @@ impl<'a> ProgramState<'a> {
     }
 
     fn bind_local(&mut self, local: &Local) -> Result<(), Error> {
+        if matches!(local.pat, Pat::Tuple(_)) {
+            return self.bind_tuple_local(local);
+        }
         let (name, expression) = local_binding(local)?;
         if self.const_args.iter().any(|constant| constant == name) {
             return Err(Error::new_spanned(
@@ -1110,6 +1205,137 @@ impl<'a> ProgramState<'a> {
         Ok(())
     }
 
+    fn bind_tuple_local(&mut self, local: &Local) -> Result<(), Error> {
+        let Pat::Tuple(pattern) = &local.pat else {
+            unreachable!("tuple binding checked");
+        };
+        if !local.attrs.is_empty() || pattern.elems.is_empty() {
+            return Err(composition_body_error(local));
+        }
+        let names = pattern
+            .elems
+            .iter()
+            .map(|pat| {
+                let Pat::Ident(name) = pat else {
+                    return Err(composition_body_error(pat));
+                };
+                if name.mutability.is_some()
+                    || name.by_ref.is_some()
+                    || name.subpat.is_some()
+                    || self.const_args.contains(&name.ident)
+                {
+                    return Err(composition_body_error(pat));
+                }
+                Ok(name.ident.clone())
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let initializer = local
+            .init
+            .as_ref()
+            .ok_or_else(|| composition_body_error(local))?;
+        if initializer.diverge.is_some() {
+            return Err(composition_body_error(local));
+        }
+        let expression = unwrap_transparent(&initializer.expr)?;
+        let expression = if let Expr::Try(syntax) = expression {
+            if !syntax.attrs.is_empty() {
+                return Err(composition_body_error(expression));
+            }
+            unwrap_transparent(&syntax.expr)?
+        } else {
+            expression
+        };
+        let Expr::Call(call) = expression else {
+            return Err(composition_body_error(&initializer.expr));
+        };
+        let Expr::Path(path) = call.func.as_ref() else {
+            return Err(composition_body_error(call));
+        };
+        let capture = self.capture;
+        let call_tokens = if is_pcu_builtin(&path.path, "gradients") {
+            self.lower_gradients(call, names.len())?
+        } else {
+            let operation = operation_for_path(
+                &path.path,
+                &call.func,
+                self.inputs,
+                self.const_args,
+                self.type_args,
+                &self.bindings,
+            )?;
+            let Operation::Helper(helper) = operation else {
+                return Err(composition_body_error(call));
+            };
+            let arguments = call
+                .args
+                .iter()
+                .map(|argument| {
+                    self.lower(argument)
+                        .map(|value| value_tokens(&value, self.inputs, self.input_modes, true))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            quote! { #helper(#capture, #(#arguments),*)? }
+        };
+        let values = names
+            .iter()
+            .map(|_| self.fresh_local("__pcu_tuple_value"))
+            .collect::<Vec<_>>();
+        self.emitted
+            .push(quote! { let [#(#values),*] = #call_tokens; });
+        let crate_path = self.crate_path;
+        for (name, value) in names.into_iter().zip(values) {
+            let owner = self.fresh_local("__pcu_tuple_owner");
+            self.emitted.push(quote! { let #owner = #crate_path::global::PcuTensorGraphOwner::from_graph_value(#value); });
+            let owner_id = self.next_owner_id;
+            self.next_owner_id += 1;
+            self.bindings.push((
+                name,
+                Value::OwnerAlias {
+                    ident: owner,
+                    owner_id,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn lower_gradients(
+        &mut self,
+        call: &ExprCall,
+        arity: usize,
+    ) -> Result<proc_macro2::TokenStream, Error> {
+        let capture = self.capture;
+        if call.args.len() != 2 {
+            return Err(Error::new_spanned(
+                call,
+                "pcu::gradients requires a loss and a nonempty target tuple",
+            ));
+        }
+        let Expr::Tuple(targets) = unwrap_transparent(&call.args[1])? else {
+            return Err(Error::new_spanned(
+                call,
+                "pcu::gradients requires a target tuple",
+            ));
+        };
+        if targets.elems.len() != arity {
+            return Err(Error::new_spanned(
+                call,
+                "gradient target and binding tuple arities must match",
+            ));
+        }
+        let loss = self.lower(&call.args[0])?;
+        let loss = value_tokens(&loss, self.inputs, self.input_modes, false);
+        let targets = targets
+            .elems
+            .iter()
+            .map(|target| {
+                self.lower(target)
+                    .map(|value| value_tokens(&value, self.inputs, self.input_modes, false))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(quote! { #capture.gradients(#loss, [#(#targets),*])? })
+    }
+
     fn lower(&mut self, expression: &Expr) -> Result<Value, Error> {
         LoweringState {
             inputs: self.inputs,
@@ -1128,7 +1354,7 @@ impl<'a> ProgramState<'a> {
 
     fn fresh_local(&mut self, base: &str) -> syn::Ident {
         let reserved = self.generated.iter().collect::<Vec<_>>();
-        let local = fresh_ident(base, &self.inputs[0], &reserved);
+        let local = fresh_ident(base, self.inputs.first().unwrap_or(self.capture), &reserved);
         self.generated.push(local.clone());
         local
     }
@@ -1359,6 +1585,34 @@ impl LoweringState<'_> {
         {
             return Err(composition_body_error(&call.func));
         }
+        if is_pcu_builtin(&path.path, "constant") {
+            if call.args.len() != 1 {
+                return Err(Error::new_spanned(
+                    &call.args,
+                    "pcu::constant requires one inline-const array payload",
+                ));
+            }
+            let payload = constants::immutable_inline_const(&call.args[0])?;
+            return Ok(self.emit(Operation::Constant(payload), &[]));
+        }
+        if is_pcu_builtin(&path.path, "uniform_like") {
+            if call.args.len() != 2 {
+                return Err(Error::new_spanned(
+                    &call.args,
+                    "pcu::uniform_like requires one tensor shape anchor and one inline-const scalar payload",
+                ));
+            }
+            let payload = constants::immutable_inline_const(&call.args[1])?;
+            let anchor = self.lower(&call.args[0], depth + 1)?;
+            let anchor = match anchor {
+                Value::Input(index) if self.input_modes[index] == SourceMode::ConsumedResident => {
+                    Value::BorrowedInput(index)
+                }
+                Value::OwnerAlias { ident, owner_id } => Value::BorrowAlias { ident, owner_id },
+                other => other,
+            };
+            return Ok(self.emit(Operation::UniformLike(payload), &[anchor]));
+        }
         if is_pcu_builtin(&path.path, "sgd_update") {
             if call.args.len() != 3 {
                 return Err(Error::new_spanned(
@@ -1380,7 +1634,8 @@ impl LoweringState<'_> {
             self.bindings,
         )?;
         let expected = match &operation {
-            Operation::Identity | Operation::Relu => Some(1),
+            Operation::Constant(_) => Some(0),
+            Operation::UniformLike(_) | Operation::Identity | Operation::Relu => Some(1),
             Operation::Add
             | Operation::Sub
             | Operation::Mul
@@ -1392,9 +1647,7 @@ impl LoweringState<'_> {
             Operation::SgdUpdate(_) => Some(3),
             Operation::Helper(_) => None,
         };
-        if expected.is_some_and(|expected| call.args.len() != expected)
-            || (call.args.is_empty() && matches!(&operation, Operation::Helper(_)))
-        {
+        if expected.is_some_and(|expected| call.args.len() != expected) {
             return Err(composition_body_error(&call.args));
         }
         let mut values = Vec::with_capacity(call.args.len());
@@ -1407,7 +1660,11 @@ impl LoweringState<'_> {
     #[allow(clippy::cognitive_complexity)] // Preserve the exhaustive operation/ownership lowering table in one cold pass.
     fn emit(&mut self, operation: Operation, sources: &[Value]) -> Value {
         let reserved = self.generated.iter().collect::<Vec<_>>();
-        let temporary = fresh_ident("__pcu_graph_value", &self.inputs[0], &reserved);
+        let temporary = fresh_ident(
+            "__pcu_graph_value",
+            self.inputs.first().unwrap_or(self.capture),
+            &reserved,
+        );
         self.generated.push(temporary.clone());
         let helper_arguments = matches!(&operation, Operation::Helper(_));
         let values = sources
@@ -1415,6 +1672,23 @@ impl LoweringState<'_> {
             .map(|value| value_tokens(value, self.inputs, self.input_modes, helper_arguments));
         let capture = self.capture;
         let call = match operation {
+            // Borrow the inline-const payload so large model literals can be
+            // promoted instead of materializing a proportional caller frame.
+            // Cold capture still copies the data into owned graph storage.
+            Operation::Constant(payload) => {
+                quote! {
+                    #capture.constant_array(const {
+                        // This entire reference is const-evaluated. Clippy's
+                        // array-expression size heuristic is not a runtime
+                        // stack allocation; the small-stack source test guards it.
+                        #[allow(clippy::large_stack_arrays)]
+                        { &(#payload) }
+                    })?
+                }
+            }
+            Operation::UniformLike(payload) => {
+                quote! { #capture.uniform_like(#(#values),*, #payload)? }
+            }
             Operation::Identity => quote! { #capture.identity(#(#values),*)? },
             Operation::Relu => quote! { #capture.relu(#(#values),*)? },
             Operation::ReluBackward => quote! { #capture.relu_backward(#(#values),*)? },
@@ -1564,11 +1838,23 @@ fn source_binding_names(function: &ItemFn) -> Vec<syn::Ident> {
             let syn::Stmt::Local(local) = statement else {
                 return None;
             };
-            let Pat::Ident(pattern) = &local.pat else {
-                return None;
-            };
-            Some(pattern.ident.clone())
+            Some(match &local.pat {
+                Pat::Ident(pattern) => vec![pattern.ident.clone()],
+                Pat::Tuple(pattern) => pattern
+                    .elems
+                    .iter()
+                    .filter_map(|pat| {
+                        if let Pat::Ident(name) = pat {
+                            Some(name.ident.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
         })
+        .flatten()
         .collect()
 }
 
@@ -1678,6 +1964,25 @@ fn fresh_ident(base: &str, input: &syn::Ident, reserved: &[&syn::Ident]) -> syn:
     candidate
 }
 
+fn owned_return_arity(output: &ReturnType) -> Option<usize> {
+    let ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    let Type::Path(result) = super::transparent_type(ty) else {
+        return None;
+    };
+    let syn::PathArguments::AngleBracketed(args) = &result.path.segments.last()?.arguments else {
+        return None;
+    };
+    let syn::GenericArgument::Type(ty) = args.args.first()? else {
+        return None;
+    };
+    let Type::Tuple(tuple) = super::transparent_type(ty) else {
+        return None;
+    };
+    Some(tuple.elems.len())
+}
+
 fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
     let ReturnType::Type(_, ty) = output else {
         return None;
@@ -1698,6 +2003,24 @@ fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
     let Some(syn::GenericArgument::Type(tensor_ty)) = result_args.args.first() else {
         return None;
     };
+    if !matches!(result_args.args.last(), Some(syn::GenericArgument::Type(ty))
+        if matches!(super::transparent_type(ty), Type::Path(error)
+            if error.path.segments.last().is_some_and(|segment| segment.ident == "PcuExecutionError")))
+    {
+        return None;
+    }
+    if let Type::Tuple(tuple) = super::transparent_type(tensor_ty) {
+        let mut scalar = None;
+        for ty in &tuple.elems {
+            let output: ReturnType = syn::parse_quote!(-> Result<#ty, PcuExecutionError>);
+            let element = owned_return_scalar(&output)?;
+            if scalar.as_ref().is_some_and(|scalar| scalar != &element) {
+                return None;
+            }
+            scalar = Some(element);
+        }
+        return scalar;
+    }
     let Type::Path(tensor) = super::transparent_type(tensor_ty) else {
         return None;
     };
@@ -1731,6 +2054,72 @@ fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_argument_producers_and_helpers_emit_without_fabricated_inputs() {
+        for function in [
+            syn::parse_quote! {
+                fn zero<const N: usize>() -> Result<PcuTensor<u32>, PcuExecutionError> {
+                    pcu::constant(const { [7_u32; N] })
+                }
+            },
+            syn::parse_quote! {
+                fn zero() -> Result<PcuTensor<u32>, PcuExecutionError> {
+                    helper()
+                }
+            },
+            syn::parse_quote! {
+                fn zero() -> Result<PcuTensor<f32>, PcuExecutionError> {
+                    let shape = pcu::constant(const { [0_f32; 3] })?;
+                    pcu::uniform_like(&shape, const { 2_f32 })
+                }
+            },
+        ] {
+            let output = expand_owned_return(&function, &syn::parse_quote!(::pcu_alias)).unwrap();
+            syn::parse2::<syn::File>(output).unwrap();
+        }
+        let flagged = syn::parse_quote! {
+            fn zero() -> Result<PcuTensor<f32>, PcuExecutionError> {
+                pcu::constant(const { [1_f32; 3] })
+            }
+        };
+        let output = expand_owned_return_with_flag(
+            &flagged,
+            &syn::parse_quote!(::pcu_alias),
+            Some(super::super::PcuOwnedFlag::IeeeUnderflow),
+        )
+        .unwrap();
+        syn::parse2::<syn::File>(output).unwrap();
+    }
+
+    #[test]
+    fn immutable_tensor_producers_emit_real_owner_nodes_and_reject_dynamic_payloads() {
+        let function: ItemFn = syn::parse_quote! {
+            fn kernel<const N: usize>(input: &[u32; N]) -> Result<PcuTensor<u32>, PcuExecutionError> {
+                let literal = pcu::constant(const { [7_u32; N] })?;
+                let uniform = pcu::uniform_like(input, const { 2_u32 })?;
+                let sum = pcu::add(input, &literal)?;
+                pcu::mul(&sum, &uniform)
+            }
+        };
+        let expanded = expand_owned_return(&function, &syn::parse_quote!(::pcu_alias))
+            .unwrap()
+            .to_string();
+        assert!(expanded.contains("constant_array"));
+        assert!(expanded.contains("uniform_like"));
+        assert!(expanded.contains("const {"));
+        for payload in ["runtime", "[7_u32; N]", "get_payload()"] {
+            let mut invalid = function.clone();
+            invalid.block = syn::parse_str(&format!("{{ pcu::constant({payload}) }}")).unwrap();
+            assert!(expand_owned_return(&invalid, &syn::parse_quote!(::pcu_alias)).is_err());
+        }
+        let generic: ItemFn = syn::parse_quote! {
+            fn identity<T: PcuScalar + TensorElement>(input: &[T]) -> Result<PcuTensor<T>, PcuExecutionError> {
+                pcu::identity(input)
+            }
+        };
+        assert!(expand_owned_return(&generic, &syn::parse_quote!(::pcu_alias)).is_ok());
+    }
 
     #[test]
     fn low_float_owned_helpers_keep_explicit_underflow_policy() {
@@ -2789,5 +3178,93 @@ mod tests {
             }
         };
         assert!(expand_owned_return(&shadowed_helper, &syn::parse_quote!(::pcu_alias)).is_err());
+    }
+    #[test]
+    fn tuple_outputs_capture_one_shared_gradient_request() {
+        let source: ItemFn = syn::parse_quote! {
+            fn train(w1: &[f32], w2: &[f32], target: &[f32])
+                -> Result<(PcuTensor<f32>, PcuTensor<f32>, PcuTensor<f32>), PcuExecutionError>
+            {
+                let prediction = pcu::add(w1, w2)?;
+                let loss = pcu::mean_squared_error(&prediction, target)?;
+                let (g1, g2) = pcu::gradients(&loss, (w1, w2))?;
+                let u1 = pcu::sgd_update(w1, &g1, 1e-6)?;
+                let u2 = pcu::sgd_update(w2, &g2, 1e-6)?;
+                Ok((u1, u2, loss))
+            }
+        };
+        let output = expand_owned_return(&source, &syn::parse_quote!(::pcu_alias)).unwrap();
+        syn::parse2::<syn::File>(output.clone()).unwrap();
+        let tokens = output.to_string();
+        assert!(tokens.contains("call_owned_tensors_capture :: < f32 , 3usize , 3usize , _ >"));
+        assert_eq!(tokens.matches(". gradients (").count(), 1);
+        assert!(!tokens.contains(". gradient ("));
+        assert!(tokens.contains(". map (| ["));
+    }
+
+    #[test]
+    fn tuple_outputs_reject_duplicate_moves_consumed_inputs_and_mixed_scalars() {
+        let duplicate: ItemFn = syn::parse_quote! {
+            fn duplicate(input: &[f32]) -> Result<(PcuTensor<f32>, PcuTensor<f32>), PcuExecutionError> {
+                let value = pcu::relu(input)?;
+                Ok((value, value))
+            }
+        };
+        assert!(
+            expand_owned_return(&duplicate, &syn::parse_quote!(::pcu_alias))
+                .unwrap_err()
+                .to_string()
+                .contains("multiple return tuple positions")
+        );
+        let consumed: ItemFn = syn::parse_quote! {
+            fn consumed(input: PcuTensor<f32>) -> Result<(PcuTensor<f32>,), PcuExecutionError> {
+                Ok((input,))
+            }
+        };
+        assert!(
+            expand_owned_return(&consumed, &syn::parse_quote!(::pcu_alias))
+                .unwrap_err()
+                .to_string()
+                .contains("require borrowed inputs")
+        );
+        let mixed: ItemFn = syn::parse_quote! {
+            fn mixed(input: &[f32]) -> Result<(PcuTensor<f32>, PcuTensor<f64>), PcuExecutionError> {
+                Ok((pcu::relu(input)?, pcu::relu(input)?))
+            }
+        };
+        assert!(declares_owned_tensor_return(&mixed.sig.output));
+        assert!(
+            expand_owned_return(&mixed, &syn::parse_quote!(::pcu_alias))
+                .unwrap_err()
+                .to_string()
+                .contains("homogeneous scalar")
+        );
+    }
+    #[test]
+    fn tuple_helpers_and_generic_singleton_returns_use_array_companions() {
+        let helper: ItemFn = syn::parse_quote! {
+            fn pair<T: PcuScalar>(input: &[T]) -> Result<(PcuTensor<T>, PcuTensor<T>), PcuExecutionError> {
+                Ok((pcu::relu(input)?, pcu::identity(input)?))
+            }
+        };
+        let output = expand_owned_return(&helper, &syn::parse_quote!(::pcu_alias)).unwrap();
+        syn::parse2::<syn::File>(output.clone()).unwrap();
+        assert!(
+            output
+                .to_string()
+                .contains("call_owned_tensors_capture :: < T , 1usize , 2usize , _ >")
+        );
+        let caller: ItemFn = syn::parse_quote! {
+            fn singleton<T: PcuScalar>(input: &[T]) -> Result<(PcuTensor<T>,), PcuExecutionError> {
+                let (a, b) = pair::<T>(input)?;
+                Ok((pcu::add(&a, &b)?,))
+            }
+        };
+        let output = expand_owned_return(&caller, &syn::parse_quote!(::pcu_alias)).unwrap();
+        syn::parse2::<syn::File>(output.clone()).unwrap();
+        let tokens = output.to_string();
+        assert!(tokens.contains("pair :: __pcu_capture :: < T >"));
+        assert!(tokens.contains("call_owned_tensors_capture :: < T , 1usize , 1usize , _ >"));
+        assert!(tokens.contains("PcuTensorGraphOwner :: from_graph_value"));
     }
 }

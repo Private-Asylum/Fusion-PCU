@@ -74,6 +74,10 @@ pub fn validate_integer_checked_div_rem_kernel(
     let allowed_types = scalar_caps | PcuValueTypeCaps::SCALAR_VALUES;
     let allowed_features =
         PcuDispatchFeatureCaps::MUTABLE_RESOURCES | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES;
+    // Guard flat-map admission before recursive capability scanners.
+    if kernel.has_nested_grid_stride_loop() {
+        return Err(IntegerMapValidationError::UnsupportedOperation(0));
+    }
     if kernel.required_type_support().bits() & !allowed_types.bits() != 0
         || kernel.required_feature_support().bits() & !allowed_features.bits() != 0
         || kernel.numerical_requirements.range_policy != PcuRangePolicy::Reject
@@ -253,6 +257,10 @@ pub fn validate_integer_map_kernel(
     let types = scalar_caps | PcuValueTypeCaps::SCALAR_VALUES;
     let features =
         PcuDispatchFeatureCaps::MUTABLE_RESOURCES | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES;
+    // Guard flat-map admission before recursive capability scanners.
+    if kernel.has_nested_grid_stride_loop() {
+        return Err(IntegerMapValidationError::UnsupportedOperation(0));
+    }
     if kernel.required_type_support().bits() & !types.bits() != 0
         || kernel.required_feature_support().bits() & !features.bits() != 0
     {

@@ -10,6 +10,7 @@ pub struct CudaApiCensus {
     pub frees: u64,
     pub host_to_device_copies: u64,
     pub device_to_host_copies: u64,
+    pub device_to_device_copies: u64,
     pub kernel_launches: u64,
     pub event_creates: u64,
     pub event_records: u64,
@@ -21,7 +22,7 @@ pub struct CudaApiCensus {
     /// Explicit device/stream wait time, measured only in the separate instrumentation build.
     pub completion_wait_nanoseconds: u64,
 }
-std::thread_local! { static CENSUS: std::cell::Cell<CudaApiCensus> = const { std::cell::Cell::new(CudaApiCensus { symbol_resolutions: 0, runtime_driver_calls: 0, device_selections: 0, cublas_calls: 0, cublaslt_matmul_calls: 0, allocations: 0, frees: 0, host_to_device_copies: 0, device_to_host_copies: 0, kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0, device_synchronizations: 0, stream_synchronizations: 0, completion_wait_nanoseconds: 0 }) }; }
+std::thread_local! { static CENSUS: std::cell::Cell<CudaApiCensus> = const { std::cell::Cell::new(CudaApiCensus { symbol_resolutions: 0, runtime_driver_calls: 0, device_selections: 0, cublas_calls: 0, cublaslt_matmul_calls: 0, allocations: 0, frees: 0, host_to_device_copies: 0, device_to_host_copies: 0, device_to_device_copies: 0, kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0, device_synchronizations: 0, stream_synchronizations: 0, completion_wait_nanoseconds: 0 }) }; }
 #[must_use]
 pub fn cuda_api_census() -> CudaApiCensus {
     CENSUS.get()
@@ -55,6 +56,7 @@ pub(super) fn call(name: &str, copy_direction: Option<i32>) {
             "cudaMemcpy" | "cudaMemcpyAsync" => match copy_direction {
                 Some(1) => census.host_to_device_copies += 1,
                 Some(2) => census.device_to_host_copies += 1,
+                Some(3) => census.device_to_device_copies += 1,
                 _ => (),
             },
             _ => (),

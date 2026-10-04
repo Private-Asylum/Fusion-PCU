@@ -14,6 +14,7 @@ use super::{
 pub(super) fn portable_plan(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<MlxCheckedUnaryPlan, MlxError> {
+    crate::dispatch_shape::require_non_nested(kernel)?;
     if cfg!(target_endian = "big") {
         return Err(MlxError::InvalidRequest(
             "MLX Portable unary requires little-endian exact carriers".into(),
@@ -27,6 +28,7 @@ pub(super) fn portable_plan(
 pub(super) fn normal_plan(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<MlxCheckedUnaryPlan, MlxError> {
+    crate::dispatch_shape::require_non_nested(kernel)?;
     if cfg!(target_endian = "big") {
         return Err(MlxError::InvalidRequest(
             "MLX checked unary requires little-endian exact carriers".into(),

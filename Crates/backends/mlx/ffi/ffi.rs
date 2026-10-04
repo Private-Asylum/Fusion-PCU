@@ -16,6 +16,8 @@ pub use rust::{
     CarrierCopy,
     Transport,
     Composed,
+    Conversion,
+    ReluBackward,
     as_f32,
     as_f32_mut,
 };
@@ -61,3 +63,12 @@ pub use rust::{
     integer_call_census,
     reset_integer_call_census,
 };
+
+#[cfg(feature = "tensor")]
+pub use rust::StrictMatMul;
+
+#[cfg(feature = "tensor")]
+pub use rust::StrictSgd;
+
+#[cfg(feature="tensor")]
+pub use rust::StrictMse;

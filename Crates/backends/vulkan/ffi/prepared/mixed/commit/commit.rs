@@ -33,6 +33,8 @@ pub(in crate::ffi::prepared) struct Commit {
 }
 impl Commit {
     pub(super) fn new(device: &Rc<VulkanDevice>) -> Result<Self, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        let _api_scope = device.api_scope();
         if device.poisoned.get() {
             return Err(PcuVulkanError::Quarantined);
         }
@@ -45,7 +47,7 @@ impl Commit {
             command,
             fence: fence.handle,
         };
-        mem::forget((pool, fence));
+        vk_transfer_guards!(pool, fence);
         Ok(result)
     }
     pub(super) fn execute(
@@ -75,17 +77,27 @@ impl Commit {
         let device = &self.device.device;
         vk_try("reset retained public commit command", unsafe {
             // SAFETY: Prior submissions are terminal; this uniquely owned pool permits reset.
-            device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+            vk_api_owner!(
+                self.device,
+                ResetCommandBuffer,
+                device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+            )
         })?;
         vk_try("reset retained public commit fence", unsafe {
             // SAFETY: Every preceding call is terminal and this fence is not in use.
-            device.reset_fences(&[self.fence])
+            vk_api_owner!(self.device, ResetFences, device.reset_fences(&[self.fence]))
         })?;
-        record(device, self.command, regions)?;
+        record(
+            device,
+            #[cfg(feature = "insights")]
+            self.device.api_insights.as_deref(),
+            self.command,
+            regions,
+        )?;
         // Mutation is possible only when the validated public transfer is submitted. Earlier
         // argument failures, private-kernel faults and command-recording failures preserve Ready.
         state.may_have_written = true;
-        if let Err(error) = submit_and_wait(device, self.device.queue, self.command, self.fence) {
+        if let Err(error) = submit_and_wait(&self.device, self.command, self.fence) {
             // This error is the native submission protocol's explicit lack of quiescence proof,
             // rather than a facade guess from an arbitrary public error variant.
             if matches!(error, PcuVulkanError::CompletionUnknown) {
@@ -100,12 +112,17 @@ impl Commit {
 }
 fn record(
     device: &ash::Device,
+    #[cfg(feature = "insights")] api_insights: Option<&crate::PcuVulkanApiInsights>,
     command: vk::CommandBuffer,
     regions: &[Region<'_>],
 ) -> Result<(), PcuVulkanError> {
     vk_try("begin exact public Vulkan commit", unsafe {
         // SAFETY: Retained command belongs to a reset, nonpending pool.
-        device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+        vk_api_retained!(
+            api_insights,
+            BeginCommandBuffer,
+            device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+        )
     })?;
     unsafe {
         // SAFETY: Private compute outputs and exclusive public destination owners remain live
@@ -117,27 +134,35 @@ fn record(
                     | vk::AccessFlags::TRANSFER_WRITE,
             )
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)];
-        device.cmd_pipeline_barrier(
-            command,
-            vk::PipelineStageFlags::COMPUTE_SHADER
-                | vk::PipelineStageFlags::HOST
-                | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &readable,
-            &[],
-            &[],
+        vk_api_retained!(
+            api_insights,
+            PipelineBarrier,
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::HOST
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &readable,
+                &[],
+                &[],
+            )
         );
         for region in regions {
             // VkBufferCopy permits any positive exact byte size. Deliberately do not round
             // packed tails up: caller-owned U8/FP8/F16/BF16 suffix carriers must stay unchanged.
             // https://docs.vulkan.org/refpages/latest/refpages/source/VkBufferCopy.html
             // https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyBuffer.html
-            device.cmd_copy_buffer(
-                command,
-                region.source,
-                region.target.descriptor_info().buffer,
-                &[vk::BufferCopy::default().size(region.bytes as u64)],
+            vk_api_retained!(
+                api_insights,
+                CopyBuffer,
+                device.cmd_copy_buffer(
+                    command,
+                    region.source,
+                    region.target.descriptor_info().buffer,
+                    &[vk::BufferCopy::default().size(region.bytes as u64)],
+                )
             );
         }
         let visible = [vk::MemoryBarrier::default()
@@ -147,21 +172,29 @@ fn record(
                     | vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::TRANSFER_READ,
             )];
-        device.cmd_pipeline_barrier(
-            command,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::HOST
-                | vk::PipelineStageFlags::COMPUTE_SHADER
-                | vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &visible,
-            &[],
-            &[],
+        vk_api_retained!(
+            api_insights,
+            PipelineBarrier,
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &visible,
+                &[],
+                &[],
+            )
         );
     }
     vk_try("end exact public Vulkan commit", unsafe {
         // SAFETY: Command is recording and every referenced live owner outlives submission.
-        device.end_command_buffer(command)
+        vk_api_retained!(
+            api_insights,
+            EndCommandBuffer,
+            device.end_command_buffer(command)
+        )
     })
 }
 impl Drop for Commit {
@@ -172,8 +205,16 @@ impl Drop for Commit {
         unsafe {
             // SAFETY: All submitted work is terminal; this uniquely owned pool/fence is retained
             // until completion and destroyed before its logical-device owner.
-            self.device.device.destroy_fence(self.fence, None);
-            self.device.device.destroy_command_pool(self.pool, None);
+            vk_api_owner!(
+                self.device,
+                DestroyFence,
+                self.device.device.destroy_fence(self.fence, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyCommandPool,
+                self.device.device.destroy_command_pool(self.pool, None)
+            );
         }
     }
 }

@@ -597,10 +597,10 @@ fn sample_resident<const N: usize, E: Error + 'static>(
     let mut pcu_walls = [Duration::ZERO; 32];
     let mut native_walls = [Duration::ZERO; 32];
     let mut paired_ratios = [0.0_f64; 32];
-    for sample in 0..32 {
+    for sample in 0_usize..32 {
         let values = fresh_input::<N>(u64::try_from(sample)? + 1_000_000);
         fill_oracle(&values, oracle);
-        for pcu_target in [sample % 2 == 0, sample % 2 != 0] {
+        for pcu_target in [sample.is_multiple_of(2), !sample.is_multiple_of(2)] {
             if pcu_target {
                 backend.refresh_buffer(pool, input, &values)?;
                 let started = Instant::now();

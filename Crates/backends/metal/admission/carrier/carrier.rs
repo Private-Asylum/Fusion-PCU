@@ -62,6 +62,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedCarrierKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         super::require_scalar_numerics(kernel)?;
         let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
             kernel.bindings.first().map(|b| b.binding_type)
@@ -114,6 +115,9 @@ impl MetalSession {
 }
 
 pub fn is_carrier_kernel(kernel: &PcuDispatchKernelIr<'_>) -> bool {
+    if crate::dispatch_shape::require_non_nested(kernel).is_err() {
+        return false;
+    }
     let Some(PcuBindingType::Value(PcuValueType::Scalar(scalar))) =
         kernel.bindings.first().map(|b| b.binding_type)
     else {

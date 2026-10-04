@@ -36,6 +36,8 @@ pub struct VulkanNativeDevice {
 
 impl VulkanNativeDevice {
     pub fn discover() -> Result<Vec<Self>, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        crate::api_insights::count_attached(crate::PcuVulkanApiPoint::LoaderLoad);
         let entry = unsafe {
             // SAFETY: ash resolves process-local Vulkan loader entry points.
             ash::Entry::load()
@@ -43,11 +45,16 @@ impl VulkanNativeDevice {
         .map_err(PcuVulkanError::Loader)?;
         let api = choose_instance_api_version(&entry)?;
         let instance = VulkanProbeInstance {
+            #[cfg(feature = "insights")]
+            api_insights: crate::api_insights::attached(),
             handle: create_instance(&entry, api)?,
         };
         let devices = vk_try("enumerate Vulkan discovery devices", unsafe {
             // SAFETY: The probe instance remains live through all physical queries.
-            instance.handle.enumerate_physical_devices()
+            vk_api_cold!(
+                EnumeratePhysicalDevices,
+                instance.handle.enumerate_physical_devices()
+            )
         })?;
         let mut inventory = Vec::new();
         for (ordinal, physical) in devices.into_iter().enumerate() {
@@ -76,7 +83,10 @@ fn describe(
 ) -> Result<VulkanNativeDevice, PcuVulkanError> {
     let properties = unsafe {
         // SAFETY: physical belongs to this live probe instance.
-        instance.get_physical_device_properties(physical)
+        vk_api_cold!(
+            PhysicalDeviceProperties,
+            instance.get_physical_device_properties(physical)
+        )
     };
     let caps = query_backend_caps(
         instance,
@@ -143,7 +153,10 @@ pub(super) fn select_native_device(
 ) -> Result<SelectedPhysicalDevice, PcuVulkanError> {
     let devices = vk_try("enumerate Vulkan selected device", unsafe {
         // SAFETY: Native activation owns this live instance.
-        instance.enumerate_physical_devices()
+        vk_api_cold!(
+            EnumeratePhysicalDevices,
+            instance.enumerate_physical_devices()
+        )
     })?;
     let physical_device = *devices
         .get(expected.ordinal as usize)
@@ -161,7 +174,10 @@ pub(super) fn select_native_device(
         .ok_or(PcuVulkanError::NoComputeQueueFamily)?;
     let properties = unsafe {
         // SAFETY: The selected physical handle was returned by this instance.
-        instance.get_physical_device_properties(physical_device)
+        vk_api_cold!(
+            PhysicalDeviceProperties,
+            instance.get_physical_device_properties(physical_device)
+        )
     };
     Ok(SelectedPhysicalDevice {
         physical_device,

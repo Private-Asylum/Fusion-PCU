@@ -33,6 +33,7 @@ impl MlxCheckedDivRemPlan {
     /// # Errors
     /// Rejects unsupported type/schema/extent, Clamp, ineligible Portable or repeated mathematical operands.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let invalid = || MlxError::InvalidRequest("unsupported MLX checked DivRem profile".into());
         if cfg!(target_endian = "big")
             || kernel.entry.logical_shape[1..] != [1, 1]
@@ -208,6 +209,7 @@ pub(super) fn checked_bytes(scalar: PcuScalarType, count: usize) -> Result<usize
 
 /// Exact descriptor admission is separate from the scalar arithmetic permissions.
 pub(super) fn validate_reproducibility(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), MlxError> {
+    crate::dispatch_shape::require_non_nested(kernel)?;
     if kernel
         .numerical_requirements
         .numerical_options

@@ -21,6 +21,8 @@ mod carrier;
 mod checked;
 #[path = "composed/composed.rs"]
 mod composed;
+#[path = "conversion/conversion.rs"]
+mod conversion;
 #[path = "device/device.rs"]
 mod device;
 #[path = "div_rem/div_rem.rs"]
@@ -38,6 +40,8 @@ mod owner;
 #[cfg(feature = "tensor")]
 #[path = "prepared/prepared.rs"]
 mod prepared;
+#[path = "relu_backward/relu_backward.rs"]
+mod relu_backward;
 #[path = "session/session.rs"]
 mod session;
 #[path = "text/text.rs"]
@@ -60,6 +64,8 @@ pub use {
     carrier::CarrierCopy,
     transport::Transport,
     composed::Composed,
+    conversion::Conversion,
+    relu_backward::ReluBackward,
 };
 #[cfg(feature = "tensor")]
 pub use prepared::PreparedMatmul;
@@ -107,3 +113,21 @@ pub use integer::census::{
     integer_call_census,
     reset_integer_call_census,
 };
+
+#[cfg(feature = "tensor")]
+#[path = "strict_matmul/strict_matmul.rs"]
+mod strict_matmul;
+#[cfg(feature = "tensor")]
+pub use strict_matmul::StrictMatMul;
+
+#[cfg(feature = "tensor")]
+#[path = "strict_sgd/strict_sgd.rs"]
+mod strict_sgd;
+#[cfg(feature = "tensor")]
+pub use strict_sgd::StrictSgd;
+
+#[cfg(feature="tensor")]
+#[path="strict_mse/strict_mse.rs"]
+mod strict_mse;
+#[cfg(feature="tensor")]
+pub use strict_mse::StrictMse;

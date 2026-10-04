@@ -176,8 +176,12 @@ impl Plan {
         for &index in &self.literals {
             let node = view.node(index)?;
             let layout = view.physical_layout(node.value)?;
-            let resource = if node.scalar_type == PcuScalarType::F64 {
-                super::literal::upload_f64(node, layout, None, pool, memory)?
+            let resource = if node.scalar_type == PcuScalarType::F64
+                || super::is_low_float_type(node.scalar_type)
+                || super::is_raw_float_type(node.scalar_type)
+                || super::is_checked_integer_scalar(node.scalar_type)
+            {
+                super::literal::upload_dense(node, layout, None, pool, memory)?
             } else {
                 match node.op {
                     OpDescriptor::Constant(value) => super::upload_tensor(

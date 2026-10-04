@@ -87,6 +87,7 @@ impl MlxCheckedBinaryPlan {
     /// Rejects unsupported formats, Portable requests, mismatched headers or malformed source maps.
     #[allow(clippy::too_many_lines)] // Detached schema, request and actual operand gate must remain one cold admission.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let invalid = || MlxError::InvalidRequest("unsupported MLX checked binary profile".into());
         if cfg!(target_endian = "big")
             || kernel.entry.logical_shape[1..] != [1, 1]
@@ -289,6 +290,8 @@ impl PcuHostKernelBackend for MlxCheckedBinaryBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCheckedBinaryPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         self.prepare_plan(plan, None)
     }
@@ -304,6 +307,8 @@ impl MlxCheckedBinaryBackend {
         kernel: &PcuDispatchKernelIr<'_>,
         extents: &[usize],
     ) -> Result<MlxPreparedBinaryHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCheckedBinaryPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         let full = plan
             .assess_input_extents(extents)

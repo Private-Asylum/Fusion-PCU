@@ -15,6 +15,7 @@ mod x86;
 /// Native vector methods are static monomorphized calls, never a warm trait-object table.
 trait Vector {
     type Bits: Copy;
+    const BYTES: usize;
     unsafe fn load(pointer: *const u8) -> Self::Bits;
     unsafe fn store(pointer: *mut u8, value: Self::Bits);
     unsafe fn add<const SIZE: usize>(a: Self::Bits, b: Self::Bits) -> Self::Bits;
@@ -26,7 +27,23 @@ trait Vector {
     /// All bits of each lane become its original sign bit.
     unsafe fn signs<const SIZE: usize>(value: Self::Bits) -> Self::Bits;
     /// One bit per byte. Only the high byte of each masked native lane is nonzero.
-    unsafe fn mask(value: Self::Bits) -> u32;
+    unsafe fn mask(value: Self::Bits) -> u64;
+    /// Enters this vector family's guarded target-feature loop.
+    #[allow(clippy::too_many_arguments)] // Same complete transaction boundary for each ISA.
+    unsafe fn execute<
+        T: PcuCheckedInteger,
+        const OP: u8,
+        const CLAMP: bool,
+        const LB: bool,
+        const RB: bool,
+    >(
+        left: &[u8],
+        right: &[u8],
+        output: &mut [u8],
+        extent: usize,
+        broadcast_left: &[u8; 64],
+        broadcast_right: &[u8; 64],
+    ) -> Result<(), PcuCpuCheckedIntegerError>;
 }
 
 pub(super) fn prepare<T: PcuCheckedInteger>(
@@ -71,6 +88,10 @@ pub(super) fn prepare<T: PcuCheckedInteger>(
     let selected = match implementation {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         PcuCpuImplementation::Sse2 => operation!(x86::Sse2),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        PcuCpuImplementation::Avx2 => operation!(x86::Avx2),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        PcuCpuImplementation::Avx512 => operation!(x86::Avx512),
         #[cfg(target_arch = "aarch64")]
         PcuCpuImplementation::Neon => operation!(neon::Neon),
         _ => return Err(PcuCpuCheckedIntegerError::UnsupportedProfile),
@@ -97,8 +118,8 @@ fn run<
     let left = &left[..if LB { size } else { extent * size }];
     let right = &right[..if RB { size } else { extent * size }];
     let output = &mut output[..extent * size];
-    let mut a = [0u8; 16];
-    let mut b = [0u8; 16];
+    let mut a = [0u8; 64];
+    let mut b = [0u8; 64];
     if LB {
         for chunk in a.chunks_exact_mut(size) {
             chunk.copy_from_slice(left);
@@ -110,8 +131,8 @@ fn run<
         }
     }
     // SAFETY: Private prepared function pointer is chosen only after detected ISA admission;
-    // T is sealed, byte spans are complete/disjoint, broadcasts copied to initialized16-byte storage.
-    unsafe { execute::<T, V, OP, CLAMP, LB, RB>(left, right, output, extent, &a, &b) }
+    // T is sealed, byte spans are complete/disjoint, broadcasts copied to initialized64-byte storage.
+    unsafe { V::execute::<T, OP, CLAMP, LB, RB>(left, right, output, extent, &a, &b) }
 }
 
 fn scalar<T: PcuCheckedInteger, const OP: u8>(
@@ -126,11 +147,8 @@ fn scalar<T: PcuCheckedInteger, const OP: u8>(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // The vector transaction and scalar exact fault/tail bridge remain one guarded loop law.
-#[cfg_attr(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature(enable = "sse2")
-)]
-#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+#[allow(clippy::inline_always)] // Inline the shared loop into its ISA wrapper so target-feature calls vanish per vector.
+#[inline(always)]
 unsafe fn execute<
     T: PcuCheckedInteger,
     V: Vector,
@@ -143,11 +161,11 @@ unsafe fn execute<
     right: &[u8],
     output: &mut [u8],
     extent: usize,
-    broadcast_left: &[u8; 16],
-    broadcast_right: &[u8; 16],
+    broadcast_left: &[u8; 64],
+    broadcast_right: &[u8; 64],
 ) -> Result<(), PcuCpuCheckedIntegerError> {
     let size = T::HOST_SIZE;
-    let lanes = 16 / size;
+    let lanes = V::BYTES / size;
     let vectors = extent / lanes;
     let prefix = vectors * lanes;
     let signed = matches!(
@@ -157,17 +175,17 @@ unsafe fn execute<
             | fusion_pcu::PcuScalarType::I32
             | fusion_pcu::PcuScalarType::I64
     );
-    let mut sign = [0u8; 16];
-    let mut maximum = [255u8; 16];
-    let mut minimum = [0u8; 16];
-    for i in (size - 1..16).step_by(size) {
+    let mut sign = [0u8; 64];
+    let mut maximum = [255u8; 64];
+    let mut minimum = [0u8; 64];
+    for i in (size - 1..V::BYTES).step_by(size) {
         sign[i] = 128;
         if signed {
             maximum[i] = 127;
             minimum[i] = 128;
         }
     }
-    // SAFETY: Every method is guarded by the cold ISA proof. Local masks contain16 initialized
+    // SAFETY: Every method is guarded by the cold ISA proof. Local masks contain64 initialized
     // bytes; native spans cover every complete vector below prefix. No typed alignment required.
     unsafe {
         let sign = V::load(sign.as_ptr());

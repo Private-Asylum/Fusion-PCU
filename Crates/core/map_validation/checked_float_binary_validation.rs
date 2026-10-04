@@ -88,6 +88,12 @@ fn validate_canonical_binary_kernel(
     let allowed_features = PcuDispatchFeatureCaps::MUTABLE_RESOURCES
         | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES
         | PcuDispatchFeatureCaps::RANGE_CLAMP;
+    // Guard flat-map admission before recursive capability scanners.
+    if kernel.has_nested_grid_stride_loop() {
+        return Err(CheckedFloatBinaryMapValidationError::UnsupportedOperation(
+            0,
+        ));
+    }
     if kernel.required_type_support().bits() & !allowed_types.bits() != 0
         || kernel.required_feature_support().bits() & !allowed_features.bits() != 0
         || !scalar_caps.contains(required_scalar_cap)

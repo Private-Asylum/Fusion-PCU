@@ -4,12 +4,12 @@ use fusion_pcu::{
     PcuBindingAccess,
     PcuHostArgument,
 };
-use fusion_pcu_spirv::PcuSpirvComposedFloatProfile;
+use fusion_pcu_spirv::PcuSpirvComposedProfile;
 use crate::PcuVulkanError;
 
 pub(super) fn validate(
     arguments: &[PcuHostArgument<'_>],
-    profile: &PcuSpirvComposedFloatProfile,
+    profile: &PcuSpirvComposedProfile,
 ) -> Result<[usize; 4], PcuVulkanError> {
     if arguments.len() != profile.declarations().len() {
         return Err(PcuVulkanError::InvalidArguments);
@@ -25,7 +25,7 @@ pub(super) fn validate(
         }
         let argument = &arguments[position];
         if argument.scalar() != profile.scalar()
-            || Some(argument.access()) != profile.declaration_access(slot)
+            || Some(argument.access()) != profile.argument_access(slot)
         {
             return Err(PcuVulkanError::InvalidArguments);
         }

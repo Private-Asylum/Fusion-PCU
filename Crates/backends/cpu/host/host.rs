@@ -282,6 +282,10 @@ impl PcuHostKernelBackend for PcuCpuHostBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        // Reject once before primitive/composed/transport fallback can inspect IR.
+        if kernel.has_nested_grid_stride_loop() {
+            return Err(PcuCpuHostError::UnsupportedProfile);
+        }
         let primitive = self.prepare_primitive(kernel);
         #[cfg(any(feature = "std", feature = "tensor"))]
         if matches!(
@@ -653,6 +657,20 @@ pub use offers::{
 pub fn validated_region<'a>(
     kernel: &PcuDispatchKernelIr<'a>,
 ) -> Result<&'a [PcuDispatchOp<'a>], PcuCpuHostError> {
+    // Refuse nesting before typed/capability scans can follow cyclic public IR.
+    let bounded_body = match kernel.ops {
+        [
+            PcuDispatchOp::GridStrideLoop { body, .. },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ] => *body,
+        _ => kernel.ops,
+    };
+    if bounded_body
+        .iter()
+        .any(|operation| matches!(operation, PcuDispatchOp::GridStrideLoop { .. }))
+    {
+        return Err(PcuCpuHostError::UnsupportedProfile);
+    }
     validate_portable_region(kernel)?;
     if kernel.entry.logical_shape.contains(&0) {
         return Err(PcuCpuHostError::InvalidLogicalShape(
@@ -741,6 +759,10 @@ fn validate_portable_region(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), PcuC
         .reproducibility
         == fusion_pcu::PcuReproducibility::PortableV1
     {
+        #[cfg(any(feature = "std", feature = "tensor"))]
+        if fusion_pcu::describe_portable_v1_checked_integer_composed_map::<4>(kernel).is_ok() {
+            return Ok(());
+        }
         if fusion_pcu::describe_portable_v1_integer_map(kernel).is_ok()
             || fusion_pcu::describe_portable_v1_integer_div_rem_map(kernel).is_ok()
             || fusion_pcu::describe_portable_v1_unary_map(kernel).is_ok()

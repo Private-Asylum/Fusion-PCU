@@ -286,7 +286,7 @@ fn ordered<T: Format>(backend: &PcuVulkanBackend) {
 #[test]
 #[ignore = "requires actual Vulkan hardware; ordinary composed source and private transactions"]
 fn six_format_source_graph_private_transactions_and_ordered_stores() {
-    let backend = PcuVulkanBackend::new().unwrap();
+    let backend = selected_template_source();
     for mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
         for compound in [
             PcuCompoundArithmeticPolicy::Checked,
@@ -319,8 +319,21 @@ fn six_format_source_graph_private_transactions_and_ordered_stores() {
 #[ignore = "requires actual Vulkan hardware; bounded smoke before full encoding proof"]
 fn small_static_native_source_smoke() {
     global::use_defaults().unwrap();
-    let backend = PcuVulkanBackend::new().unwrap();
+    let backend = selected_template_source();
     width::<pcu_facade::PcuF8E4M3FnBits>(&backend);
     width::<f32>(&backend);
     width::<f64>(&backend);
+}
+
+fn selected_template_source() -> PcuVulkanBackend {
+    let backend = PcuVulkanBackend::new().unwrap();
+    if let Some(directory) = std::env::var_os("PCU_COMPOSED_PACKAGES") {
+        backend.configure_shader_source(
+            fusion_pcu_vulkan::PcuVulkanShaderSource::ExternalComposed {
+                directory: directory.into(),
+                retain_in_memory: true,
+            },
+        );
+    }
+    backend
 }

@@ -461,7 +461,7 @@ fn integer_body(
         .collect()
 }
 #[test]
-fn fourteen_structural_integer_maps_and_ten_provider_composed_profiles() {
+fn fourteen_structural_integer_maps_and_provider_composed_profiles() {
     for scalar in [
         PcuScalarType::U8,
         PcuScalarType::I8,
@@ -510,17 +510,6 @@ fn fourteen_structural_integer_maps_and_ten_provider_composed_profiles() {
                 )
                 .is_ok()
             );
-            if matches!(
-                scalar,
-                PcuScalarType::U256
-                    | PcuScalarType::I256
-                    | PcuScalarType::U512
-                    | PcuScalarType::I512
-            ) {
-                assert!(super::composed::project(&kernel).is_none());
-                assert!(super::lower_dispatch_to_cuda_source(&kernel).is_err());
-                continue;
-            }
             assert!(
                 super::composed::project(&kernel).is_some(),
                 "genuine composed integer structural profile {scalar:?} grid={grid}"
@@ -536,8 +525,142 @@ fn fourteen_structural_integer_maps_and_ten_provider_composed_profiles() {
                 !projection.contains_output(PcuBindingRef::new(0, 2)),
                 "untouched mutable declaration is not a physical resource"
             );
+            let mut portable = kernel;
+            portable
+                .numerical_requirements
+                .numerical_options
+                .reproducibility = fusion_pcu::PcuReproducibility::PortableV1;
+            let qualified = true;
+            assert_eq!(
+                crate::admission::portable_integer_composed_contract(&portable),
+                qualified
+            );
+            assert_eq!(
+                super::lower_dispatch_to_cuda_source(&portable).is_ok(),
+                qualified
+            );
         }
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep all requested policy axes beside the exact emitter comparison.
+fn portable_fourteen_integer_composition_retains_identical_checked_emission() {
+    #[rustfmt::skip]
+    use fusion_pcu::{
+        PcuCompoundArithmeticPolicy,
+        PcuNumericalMode,
+        PcuPrecisionPolicy,
+        PcuReproducibility,
+    };
+    let mut cases = 0;
+    for scalar in [
+        PcuScalarType::I8,
+        PcuScalarType::U8,
+        PcuScalarType::I16,
+        PcuScalarType::U16,
+        PcuScalarType::I32,
+        PcuScalarType::U32,
+        PcuScalarType::I64,
+        PcuScalarType::U64,
+        PcuScalarType::I128,
+        PcuScalarType::U128,
+        PcuScalarType::I256,
+        PcuScalarType::U256,
+        PcuScalarType::I512,
+        PcuScalarType::U512,
+    ] {
+        let bindings = bindings(scalar);
+        for numerical_mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
+            for compound in [
+                PcuCompoundArithmeticPolicy::Checked,
+                PcuCompoundArithmeticPolicy::BackendDefined,
+            ] {
+                for precision in [
+                    PcuPrecisionPolicy::Preserve,
+                    PcuPrecisionPolicy::BackendOptimized,
+                ] {
+                    for underflow in [
+                        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                        PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+                        PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                    ] {
+                        for range in [PcuRangePolicy::Reject, PcuRangePolicy::Clamp] {
+                            for grid in [false, true] {
+                                let index = if grid {
+                                    PcuDispatchIndex::GridStrideId
+                                } else {
+                                    PcuDispatchIndex::InvocationId
+                                };
+                                let mut body = integer_body(scalar, index, false);
+                                for op in &mut body {
+                                    if let PcuDispatchOp::Data(
+                                        PcuDispatchDataOp::CheckedIntegerBinary {
+                                            range_policy,
+                                            ..
+                                        },
+                                    ) = op
+                                    {
+                                        *range_policy = range;
+                                    }
+                                }
+                                if !grid {
+                                    body.push(PcuDispatchOp::Control(PcuDispatchControlOp::Return));
+                                }
+                                let outer = [
+                                    PcuDispatchOp::GridStrideLoop {
+                                        extent: 19,
+                                        body: &body,
+                                    },
+                                    PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+                                ];
+                                let mut kernel = fixture(
+                                    scalar,
+                                    if grid { 3 } else { 19 },
+                                    &bindings,
+                                    if grid { &outer } else { &body },
+                                );
+                                kernel.feature_caps = kernel
+                                    .feature_caps
+                                    .union(PcuDispatchFeatureCaps::RANGE_CLAMP);
+                                kernel.numerical_requirements.numerical_mode = numerical_mode;
+                                kernel
+                                    .numerical_requirements
+                                    .numerical_options
+                                    .compound_arithmetic = compound;
+                                kernel.numerical_requirements.numerical_options.precision =
+                                    precision;
+                                kernel.numerical_requirements.float_underflow = underflow;
+                                kernel.numerical_requirements.range_policy = range;
+                                let normal = super::lower_dispatch_to_cuda_source(&kernel).unwrap();
+                                kernel
+                                    .numerical_requirements
+                                    .numerical_options
+                                    .reproducibility = PcuReproducibility::PortableV1;
+                                assert!(crate::admission::portable_integer_composed_contract(
+                                    &kernel
+                                ));
+                                assert!(crate::admission::checked_numeric_contract(&kernel));
+                                let portable =
+                                    super::lower_dispatch_to_cuda_source(&kernel).unwrap();
+                                // Complete requested metadata stays in the first-line comment/cache identity.
+                                assert!(portable.lines().next().unwrap().contains("PortableV1"));
+                                assert!(normal.lines().next().unwrap().contains("Unspecified"));
+                                assert_eq!(
+                                    portable.split_once('\n').unwrap().1,
+                                    normal.split_once('\n').unwrap().1
+                                );
+                                let schema = fusion_pcu::describe_portable_v1_checked_integer_composed_map::<4>(&kernel).unwrap();
+                                assert_eq!(schema.requirements, kernel.numerical_requirements);
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 1344);
 }
 
 #[test]
@@ -585,6 +708,117 @@ fn integer_primitive_projection_stays_distinct_from_composition() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Exhaustive typed extrema share direct/grid and refusal witnesses.
+fn primitive_integer_literals_preserve_full_bits_in_direct_and_grid_composition() {
+    for (scalar, value, cpp_type, bits) in [
+        (
+            PcuScalarType::U8,
+            PcuParameterValue::U8(u8::MAX),
+            "unsigned char",
+            0xff_u64,
+        ),
+        (
+            PcuScalarType::I8,
+            PcuParameterValue::I8(i8::MIN),
+            "signed char",
+            0x80,
+        ),
+        (
+            PcuScalarType::U16,
+            PcuParameterValue::U16(u16::MAX),
+            "unsigned short",
+            0xffff,
+        ),
+        (
+            PcuScalarType::I16,
+            PcuParameterValue::I16(i16::MIN),
+            "short",
+            0x8000,
+        ),
+        (
+            PcuScalarType::U32,
+            PcuParameterValue::U32(u32::MAX),
+            "unsigned int",
+            0xffff_ffff,
+        ),
+        (
+            PcuScalarType::I32,
+            PcuParameterValue::I32(i32::MIN),
+            "int",
+            0x8000_0000,
+        ),
+        (
+            PcuScalarType::U64,
+            PcuParameterValue::U64(u64::MAX),
+            "unsigned long long",
+            u64::MAX,
+        ),
+        (
+            PcuScalarType::I64,
+            PcuParameterValue::I64(i64::MIN),
+            "long long",
+            0x8000_0000_0000_0000,
+        ),
+    ] {
+        let bindings = bindings(scalar);
+        for grid in [false, true] {
+            let index = if grid {
+                PcuDispatchIndex::GridStrideId
+            } else {
+                PcuDispatchIndex::InvocationId
+            };
+            let mut body = integer_body(scalar, index, false);
+            body[1] = PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(2),
+                value,
+            });
+            if !grid {
+                body.push(PcuDispatchOp::Control(PcuDispatchControlOp::Return));
+            }
+            let outer = [
+                PcuDispatchOp::GridStrideLoop {
+                    extent: 19,
+                    body: &body,
+                },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = fixture(
+                scalar,
+                if grid { 3 } else { 19 },
+                &bindings,
+                if grid { &outer } else { &body },
+            );
+            let projection = super::composed::project(&kernel).expect("typed literal composition");
+            assert_eq!(projection.input_bindings(), [PcuBindingRef::new(0, 0)]);
+            let source = super::lower_dispatch_to_cuda_source(&kernel).unwrap();
+            assert!(source.contains(&format!("{cpp_type} v2 = __builtin_bit_cast({cpp_type},")));
+            assert!(source.contains(&format!("0x{bits:016x}ull")));
+            assert!(super::lower_dispatch_to_cuda_rtc_source(&kernel).is_ok());
+            // A same-size unsigned literal cannot manufacture a signed value type.
+            body[1] = PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(2),
+                value: PcuParameterValue::F32(0),
+            });
+            let outer = [
+                PcuDispatchOp::GridStrideLoop {
+                    extent: 19,
+                    body: &body,
+                },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = fixture(
+                scalar,
+                if grid { 3 } else { 19 },
+                &bindings,
+                if grid { &outer } else { &body },
+            );
+            assert!(super::composed::project(&kernel).is_none());
+            assert!(super::lower_dispatch_to_cuda_source(&kernel).is_err());
+        }
+    }
+}
+
+#[test]
 fn integer_composed_hazard_header_and_ssa_rejections_remain_cold() {
     let scalar = PcuScalarType::U64;
     let bindings = bindings(scalar);
@@ -606,8 +840,8 @@ fn integer_composed_hazard_header_and_ssa_rejections_remain_cold() {
         .numerical_options
         .reproducibility = fusion_pcu::PcuReproducibility::PortableV1;
     assert!(
-        super::lower_dispatch_to_cuda_source(&kernel).is_err(),
-        "no composed Portable descriptor or provider grant"
+        super::lower_dispatch_to_cuda_source(&kernel).is_ok(),
+        "bounded narrow composition now has its requested Portable grant"
     );
     kernel
         .numerical_requirements
@@ -627,4 +861,51 @@ fn integer_composed_hazard_header_and_ssa_rejections_remain_cold() {
         rhs: PcuDispatchValueId(3),
     });
     assert!(super::composed::project(&fixture(scalar, 19, &bindings, &ops)).is_none());
+}
+
+#[test]
+fn public_self_cyclic_grid_ir_refuses_before_recursive_admission_or_codegen() {
+    static CYCLE: [PcuDispatchOp<'static>; 2] = [
+        PcuDispatchOp::GridStrideLoop {
+            body: &CYCLE,
+            extent: 19,
+        },
+        PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+    ];
+    let scalar = PcuScalarType::U256;
+    let bindings = bindings(scalar);
+    for mode in [
+        fusion_pcu::PcuNumericalMode::Boundary,
+        fusion_pcu::PcuNumericalMode::Strict,
+    ] {
+        for reproducibility in [
+            fusion_pcu::PcuReproducibility::Unspecified,
+            fusion_pcu::PcuReproducibility::PortableV1,
+        ] {
+            let mut kernel = fixture(scalar, 3, &bindings, &CYCLE);
+            kernel.numerical_requirements.numerical_mode = mode;
+            kernel
+                .numerical_requirements
+                .numerical_options
+                .reproducibility = reproducibility;
+            assert!(!crate::admission::checked_numeric_contract(&kernel));
+            assert!(!crate::owned_dispatch::kernel_uses_checked_arithmetic(
+                &kernel
+            ));
+            assert!(crate::owned_dispatch::checked_scalar_fault_law(&kernel).is_none());
+            kernel
+                .numerical_requirements
+                .numerical_options
+                .compound_arithmetic = fusion_pcu::PcuCompoundArithmeticPolicy::BackendDefined;
+            assert!(!crate::admission::checked_numeric_contract(&kernel));
+            assert_eq!(
+                super::lower_dispatch_to_cuda_source(&kernel),
+                Err(CudaLowerError::UnsupportedRequirements)
+            );
+            assert_eq!(
+                super::lower_dispatch_to_cuda_rtc_source(&kernel),
+                Err(CudaLowerError::UnsupportedRequirements)
+            );
+        }
+    }
 }

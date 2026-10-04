@@ -14,6 +14,13 @@
 
 #[path = "div_rem/div_rem.rs"]
 mod div_rem;
+#[path = "composed/composed.rs"]
+mod composed;
+#[rustfmt::skip]
+pub use composed::{
+    describe_portable_v1_checked_integer_composed_map,
+    PcuPortableV1IntegerComposedMapError,
+};
 #[rustfmt::skip]
 pub use div_rem::{
     describe_portable_v1_integer_div_rem_map,

@@ -96,6 +96,10 @@ fn validate_scalar_transport(
             return Err(Error::InvalidBinding(target));
         }
     }
+    // Guard flat-map admission before recursive capability scanners.
+    if kernel.has_nested_grid_stride_loop() {
+        return Err(Error::UnsupportedOperation(0));
+    }
     if kernel.required_type_support().bits() & !supported_types.bits() != 0
         || kernel.required_feature_support().bits() & !supported_features.bits() != 0
     {

@@ -92,6 +92,34 @@ pub fn validate_checked_float_map_kernel(
     {
         return Err(CheckedFloatMapValidationError::InvalidLogicalShape);
     }
+    let (body, index) = match kernel.ops {
+        [
+            PcuDispatchOp::GridStrideLoop { extent, body },
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ] => {
+            if *extent == 0 {
+                return Err(CheckedFloatMapValidationError::UnsupportedOperation(0));
+            }
+            (*body, PcuDispatchIndex::GridStrideId)
+        }
+        ops if matches!(
+            ops.last(),
+            Some(PcuDispatchOp::Control(PcuDispatchControlOp::Return))
+        ) =>
+        {
+            (&ops[..ops.len() - 1], PcuDispatchIndex::InvocationId)
+        }
+        _ => return Err(CheckedFloatMapValidationError::MissingStoreOrReturn),
+    };
+    // Refuse nested/cyclic borrowed bodies before recursive capability scanners.
+    if let Some(position) = body
+        .iter()
+        .position(|operation| matches!(operation, PcuDispatchOp::GridStrideLoop { .. }))
+    {
+        return Err(CheckedFloatMapValidationError::UnsupportedOperation(
+            position,
+        ));
+    }
     let allowed_types = scalar_caps | PcuValueTypeCaps::SCALAR_VALUES;
     let allowed_features = PcuDispatchFeatureCaps::MUTABLE_RESOURCES
         | PcuDispatchFeatureCaps::READ_ONLY_RESOURCES
@@ -118,25 +146,6 @@ pub fn validate_checked_float_map_kernel(
         }
     }
 
-    let (body, index) = match kernel.ops {
-        [
-            PcuDispatchOp::GridStrideLoop { extent, body },
-            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
-        ] => {
-            if *extent == 0 {
-                return Err(CheckedFloatMapValidationError::UnsupportedOperation(0));
-            }
-            (*body, PcuDispatchIndex::GridStrideId)
-        }
-        ops if matches!(
-            ops.last(),
-            Some(PcuDispatchOp::Control(PcuDispatchControlOp::Return))
-        ) =>
-        {
-            (&ops[..ops.len() - 1], PcuDispatchIndex::InvocationId)
-        }
-        _ => return Err(CheckedFloatMapValidationError::MissingStoreOrReturn),
-    };
     if body.is_empty() {
         return Err(CheckedFloatMapValidationError::MissingCheckedOperation);
     }

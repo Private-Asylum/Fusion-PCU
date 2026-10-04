@@ -87,9 +87,6 @@ where
         [PcuTensorGraphValue<T>; N],
     ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>,
 {
-    if N == 0 {
-        return Err(PcuExecutionError::EmptyTensorInput);
-    }
     build(
         shapes.map(PcuTensorShapeWitness::Static),
         float_underflow,
@@ -112,6 +109,59 @@ where
         [PcuTensorGraphValue<T>; N],
     ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>,
 {
+    build_outputs::<T, N, 1, _>(
+        shapes,
+        float_underflow,
+        numerical_mode,
+        numerical_options,
+        |capture, inputs| capture_function(capture, inputs).map(|output| [output]),
+    )
+}
+
+/// Capture all terminals of a generated tuple companion in one selected graph.
+///
+/// This has the same cold, provider-independent contract as
+/// [`__pcu_capture_tensor_program`]. Output order follows the source tuple.
+///
+/// # Errors
+/// Rejects empty/duplicate/foreign terminals, malformed input shapes and
+/// unsupported source semantics before any device work.
+#[doc(hidden)]
+pub fn __pcu_capture_tensor_program_outputs<T: PcuScalar, const N: usize, const M: usize, F>(
+    shapes: [PcuSourceShape; N],
+    float_underflow: PcuFloatUnderflowPolicy,
+    numerical_mode: PcuNumericalMode,
+    numerical_options: PcuNumericalOptions,
+    capture: F,
+) -> Result<PcuCapturedTensorProgram, PcuExecutionError>
+where
+    F: FnOnce(
+        &mut PcuTensorGraphCapture,
+        [PcuTensorGraphValue<T>; N],
+    ) -> Result<[PcuTensorGraphValue<T>; M], PcuExecutionError>,
+{
+    build_outputs(
+        shapes.map(PcuTensorShapeWitness::Static),
+        float_underflow,
+        numerical_mode,
+        numerical_options,
+        capture,
+    )
+}
+
+pub(super) fn build_outputs<T: PcuScalar, const N: usize, const M: usize, F>(
+    shapes: [PcuTensorShapeWitness<'_>; N],
+    float_underflow: PcuFloatUnderflowPolicy,
+    numerical_mode: PcuNumericalMode,
+    numerical_options: PcuNumericalOptions,
+    capture_function: F,
+) -> Result<PcuCapturedTensorProgram, PcuExecutionError>
+where
+    F: FnOnce(
+        &mut PcuTensorGraphCapture,
+        [PcuTensorGraphValue<T>; N],
+    ) -> Result<[PcuTensorGraphValue<T>; M], PcuExecutionError>,
+{
     let mut declared_elements = [0_usize; N];
     for (index, shape) in shapes.iter().copied().enumerate() {
         declared_elements[index] = element_count(shape)?;
@@ -122,11 +172,11 @@ where
     capture.numerical_options.set(numerical_options);
     let captured_input_ids = input_values.map(|value| value.value.erase());
     let output = capture_function(&mut capture, input_values)?;
-    let (graph, output_id) = capture.finish(output)?;
+    let (graph, output_ids) = capture.finish_outputs(output)?;
     let program = Arc::new(
         graph
             .into_selected_program(
-                &[output_id],
+                &output_ids,
                 TensorArithmeticRewritePolicy::Disabled,
                 TensorArithmeticCapability::Strict,
                 TensorPointwiseGroupingPolicy::Disabled,
@@ -146,9 +196,8 @@ where
         input_ids.push(selected_id);
         input_indices.push(argument_index);
     }
-    if input_ids.is_empty() {
-        return Err(PcuExecutionError::InvalidTensorSourcePlan);
-    }
+    // Immutable producer-only graphs have no executable data inputs. Keep the empty
+    // selected prefix; a declared shape anchor must never become a fake binding.
     Ok(PcuCapturedTensorProgram {
         program,
         input_ids,

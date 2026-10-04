@@ -1,0 +1,89 @@
+// Independently handwritten arithmetic control. No PCU shader/emitter/helper imports.
+// BITS/L/SIGNED/EXTENT/CLAMP/ONE are frozen by the control's own cold constructor.
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) writeonly buffer Output { uint words[]; } output_data;
+layout(set=0,binding=1,std430) readonly buffer Input { uint words[]; } input_data;
+layout(set=0,binding=4,std430) writeonly buffer Status { uint words[]; } status_data;
+struct W { uint x[L]; };
+const uint PACK_LANES=max(32u/BITS,1u);
+uint mask() { return BITS<32u ? (1u<<(BITS%32u))-1u : ~0u; }
+W zero() { W a;for(int i=0;i<L;i++)a.x[i]=0u;return a; }
+bool negative(W a) { return SIGNED && ((a.x[L-1]>>((BITS-1u)%32u))&1u)!=0u; }
+W negate(W a) {
+ uint carry=1u;
+ for(int i=0;i<L;i++){uint next;a.x[i]=uaddCarry(~a.x[i],carry,next);carry=next;}
+ a.x[L-1]&=mask();return a;
+}
+int compare(W a,W b) {
+ for(int i=L-1;i>=0;i--)if(a.x[i]!=b.x[i])return a.x[i]>b.x[i]?1:-1;
+ return 0;
+}
+W bound(bool lower) {
+ W a=zero();
+ if(!SIGNED){if(!lower)for(int i=0;i<L;i++)a.x[i]=~0u;}
+ else if(lower)a.x[L-1]=1u<<((BITS-1u)%32u);
+ else {for(int i=0;i<L;i++)a.x[i]=~0u;a.x[L-1]&=(1u<<((BITS-1u)%32u))-1u;}
+ a.x[L-1]&=mask();return a;
+}
+W add(W a,W b,out uint fault) {
+ W r;uint carry=0u;fault=0u;
+ for(int i=0;i<L;i++){uint first,second;uint sum=uaddCarry(a.x[i],b.x[i],first);r.x[i]=uaddCarry(sum,carry,second);carry=first|second;}
+ bool outside=carry!=0u || (r.x[L-1]&~mask())!=0u;r.x[L-1]&=mask();
+ if(SIGNED){if(negative(a)==negative(b)&&negative(r)!=negative(a))fault=negative(a)?2u:3u;}
+ else if(outside)fault=3u;
+ return r;
+}
+W sub(W a,W b,out uint fault) {
+ W r;uint borrow=0u;fault=0u;
+ for(int i=0;i<L;i++){uint right=b.x[i]+borrow;bool wrapped=right<b.x[i];r.x[i]=a.x[i]-right;borrow=uint(wrapped||a.x[i]<right);}
+ r.x[L-1]&=mask();
+ if(SIGNED){if(negative(a)!=negative(b)&&negative(r)!=negative(a))fault=negative(a)?2u:3u;}
+ else if(borrow!=0u)fault=2u;
+ return r;
+}
+W mul(W a,W b,out uint fault) {
+ bool sign=negative(a)!=negative(b);fault=0u;
+ if(SIGNED){if(negative(a))a=negate(a);if(negative(b))b=negate(b);}
+ uint full[2*L];for(int i=0;i<2*L;i++)full[i]=0u;
+ for(int i=0;i<L;i++){
+  uint carry=0u;
+  for(int j=0;j<L;j++){
+   uint hi,lo,first,second;umulExtended(a.x[i],b.x[j],hi,lo);
+   lo=uaddCarry(lo,full[i+j],first);full[i+j]=uaddCarry(lo,carry,second);carry=hi+first+second;
+  }
+  full[i+L]=carry;
+ }
+ W r;for(int i=0;i<L;i++)r.x[i]=full[i];
+ bool outside=(r.x[L-1]&~mask())!=0u;for(int i=L;i<2*L;i++)outside=outside||full[i]!=0u;r.x[L-1]&=mask();
+ if(SIGNED){W maximum=bound(sign);if(sign)maximum=negate(maximum);if(outside||compare(r,maximum)>0)fault=sign?2u:3u;if(sign)r=negate(r);}
+ else if(outside)fault=3u;
+ return r;
+}
+W load(uint index) {
+ W a=zero();
+ if(BITS<32u)a.x[0]=(input_data.words[index/PACK_LANES]>>((index%PACK_LANES)*BITS))&mask();
+ else for(int i=0;i<L;i++)a.x[i]=input_data.words[index*uint(L)+uint(i)];
+ return a;
+}
+bool checked(uint op,W a,W b,uint ordinal,inout uint notice,inout uint step,out W result) {
+ uint fault;if(op==0u)result=add(a,b,fault);else if(op==1u)result=mul(a,b,fault);else result=sub(a,b,fault);
+ if(fault==0u)return true;
+ if(!CLAMP){notice=fault;step=ordinal;return false;}
+ if(notice==0u){notice=fault|256u;step=ordinal;}
+ result=bound(fault==2u);return true;
+}
+void main() {
+ uint lanes=PACK_LANES;uint word=gl_GlobalInvocationID.x;
+ if(word>=EXTENT/lanes+uint(EXTENT%lanes!=0u))return;
+ uint packed=0u;
+ for(uint lane=0u;lane<lanes;lane++){
+  uint index=word*lanes+lane;if(index>=EXTENT)break;
+  W original=load(index),sum,result=zero();uint notice=0u,step=0u;
+  bool healthy=checked(0u,original,original,2u,notice,step,sum);
+  if(healthy){if(ONE)result=original;else healthy=checked(1u,sum,original,4u,notice,step,result);}
+  status_data.words[2u*index]=notice;status_data.words[2u*index+1u]=step;
+  if(BITS<32u)packed|=(result.x[0]&mask())<<(lane*BITS);
+  else if(healthy)for(int i=0;i<L;i++)output_data.words[index*uint(L)+uint(i)]=result.x[i];
+ }
+ if(BITS<32u)output_data.words[word]=packed;
+}

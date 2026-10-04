@@ -942,6 +942,15 @@ pub struct TensorOwnedSelectedProgram {
     operation_storage_constraints: Vec<TensorStorageConstraint>,
 }
 
+#[path = "tensor/fragment/fragment.rs"]
+mod fragment;
+#[rustfmt::skip]
+pub use fragment::{
+    TensorFragmentError,
+    TensorFragmentInput,
+    TensorOperationFragment,
+};
+
 /// An inspectable lowering-only replacement for `Sub(weights, Mul(rate, gradient))`.
 ///
 /// Consuming a candidate authorizes a different floating-point result whenever contraction
@@ -4353,6 +4362,26 @@ impl Graph {
         target: ValueId,
     ) -> Result<ValueId, TensorError> {
         gradients::backward_mse_for(self, loss, target)
+    }
+
+    /// Append one shared reverse pass for the requested MSE derivatives.
+    ///
+    /// Results follow `targets` order. Shared ancestors are differentiated once;
+    /// branches that cannot reach any requested target are never appended.
+    /// Forward checked effects and each source operation's numerical contract
+    /// remain unchanged. Repeated target IDs refer to the same derivative value.
+    /// This is a cold graph transform, not host execution or repeated training.
+    ///
+    /// # Errors
+    /// Rejects empty targets, foreign/disconnected targets, invalid roots and
+    /// unsupported source operations before appending nodes. Shape/extent errors
+    /// can arise during derivative construction.
+    pub fn backward_mse_for_targets(
+        &mut self,
+        loss: ValueId,
+        targets: &[ValueId],
+    ) -> Result<Vec<ValueId>, TensorError> {
+        gradients::backward_mse_for_targets(self, loss, targets)
     }
 
     /// Returns the shape of a graph value.

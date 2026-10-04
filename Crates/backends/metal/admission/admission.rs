@@ -41,6 +41,7 @@ use crate::{
 };
 
 pub fn require_scalar_numerics(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), MetalError> {
+    crate::dispatch_shape::require_non_nested(kernel)?;
     // Scalar instruction checks remain exact under compound/precision permissions. Portable
     // reproducibility requires its separate qualified binary admission; this gate has no profile.
     if kernel
@@ -171,6 +172,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedIntegerKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if kernel.bindings.first().is_none_or(|binding| {
             binding.binding_type != fusion_pcu::PcuBindingType::Value(PcuValueType::u32())
         }) {
@@ -186,6 +188,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedIntegerKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let profile = Profile::admit(kernel)?;
         Ok(MetalPreparedIntegerKernel {
             map: self.prepare_checked_integer_map(
@@ -238,6 +241,7 @@ impl Profile {
     }
     #[allow(clippy::too_many_lines)] // One cold gate checks numerical, schema, SSA and opcode admission.
     fn admit(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         require_scalar_numerics(kernel)?;
         if kernel.entry.logical_shape[1..] != [1, 1] {
             return Err(MetalError::Unsupported);
@@ -454,6 +458,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedFloatKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if kernel.bindings.first().is_none_or(|binding| {
             binding.binding_type != fusion_pcu::PcuBindingType::Value(PcuValueType::f32())
         }) {
@@ -470,6 +475,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedFloatKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if kernel
             .numerical_requirements
             .numerical_options

@@ -223,3 +223,27 @@ pub use binary::MetalNativeTensorBinaryControl;
 #[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
+
+#[path = "backward/backward.rs"]
+mod backward;
+pub use backward::{MetalTensorBackwardPlan, MetalPreparedTensorBackwardProgram};
+
+#[path = "matmul/matmul.rs"]
+mod matmul;
+pub use matmul::{MetalTensorMatMulPlan, MetalPreparedTensorMatMulProgram};
+
+#[path = "sgd/sgd.rs"]
+mod sgd;
+pub use sgd::{MetalTensorSgdPlan, MetalPreparedTensorSgdProgram};
+
+#[path = "selected_numerical/selected_numerical.rs"]
+mod selected_numerical;
+pub use selected_numerical::{MetalSelectedNumericalTensorPlan,MetalPreparedSelectedNumericalTensorProgram,MetalSelectedNumericalTensorOperation};
+
+#[path="mse/mse.rs"]
+mod mse;
+pub use mse::{MetalTensorMsePlan,MetalPreparedTensorMseProgram};
+
+#[path="selected_graph/selected_graph.rs"]
+mod selected_graph;
+pub use selected_graph::{MetalSelectedTensorGraphPlan, MetalPreparedSelectedTensorGraph, MetalTensorGraphError};

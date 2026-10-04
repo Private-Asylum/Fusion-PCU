@@ -8,6 +8,7 @@ use fusion_pcu::{
 
 #[test]
 #[allow(clippy::too_many_lines)] // One fixture keeps each cold tuple, exact SSA and ABI witness together.
+#[allow(clippy::cognitive_complexity)] // Exhaustive typed fault/ownership matrix retains its exact witnesses.
 fn six_format_operand_schema_preserves_roles_and_projects_only_unread_declarations() {
     for scalar in [
         PcuScalarType::F16,

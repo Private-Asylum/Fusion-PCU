@@ -136,11 +136,14 @@ fn execute<const N: usize, const OUTPUTS: usize>(
     let uploaded = started.map(|_| std::time::Instant::now());
     vk_try("reset retained Vulkan transport fence", unsafe {
         // SAFETY: Every previous call completed or poisoned the actual retained device.
-        map.device.device.reset_fences(&[resources.fence])
+        vk_api_owner!(
+            map.device,
+            ResetFences,
+            map.device.device.reset_fences(&[resources.fence])
+        )
     })?;
     if let Err(error) = submit_and_wait_measured(
-        &map.device.device,
-        map.device.queue,
+        &map.device,
         resources.command,
         resources.fence,
         measurements.as_deref_mut(),

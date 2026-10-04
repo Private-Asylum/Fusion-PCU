@@ -272,6 +272,7 @@ fn role_body(scalar: PcuScalarType, grid: bool, role: usize) -> Vec<PcuDispatchO
 
 #[test]
 #[allow(clippy::too_many_lines)] // Complete exact request matrix shares one detached fixture.
+#[allow(clippy::cognitive_complexity)] // Exhaustive typed fault/ownership matrix retains its exact witnesses.
 fn fourteen_joint_operand_schemas_and_portable_headers_preserve_unique_resources() {
     for scalar in INTEGERS {
         for grid in [false, true] {

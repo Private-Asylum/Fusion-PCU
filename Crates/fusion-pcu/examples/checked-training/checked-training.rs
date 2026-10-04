@@ -8,6 +8,11 @@ use fusion_pcu::{
     PcuTensor,
 };
 
+#[pcu]
+fn initial_weights() -> Result<PcuTensor<f32>, PcuExecutionError> {
+    pcu::constant(const { [[2.0_f32], [-1.0]] })
+}
+
 #[pcu(flag(strict))]
 fn loss(
     input: &[[f32; 2]; 2],
@@ -51,11 +56,14 @@ fn main() -> Result<(), PcuExecutionError> {
         ..Default::default()
     })?;
     let input = [[1.0, 0.0], [0.0, 1.0]];
-    let weights = [[2.0], [-1.0]];
     let target = [[1.0], [0.0]];
     let mut host_loss = [0.0];
     let mut host_weights = [0.0; 2];
     {
+        // The inline-const matrix is captured once with its actual [2, 1] shape.
+        // PCU initializes device backing; this owner keeps it resident across
+        // both calls, without a consumer upload or an intermediate readback.
+        let weights = initial_weights()?;
         // Ordinary RAM borrows are staged by PCU. Inside each captured function,
         // intermediates stay on the selected device; graph liveness permits reuse.
         // Strict checks the prescribed operations individually. It does not request

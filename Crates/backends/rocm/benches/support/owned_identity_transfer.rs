@@ -461,7 +461,7 @@ fn fill(values: &mut [f32], job: u64) {
     let phase = f32::from(u8::try_from(job % 17).expect("phase fits")) / 16.0;
     for (index, value) in values.iter_mut().enumerate() {
         let base = f32::from(u16::try_from(index % 1024).expect("sample fits"));
-        *value = if (index + usize::try_from(job).expect("job fits")) % 2 == 0 {
+        *value = if (index + usize::try_from(job).expect("job fits")).is_multiple_of(2) {
             base + phase
         } else {
             -base - phase

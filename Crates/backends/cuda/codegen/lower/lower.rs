@@ -116,7 +116,7 @@ impl fmt::Display for CudaLowerError {
                 )
             }
             Self::UnsupportedConstant => {
-                formatter.write_str("CUDA lowering supports f32 constants only")
+                formatter.write_str("CUDA lowering supports F32/F64 and I/U8/16/32/64 constants")
             }
             Self::UnsupportedAlu(op) => write!(formatter, "CUDA lowering does not support {op:?}"),
             Self::UnsupportedOperation { index, support } => write!(
@@ -592,6 +592,9 @@ fn lower_dispatch_to_cuda_source_with_preamble(
                 result.0
             )
             .map_err(|_| CudaLowerError::FormattingFailure)?,
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
+                integer_constant::emit(&mut source, "    ", result, value)?;
+            }
             PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
                 result,
                 op,
@@ -1717,6 +1720,9 @@ fn emit_cuda_data_op(
             result.0
         )
         .map_err(|_| CudaLowerError::FormattingFailure),
+        PcuDispatchOp::Data(PcuDispatchDataOp::Constant { result, value }) => {
+            integer_constant::emit(source, "        ", result, value)
+        }
         PcuDispatchOp::Data(PcuDispatchDataOp::Alu {
             result,
             op,
@@ -2173,6 +2179,8 @@ fn emit_i64_checked_div_rem(
 mod checked_float;
 #[path = "checked_integer/checked_integer.rs"]
 mod checked_integer;
+#[path = "integer_constant/integer_constant.rs"]
+mod integer_constant;
 #[path = "validation.rs"]
 mod validation;
 #[rustfmt::skip]

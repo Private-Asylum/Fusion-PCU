@@ -30,7 +30,7 @@ const fn validate_batch_fault_semantics(
 }
 
 pub fn kernel_uses_checked_arithmetic(kernel: &PcuDispatchKernelIr<'_>) -> bool {
-    ops_use_checked_arithmetic(kernel.ops)
+    crate::admission::supported_control_shape(kernel.ops) && ops_use_checked_arithmetic(kernel.ops)
 }
 
 fn validate_dispatch_requirements(
@@ -173,6 +173,9 @@ impl CudaPreparedFaultContract {
 pub fn checked_scalar_fault_law(
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Option<PcuCheckedScalarFaultLaw> {
+    if !crate::admission::supported_control_shape(kernel.ops) {
+        return None;
+    }
     fault_law::capture(kernel)
 }
 

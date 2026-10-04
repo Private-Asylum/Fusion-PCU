@@ -159,6 +159,7 @@ struct Profile {
 impl Profile {
     #[allow(clippy::too_many_lines)] // Authentic node/SSA/schema/shape admission forms one cold gate.
     fn admit(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if kernel
             .numerical_requirements
             .numerical_options
@@ -253,6 +254,7 @@ impl Profile {
     }
 
     fn admit_portable(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         // Eligibility is not conformance: this provider explicitly opts into only the four
         // independently qualified integer-synthesized encodings and this frozen map realization.
         let description =
@@ -311,6 +313,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedFloatBinaryKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let profile = Profile::admit(kernel)?;
         Ok(MetalPreparedFloatBinaryKernel {
             map: self
@@ -340,6 +343,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedF64BinaryKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if Profile::admit(kernel)?.scalar != fusion_pcu::PcuScalarType::F64 {
             return Err(MetalError::Unsupported);
         }
@@ -353,6 +357,7 @@ impl MetalSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MetalPreparedF32BinaryKernel, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if Profile::admit(kernel)?.scalar != fusion_pcu::PcuScalarType::F32 {
             return Err(MetalError::Unsupported);
         }

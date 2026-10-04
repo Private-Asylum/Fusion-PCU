@@ -19,6 +19,8 @@ use fusion_pcu_mlx::{
     MlxPreparedDivRemRoleHostKernel,
     MlxPreparedCarrierHostKernel,
     MlxPreparedTransportHostKernel,
+    MlxPreparedConversionHostKernel,
+    MlxCheckedConversionPlan,
     MlxSession,
 };
 #[rustfmt::skip]
@@ -55,6 +57,8 @@ pub(super) use input::MlxInputLayout;
 mod single_input;
 use single_input::SingleInputKernel;
 
+#[path = "conversion/conversion.rs"]
+mod conversion;
 #[path = "div_rem/div_rem.rs"]
 mod div_rem;
 #[path = "transport/transport.rs"]
@@ -65,6 +69,7 @@ mod two_input;
 // Concrete paths stay inline in the retained cache; warm selection is an enum match.
 #[allow(clippy::large_enum_variant)] // Boxing the cold prepared kernel adds unnecessary warm ownership indirection.
 pub(super) enum MlxKernel {
+    Conversion(MlxPreparedConversionHostKernel),
     Carrier(MlxPreparedCarrierHostKernel),
     Transport {
         kernel: MlxPreparedTransportHostKernel,
@@ -102,6 +107,9 @@ impl MlxKernel {
         args: &mut [crate::PcuHostArgument<'_>],
     ) -> Result<(), MlxHostKernelError> {
         match self {
+            Self::Conversion(kernel) => kernel
+                .call(args)
+                .map_err(crate::PcuHostDispatchError::Backend),
             Self::Carrier(kernel) => kernel.call(args),
             Self::Transport { kernel, .. } => kernel.call(args),
             Self::Unary(kernel) => kernel.call(args),
@@ -113,6 +121,7 @@ impl MlxKernel {
     }
     const fn scalar_type(&self) -> crate::PcuScalarType {
         match self {
+            Self::Conversion(kernel) => kernel.scalar_type(),
             Self::Carrier(kernel) => kernel.scalar_type(),
             Self::Transport { kernel, .. } => kernel.plan().scalar_type(),
             Self::Unary(kernel) => kernel.scalar_type(),
@@ -125,6 +134,7 @@ impl MlxKernel {
     fn outputs(&self) -> [Option<(crate::PcuBindingRef, usize)>; 2] {
         let single = |binding, bytes| [Some((binding, bytes)), None];
         match self {
+            Self::Conversion(kernel) => single(kernel.output_binding(), kernel.output_byte_len()),
             Self::Carrier(kernel) => single(kernel.output_binding(), kernel.output_byte_len()),
             Self::Transport { kernel, .. } => kernel.output_layout(),
             Self::Unary(kernel) => single(kernel.output_binding(), kernel.output_byte_len()),
@@ -161,7 +171,9 @@ impl MlxInvocation {
         source: &crate::PcuDispatchKernelIr<'_>,
         inputs: MlxInputLayout,
     ) -> Result<Self, PcuExecutionError> {
-        let kernel = if let Ok(plan) = MlxCarrierPlan::assess(source) {
+        let kernel = if let Ok(plan) = MlxCheckedConversionPlan::assess(source) {
+            conversion::prepare(session, source, inputs, plan)?
+        } else if let Ok(plan) = MlxCarrierPlan::assess(source) {
             let minimum = [plan.input_element_count(), 0];
             let extents = inputs.extents(plan.input_bindings(), minimum)?;
             // Logical read spans remain unchanged. An escaped MLX input keeps
@@ -431,6 +443,9 @@ pub(super) fn call_mlx_arguments<const N: usize>(
     arguments: [super::super::arguments::PcuCallArgument<'_>; N],
 ) -> Result<(), PcuExecutionError> {
     match &mut invocation.kernel {
+        MlxKernel::Conversion(kernel) => {
+            conversion::call(kernel, invocation.prefixes[0].as_ref(), arguments)
+        }
         MlxKernel::Transport { kernel, readback } => {
             transport::call(kernel, &invocation.prefixes, readback, arguments)
         }

@@ -92,6 +92,10 @@ fn validate_interface(
     let types = PcuValueTypeCaps::for_scalar(scalar) | PcuValueTypeCaps::SCALAR_VALUES;
     let features =
         PcuDispatchFeatureCaps::READ_ONLY_RESOURCES | PcuDispatchFeatureCaps::MUTABLE_RESOURCES;
+    // Guard flat-map admission before recursive capability scanners.
+    if kernel.has_nested_grid_stride_loop() {
+        return Err(Error::UnsupportedOperation(0));
+    }
     if kernel.required_type_support().bits() & !types.bits() != 0
         || kernel.required_feature_support().bits() & !features.bits() != 0
     {

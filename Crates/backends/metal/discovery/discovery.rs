@@ -236,7 +236,7 @@ impl PcuRuntimeDiscovery for MetalDiscovery {
             support: if self.devices.is_empty() {
                 PcuSupport::unsupported()
             } else {
-                crate::owned_dispatch::discovery_support()
+                source_support()
             },
         })
     }
@@ -246,7 +246,7 @@ impl PcuRuntimeDiscovery for MetalDiscovery {
     ) -> Result<PcuCapabilitySnapshot, MetalError> {
         self.validate(device, PcuObjectKind::Device)?;
         Ok(PcuCapabilitySnapshot {
-            support: crate::owned_dispatch::discovery_support(),
+            support: source_support(),
         })
     }
     fn device_facts(&self, device: PcuObjectRef) -> Result<PcuDeviceFacts, MetalError> {
@@ -277,6 +277,11 @@ impl PcuRuntimeDiscovery for MetalDiscovery {
         let descriptors = crate::owned_dispatch::executor_descriptors();
         for (slot, descriptor) in output.iter_mut().zip(descriptors) {
             *slot = *descriptor;
+            slot.support.dispatch_instructions = slot
+                .support
+                .dispatch_instructions
+                .union(fusion_pcu::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT);
+            slot.support.dispatch_scalar_alu = conversion_alu(slot.support.dispatch_scalar_alu);
         }
         Ok(descriptors.len())
     }
@@ -339,3 +344,49 @@ mod tests {
         );
     }
 }
+
+#[path = "checked_offers/checked_offers.rs"]
+mod checked_offers;
+
+// Source-host capability union is distinct from actual neutral owned lowering support.
+const fn conversion_alu(
+    support: fusion_pcu::PcuDispatchScalarAluSupport,
+) -> fusion_pcu::PcuDispatchScalarAluSupport {
+    use fusion_pcu::{PcuDispatchOpCaps, PcuScalarType};
+    support
+        .with(
+            PcuScalarType::F32,
+            support
+                .for_scalar(PcuScalarType::F32)
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT),
+        )
+        .with(
+            PcuScalarType::F64,
+            support
+                .for_scalar(PcuScalarType::F64)
+                .union(PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT),
+        )
+}
+const fn source_support() -> PcuSupport {
+    let mut support = crate::owned_dispatch::discovery_support();
+    support.dispatch_support.instructions.direct = support
+        .dispatch_support
+        .instructions
+        .direct
+        .union(fusion_pcu::PcuDispatchOpCaps::ALU_CHECKED_FLOAT_CONVERT);
+    support.dispatch_support.scalar_alu.direct =
+        conversion_alu(support.dispatch_support.scalar_alu.direct);
+    support
+}
+
+#[cfg(feature = "tensor")]
+#[path = "selected_numerical_offers/selected_numerical_offers.rs"]
+mod selected_numerical_offers;
+#[cfg(feature = "tensor")]
+pub use selected_numerical_offers::MetalSelectedNumericalTensorRequest;
+
+#[cfg(feature="tensor")]
+#[path="selected_graph_offers/selected_graph_offers.rs"]
+mod selected_graph_offers;
+#[cfg(feature="tensor")]
+pub use selected_graph_offers::MetalSelectedTensorGraphRequest;

@@ -125,6 +125,8 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
         status_policy: StatusPolicy,
         descriptor_buffers: [usize; D],
     ) -> Result<Self, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        let _api_scope = device.api_scope();
         if D > 5 || descriptor_buffers.iter().any(|index| *index >= N) {
             return Err(PcuVulkanError::InvalidArguments);
         }
@@ -153,13 +155,14 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
                 &device.instance,
                 device.physical_device,
                 &device.device,
+                device.caps.api_version,
                 length,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
             )?);
         }
         let allocations =
             allocations.map(|allocation| allocation.expect("all buffers constructed"));
-        let shader = create_shader_module(&device.device, words)?;
+        let shader = create_shader_module(&device, words)?;
         let descriptor_layout = create_map_descriptor_set_layout::<D>(&device.device)?;
         let pipeline_layout = create_pipeline_layout(&device.device, descriptor_layout.handle)?;
         let pipeline = create_compute_pipeline(
@@ -188,7 +191,11 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
         unsafe {
             // SAFETY: All infos refer to live owners on this device. Callers prove aliases
             // readonly or statically unused; actual written resources and status never alias.
-            device.device.update_descriptor_sets(&writes, &[]);
+            vk_api_owner!(
+                device,
+                UpdateDescriptorSets,
+                device.device.update_descriptor_sets(&writes, &[])
+            );
         }
         let command_pool = create_command_pool(&device.device, device.queue_family_index)?;
         let command = allocate_command_buffer(&device.device, command_pool.handle)?;
@@ -211,11 +218,15 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
             buffer.mapped = vk_try("map retained Vulkan bit-map memory", unsafe {
                 // SAFETY: Each memory owner is host-visible/coherent, live and not yet mapped.
                 // Failed cold construction frees its own allocations, including mapped memory.
-                device.device.map_memory(
-                    buffer.memory,
-                    0,
-                    vk::WHOLE_SIZE,
-                    vk::MemoryMapFlags::empty(),
+                vk_api_owner!(
+                    device,
+                    MapMemory,
+                    device.device.map_memory(
+                        buffer.memory,
+                        0,
+                        vk::WHOLE_SIZE,
+                        vk::MemoryMapFlags::empty(),
+                    )
                 )
             })?
             .cast();
@@ -245,8 +256,13 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
             descriptor_count: D,
         };
         // Ownership moves to the retained native handle set, whose Drop runs before its device.
-        mem::forget((
-            allocations,
+        #[cfg(feature = "insights")]
+        for allocation in allocations {
+            vk_transfer_guards!(allocation);
+        }
+        #[cfg(not(feature = "insights"))]
+        mem::forget(allocations);
+        vk_transfer_guards!(
             shader,
             descriptor_layout,
             pipeline_layout,
@@ -254,7 +270,7 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
             descriptor_pool,
             command_pool,
             fence,
-        ));
+        );
         Ok(Self {
             device,
             resources: Some(resources),
@@ -320,11 +336,14 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize>
         let uploaded = started.map(|_| std::time::Instant::now());
         vk_try("reset retained Vulkan bit-map fence", unsafe {
             // SAFETY: Every earlier successful or known-quiescent failed call has completed.
-            self.device.device.reset_fences(&[resources.fence])
+            vk_api_owner!(
+                self.device,
+                ResetFences,
+                self.device.device.reset_fences(&[resources.fence])
+            )
         })?;
         if let Err(error) = submit_and_wait_measured(
-            &self.device.device,
-            self.device.queue,
+            &self.device,
             resources.command,
             resources.fence,
             measurements.as_deref_mut(),
@@ -393,17 +412,53 @@ impl<const N: usize, const CHECKED: bool, const OUTPUTS: usize> Drop
             // SAFETY: Calls wait synchronously, or remove/quarantine all owners on unknown
             // completion. These handles are uniquely owned and their Rc device is still live.
             let device = &self.device.device;
-            device.destroy_fence(resources.fence, None);
-            device.destroy_command_pool(resources.command_pool, None);
-            device.destroy_descriptor_pool(resources.descriptor_pool, None);
-            device.destroy_pipeline(resources.pipeline, None);
-            device.destroy_pipeline_layout(resources.pipeline_layout, None);
-            device.destroy_descriptor_set_layout(resources.descriptor_layout, None);
-            device.destroy_shader_module(resources.shader, None);
+            vk_api_owner!(
+                self.device,
+                DestroyFence,
+                device.destroy_fence(resources.fence, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyCommandPool,
+                device.destroy_command_pool(resources.command_pool, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyDescriptorPool,
+                device.destroy_descriptor_pool(resources.descriptor_pool, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyPipeline,
+                device.destroy_pipeline(resources.pipeline, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyPipelineLayout,
+                device.destroy_pipeline_layout(resources.pipeline_layout, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyDescriptorSetLayout,
+                device.destroy_descriptor_set_layout(resources.descriptor_layout, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyShaderModule,
+                device.destroy_shader_module(resources.shader, None)
+            );
             for buffer in resources.buffers {
-                device.unmap_memory(buffer.memory);
-                device.destroy_buffer(buffer.buffer, None);
-                device.free_memory(buffer.memory, None);
+                vk_api_owner!(self.device, UnmapMemory, device.unmap_memory(buffer.memory));
+                vk_api_owner!(
+                    self.device,
+                    DestroyBuffer,
+                    device.destroy_buffer(buffer.buffer, None)
+                );
+                vk_api_owner!(
+                    self.device,
+                    FreeMemory,
+                    device.free_memory(buffer.memory, None)
+                );
             }
         }
     }

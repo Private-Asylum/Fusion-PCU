@@ -63,6 +63,27 @@ pub struct PcuVulkanBackend {
 }
 
 impl PcuVulkanBackend {
+    /// Chooses the cold compiler template source independently of artifact retention.
+    pub fn configure_shader_source(&self, source: crate::PcuVulkanShaderSource) {
+        self.device.shader_source.borrow_mut().configure(source);
+    }
+    /// Releases loaded source-package RAM. Existing prepared pipelines retain their owners.
+    pub fn clear_shader_source_cache(&self) {
+        self.device.shader_source.borrow_mut().clear();
+    }
+
+    /// Configures cold shader retention. Already prepared pipelines remain usable.
+    /// Disk mode currently requires typed host preparation; direct leaf/tensor factories refuse.
+    pub fn configure_shader_cache(&self, policy: crate::PcuVulkanShaderCachePolicy) {
+        self.device.artifacts.borrow_mut().configure(policy);
+    }
+
+    /// Returns cold artifact cache observations.
+    #[must_use]
+    pub fn shader_cache_stats(&self) -> crate::PcuVulkanShaderCacheStats {
+        self.device.artifacts.borrow().stats
+    }
+
     /// Opens the first compute-capable Vulkan device.
     ///
     /// # Errors
@@ -73,6 +94,18 @@ impl PcuVulkanBackend {
             identity: None,
             _exclusive_queue: PhantomData,
         })
+    }
+
+    /// Opens a device with explicit caller-owned SDK accounting from its first loader call.
+    /// Existing owners keep their own attachment; this constructor performs normal discovery.
+    ///
+    /// # Errors
+    /// Returns the same loader, discovery and creation failures as `new`.
+    #[cfg(feature = "insights")]
+    pub fn with_api_insights(
+        ledger: Rc<crate::PcuVulkanApiInsights>,
+    ) -> Result<Self, PcuVulkanError> {
+        crate::with_api_insights_scope(ledger, Self::new)
     }
 
     /// Inspects the first compute-capable device without retaining a logical device.

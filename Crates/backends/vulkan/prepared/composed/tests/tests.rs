@@ -14,7 +14,7 @@ struct AdmissionCase {
     portable: bool,
     write_only: bool,
 }
-struct Admission(Option<PcuSpirvComposedFloatProfile>);
+struct Admission(Option<PcuSpirvComposedProfile>);
 impl PcuHostKernelBackend for AdmissionCase {
     type Prepared = Admission;
     type Error = PcuVulkanError;
@@ -53,26 +53,29 @@ impl PcuPreparedHostKernel for Admission {
 #[test]
 fn ordinary_cold_admission_preserves_access_and_reproducibility() {
     macro_rules! width {
-        ($ty:ty) => {
-            for portable in [false, true] {
-                for write_only in [false, true] {
-                    let captured = graph::prepare::<$ty, 65, _>(
-                        &AdmissionCase {
-                            portable,
-                            write_only,
-                        },
-                        PcuFloatUnderflowPolicy::IeeeAfterRounding,
-                        PcuRangePolicy::Clamp,
-                    );
-                    assert_eq!(captured.0.is_some(), !portable && !write_only);
-                    if let Some(profile) = captured.0 {
-                        assert_eq!(profile.requirements().range_policy, PcuRangePolicy::Clamp);
-                        assert_eq!(profile.declarations().len(), 2);
-                        assert_eq!(profile.resources().len(), 2);
+        ($ty:ty) => {{
+            fn case() {
+                for portable in [false, true] {
+                    for write_only in [false, true] {
+                        let captured = graph::prepare::<$ty, 65, _>(
+                            &AdmissionCase {
+                                portable,
+                                write_only,
+                            },
+                            PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                            PcuRangePolicy::Clamp,
+                        );
+                        assert_eq!(captured.0.is_some(), !portable && !write_only);
+                        if let Some(profile) = captured.0 {
+                            assert_eq!(profile.requirements().range_policy, PcuRangePolicy::Clamp);
+                            assert_eq!(profile.declarations().len(), 2);
+                            assert_eq!(profile.resources().len(), 2);
+                        }
                     }
                 }
             }
-        };
+            case();
+        }};
     }
     width!(fusion_pcu::PcuF16Bits);
     width!(fusion_pcu::PcuBf16Bits);
@@ -83,7 +86,7 @@ fn ordinary_cold_admission_preserves_access_and_reproducibility() {
 }
 
 struct Capture;
-struct Captured(PcuSpirvComposedFloatProfile);
+struct Captured(PcuSpirvComposedProfile);
 impl PcuHostKernelBackend for Capture {
     type Prepared = Captured;
     type Error = fusion_pcu_spirv::PcuSpirvError;

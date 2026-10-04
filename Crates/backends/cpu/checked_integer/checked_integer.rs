@@ -98,12 +98,16 @@ impl<T: PcuCheckedInteger> PcuCpuCheckedInteger<T> {
     }
     /// Admits an explicit bounded Add/Sub instruction implementation during cold preparation.
     /// # Errors
-    /// Rejects unavailable ISA or unsupported AVX2; later preparation rejects wide/Mul profiles.
+    /// Rejects unavailable ISA; later preparation rejects unsupported wide/Mul profiles.
     pub const fn with_implementation(
         processor: PcuCpuProcessor,
         implementation: PcuCpuImplementation,
     ) -> Result<Self, PcuCpuCheckedIntegerError> {
-        if matches!(implementation, PcuCpuImplementation::Avx2) {
+        if matches!(implementation, PcuCpuImplementation::Avx) {
+            return Err(PcuCpuCheckedIntegerError::UnsupportedProfile);
+        }
+        if matches!(implementation, PcuCpuImplementation::Avx512) && !processor.features().avx512bw
+        {
             return Err(PcuCpuCheckedIntegerError::UnsupportedProfile);
         }
         match processor.require(implementation) {
@@ -147,6 +151,14 @@ impl<T: PcuCheckedInteger> PcuCpuCheckedInteger<T> {
                 )))]
                 let _ = processor;
                 if native {
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    if processor.features().avx512f && processor.features().avx512bw {
+                        return Ok(PcuCpuImplementation::Avx512);
+                    }
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    if processor.features().avx2 {
+                        return Ok(PcuCpuImplementation::Avx2);
+                    }
                     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                     if processor.features().sse2 {
                         return Ok(PcuCpuImplementation::Sse2);
@@ -334,7 +346,7 @@ impl<T: PcuCheckedInteger> PcuHostKernelBackend for PcuCpuCheckedInteger<T> {
                 .reproducibility
                 == fusion_pcu::PcuReproducibility::PortableV1
             {
-                // Scalar/SSE2/NEON numerical mechanisms stay identical; cold profile IDs are separate.
+                // Scalar and SIMD numerical mechanisms stay identical; cold profile IDs are separate.
                 operand_id(T::TYPE, *op, *range_policy, implementation)? + 2048
             } else if legacy {
                 implementation_id(T::TYPE, *op, *range_policy, implementation, base)?
@@ -586,6 +598,8 @@ fn simd_id(
     let arch = match implementation {
         PcuCpuImplementation::Sse2 => 0,
         PcuCpuImplementation::Neon => 1,
+        PcuCpuImplementation::Avx2 => 2,
+        PcuCpuImplementation::Avx512 => 3,
         _ => return Err(PcuCpuCheckedIntegerError::UnsupportedProfile),
     };
     let operation = match op {
@@ -657,11 +671,18 @@ fn operand_id(
     let clamp = u32::from(range == PcuRangePolicy::Clamp);
     match implementation {
         PcuCpuImplementation::Scalar => Ok(2048 + index * 6 + clamp * 3 + operation),
-        PcuCpuImplementation::Sse2 | PcuCpuImplementation::Neon if index < 8 && operation < 2 => {
-            Ok(if implementation == PcuCpuImplementation::Sse2 {
-                2176
-            } else {
-                2304
+        PcuCpuImplementation::Sse2
+        | PcuCpuImplementation::Neon
+        | PcuCpuImplementation::Avx2
+        | PcuCpuImplementation::Avx512
+            if index < 8 && operation < 2 =>
+        {
+            Ok(match implementation {
+                PcuCpuImplementation::Sse2 => 2176,
+                PcuCpuImplementation::Neon => 2304,
+                PcuCpuImplementation::Avx2 => 2432,
+                PcuCpuImplementation::Avx512 => 2560,
+                _ => unreachable!(),
             } + index * 4
                 + clamp * 2
                 + operation)

@@ -577,8 +577,8 @@ fn fill(lhs: &mut [f32], rhs: &mut [f32], job: u64) {
     let job_value = f32::from(u16::try_from(job % 32_768).expect("job value fits"));
     for (index, (left, right)) in lhs.iter_mut().zip(rhs).enumerate() {
         let lane = f32::from(u16::try_from(index % 1024).expect("lane fits"));
-        *left = job_value + lane * 0.0625;
-        *right = if index % 2 == 0 { 1.0 } else { -1.0 };
+        *left = lane.mul_add(0.0625, job_value);
+        *right = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
     }
 }
 

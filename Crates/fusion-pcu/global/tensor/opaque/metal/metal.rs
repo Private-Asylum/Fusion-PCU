@@ -1,4 +1,4 @@
-//! Bounded leaf/ReLU/binary Metal publication through the existing initialized device owner.
+//! Selected leaf and graph Metal publication through the existing initialized device owner.
 #[rustfmt::skip]
 use std::rc::Rc;
 #[rustfmt::skip]
@@ -70,7 +70,9 @@ impl Prepared {
         {
             return Err(PcuExecutionError::ResidentPolicyConflict);
         }
-        if !(1..=2).contains(&built.input_indices.len()) {
+        // Exact backend assessment admits zero bindings only for a real immutable
+        // producer graph. Never invent an input merely to open a device session.
+        if built.input_indices.len() > N {
             return Err(PcuExecutionError::InvalidTensorSourcePlan);
         }
         let mut root: Option<Rc<Session>> = None;
@@ -137,12 +139,12 @@ impl Prepared {
         inputs: &[PcuTensorInput<'_, T>; N],
         indices: &[usize],
     ) -> Result<PcuTensor<T>, PcuExecutionError> {
-        if !(1..=2).contains(&indices.len()) || indices.iter().any(|&index| index >= N) {
+        if indices.len() > N || indices.iter().any(|&index| index >= N) {
             return Err(PcuExecutionError::InvalidTensorSourcePlan);
         }
         // Caller-owned stack argument spans live until terminal backend completion.
         // Repeated operands share one unique input and are projected by the frozen plan.
-        let hosts: [Option<PcuHostArgument<'_>>; 2] = core::array::from_fn(|slot| {
+        let hosts: [Option<PcuHostArgument<'_>>; N] = core::array::from_fn(|slot| {
             indices
                 .get(slot)
                 .and_then(|&index| match inputs[index].kind {
@@ -152,11 +154,21 @@ impl Prepared {
                     TensorInputKind::Resident(_) => None,
                 })
         });
-        let first = self.bind(inputs[indices[0]], hosts[0].as_ref())?;
-        let output = if let Some(&second) = indices.get(1) {
+        let output = if indices.is_empty() {
+            // The frozen graph owns its producer seeds and fresh output-copy controls.
+            self.program.execute(&[])?
+        } else if indices.len() > 2 {
+            let mut bindings = smallvec::SmallVec::<[_; 4]>::new();
+            for (slot, &index) in indices.iter().enumerate() {
+                bindings.push(self.bind(inputs[index], hosts[slot].as_ref())?);
+            }
+            self.program.execute(&bindings)?
+        } else if let Some(&second) = indices.get(1) {
+            let first = self.bind(inputs[indices[0]], hosts[0].as_ref())?;
             let second = self.bind(inputs[second], hosts[1].as_ref())?;
             self.program.execute(&[first, second])?
         } else {
+            let first = self.bind(inputs[indices[0]], hosts[0].as_ref())?;
             self.program.execute(&[first])?
         };
         let shape = crate::PcuOwnedShape::from_slice(output.shape());

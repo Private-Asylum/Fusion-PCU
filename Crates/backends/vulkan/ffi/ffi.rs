@@ -44,6 +44,9 @@ use fusion_pcu::{
 const BACKEND_APP_NAME: &CStr = c"fusion-pcu-vulkan-prototype";
 const BACKEND_ENGINE_NAME: &CStr = c"fusion-pcu";
 const SHADER_ENTRY_POINT: &CStr = c"main";
+// Vulkan 1.4 is the current stable core. The bound is independent of ash's generated
+// header patch; we only call entry points represented by the installed bindings.
+const MAX_INSTANCE_API_VERSION: u32 = vk::make_api_version(0, 1, 4, 0);
 
 #[path = "prepared/prepared.rs"]
 mod prepared;
@@ -79,6 +82,8 @@ pub use tensor::{VulkanPreparedTensorMap, TensorStatusPolicy};
 
 /// Vulkan PCU prototype.
 pub struct VulkanDevice {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     entry: ManuallyDrop<ash::Entry>,
     instance: ash::Instance,
     device: ash::Device,
@@ -88,6 +93,9 @@ pub struct VulkanDevice {
     caps: PcuVulkanCaps,
     physical_device_name: String,
     poisoned: Cell<bool>,
+    synchronization2: bool,
+    pub(crate) shader_source: std::cell::RefCell<crate::shader_source::SourceStore>,
+    pub(crate) artifacts: std::cell::RefCell<crate::shader_artifact::ArtifactStore>,
     limits: vk::PhysicalDeviceLimits,
 }
 
@@ -118,6 +126,8 @@ impl VulkanDevice {
     pub fn probe_with_descriptor_heap_budget(
         requested_heap_budget: PcuVulkanDescriptorHeapBudget,
     ) -> Result<PcuVulkanCaps, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        crate::api_insights::count_attached(crate::PcuVulkanApiPoint::LoaderLoad);
         let entry = unsafe {
             // SAFETY: Loading the Vulkan loader is process-local and ash validates entry points.
             ash::Entry::load()
@@ -125,7 +135,11 @@ impl VulkanDevice {
         .map_err(PcuVulkanError::Loader)?;
         let instance_api_version = choose_instance_api_version(&entry)?;
         let instance = create_instance(&entry, instance_api_version)?;
-        let instance = VulkanProbeInstance { handle: instance };
+        let instance = VulkanProbeInstance {
+            #[cfg(feature = "insights")]
+            api_insights: crate::api_insights::attached(),
+            handle: instance,
+        };
         let selected = select_compute_device(&instance.handle)?;
         let caps = query_backend_caps(
             &instance.handle,
@@ -152,6 +166,8 @@ impl VulkanDevice {
         requested_heap_budget: PcuVulkanDescriptorHeapBudget,
         expected: Option<&VulkanNativeDevice>,
     ) -> Result<Self, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        crate::api_insights::count_attached(crate::PcuVulkanApiPoint::LoaderLoad);
         let entry = unsafe {
             // SAFETY: Loading the Vulkan loader is process-local and ash validates entry points.
             ash::Entry::load()
@@ -159,6 +175,8 @@ impl VulkanDevice {
         .map_err(PcuVulkanError::Loader)?;
         let instance_api_version = choose_instance_api_version(&entry)?;
         let instance_owner = VulkanProbeInstance {
+            #[cfg(feature = "insights")]
+            api_insights: crate::api_insights::attached(),
             handle: create_instance(&entry, instance_api_version)?,
         };
         let instance = &instance_owner.handle;
@@ -175,20 +193,30 @@ impl VulkanDevice {
             instance_api_version,
             requested_heap_budget,
         )?;
-        let device = create_device(
+        let (device, synchronization2) = create_device(
             instance,
             selected.physical_device,
             selected.queue_family_index,
             caps.shader_float64,
+            caps.api_version,
         )?;
         let queue = unsafe {
             // SAFETY: The logical device was created with queue index 0 for this queue family.
-            device.get_device_queue(selected.queue_family_index, 0)
+            vk_api_cold!(
+                GetDeviceQueue,
+                device.get_device_queue(selected.queue_family_index, 0)
+            )
         };
 
         let instance = instance.clone();
+        #[cfg(feature = "insights")]
+        let mut instance_owner = instance_owner;
+        #[cfg(feature = "insights")]
+        let api_insights = instance_owner.api_insights.take();
         mem::forget(instance_owner); // Native ownership transfers into VulkanDevice.
         Ok(Self {
+            #[cfg(feature = "insights")]
+            api_insights,
             entry: ManuallyDrop::new(entry),
             instance,
             device,
@@ -198,8 +226,23 @@ impl VulkanDevice {
             caps,
             physical_device_name: physical_device_name(&selected.properties),
             poisoned: Cell::new(false),
+            synchronization2,
+            artifacts: std::cell::RefCell::default(),
+            shader_source: std::cell::RefCell::default(),
             limits: selected.properties.limits,
         })
+    }
+
+    #[cfg(feature = "insights")]
+    pub(super) fn count_api(&self, point: crate::PcuVulkanApiPoint) {
+        if let Some(ledger) = self.api_insights.as_ref() {
+            ledger.count(point.index(), 1);
+        }
+    }
+
+    #[cfg(feature = "insights")]
+    pub(super) fn api_scope(&self) -> crate::api_insights::Restore {
+        crate::api_insights::install(self.api_insights.as_ref().map(std::rc::Rc::clone))
     }
 
     #[must_use]
@@ -262,16 +305,16 @@ impl VulkanDevice {
 
     pub fn validate_composed_geometry(
         &self,
-        profile: &fusion_pcu_spirv::PcuSpirvComposedFloatProfile,
+        profile: &fusion_pcu_spirv::PcuSpirvComposedProfile,
     ) -> Result<(), PcuVulkanError> {
         if self.poisoned.get() {
             return Err(PcuVulkanError::Quarantined);
         }
         validate_map_descriptor_count(&self.limits, 5)?;
-        // The 8-byte ordered status is at least as large as every scalar resource.
+        // The largest scalar bank or the ordered status determines the byte geometry.
         let bytes = usize::try_from(profile.extent())
             .ok()
-            .and_then(|extent| extent.checked_mul(8))
+            .and_then(|extent| extent.checked_mul(profile.element_bytes().max(8)))
             .ok_or(PcuVulkanError::BufferTooLarge)?;
         validate_device_geometry(
             &self.limits,
@@ -466,6 +509,8 @@ impl VulkanDevice {
         submission: PcuDispatchSubmission<'_>,
         bindings: &mut [PcuInvocationBinding<'_>],
     ) -> Result<PcuVulkanExecutionReport, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        let _api_scope = self.api_scope();
         if self.poisoned.get() {
             return Err(PcuVulkanError::Quarantined);
         }
@@ -481,25 +526,28 @@ impl VulkanDevice {
             &self.instance,
             self.physical_device,
             &self.device,
+            self.caps.api_version,
             execution.bound_byte_len,
         )?;
         let bias_buffer = VulkanBuffer::new_storage_buffer(
             &self.instance,
             self.physical_device,
             &self.device,
+            self.caps.api_version,
             execution.bound_byte_len,
         )?;
         let output_buffer = VulkanBuffer::new_storage_buffer(
             &self.instance,
             self.physical_device,
             &self.device,
+            self.caps.api_version,
             execution.bound_byte_len,
         )?;
 
         write_binding_buffer(bindings, 0, &source_buffer)?;
         write_binding_buffer(bindings, 1, &bias_buffer)?;
 
-        let shader_module = create_shader_module(&self.device, dispatch.words)?;
+        let shader_module = create_shader_module(self, dispatch.words)?;
         let shader_entry = CString::new(submission.kernel.entry.name)
             .map_err(|_| PcuVulkanError::InvalidArguments)?;
         let descriptor_set_layout = create_descriptor_set_layout(&self.device)?;
@@ -536,8 +584,7 @@ impl VulkanDevice {
         )?;
 
         let fence = create_fence(&self.device)?;
-        if let Err(error) = submit_and_wait(&self.device, self.queue, command_buffer, fence.handle)
-        {
+        if let Err(error) = submit_and_wait(self, command_buffer, fence.handle) {
             if matches!(error, PcuVulkanError::CompletionUnknown) {
                 self.poisoned.set(true);
                 // Unknown device execution retains every allocation, descriptor and command owner.
@@ -786,9 +833,21 @@ impl Drop for VulkanDevice {
         }
         unsafe {
             // SAFETY: The prototype owns the logical device and instance and destroys them exactly once.
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            let _ = vk_api_retained!(
+                &self.api_insights,
+                DeviceWaitIdle,
+                self.device.device_wait_idle()
+            );
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyDevice,
+                self.device.destroy_device(None)
+            );
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyInstance,
+                self.instance.destroy_instance(None)
+            );
             ManuallyDrop::drop(&mut self.entry);
         }
     }
@@ -801,6 +860,8 @@ struct SelectedPhysicalDevice {
 }
 
 struct VulkanProbeInstance {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     handle: ash::Instance,
 }
 
@@ -808,7 +869,11 @@ impl Drop for VulkanProbeInstance {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the probe instance and destroys it exactly once.
-            self.handle.destroy_instance(None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyInstance,
+                self.handle.destroy_instance(None)
+            );
         }
     }
 }
@@ -816,18 +881,19 @@ impl Drop for VulkanProbeInstance {
 fn choose_instance_api_version(entry: &ash::Entry) -> Result<u32, PcuVulkanError> {
     let supported = unsafe {
         // SAFETY: This only queries loader-level Vulkan version support.
-        entry.try_enumerate_instance_version()
+        vk_api_cold!(InstanceVersion, entry.try_enumerate_instance_version())
     }
     .map_err(|result| PcuVulkanError::Vulkan {
         context: "enumerate Vulkan instance version",
         result,
     })?;
-    let version = supported.unwrap_or(vk::API_VERSION_1_0);
-    if version >= vk::API_VERSION_1_1 {
-        Ok(vk::API_VERSION_1_1)
-    } else {
-        Ok(vk::API_VERSION_1_0)
-    }
+    Ok(negotiated_instance_api_version(supported))
+}
+
+fn negotiated_instance_api_version(supported: Option<u32>) -> u32 {
+    supported
+        .unwrap_or(vk::API_VERSION_1_0)
+        .min(MAX_INSTANCE_API_VERSION)
 }
 
 fn create_instance(entry: &ash::Entry, api_version: u32) -> Result<ash::Instance, PcuVulkanError> {
@@ -841,7 +907,7 @@ fn create_instance(entry: &ash::Entry, api_version: u32) -> Result<ash::Instance
     let create_info = vk::InstanceCreateInfo::default().application_info(&application_info);
     vk_try("create Vulkan instance", unsafe {
         // SAFETY: The create info only references static C strings and no extension pointers.
-        entry.create_instance(&create_info, None)
+        vk_api_cold!(CreateInstance, entry.create_instance(&create_info, None))
     })
 }
 
@@ -850,7 +916,10 @@ fn select_compute_device(
 ) -> Result<SelectedPhysicalDevice, PcuVulkanError> {
     let physical_devices = vk_try("enumerate physical Vulkan devices", unsafe {
         // SAFETY: The instance is live for the duration of the call.
-        instance.enumerate_physical_devices()
+        vk_api_cold!(
+            EnumeratePhysicalDevices,
+            instance.enumerate_physical_devices()
+        )
     })?;
     if physical_devices.is_empty() {
         return Err(PcuVulkanError::NoPhysicalDevice);
@@ -862,7 +931,10 @@ fn select_compute_device(
         };
         let properties = unsafe {
             // SAFETY: The physical device handle was returned by this live instance.
-            instance.get_physical_device_properties(physical_device)
+            vk_api_cold!(
+                PhysicalDeviceProperties,
+                instance.get_physical_device_properties(physical_device)
+            )
         };
         if properties.device_type == vk::PhysicalDeviceType::CPU {
             continue; // Native software Vulkan execution is never a silent CPU fallback.
@@ -882,19 +954,40 @@ fn create_device(
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
     shader_float64: bool,
-) -> Result<ash::Device, PcuVulkanError> {
+    api_version: u32,
+) -> Result<(ash::Device, bool), PcuVulkanError> {
     let queue_priorities = [1.0_f32];
     let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family_index)
         .queue_priorities(&queue_priorities)];
     let features = vk::PhysicalDeviceFeatures::default().shader_float64(shader_float64);
-    let create_info = vk::DeviceCreateInfo::default()
+    let mut synchronization2 = vk::PhysicalDeviceSynchronization2Features::default();
+    if api_version >= vk::API_VERSION_1_3 {
+        let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut synchronization2);
+        unsafe {
+            // SAFETY: Negotiated core 1.3 includes synchronization2; this valid output chain
+            // queries the optional feature before requesting it on the logical device.
+            vk_api_cold!(
+                PhysicalDeviceFeatures2,
+                instance.get_physical_device_features2(physical_device, &mut query)
+            );
+        }
+    }
+    let enabled = synchronization2.synchronization2 != 0;
+    let mut create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
         .enabled_features(&features);
-    vk_try("create Vulkan logical device", unsafe {
+    if enabled {
+        create_info = create_info.push_next(&mut synchronization2);
+    }
+    let device = vk_try("create Vulkan logical device", unsafe {
         // SAFETY: The physical device and queue family index were enumerated from this instance.
-        instance.create_device(physical_device, &create_info, None)
-    })
+        vk_api_cold!(
+            CreateDevice,
+            instance.create_device(physical_device, &create_info, None)
+        )
+    })?;
+    Ok((device, enabled))
 }
 
 fn query_backend_caps(
@@ -906,7 +999,10 @@ fn query_backend_caps(
 ) -> Result<PcuVulkanCaps, PcuVulkanError> {
     let native_features = unsafe {
         // SAFETY: physical_device belongs to this live instance; this is a core feature query.
-        instance.get_physical_device_features(physical_device)
+        vk_api_cold!(
+            PhysicalDeviceFeatures,
+            instance.get_physical_device_features(physical_device)
+        )
     };
     let mut descriptor_indexing = PcuVulkanDescriptorIndexingCaps {
         requested_heap_budget,
@@ -917,24 +1013,40 @@ fn query_backend_caps(
         max_size_bytes: properties.limits.max_push_constants_size,
     };
 
-    if instance_api_version >= vk::API_VERSION_1_1 {
+    let api_version = instance_api_version.min(properties.api_version);
+    if api_version >= vk::API_VERSION_1_1 {
         let extensions = query_device_extensions(instance, physical_device)?;
         let mut descriptor_features = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
         let mut buffer_address_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
         let mut mutable_descriptor_features =
             vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default();
-        let mut features = vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut descriptor_features)
-            .push_next(&mut buffer_address_features)
-            .push_next(&mut mutable_descriptor_features);
+        let descriptor_available =
+            api_version >= vk::API_VERSION_1_2 || extensions.descriptor_indexing;
+        let address_available =
+            api_version >= vk::API_VERSION_1_2 || extensions.buffer_device_address;
+        let mut features = vk::PhysicalDeviceFeatures2::default();
+        if descriptor_available {
+            features = features.push_next(&mut descriptor_features);
+        }
+        if address_available {
+            features = features.push_next(&mut buffer_address_features);
+        }
+        if extensions.mutable_descriptor_type {
+            features = features.push_next(&mut mutable_descriptor_features);
+        }
         unsafe {
             // SAFETY: The pNext feature chain contains valid feature structs for query only.
-            instance.get_physical_device_features2(physical_device, &mut features);
+            vk_api_cold!(
+                PhysicalDeviceFeatures2,
+                instance.get_physical_device_features2(physical_device, &mut features)
+            );
         }
 
         let mut descriptor_properties = vk::PhysicalDeviceDescriptorIndexingProperties::default();
-        let mut properties2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut descriptor_properties);
+        let mut properties2 = vk::PhysicalDeviceProperties2::default();
+        if descriptor_available {
+            properties2 = properties2.push_next(&mut descriptor_properties);
+        }
         unsafe {
             // SAFETY: The pNext property chain contains valid property structs for query only.
             instance.get_physical_device_properties2(physical_device, &mut properties2);
@@ -970,8 +1082,8 @@ fn query_backend_caps(
             PcuVulkanDescriptorHeapBudget::empty()
         };
 
-        buffer_device_address.supported = extensions.buffer_device_address
-            && bool32(buffer_address_features.buffer_device_address);
+        buffer_device_address.supported =
+            address_available && bool32(buffer_address_features.buffer_device_address);
         buffer_device_address.capture_replay =
             bool32(buffer_address_features.buffer_device_address_capture_replay);
         buffer_device_address.multi_device =
@@ -979,7 +1091,7 @@ fn query_backend_caps(
     }
 
     Ok(PcuVulkanCaps {
-        api_version: instance_api_version.min(properties.api_version),
+        api_version,
         shader_float64: bool32(native_features.shader_float64),
         descriptor_indexing,
         buffer_device_address,
@@ -990,6 +1102,7 @@ fn query_backend_caps(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct PcuVulkanDeviceExtensions {
+    descriptor_indexing: bool,
     buffer_device_address: bool,
     mutable_descriptor_type: bool,
 }
@@ -1000,7 +1113,10 @@ fn query_device_extensions(
 ) -> Result<PcuVulkanDeviceExtensions, PcuVulkanError> {
     let properties = vk_try("enumerate Vulkan device extensions", unsafe {
         // SAFETY: The physical device handle was returned by this live instance.
-        instance.enumerate_device_extension_properties(physical_device)
+        vk_api_cold!(
+            DeviceExtensions,
+            instance.enumerate_device_extension_properties(physical_device)
+        )
     })?;
     let mut extensions = PcuVulkanDeviceExtensions::default();
     for property in properties {
@@ -1008,6 +1124,9 @@ fn query_device_extensions(
             // SAFETY: Vulkan extension names are fixed-size null-terminated C strings.
             CStr::from_ptr(property.extension_name.as_ptr())
         };
+        if name == vk::EXT_DESCRIPTOR_INDEXING_NAME {
+            extensions.descriptor_indexing = true;
+        }
         if name == vk::KHR_BUFFER_DEVICE_ADDRESS_NAME {
             extensions.buffer_device_address = true;
         }
@@ -1019,18 +1138,32 @@ fn query_device_extensions(
 }
 
 fn create_shader_module<'a>(
-    device: &'a ash::Device,
+    session: &'a VulkanDevice,
     words: &[u32],
 ) -> Result<VulkanShaderModule<'a>, PcuVulkanError> {
-    let create_info = vk::ShaderModuleCreateInfo::default().code(words);
+    let resolved = session
+        .artifacts
+        .borrow_mut()
+        .resolve(words)
+        .map_err(PcuVulkanError::ShaderArtifact)?;
+    let device = &session.device;
+    let create_info = vk::ShaderModuleCreateInfo::default().code(&resolved);
     let handle = vk_try(
         "create Vulkan shader module from fusion-pcu SPIR-V",
         unsafe {
             // SAFETY: `words` is SPIR-V word-aligned `u32` storage and lives for the duration of the call.
-            device.create_shader_module(&create_info, None)
+            vk_api_cold!(
+                CreateShaderModule,
+                device.create_shader_module(&create_info, None)
+            )
         },
     )?;
-    Ok(VulkanShaderModule { device, handle })
+    Ok(VulkanShaderModule {
+        #[cfg(feature = "insights")]
+        api_insights: crate::api_insights::attached(),
+        device,
+        handle,
+    })
 }
 
 fn create_descriptor_set_layout(
@@ -1048,9 +1181,17 @@ fn create_map_descriptor_set_layout<const N: usize>(
     let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     let handle = vk_try("create Vulkan descriptor set layout", unsafe {
         // SAFETY: The create info references only stack-local binding descriptors for the duration of the call.
-        device.create_descriptor_set_layout(&create_info, None)
+        vk_api_cold!(
+            CreateDescriptorSetLayout,
+            device.create_descriptor_set_layout(&create_info, None)
+        )
     })?;
-    Ok(VulkanDescriptorSetLayout { device, handle })
+    Ok(VulkanDescriptorSetLayout {
+        #[cfg(feature = "insights")]
+        api_insights: crate::api_insights::attached(),
+        device,
+        handle,
+    })
 }
 
 fn storage_buffer_layout_binding(binding: u32) -> vk::DescriptorSetLayoutBinding<'static> {
@@ -1069,9 +1210,17 @@ fn create_pipeline_layout(
     let create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
     let handle = vk_try("create Vulkan pipeline layout", unsafe {
         // SAFETY: The descriptor set layout handle is live and belongs to this device.
-        device.create_pipeline_layout(&create_info, None)
+        vk_api_cold!(
+            CreatePipelineLayout,
+            device.create_pipeline_layout(&create_info, None)
+        )
     })?;
-    Ok(VulkanPipelineLayout { device, handle })
+    Ok(VulkanPipelineLayout {
+        #[cfg(feature = "insights")]
+        api_insights: crate::api_insights::attached(),
+        device,
+        handle,
+    })
 }
 
 fn create_compute_pipeline<'a>(
@@ -1090,20 +1239,28 @@ fn create_compute_pipeline<'a>(
 
     let pipelines = unsafe {
         // SAFETY: The shader module and pipeline layout are live and belong to this device.
-        device.create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
+        vk_api_cold!(
+            CreateComputePipelines,
+            device.create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
+        )
     };
     match pipelines {
         Ok(mut pipelines) => {
             let Some(handle) = pipelines.pop() else {
                 return Err(PcuVulkanError::NoComputePipeline);
             };
-            Ok(VulkanComputePipeline { device, handle })
+            Ok(VulkanComputePipeline {
+                #[cfg(feature = "insights")]
+                api_insights: crate::api_insights::attached(),
+                device,
+                handle,
+            })
         }
         Err((partial, result)) => {
             for pipeline in partial {
                 unsafe {
                     // SAFETY: Partial pipelines returned by Vulkan belong to this device and are not otherwise owned.
-                    device.destroy_pipeline(pipeline, None);
+                    vk_api_cold!(DestroyPipeline, device.destroy_pipeline(pipeline, None));
                 }
             }
             Err(PcuVulkanError::Vulkan {
@@ -1131,9 +1288,17 @@ fn create_map_descriptor_pool<const N: usize>(
         .pool_sizes(&pool_sizes);
     let handle = vk_try("create Vulkan descriptor pool", unsafe {
         // SAFETY: The create info references only stack-local pool sizes for the duration of the call.
-        device.create_descriptor_pool(&create_info, None)
+        vk_api_cold!(
+            CreateDescriptorPool,
+            device.create_descriptor_pool(&create_info, None)
+        )
     })?;
-    Ok(VulkanDescriptorPool { device, handle })
+    Ok(VulkanDescriptorPool {
+        #[cfg(feature = "insights")]
+        api_insights: crate::api_insights::attached(),
+        device,
+        handle,
+    })
 }
 
 fn allocate_descriptor_set(
@@ -1147,7 +1312,10 @@ fn allocate_descriptor_set(
         .set_layouts(&set_layouts);
     let sets = vk_try("allocate Vulkan descriptor set", unsafe {
         // SAFETY: The descriptor pool and layout are live and belong to this device.
-        device.allocate_descriptor_sets(&allocate_info)
+        vk_api_cold!(
+            AllocateDescriptorSets,
+            device.allocate_descriptor_sets(&allocate_info)
+        )
     })?;
     sets.first().copied().ok_or(PcuVulkanError::NoDescriptorSet)
 }
@@ -1172,7 +1340,10 @@ fn update_storage_descriptors(
     ];
     unsafe {
         // SAFETY: Descriptor set, buffers, and buffer ranges are live for this update call.
-        device.update_descriptor_sets(&writes, &[]);
+        vk_api_cold!(
+            UpdateDescriptorSets,
+            device.update_descriptor_sets(&writes, &[])
+        );
     }
 }
 
@@ -1197,9 +1368,17 @@ fn create_command_pool(
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     let handle = vk_try("create Vulkan command pool", unsafe {
         // SAFETY: The queue family index was selected from this physical device before logical device creation.
-        device.create_command_pool(&create_info, None)
+        vk_api_cold!(
+            CreateCommandPool,
+            device.create_command_pool(&create_info, None)
+        )
     })?;
-    Ok(VulkanCommandPool { device, handle })
+    Ok(VulkanCommandPool {
+        #[cfg(feature = "insights")]
+        api_insights: crate::api_insights::attached(),
+        device,
+        handle,
+    })
 }
 
 fn allocate_command_buffer(
@@ -1212,7 +1391,10 @@ fn allocate_command_buffer(
         .command_buffer_count(1);
     let command_buffers = vk_try("allocate Vulkan command buffer", unsafe {
         // SAFETY: The command pool is live and belongs to this device.
-        device.allocate_command_buffers(&allocate_info)
+        vk_api_cold!(
+            AllocateCommandBuffers,
+            device.allocate_command_buffers(&allocate_info)
+        )
     })?;
     command_buffers
         .first()
@@ -1231,36 +1413,51 @@ fn record_compute_commands(
     let begin_info = vk::CommandBufferBeginInfo::default();
     vk_try("begin Vulkan command buffer", unsafe {
         // SAFETY: The command buffer is allocated from a resettable pool and currently not recording.
-        device.begin_command_buffer(command_buffer, &begin_info)
+        vk_api_cold!(
+            BeginCommandBuffer,
+            device.begin_command_buffer(command_buffer, &begin_info)
+        )
     })?;
     unsafe {
         // SAFETY: Pipeline, layout, and descriptor set are live and compatible by construction.
-        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-        device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline_layout,
-            0,
-            &[descriptor_set],
-            &[],
+        vk_api_cold!(
+            BindPipeline,
+            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline)
         );
-        device.cmd_dispatch(command_buffer, dispatch_groups_x, 1, 1);
+        vk_api_cold!(
+            BindDescriptorSets,
+            device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline_layout,
+                0,
+                &[descriptor_set],
+                &[],
+            )
+        );
+        vk_api_cold!(
+            Dispatch,
+            device.cmd_dispatch(command_buffer, dispatch_groups_x, 1, 1)
+        );
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)];
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &barrier,
-            &[],
-            &[],
+        vk_api_cold!(
+            PipelineBarrier,
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            )
         );
     }
     vk_try("end Vulkan command buffer", unsafe {
         // SAFETY: The command buffer is in the recording state.
-        device.end_command_buffer(command_buffer)
+        vk_api_cold!(EndCommandBuffer, device.end_command_buffer(command_buffer))
     })
 }
 
@@ -1268,58 +1465,86 @@ fn create_fence(device: &ash::Device) -> Result<VulkanFence<'_>, PcuVulkanError>
     let create_info = vk::FenceCreateInfo::default();
     let handle = vk_try("create Vulkan fence", unsafe {
         // SAFETY: The create info contains no borrowed extension data.
-        device.create_fence(&create_info, None)
+        vk_api_cold!(CreateFence, device.create_fence(&create_info, None))
     })?;
-    Ok(VulkanFence { device, handle })
+    Ok(VulkanFence {
+        #[cfg(feature = "insights")]
+        api_insights: crate::api_insights::attached(),
+        device,
+        handle,
+    })
 }
 
 fn submit_and_wait(
-    device: &ash::Device,
-    queue: vk::Queue,
+    session: &VulkanDevice,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
 ) -> Result<(), PcuVulkanError> {
-    submit_and_wait_measured(device, queue, command_buffer, fence, None)
+    submit_and_wait_measured(session, command_buffer, fence, None)
 }
 
 fn submit_and_wait_measured(
-    device: &ash::Device,
-    queue: vk::Queue,
+    session: &VulkanDevice,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     measurements: Option<&mut PcuVulkanCallMeasurements>,
 ) -> Result<(), PcuVulkanError> {
-    let command_buffers = [command_buffer];
-    let submit_infos = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-    let submission = unsafe {
-        // SAFETY: The queue and command buffer belong to this device, and the fence is unsignaled.
-        device.queue_submit(queue, &submit_infos, fence)
+    let device = &session.device;
+    let submission = if session.synchronization2 {
+        let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
+        let submits = [vk::SubmitInfo2::default().command_buffer_infos(&commands)];
+        unsafe {
+            // SAFETY: Core 1.3 synchronization2 was explicitly enabled on this device. Queue,
+            // command and unsignaled fence belong to the serialized retained session.
+            vk_api_owner!(
+                session,
+                QueueSubmit2,
+                device.queue_submit2(session.queue, &submits, fence)
+            )
+        }
+    } else {
+        let commands = [command_buffer];
+        let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+        unsafe {
+            // SAFETY: Legacy submission needs no optional feature. All handles belong to
+            // this session, whose previous submission has reached terminal completion.
+            vk_api_owner!(
+                session,
+                QueueSubmit,
+                device.queue_submit(session.queue, &submits, fence)
+            )
+        }
     };
     if let Err(result) = submission {
-        return terminal_submission_error(device, "submit Vulkan compute work", result);
+        return terminal_submission_error(session, "submit Vulkan compute work", result);
     }
     let started = measurements.as_ref().map(|_| std::time::Instant::now());
     let completion = unsafe {
         // SAFETY: The fence belongs to this device and was submitted above.
-        device.wait_for_fences(&[fence], true, u64::MAX)
+        vk_api_owner!(
+            session,
+            WaitForFences,
+            device.wait_for_fences(&[fence], true, u64::MAX)
+        )
     };
     if let (Some(measurements), Some(started)) = (measurements, started) {
         measurements.completion = started.elapsed();
     }
     match completion {
         Ok(()) => Ok(()),
-        Err(result) => terminal_submission_error(device, "wait for Vulkan compute work", result),
+        Err(result) => terminal_submission_error(session, "wait for Vulkan compute work", result),
     }
 }
 
 fn terminal_submission_error(
-    device: &ash::Device,
+    session: &VulkanDevice,
     context: &'static str,
     result: vk::Result,
 ) -> Result<(), PcuVulkanError> {
     // SAFETY: Host access to this session's queues is serialized; a successful idle wait proves
     // all native resources can be released even when the earlier submission/fence call failed.
-    if unsafe { device.device_wait_idle() }.is_ok() {
+    if unsafe { vk_api_owner!(session, DeviceWaitIdle, session.device.device_wait_idle()) }.is_ok()
+    {
         Err(PcuVulkanError::Vulkan { context, result })
     } else {
         Err(PcuVulkanError::CompletionUnknown)
@@ -1370,7 +1595,10 @@ fn find_compute_queue_family(
 ) -> Option<u32> {
     let families = unsafe {
         // SAFETY: The physical device handle was returned by this live instance.
-        instance.get_physical_device_queue_family_properties(physical_device)
+        vk_api_cold!(
+            QueueFamilyProperties,
+            instance.get_physical_device_queue_family_properties(physical_device)
+        )
     };
 
     families.iter().enumerate().find_map(|(index, family)| {
@@ -1398,6 +1626,8 @@ const fn bool32(value: vk::Bool32) -> bool {
 }
 
 struct VulkanShaderModule<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     handle: vk::ShaderModule,
 }
@@ -1406,12 +1636,18 @@ impl Drop for VulkanShaderModule<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the shader module and destroys it before the device guard drops.
-            self.device.destroy_shader_module(self.handle, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyShaderModule,
+                self.device.destroy_shader_module(self.handle, None)
+            );
         }
     }
 }
 
 struct VulkanDescriptorSetLayout<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     handle: vk::DescriptorSetLayout,
 }
@@ -1420,12 +1656,18 @@ impl Drop for VulkanDescriptorSetLayout<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the descriptor set layout and destroys it exactly once.
-            self.device.destroy_descriptor_set_layout(self.handle, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyDescriptorSetLayout,
+                self.device.destroy_descriptor_set_layout(self.handle, None)
+            );
         }
     }
 }
 
 struct VulkanPipelineLayout<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     handle: vk::PipelineLayout,
 }
@@ -1434,12 +1676,18 @@ impl Drop for VulkanPipelineLayout<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the pipeline layout and destroys it exactly once.
-            self.device.destroy_pipeline_layout(self.handle, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyPipelineLayout,
+                self.device.destroy_pipeline_layout(self.handle, None)
+            );
         }
     }
 }
 
 struct VulkanComputePipeline<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     handle: vk::Pipeline,
 }
@@ -1448,12 +1696,18 @@ impl Drop for VulkanComputePipeline<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the compute pipeline and destroys it exactly once.
-            self.device.destroy_pipeline(self.handle, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyPipeline,
+                self.device.destroy_pipeline(self.handle, None)
+            );
         }
     }
 }
 
 struct VulkanDescriptorPool<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     handle: vk::DescriptorPool,
 }
@@ -1462,12 +1716,18 @@ impl Drop for VulkanDescriptorPool<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the descriptor pool and destroys it exactly once.
-            self.device.destroy_descriptor_pool(self.handle, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyDescriptorPool,
+                self.device.destroy_descriptor_pool(self.handle, None)
+            );
         }
     }
 }
 
 struct VulkanCommandPool<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     handle: vk::CommandPool,
 }
@@ -1476,12 +1736,18 @@ impl Drop for VulkanCommandPool<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the command pool and destroys it exactly once.
-            self.device.destroy_command_pool(self.handle, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyCommandPool,
+                self.device.destroy_command_pool(self.handle, None)
+            );
         }
     }
 }
 
 struct VulkanFence<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     handle: vk::Fence,
 }
@@ -1490,12 +1756,18 @@ impl Drop for VulkanFence<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the fence and destroys it exactly once.
-            self.device.destroy_fence(self.handle, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyFence,
+                self.device.destroy_fence(self.handle, None)
+            );
         }
     }
 }
 
 struct VulkanBuffer<'a> {
+    #[cfg(feature = "insights")]
+    api_insights: Option<std::rc::Rc<crate::PcuVulkanApiInsights>>,
     device: &'a ash::Device,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -1508,21 +1780,25 @@ impl<'a> VulkanBuffer<'a> {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: &'a ash::Device,
+        api_version: u32,
         byte_len: usize,
     ) -> Result<Self, PcuVulkanError> {
         Self::new_buffer(
             instance,
             physical_device,
             device,
+            api_version,
             byte_len,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )
     }
 
+    #[allow(clippy::too_many_lines)] // Dedicated allocation and partial-failure cleanup stay in one cold RAII construction.
     fn new_buffer(
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         device: &'a ash::Device,
+        api_version: u32,
         byte_len: usize,
         usage: vk::BufferUsageFlags,
     ) -> Result<Self, PcuVulkanError> {
@@ -1533,15 +1809,35 @@ impl<'a> VulkanBuffer<'a> {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = vk_try("create Vulkan storage buffer", unsafe {
             // SAFETY: The create info contains no borrowed extension data.
-            device.create_buffer(&create_info, None)
+            vk_api_cold!(CreateBuffer, device.create_buffer(&create_info, None))
         })?;
-        let requirements = unsafe {
-            // SAFETY: The buffer was created on this device and is live.
-            device.get_buffer_memory_requirements(buffer)
+        let mut dedicated = vk::MemoryDedicatedRequirements::default();
+        let requirements = if api_version >= vk::API_VERSION_1_1 {
+            let info = vk::BufferMemoryRequirementsInfo2::default().buffer(buffer);
+            let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+            unsafe {
+                // SAFETY: The negotiated device API includes this core query; buffer is live.
+                vk_api_cold!(
+                    BufferMemoryRequirements2,
+                    device.get_buffer_memory_requirements2(&info, &mut requirements)
+                );
+            }
+            requirements.memory_requirements
+        } else {
+            unsafe {
+                // SAFETY: Core 1.0 query for a buffer created on this live device.
+                vk_api_cold!(
+                    BufferMemoryRequirements,
+                    device.get_buffer_memory_requirements(buffer)
+                )
+            }
         };
         let memory_properties = unsafe {
             // SAFETY: The physical device handle was returned by this live instance.
-            instance.get_physical_device_memory_properties(physical_device)
+            vk_api_cold!(
+                MemoryProperties,
+                instance.get_physical_device_memory_properties(physical_device)
+            )
         };
         // Full host-boundary maps read status and output on the CPU. Prefer reported cached
         // coherent host memory rather than millions of uncached PCIe BAR scalar reads.
@@ -1564,40 +1860,53 @@ impl<'a> VulkanBuffer<'a> {
             Err(error) => {
                 unsafe {
                     // SAFETY: The buffer is live and not yet owned by a guard.
-                    device.destroy_buffer(buffer, None);
+                    vk_api_cold!(DestroyBuffer, device.destroy_buffer(buffer, None));
                 }
                 return Err(error);
             }
         };
-        let allocate_info = vk::MemoryAllocateInfo::default()
+        let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        let mut allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index);
+        if dedicated.requires_dedicated_allocation != 0
+            || dedicated.prefers_dedicated_allocation != 0
+        {
+            // Each buffer already owns a separate allocation. Declare that association when
+            // the driver requires or prefers it; offset zero satisfies dedicated binding.
+            allocate_info = allocate_info.push_next(&mut dedicated_info);
+        }
         let memory = match vk_try("allocate Vulkan buffer memory", unsafe {
             // SAFETY: The allocation info was built from this buffer's memory requirements.
-            device.allocate_memory(&allocate_info, None)
+            vk_api_cold!(AllocateMemory, device.allocate_memory(&allocate_info, None))
         }) {
             Ok(memory) => memory,
             Err(error) => {
                 unsafe {
                     // SAFETY: The buffer is live and not yet owned by a guard.
-                    device.destroy_buffer(buffer, None);
+                    vk_api_cold!(DestroyBuffer, device.destroy_buffer(buffer, None));
                 }
                 return Err(error);
             }
         };
         if let Err(error) = vk_try("bind Vulkan buffer memory", unsafe {
             // SAFETY: The buffer and memory are live, compatible, and offset zero satisfies Vulkan requirements here.
-            device.bind_buffer_memory(buffer, memory, 0)
+            vk_api_cold!(
+                BindBufferMemory,
+                device.bind_buffer_memory(buffer, memory, 0)
+            )
         }) {
             unsafe {
                 // SAFETY: The memory and buffer are live and not yet owned by a guard.
-                device.free_memory(memory, None);
-                device.destroy_buffer(buffer, None);
+                vk_api_cold!(FreeMemory, device.free_memory(memory, None));
+                vk_api_cold!(DestroyBuffer, device.destroy_buffer(buffer, None));
             }
             return Err(error);
         }
 
         Ok(Self {
+            #[cfg(feature = "insights")]
+            api_insights: crate::api_insights::attached(),
             device,
             buffer,
             memory,
@@ -1619,14 +1928,26 @@ impl<'a> VulkanBuffer<'a> {
         }
         let mapped = vk_try("map Vulkan buffer memory for write", unsafe {
             // SAFETY: The memory is host-visible and this prototype maps the whole write range exclusively.
-            self.device
-                .map_memory(self.memory, 0, byte_len_device, vk::MemoryMapFlags::empty())
+            vk_api_retained!(
+                &self.api_insights,
+                MapMemory,
+                self.device.map_memory(
+                    self.memory,
+                    0,
+                    byte_len_device,
+                    vk::MemoryMapFlags::empty()
+                )
+            )
         })?;
         unsafe {
             // SAFETY: `source` comes from a live invocation slice, the mapped range is at least
             // `byte_len` bytes, and host/device mapped memory does not overlap caller storage.
             ptr::copy_nonoverlapping(source, mapped.cast::<u8>(), byte_len);
-            self.device.unmap_memory(self.memory);
+            vk_api_retained!(
+                &self.api_insights,
+                UnmapMemory,
+                self.device.unmap_memory(self.memory)
+            );
         }
         Ok(())
     }
@@ -1638,14 +1959,26 @@ impl<'a> VulkanBuffer<'a> {
         }
         let mapped = vk_try("map Vulkan buffer memory for read", unsafe {
             // SAFETY: The memory is host-visible and GPU execution has completed before this read.
-            self.device
-                .map_memory(self.memory, 0, byte_len_device, vk::MemoryMapFlags::empty())
+            vk_api_retained!(
+                &self.api_insights,
+                MapMemory,
+                self.device.map_memory(
+                    self.memory,
+                    0,
+                    byte_len_device,
+                    vk::MemoryMapFlags::empty()
+                )
+            )
         })?;
         unsafe {
             // SAFETY: `target` comes from a live mutable invocation slice, GPU work has completed,
             // the mapped range is at least `byte_len` bytes, and the regions do not overlap.
             ptr::copy_nonoverlapping(mapped.cast::<u8>(), target, byte_len);
-            self.device.unmap_memory(self.memory);
+            vk_api_retained!(
+                &self.api_insights,
+                UnmapMemory,
+                self.device.unmap_memory(self.memory)
+            );
         }
         Ok(())
     }
@@ -1662,8 +1995,16 @@ impl Drop for VulkanBuffer<'_> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: This guard owns the buffer and memory and destroys/frees them exactly once.
-            self.device.destroy_buffer(self.buffer, None);
-            self.device.free_memory(self.memory, None);
+            vk_api_retained!(
+                &self.api_insights,
+                DestroyBuffer,
+                self.device.destroy_buffer(self.buffer, None)
+            );
+            vk_api_retained!(
+                &self.api_insights,
+                FreeMemory,
+                self.device.free_memory(self.memory, None)
+            );
         }
     }
 }
@@ -1705,6 +2046,10 @@ mod tests {
     #[rustfmt::skip]
     use super::{
     fixed_descriptor_geometry,
+    VulkanDevice,
+    VulkanOwnedBuffer,
+    negotiated_instance_api_version,
+    MAX_INSTANCE_API_VERSION,
     validate_device_geometry,
     validate_map_descriptor_count,
     vk,
@@ -1712,6 +2057,53 @@ mod tests {
     PcuVulkanDescriptorHeapBudget,
     PcuVulkanDescriptorIndexingCaps,
 };
+
+    #[test]
+    #[ignore = "requires actual Vulkan compute device; both submission APIs and retained owned transfers"]
+    fn modern_and_legacy_submissions_preserve_owned_bytes() {
+        for modern in [false, true] {
+            let mut device = VulkanDevice::new().unwrap();
+            eprintln!(
+                "negotiated_api={} synchronization2_supported={} path={}",
+                device.caps.api_version, device.synchronization2, modern
+            );
+            if modern {
+                assert!(
+                    device.synchronization2,
+                    "this native gate requires core synchronization2"
+                );
+            } else {
+                device.synchronization2 = false;
+            }
+            let device = std::rc::Rc::new(device);
+            let mut source = VulkanOwnedBuffer::new(&device, 7).unwrap();
+            source.write(&[0, 255, 128, 17, 34, 51, 68]).unwrap();
+            let copy = source.copy_owned().unwrap();
+            source.write(&[91; 7]).unwrap();
+            drop(source);
+            let mut output = [73; 11];
+            copy.read(&mut output).unwrap();
+            assert_eq!(output, [0, 255, 128, 17, 34, 51, 68, 73, 73, 73, 73]);
+        }
+    }
+
+    #[test]
+    fn api_negotiation_preserves_older_loaders_and_caps_future_core_versions() {
+        assert_eq!(negotiated_instance_api_version(None), vk::API_VERSION_1_0);
+        for version in [
+            vk::API_VERSION_1_0,
+            vk::API_VERSION_1_1,
+            vk::API_VERSION_1_2,
+            vk::API_VERSION_1_3,
+            MAX_INSTANCE_API_VERSION,
+        ] {
+            assert_eq!(negotiated_instance_api_version(Some(version)), version);
+        }
+        assert_eq!(
+            negotiated_instance_api_version(Some(vk::make_api_version(0, 1, 5, 0))),
+            MAX_INSTANCE_API_VERSION
+        );
+    }
 
     #[test]
     fn native_limits_reject_workgroup_dispatch_range_and_descriptor_excesses() {

@@ -9,15 +9,15 @@ use fusion_pcu::{
 };
 #[rustfmt::skip]
 use fusion_pcu_spirv::{
-    lower_composed_float_to_spirv,
-    lower_one_effect_float_to_spirv,
     validate_checked_float_binary_map,
     validate_checked_float_unary_map,
     validate_checked_float_unary_roles_map,
     validate_composed_float_map,
+    validate_composed_integer_map,
+    validate_one_effect_integer_map,
+    validate_checked_integer_map,
     validate_one_effect_float_map,
-    PcuSpirvComposedFloatProfile,
-    PcuSpirvLoweringOptions,
+    PcuSpirvComposedProfile,
 };
 #[rustfmt::skip]
 use crate::{
@@ -31,13 +31,13 @@ use crate::{
 /// Frozen static native program with private transactional resource shadows.
 pub struct PcuVulkanPreparedComposed {
     native: VulkanPreparedComposed,
-    profile: PcuSpirvComposedFloatProfile,
+    profile: PcuSpirvComposedProfile,
 }
 
 impl PcuVulkanPreparedComposed {
     pub(crate) fn admitted_profile(
         kernel: &PcuDispatchKernelIr<'_>,
-    ) -> Option<PcuSpirvComposedFloatProfile> {
+    ) -> Option<PcuSpirvComposedProfile> {
         validate_composed_float_map(kernel)
             .or_else(|error| {
                 // Exact primitive maps keep their frozen executors and identities.
@@ -48,16 +48,25 @@ impl PcuVulkanPreparedComposed {
                     Err(error)
                 } else {
                     validate_one_effect_float_map(kernel)
+                        .or_else(|_| validate_composed_integer_map(kernel))
+                        .or_else(|error| {
+                            if validate_checked_integer_map(kernel).is_ok() {
+                                Err(error)
+                            } else {
+                                validate_one_effect_integer_map(kernel)
+                            }
+                        })
                 }
             })
             .ok()
             .filter(|profile| {
-                (0..profile.declarations().len()).all(|index| {
-                    matches!(
-                        profile.declaration_access(index),
-                        Some(PcuBindingAccess::ReadOnly | PcuBindingAccess::ReadWrite)
-                    )
-                })
+                profile.is_integer()
+                    || (0..profile.declarations().len()).all(|index| {
+                        matches!(
+                            profile.declaration_access(index),
+                            Some(PcuBindingAccess::ReadOnly | PcuBindingAccess::ReadWrite)
+                        )
+                    })
             })
     }
 
@@ -71,23 +80,43 @@ impl PcuVulkanPreparedComposed {
         let mut words = Vec::new();
         let admitted =
             Self::admitted_profile(kernel).ok_or(PcuVulkanError::UnsupportedPreparedProfile)?;
-        let lower = if admitted.is_one_effect() {
-            lower_one_effect_float_to_spirv::<Vec<u32>>
-        } else {
-            lower_composed_float_to_spirv::<Vec<u32>>
+        let family = match admitted.scalar() {
+            fusion_pcu::PcuScalarType::F32 => fusion_pcu_spirv::PcuSpirvComposedTemplateFamily::F32,
+            fusion_pcu::PcuScalarType::F64 => fusion_pcu_spirv::PcuSpirvComposedTemplateFamily::F64,
+            fusion_pcu::PcuScalarType::U256
+            | fusion_pcu::PcuScalarType::I256
+            | fusion_pcu::PcuScalarType::U512
+            | fusion_pcu::PcuScalarType::I512 => {
+                fusion_pcu_spirv::PcuSpirvComposedTemplateFamily::IntegerWide
+            }
+            fusion_pcu::PcuScalarType::U8
+            | fusion_pcu::PcuScalarType::I8
+            | fusion_pcu::PcuScalarType::U16
+            | fusion_pcu::PcuScalarType::I16
+            | fusion_pcu::PcuScalarType::U32
+            | fusion_pcu::PcuScalarType::I32
+            | fusion_pcu::PcuScalarType::U64
+            | fusion_pcu::PcuScalarType::I64
+            | fusion_pcu::PcuScalarType::U128
+            | fusion_pcu::PcuScalarType::I128 => {
+                fusion_pcu_spirv::PcuSpirvComposedTemplateFamily::IntegerNarrow
+            }
+            _ => fusion_pcu_spirv::PcuSpirvComposedTemplateFamily::Low,
         };
-        let (_, profile) = lower(
+        let profile = backend.device.shader_source.borrow_mut().lower(
             kernel,
-            PcuSpirvLoweringOptions::minimal_shader(),
+            family,
+            admitted.is_one_effect(),
             &mut words,
-        )
-        .map_err(|error| PcuVulkanError::SpirvLowering { error })?;
-        if (0..profile.declarations().len()).any(|index| {
-            !matches!(
-                profile.declaration_access(index),
-                Some(PcuBindingAccess::ReadOnly | PcuBindingAccess::ReadWrite)
-            )
-        }) {
+        )?;
+        if !profile.is_integer()
+            && (0..profile.declarations().len()).any(|index| {
+                !matches!(
+                    profile.declaration_access(index),
+                    Some(PcuBindingAccess::ReadOnly | PcuBindingAccess::ReadWrite)
+                )
+            })
+        {
             return Err(PcuVulkanError::UnsupportedPreparedProfile);
         }
         backend.device.validate_composed_geometry(&profile)?;
@@ -98,7 +127,7 @@ impl PcuVulkanPreparedComposed {
 
 impl PcuVulkanPreparedComposed {
     #[must_use]
-    pub const fn profile(&self) -> &PcuSpirvComposedFloatProfile {
+    pub const fn profile(&self) -> &PcuSpirvComposedProfile {
         &self.profile
     }
 

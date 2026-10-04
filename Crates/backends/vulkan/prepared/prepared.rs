@@ -279,13 +279,34 @@ impl PcuHostKernelBackend for PcuVulkanBackend {
         if cfg!(target_endian = "big") {
             return Err(PcuVulkanError::UnsupportedPreparedProfile);
         }
+        // Reject unsupported nested/cyclic borrowed regions before any profile's
+        // capability scanner, independently of generated-artifact retention.
+        crate::shader_artifact::validate_ops(kernel.ops)
+            .map_err(|_| PcuVulkanError::UnsupportedPreparedProfile)?;
+        let key = match self.device.artifacts.borrow().policy {
+            crate::PcuVulkanShaderCachePolicy::Disabled => None,
+            _ => match crate::PcuVulkanShaderArtifactKey::for_kernel(kernel, self.caps()) {
+                Ok(key) => Some(key),
+                Err(crate::PcuVulkanShaderArtifactError::TooLarge)
+                    if matches!(
+                        self.device.artifacts.borrow().policy,
+                        crate::PcuVulkanShaderCachePolicy::MemoryOnly
+                    ) =>
+                {
+                    None
+                }
+                Err(error) => return Err(PcuVulkanError::ShaderArtifact(error)),
+            },
+        };
+        let _artifact_request =
+            crate::shader_artifact::RequestGuard::new(&self.device.artifacts, key);
         let operations = scalar_body(kernel);
-        if let Some(prepared) = self.prepare_integer_operation(operations, kernel) {
-            return prepared;
-        }
         if PcuVulkanPreparedComposed::admitted_profile(kernel).is_some() {
             return PcuVulkanPreparedComposed::prepare(self, kernel)
                 .map(|plan| PcuVulkanPreparedHost::Composed(Box::new(plan)));
+        }
+        if let Some(prepared) = self.prepare_integer_operation(operations, kernel) {
+            return prepared;
         }
         if let Some(prepared) = self.prepare_checked_float_operation(operations, kernel) {
             return prepared;

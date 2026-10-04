@@ -58,6 +58,7 @@ impl MetalCheckedMapPlan {
         kernel: &PcuDispatchKernelIr<'_>,
         scalar: PcuScalarType,
     ) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if kernel
             .numerical_requirements
             .numerical_options

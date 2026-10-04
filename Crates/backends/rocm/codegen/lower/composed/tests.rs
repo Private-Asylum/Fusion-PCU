@@ -461,7 +461,7 @@ fn integer_body(
         .collect()
 }
 #[test]
-fn fourteen_structural_integer_maps_and_ten_provider_composed_profiles() {
+fn fourteen_structural_integer_maps_and_fourteen_provider_composed_profiles() {
     for scalar in [
         PcuScalarType::U8,
         PcuScalarType::I8,
@@ -510,22 +510,28 @@ fn fourteen_structural_integer_maps_and_ten_provider_composed_profiles() {
                 )
                 .is_ok()
             );
-            if matches!(
-                scalar,
-                PcuScalarType::U256
-                    | PcuScalarType::I256
-                    | PcuScalarType::U512
-                    | PcuScalarType::I512
-            ) {
-                assert!(super::composed::project(&kernel).is_none());
-                assert!(super::lower_dispatch_to_hip_source(&kernel).is_err());
-                continue;
-            }
             assert!(
                 super::composed::project(&kernel).is_some(),
                 "genuine composed integer structural profile {scalar:?} grid={grid}"
             );
             assert!(super::lower_dispatch_to_hip_source(&kernel).is_ok());
+            let mut portable = kernel;
+            portable
+                .numerical_requirements
+                .numerical_options
+                .reproducibility = fusion_pcu::PcuReproducibility::PortableV1;
+            assert_eq!(
+                super::lower_dispatch_to_hip_source(&portable)
+                    .unwrap()
+                    .lines()
+                    .skip(1)
+                    .collect::<Vec<_>>(),
+                super::lower_dispatch_to_hip_source(&kernel)
+                    .unwrap()
+                    .lines()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+            );
             let projection = super::map_binding_projection(&kernel).unwrap();
             assert_eq!(
                 projection.input_bindings(),
@@ -606,8 +612,8 @@ fn integer_composed_hazard_header_and_ssa_rejections_remain_cold() {
         .numerical_options
         .reproducibility = fusion_pcu::PcuReproducibility::PortableV1;
     assert!(
-        super::lower_dispatch_to_hip_source(&kernel).is_err(),
-        "no composed Portable descriptor or provider grant"
+        super::lower_dispatch_to_hip_source(&kernel).is_ok(),
+        "exact composed Portable descriptor permits narrow checked arithmetic"
     );
     kernel
         .numerical_requirements
@@ -627,4 +633,145 @@ fn integer_composed_hazard_header_and_ssa_rejections_remain_cold() {
         rhs: PcuDispatchValueId(3),
     });
     assert!(super::composed::project(&fixture(scalar, 19, &bindings, &ops)).is_none());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Exhaustive typed extrema share direct/grid and refusal witnesses.
+fn primitive_integer_literals_preserve_full_bits_in_direct_and_grid_composition() {
+    for (scalar, value, cpp_type, bits) in [
+        (
+            PcuScalarType::U8,
+            PcuParameterValue::U8(u8::MAX),
+            "unsigned char",
+            0xff_u64,
+        ),
+        (
+            PcuScalarType::I8,
+            PcuParameterValue::I8(i8::MIN),
+            "signed char",
+            0x80,
+        ),
+        (
+            PcuScalarType::U16,
+            PcuParameterValue::U16(u16::MAX),
+            "unsigned short",
+            0xffff,
+        ),
+        (
+            PcuScalarType::I16,
+            PcuParameterValue::I16(i16::MIN),
+            "short",
+            0x8000,
+        ),
+        (
+            PcuScalarType::U32,
+            PcuParameterValue::U32(u32::MAX),
+            "unsigned int",
+            0xffff_ffff,
+        ),
+        (
+            PcuScalarType::I32,
+            PcuParameterValue::I32(i32::MIN),
+            "int",
+            0x8000_0000,
+        ),
+        (
+            PcuScalarType::U64,
+            PcuParameterValue::U64(u64::MAX),
+            "unsigned long long",
+            u64::MAX,
+        ),
+        (
+            PcuScalarType::I64,
+            PcuParameterValue::I64(i64::MIN),
+            "long long",
+            0x8000_0000_0000_0000,
+        ),
+    ] {
+        let bindings = bindings(scalar);
+        for grid in [false, true] {
+            let index = if grid {
+                PcuDispatchIndex::GridStrideId
+            } else {
+                PcuDispatchIndex::InvocationId
+            };
+            let mut body = integer_body(scalar, index, false);
+            body[1] = PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(2),
+                value,
+            });
+            if !grid {
+                body.push(PcuDispatchOp::Control(PcuDispatchControlOp::Return));
+            }
+            let outer = [
+                PcuDispatchOp::GridStrideLoop {
+                    extent: 19,
+                    body: &body,
+                },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = fixture(
+                scalar,
+                if grid { 3 } else { 19 },
+                &bindings,
+                if grid { &outer } else { &body },
+            );
+            let projection = super::composed::project(&kernel).expect("typed literal composition");
+            assert_eq!(projection.input_bindings(), [PcuBindingRef::new(0, 0)]);
+            let source = super::lower_dispatch_to_hip_source(&kernel).unwrap();
+            assert!(source.contains(&format!("{cpp_type} v2 = __builtin_bit_cast({cpp_type},")));
+            assert!(source.contains(&format!("0x{bits:016x}ull")));
+            assert!(super::lower_dispatch_to_hip_rtc_source(&kernel).is_ok());
+            // A same-size unsigned literal cannot manufacture a signed value type.
+            body[1] = PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(2),
+                value: PcuParameterValue::F32(0),
+            });
+            let outer = [
+                PcuDispatchOp::GridStrideLoop {
+                    extent: 19,
+                    body: &body,
+                },
+                PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+            ];
+            let kernel = fixture(
+                scalar,
+                if grid { 3 } else { 19 },
+                &bindings,
+                if grid { &outer } else { &body },
+            );
+            assert!(super::composed::project(&kernel).is_none());
+            assert!(super::lower_dispatch_to_hip_source(&kernel).is_err());
+        }
+    }
+}
+
+#[test]
+fn cyclic_regions_are_refused_before_normal_or_portable_scanners() {
+    static CYCLIC: [PcuDispatchOp<'static>; 1] = [PcuDispatchOp::GridStrideLoop {
+        extent: 19,
+        body: &CYCLIC,
+    }];
+    for scalar in [PcuScalarType::F32, PcuScalarType::U256] {
+        let bindings = bindings(scalar);
+        for reproducibility in [
+            fusion_pcu::PcuReproducibility::Unspecified,
+            fusion_pcu::PcuReproducibility::PortableV1,
+        ] {
+            let mut kernel = fixture(scalar, 19, &bindings, &CYCLIC);
+            kernel
+                .numerical_requirements
+                .numerical_options
+                .reproducibility = reproducibility;
+            assert!(matches!(
+                super::lower_dispatch_to_hip_source(&kernel),
+                Err(super::RocmLowerError::UnsupportedRequirements)
+            ));
+            assert!(super::map_binding_projection(&kernel).is_none());
+            assert!(super::checked_float_binary_operand_schema(&kernel).is_none());
+            assert!(crate::owned_dispatch::kernel_uses_checked_arithmetic(
+                &kernel
+            ));
+        }
+    }
 }

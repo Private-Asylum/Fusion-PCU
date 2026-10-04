@@ -520,7 +520,8 @@ fn narrow_fill(input: &mut [f64], seed: u64) {
         let mantissa =
             u32::try_from(seed.wrapping_add(step) & 0x000f_ffff).expect("masked significand fits");
         let fractional = f64::from_bits((1023_u64 << 52) | (u64::from(mantissa) << 20)) - 1.0;
-        *value = f64::from(u16::try_from(index % 2048).expect("sample fits")) * 0.125 + fractional;
+        *value =
+            f64::from(u16::try_from(index % 2048).expect("sample fits")).mul_add(0.125, fractional);
     }
 }
 fn narrow_oracle(input: &[f64], output: &mut [f32]) -> Result<(), Box<dyn Error>> {

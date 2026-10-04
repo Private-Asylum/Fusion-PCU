@@ -1,23 +1,21 @@
 //! Cold CPU instruction detection and guarded, bit-preserving SIMD execution.
 
-/// CPU implementations of the bounded checked F32/F64 negation profiles.
+/// CPU instruction families; each operation separately checks its required extensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcuCpuImplementation {
     Scalar,
     Sse2,
     Avx2,
     Neon,
+    /// AVX sign-bit operations; integer arithmetic needs a separate family.
+    Avx,
+    /// AVX-512 foundation. Individual arithmetic profiles may require BW/DQ/VL.
+    Avx512,
 }
 
-/// Runtime instruction facts; availability does not advertise broader IR support.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // Independent instruction facts, not policy states.
-pub struct PcuCpuFeatures {
-    pub sse2: bool,
-    pub avx: bool,
-    pub avx2: bool,
-    pub neon: bool,
-}
+#[path = "features/features.rs"]
+mod features;
+pub use features::PcuCpuFeatures;
 
 /// Explicit request for an unavailable CPU implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,12 +34,7 @@ impl PcuCpuProcessor {
     #[must_use]
     pub const fn scalar() -> Self {
         Self {
-            features: PcuCpuFeatures {
-                sse2: false,
-                avx: false,
-                avx2: false,
-                neon: false,
-            },
+            features: PcuCpuFeatures::NONE,
         }
     }
 
@@ -49,20 +42,7 @@ impl PcuCpuProcessor {
     #[cfg(feature = "std")]
     #[must_use]
     pub fn detect() -> Self {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let features = PcuCpuFeatures {
-            sse2: std::is_x86_feature_detected!("sse2"),
-            avx: std::is_x86_feature_detected!("avx"),
-            avx2: std::is_x86_feature_detected!("avx2"),
-            neon: false,
-        };
-        #[cfg(target_arch = "aarch64")]
-        let features = PcuCpuFeatures {
-            neon: std::arch::is_aarch64_feature_detected!("neon"),
-            ..PcuCpuFeatures::default()
-        };
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-        let features = PcuCpuFeatures::default();
+        let features = PcuCpuFeatures::detect();
         Self { features }
     }
 
@@ -74,8 +54,12 @@ impl PcuCpuProcessor {
     /// Chooses the widest implemented instruction family, without a throughput claim.
     #[must_use]
     pub const fn widest(self) -> PcuCpuImplementation {
-        if self.features.avx2 {
+        if self.features.avx512f {
+            PcuCpuImplementation::Avx512
+        } else if self.features.avx2 {
             PcuCpuImplementation::Avx2
+        } else if self.features.avx {
+            PcuCpuImplementation::Avx
         } else if self.features.sse2 {
             PcuCpuImplementation::Sse2
         } else if self.features.neon {
@@ -98,6 +82,8 @@ impl PcuCpuProcessor {
             PcuCpuImplementation::Sse2 => self.features.sse2,
             PcuCpuImplementation::Avx2 => self.features.avx2,
             PcuCpuImplementation::Neon => self.features.neon,
+            PcuCpuImplementation::Avx => self.features.avx,
+            PcuCpuImplementation::Avx512 => self.features.avx512f,
         };
         if supported {
             Ok(())
@@ -126,6 +112,10 @@ pub fn negate_bytes(
         PcuCpuImplementation::Sse2 => unsafe { x86::sse2(input, output) },
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         PcuCpuImplementation::Avx2 => unsafe { x86::avx2(input, output) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        PcuCpuImplementation::Avx => unsafe { x86::avx(input, output) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        PcuCpuImplementation::Avx512 => unsafe { x86::avx512(input, output) },
         #[cfg(target_arch = "aarch64")]
         PcuCpuImplementation::Neon => unsafe { neon::negate(input, output) },
         _ => 0,
@@ -159,6 +149,10 @@ pub fn negate_f64_bytes(
         PcuCpuImplementation::Sse2 => unsafe { x86::sse2_f64(input, output) },
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         PcuCpuImplementation::Avx2 => unsafe { x86::avx2_f64(input, output) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        PcuCpuImplementation::Avx => unsafe { x86::avx_f64(input, output) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        PcuCpuImplementation::Avx512 => unsafe { x86::avx512_f64(input, output) },
         #[cfg(target_arch = "aarch64")]
         PcuCpuImplementation::Neon => unsafe { neon::negate_f64(input, output) },
         _ => 0,

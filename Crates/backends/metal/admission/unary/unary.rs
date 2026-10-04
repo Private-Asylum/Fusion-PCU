@@ -27,6 +27,7 @@ impl MetalCheckedUnaryPlan {
     /// # Errors
     /// Rejects malformed maps, unsupported encodings, endian or byte extent overflow.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if cfg!(target_endian = "big") {
             return Err(MetalError::Unsupported);
         }
@@ -64,6 +65,7 @@ impl MetalPortableUnaryPlan {
     /// # Errors
     /// Rejects non-Portable/unproved requests, malformed roles or overflowing byte extents.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MetalError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if cfg!(target_endian = "big") {
             return Err(MetalError::Unsupported);
         }
@@ -91,6 +93,7 @@ pub(super) fn prepare(
     session: &MetalSession,
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<MetalPreparedFloatKernel, MetalError> {
+    crate::dispatch_shape::require_non_nested(kernel)?;
     let plan = MetalPortableUnaryPlan::assess(kernel)?;
     prepare_description(session, plan.description, plan.extent, plan.bytes)
 }
@@ -99,6 +102,7 @@ pub(super) fn prepare_normal(
     session: &MetalSession,
     kernel: &PcuDispatchKernelIr<'_>,
 ) -> Result<MetalPreparedFloatKernel, MetalError> {
+    crate::dispatch_shape::require_non_nested(kernel)?;
     super::require_scalar_numerics(kernel)?;
     let plan = MetalCheckedUnaryPlan::assess(kernel)?;
     prepare_description(session, plan.description, plan.extent, plan.bytes)

@@ -6,7 +6,6 @@ use super::{
     allocate_command_buffer,
     create_command_pool,
     create_fence,
-    mem,
     ptr,
     submit_and_wait,
     vk,
@@ -53,6 +52,8 @@ impl VulkanOwnedBuffer {
         })
     }
     pub(crate) fn new(device: &Rc<VulkanDevice>, bytes: usize) -> Result<Self, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        let _api_scope = device.api_scope();
         if device.poisoned.get() {
             return Err(PcuVulkanError::Quarantined);
         }
@@ -63,6 +64,7 @@ impl VulkanOwnedBuffer {
             &device.instance,
             device.physical_device,
             &device.device,
+            device.caps.api_version,
             padded.max(4),
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_SRC
@@ -70,11 +72,15 @@ impl VulkanOwnedBuffer {
         )?;
         let mapped = vk_try("map owned Vulkan memory", unsafe {
             // SAFETY: The uniquely owned host-visible/coherent allocation is not already mapped.
-            device.device.map_memory(
-                allocation.memory,
-                0,
-                vk::WHOLE_SIZE,
-                vk::MemoryMapFlags::empty(),
+            vk_api_owner!(
+                device,
+                MapMemory,
+                device.device.map_memory(
+                    allocation.memory,
+                    0,
+                    vk::WHOLE_SIZE,
+                    vk::MemoryMapFlags::empty(),
+                )
             )
         })?
         .cast::<u8>();
@@ -90,7 +96,7 @@ impl VulkanOwnedBuffer {
             bytes,
             realization: allocation.realization,
         };
-        mem::forget(allocation); // Raw handles transfer into this owner, before its retained device.
+        vk_transfer_guards!(allocation); // Raw handles transfer into this owner, before its retained device.
         Ok(result)
     }
 
@@ -155,6 +161,8 @@ pub struct VulkanPreparedOwnedCopy {
 
 impl VulkanPreparedOwnedCopy {
     pub(crate) fn new(device: &Rc<VulkanDevice>) -> Result<Self, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        let _api_scope = device.api_scope();
         if device.poisoned.get() {
             return Err(PcuVulkanError::Quarantined);
         }
@@ -167,7 +175,7 @@ impl VulkanPreparedOwnedCopy {
             command,
             fence: fence.handle,
         };
-        mem::forget((pool, fence)); // Retained handles are released before the Rc device owner.
+        vk_transfer_guards!(pool, fence); // Retained handles are released before the Rc device owner.
         Ok(result)
     }
 
@@ -186,20 +194,24 @@ impl VulkanPreparedOwnedCopy {
         let device = &self.device.device;
         vk_try("reset retained owned copy command", unsafe {
             // SAFETY: Every previous submission is terminal and the pool permits individual reset.
-            device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+            vk_api_owner!(
+                self.device,
+                ResetCommandBuffer,
+                device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+            )
         })?;
         vk_try("reset retained owned copy fence", unsafe {
             // SAFETY: Every previous submission is terminal; the fence is not currently in use.
-            device.reset_fences(&[self.fence])
+            vk_api_owner!(self.device, ResetFences, device.reset_fences(&[self.fence]))
         })?;
         record_copy(
-            device,
+            &self.device,
             self.command,
             source.buffer,
             output.buffer,
             source.bytes,
         )?;
-        if let Err(error) = submit_and_wait(device, self.device.queue, self.command, self.fence) {
+        if let Err(error) = submit_and_wait(&self.device, self.command, self.fence) {
             if matches!(error, PcuVulkanError::CompletionUnknown) {
                 // No proof of quiescence: every owner and this retained pool/fence deliberately
                 // keep their native handles alive on drop once the common session is poisoned.
@@ -218,24 +230,37 @@ impl Drop for VulkanPreparedOwnedCopy {
         }
         unsafe {
             // SAFETY: Synchronous transfer is terminal; pool also owns and frees its command.
-            self.device.device.destroy_fence(self.fence, None);
-            self.device.device.destroy_command_pool(self.pool, None);
+            vk_api_owner!(
+                self.device,
+                DestroyFence,
+                self.device.device.destroy_fence(self.fence, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyCommandPool,
+                self.device.device.destroy_command_pool(self.pool, None)
+            );
         }
     }
 }
 
 fn record_copy(
-    device: &ash::Device,
+    session: &VulkanDevice,
     command: vk::CommandBuffer,
     source: vk::Buffer,
     target: vk::Buffer,
     bytes: usize,
 ) -> Result<(), PcuVulkanError> {
+    let device = &session.device;
     let bytes = bytes.checked_add(3).ok_or(PcuVulkanError::BufferTooLarge)? & !3;
     let size = u64::try_from(bytes).map_err(|_| PcuVulkanError::BufferTooLarge)?;
     vk_try("begin owned Vulkan copy", unsafe {
         // SAFETY: The command belongs to a new pool and has not been submitted.
-        device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+        vk_api_owner!(
+            session,
+            BeginCommandBuffer,
+            device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+        )
     })?;
     unsafe {
         // SAFETY: Buffers belong to this device, have compatible transfer usage, disjoint live
@@ -249,39 +274,55 @@ fn record_copy(
                     | vk::AccessFlags::SHADER_WRITE,
             )
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        device.cmd_pipeline_barrier(
-            command,
-            vk::PipelineStageFlags::HOST
-                | vk::PipelineStageFlags::TRANSFER
-                | vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &upload,
-            &[],
-            &[],
+        vk_api_owner!(
+            session,
+            PipelineBarrier,
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::HOST
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &upload,
+                &[],
+                &[],
+            )
         );
-        device.cmd_copy_buffer(
-            command,
-            source,
-            target,
-            &[vk::BufferCopy::default().size(size)],
+        vk_api_owner!(
+            session,
+            CopyBuffer,
+            device.cmd_copy_buffer(
+                command,
+                source,
+                target,
+                &[vk::BufferCopy::default().size(size)],
+            )
         );
         let readback = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)];
-        device.cmd_pipeline_barrier(
-            command,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &readback,
-            &[],
-            &[],
+        vk_api_owner!(
+            session,
+            PipelineBarrier,
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &readback,
+                &[],
+                &[],
+            )
         );
     }
     vk_try("end owned Vulkan copy", unsafe {
         // SAFETY: Command remains in recording state and every referenced owner is live.
-        device.end_command_buffer(command)
+        vk_api_owner!(
+            session,
+            EndCommandBuffer,
+            device.end_command_buffer(command)
+        )
     })
 }
 
@@ -292,9 +333,21 @@ impl Drop for VulkanOwnedBuffer {
         }
         unsafe {
             // SAFETY: Synchronous submission is terminal; this owner uniquely holds these handles.
-            self.device.device.unmap_memory(self.memory);
-            self.device.device.destroy_buffer(self.buffer, None);
-            self.device.device.free_memory(self.memory, None);
+            vk_api_owner!(
+                self.device,
+                UnmapMemory,
+                self.device.device.unmap_memory(self.memory)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyBuffer,
+                self.device.device.destroy_buffer(self.buffer, None)
+            );
+            vk_api_owner!(
+                self.device,
+                FreeMemory,
+                self.device.device.free_memory(self.memory, None)
+            );
         }
     }
 }

@@ -44,6 +44,14 @@ mod mlx_roots;
 #[path = "vulkan/vulkan.rs"]
 mod vulkan;
 
+#[cfg(any(feature = "metal", feature = "mlx"))]
+#[path = "fault/fault.rs"]
+mod fault;
+
+#[cfg(any(feature = "metal", feature = "mlx"))]
+#[path = "numerical/numerical.rs"]
+mod numerical;
+
 #[derive(PartialEq, Eq)]
 enum ShapeKey {
     Static(PcuSourceShape),
@@ -65,6 +73,10 @@ impl ShapeKey {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+// Concrete prepared providers are retained once in the cold cache and borrowed
+// for replay. Boxing the encoded numerical entry adds an allocation and another
+// pointer indirection merely to shrink other compiled-provider feature subsets.
 enum Prepared {
     #[cfg(feature = "metal")]
     Metal(metal::Prepared),
@@ -78,6 +90,11 @@ enum Prepared {
     Cpu {
         program: cpu::CpuPrepared,
         shape: std::rc::Rc<[usize]>,
+    },
+    #[cfg(feature = "cpu")]
+    CpuOutputs {
+        program: cpu::CpuPrepared,
+        shapes: Vec<std::rc::Rc<[usize]>>,
     },
 }
 struct Entry {
@@ -103,7 +120,23 @@ std::thread_local! {
 }
 
 pub(super) fn selected<T: PcuScalar, const N: usize>(inputs: &[PcuTensorInput<'_, T>; N]) -> bool {
-    let backend = policy::route().backend;
+    selected_for_backend(policy::route().backend, inputs)
+}
+
+fn selected_for_backend<T: PcuScalar, const N: usize>(
+    backend: PcuBackendChoice,
+    inputs: &[PcuTensorInput<'_, T>; N],
+) -> bool {
+    // Explicit device routes inspect only captured semantic inputs later. Unused opaque
+    // owners remain shape/type witnesses; used foreign owners still fail device preflight.
+    #[cfg(feature = "cuda")]
+    if backend == PcuBackendChoice::Cuda {
+        return false;
+    }
+    #[cfg(feature = "rocm")]
+    if backend == PcuBackendChoice::Rocm {
+        return false;
+    }
     #[cfg(feature = "metal")]
     if backend == PcuBackendChoice::Metal {
         return true;
@@ -148,19 +181,37 @@ pub(super) fn selected<T: PcuScalar, const N: usize>(inputs: &[PcuTensorInput<'_
     if device_affinity {
         return false;
     }
-    (cfg!(all(
-        feature = "metal",
+    (automatic_vulkan_only(backend)
+        || cfg!(all(
+            feature = "metal",
+            not(any(
+                feature = "mlx",
+                feature = "rocm",
+                feature = "cuda",
+                feature = "vulkan",
+                feature = "cpu"
+            ))
+        ))
+        || cfg!(all(
+            feature = "mlx",
+            not(any(feature = "rocm", feature = "cuda", feature = "vulkan"))
+        )))
+        && backend == PcuBackendChoice::Automatic
+}
+
+// Sole-provider eligibility is a compile-time fact, not a runtime fallback. Preserve the
+// existing default-device opening and retained cold root; mixed-provider ranking is separate.
+const fn automatic_vulkan_only(backend: PcuBackendChoice) -> bool {
+    cfg!(all(
+        feature = "vulkan",
         not(any(
+            feature = "cpu",
+            feature = "metal",
             feature = "mlx",
             feature = "rocm",
-            feature = "cuda",
-            feature = "vulkan",
-            feature = "cpu"
+            feature = "cuda"
         ))
-    )) || cfg!(all(
-        feature = "mlx",
-        not(any(feature = "rocm", feature = "cuda", feature = "vulkan"))
-    ))) && backend == PcuBackendChoice::Automatic
+    )) && matches!(backend, PcuBackendChoice::Automatic)
 }
 
 fn roles_match<T: PcuScalar, const N: usize>(
@@ -216,7 +267,7 @@ fn affinity_matches<T: PcuScalar, const N: usize>(
                 prepared.root.session.same_session(array.session())
             }
             #[cfg(feature = "cpu")]
-            (Prepared::Cpu { .. }, TensorBacking::Cpu { .. }) => true,
+            (Prepared::Cpu { .. } | Prepared::CpuOutputs { .. }, TensorBacking::Cpu { .. }) => true,
             #[cfg(any(
                 feature = "rocm",
                 feature = "cuda",
@@ -266,7 +317,10 @@ fn prepare<T: PcuScalar, const N: usize>(
     #[cfg(feature = "vulkan")]
     {
         let resident_vulkan = built.input_indices.iter().any(|&index| matches!(inputs[index].kind, TensorInputKind::Resident(owner) if matches!(owner.backing, TensorBacking::Vulkan { .. })));
-        if options.backend == PcuBackendChoice::Vulkan || resident_vulkan {
+        if options.backend == PcuBackendChoice::Vulkan
+            || resident_vulkan
+            || automatic_vulkan_only(options.backend)
+        {
             return vulkan::Prepared::prepare(built, inputs, options).map(Prepared::Vulkan);
         }
     }
@@ -365,6 +419,8 @@ fn execute<T: PcuScalar, const N: usize>(
                 },
             })
         }
+        #[cfg(feature = "cpu")]
+        Prepared::CpuOutputs { .. } => Err(PcuExecutionError::InvalidTensorSourcePlan),
         #[cfg(feature = "cpu")]
         Prepared::Cpu { program, shape } => {
             let mut values = [&[][..]; N];
@@ -477,6 +533,84 @@ where
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?
 }
 
+pub(super) fn call_outputs<T: PcuScalar, const N: usize, const M: usize, F>(
+    site: &PcuHostCallSite,
+    specialization: TypeId,
+    inputs: &[PcuTensorInput<'_, T>; N],
+    capture_function: F,
+) -> Result<[PcuTensor<T>; M], PcuExecutionError>
+where
+    F: FnOnce(
+            &mut PcuTensorGraphCapture,
+            [PcuTensorGraphValue<T>; N],
+        ) -> Result<[PcuTensorGraphValue<T>; M], PcuExecutionError>
+        + 'static,
+{
+    let generation = policy::route().generation;
+    STATE
+        .try_with(|state| {
+            let mut state = state
+                .try_borrow_mut()
+                .map_err(|_| PcuExecutionError::ReentrantCall)?;
+            if state.generation != generation {
+                state.entries.clear();
+                state.generation = generation;
+            }
+            let site = core::ptr::from_ref(site).addr();
+            if let Some(entry) = state.entries.iter_mut().find(|entry| {
+                entry.site == site
+                    && entry.specialization == specialization
+                    && entry.factory == TypeId::of::<F>()
+                    && entry.scalar == T::TYPE
+                    && entry.shapes.len() == N
+                    && entry
+                        .shapes
+                        .iter()
+                        .zip(inputs)
+                        .all(|(shape, input)| shape.matches(input.shape))
+                    && roles_match(entry, inputs)
+                    && affinity_matches(entry, inputs)
+            }) {
+                return execute_outputs(entry, inputs);
+            }
+            let snapshot = policy::snapshot()?;
+            let shapes = inputs.map(|input| input.shape);
+            let built = super::capture::build_outputs(
+                shapes,
+                snapshot.policy.float_underflow,
+                snapshot.policy.numerical_mode,
+                snapshot.policy.numerical_options,
+                capture_function,
+            )?;
+            let prepared = prepare_outputs(&built, inputs, snapshot.policy)?;
+            let mut entry = Entry {
+                site,
+                specialization,
+                factory: TypeId::of::<F>(),
+                scalar: T::TYPE,
+                shapes: shapes.into_iter().map(ShapeKey::new).collect(),
+                #[cfg(feature = "mlx")]
+                resident_roles: inputs
+                    .iter()
+                    .map(|input| matches!(input.kind, TensorInputKind::Resident(_)))
+                    .collect(),
+                indices: built.input_indices,
+                #[cfg(feature = "mlx")]
+                ids: built.input_ids,
+                prepared,
+            };
+            let result = execute_outputs(&mut entry, inputs)?;
+            if snapshot.policy.cache_capacity != 0 {
+                if state.entries.len() >= snapshot.policy.cache_capacity {
+                    state.entries.remove(0);
+                }
+                state.entries.push(entry);
+            }
+            Ok(result)
+        })
+        .map_err(|_| PcuExecutionError::ThreadUnavailable)?
+}
+
 pub(super) fn clear() -> Result<(), PcuExecutionError> {
     STATE
         .try_with(|state| {
@@ -488,4 +622,109 @@ pub(super) fn clear() -> Result<(), PcuExecutionError> {
             Ok(())
         })
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?
+}
+
+#[cfg(all(test, feature = "cpu", any(feature = "cuda", feature = "rocm")))]
+#[path = "routing/tests/tests.rs"]
+mod routing_tests;
+
+#[cfg(all(
+    test,
+    feature = "vulkan",
+    not(any(
+        feature = "cpu",
+        feature = "metal",
+        feature = "mlx",
+        feature = "rocm",
+        feature = "cuda"
+    ))
+))]
+#[path = "routing/vulkan_only/vulkan_only.rs"]
+mod vulkan_only_routing_tests;
+
+fn prepare_outputs<T: PcuScalar, const N: usize>(
+    built: &super::capture::PcuCapturedTensorProgram,
+    inputs: &[PcuTensorInput<'_, T>; N],
+    options: crate::global::PcuExecutionPolicy,
+) -> Result<Prepared, PcuExecutionError> {
+    if options.range_policy != crate::PcuRangePolicy::Reject {
+        return Err(PcuExecutionError::UnsupportedRangePolicy);
+    }
+    #[cfg(feature = "cpu")]
+    {
+        let resident_cpu = built.input_indices.iter().any(|&index| matches!(inputs[index].kind, TensorInputKind::Resident(owner) if matches!(owner.backing, TensorBacking::Cpu { .. })));
+        if options.backend == PcuBackendChoice::Cpu || resident_cpu {
+            if resident_cpu
+                && !matches!(
+                    options.backend,
+                    PcuBackendChoice::Cpu | PcuBackendChoice::Automatic
+                )
+                || options.device.is_some_and(|ordinal| ordinal != 0)
+            {
+                return Err(PcuExecutionError::ResidentPolicyConflict);
+            }
+            let program = cpu::CpuPrepared::prepare_outputs(&built.program, T::TYPE)?;
+            let shapes = program.output_shapes();
+            return Ok(Prepared::CpuOutputs { program, shapes });
+        }
+    }
+    let _ = (built, inputs);
+    Err(PcuExecutionError::TensorExecutionUnavailable)
+}
+
+fn execute_outputs<T: PcuScalar, const N: usize, const M: usize>(
+    entry: &mut Entry,
+    inputs: &[PcuTensorInput<'_, T>; N],
+) -> Result<[PcuTensor<T>; M], PcuExecutionError> {
+    if !affinity_matches(entry, inputs) {
+        return Err(PcuExecutionError::Argument(
+            PcuArgumentError::SessionMismatch,
+        ));
+    }
+    for &index in &entry.indices {
+        if let TensorInputKind::Resident(owner) = inputs[index].kind {
+            match inputs[index].shape {
+                PcuTensorShapeWitness::Static(shape) => owner.validate_read(shape),
+                PcuTensorShapeWitness::Dynamic(_) => owner.validate_initialized(),
+            }
+            .map_err(PcuExecutionError::Argument)?;
+        }
+    }
+    #[cfg(feature = "cpu")]
+    if let Prepared::CpuOutputs { program, shapes } = &mut entry.prepared {
+        if shapes.len() != M {
+            return Err(PcuExecutionError::InvalidTensorSourcePlan);
+        }
+        let mut values = [&[][..]; N];
+        for (binding, &index) in entry.indices.iter().enumerate() {
+            values[binding] = match inputs[index].kind {
+                TensorInputKind::Host(values) => values,
+                TensorInputKind::Resident(owner) => match &owner.backing {
+                    TensorBacking::Cpu { values, .. } => values,
+                    #[cfg(any(
+                        feature = "mlx",
+                        feature = "vulkan",
+                        feature = "rocm",
+                        feature = "cuda",
+                        feature = "metal"
+                    ))]
+                    _ => {
+                        return Err(PcuExecutionError::Argument(
+                            PcuArgumentError::UnsupportedResidentBorrow,
+                        ));
+                    }
+                },
+            };
+        }
+        let outputs = program.execute_outputs::<T, M>(&values[..entry.indices.len()])?;
+        let mut index = 0;
+        return Ok(outputs.map(|values| {
+            let shape = std::rc::Rc::clone(&shapes[index]);
+            index += 1;
+            PcuTensor {
+                backing: TensorBacking::Cpu { values, shape },
+            }
+        }));
+    }
+    Err(PcuExecutionError::TensorExecutionUnavailable)
 }

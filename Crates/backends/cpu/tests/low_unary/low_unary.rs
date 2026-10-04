@@ -262,11 +262,12 @@ fn exact_cold_gates_and_offer_ids() {
                             } else {
                                 PcuRangePolicy::Clamp
                             };
-                        assert!(
-                            PcuCpuHostBackend::scalar()
-                                .prepare_host_kernel(&range_kernel)
-                                .is_err()
-                        );
+                        // A differing operation-local policy uses the composed profile;
+                        // the canonical unary profile still requires matching headers.
+                        assert!(matches!(
+                            PcuCpuHostBackend::scalar().prepare_host_kernel(&range_kernel),
+                            Ok(fusion_pcu_cpu::PcuCpuPreparedHost::Composed(_))
+                        ));
                         let mut kernel = *kernel;
                         kernel.numerical_requirements.float_underflow =
                             if policy == PcuFloatUnderflowPolicy::IeeeAfterRounding {
@@ -274,11 +275,10 @@ fn exact_cold_gates_and_offer_ids() {
                             } else {
                                 PcuFloatUnderflowPolicy::IeeeAfterRounding
                             };
-                        assert!(
-                            PcuCpuHostBackend::scalar()
-                                .prepare_host_kernel(&kernel)
-                                .is_err()
-                        );
+                        assert!(matches!(
+                            PcuCpuHostBackend::scalar().prepare_host_kernel(&kernel),
+                            Ok(fusion_pcu_cpu::PcuCpuPreparedHost::Composed(_))
+                        ));
                         let mut ops = kernel.ops.to_vec();
                         if let PcuDispatchOp::Data(PcuDispatchDataOp::CheckedFloatUnary {
                             value,

@@ -41,6 +41,7 @@ impl MlxTransportPlan {
         kernel: &PcuDispatchKernelIr<'_>,
         scalar: PcuScalarType,
     ) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         if matches!(
             scalar,
             PcuScalarType::Bool | PcuScalarType::I4 | PcuScalarType::U4

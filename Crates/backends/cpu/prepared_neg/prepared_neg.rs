@@ -131,11 +131,29 @@ impl PcuCpuPreparedNeg {
     }
 
     pub(super) const fn local_id(&self) -> u32 {
+        // Preserve old scalar/SSE2/AVX2/NEON IDs; new families occupy a separate range.
+        if matches!(
+            self.implementation(),
+            PcuCpuImplementation::Avx | PcuCpuImplementation::Avx512
+        ) {
+            return 40960
+                + if matches!(self.scalar, PcuScalarType::F64) {
+                    2
+                } else {
+                    0
+                }
+                + if matches!(self.implementation(), PcuCpuImplementation::Avx512) {
+                    1
+                } else {
+                    0
+                };
+        }
         let instruction = match self.implementation() {
             PcuCpuImplementation::Scalar => 0,
             PcuCpuImplementation::Sse2 => 1,
             PcuCpuImplementation::Avx2 => 2,
             PcuCpuImplementation::Neon => 3,
+            PcuCpuImplementation::Avx | PcuCpuImplementation::Avx512 => unreachable!(),
         };
         match self.scalar {
             PcuScalarType::F64 => 28 + instruction,

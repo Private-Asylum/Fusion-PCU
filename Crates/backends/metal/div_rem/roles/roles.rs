@@ -52,6 +52,8 @@ impl PcuHostKernelBackend for MetalDivRemRoleHostBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MetalDivRemRolePlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         let roles = plan.operand_inputs();
         let counts = plan.input_element_counts();

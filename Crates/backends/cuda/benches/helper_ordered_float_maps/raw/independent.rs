@@ -40,7 +40,9 @@ pub fn source(
         PcuFloatUnderflowPolicy::AllowGradualUnderflow => 2,
     };
     let clamp = u8::from(range == PcuRangePolicy::Clamp);
-    format!("using T={ty}; using Word={word};\n#define FRAC {fraction}\n#define EXP {exponent}ull\n#define BIAS {bias}\n#define SIGN {sign}\n#define MAXIMUM {maximum}\n#define MINIMUM {minimum}\n#define POLICY {policy}\n#define CLAMP {clamp}\n#define EXTENT {extent}ull\n#define INVOCATIONS {invocations}u\n{KERNEL}")
+    format!(
+        "using T={ty}; using Word={word};\n#define FRAC {fraction}\n#define EXP {exponent}ull\n#define BIAS {bias}\n#define SIGN {sign}\n#define MAXIMUM {maximum}\n#define MINIMUM {minimum}\n#define POLICY {policy}\n#define CLAMP {clamp}\n#define EXTENT {extent}ull\n#define INVOCATIONS {invocations}u\n{KERNEL}"
+    )
 }
 const KERNEL: &str = r#"
 using U = unsigned long long;

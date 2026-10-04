@@ -52,6 +52,7 @@ fn score(_: &global::PcuInvocationCandidate<'_>) -> i128 {
     0
 }
 
+#[allow(clippy::unnecessary_box_returns)] // Cold fixed matrices stay on the heap to bound stack use.
 fn matrix<const R: usize, const K: usize>(data: &[f32]) -> Box<[[f32; K]; R]> {
     assert_eq!(data.len(), R * K);
     let (rows, tail) = data.as_chunks::<K>();

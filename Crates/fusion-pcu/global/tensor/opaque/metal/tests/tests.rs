@@ -1,4 +1,4 @@
-//! Actual source effects and policies must reject before any native Metal discovery.
+//! Exact source effects retain qualified leaf paths and cold graph eligibility.
 #[rustfmt::skip]
 use crate::{
     PcuExecutionError,
@@ -42,7 +42,7 @@ fn unused_relu(input: &[f32]) -> Result<PcuTensor<f32>, PcuExecutionError> {
 }
 
 #[test]
-fn unsupported_checked_effect_rejects_before_discovery_instead_of_erasing_it() {
+fn multistage_checked_effects_are_retained_and_unsupported_policy_rejects_cold() {
     let options = PcuExecutionPolicy {
         backend: PcuBackendChoice::Metal,
         ..Default::default()
@@ -57,7 +57,24 @@ fn unsupported_checked_effect_rejects_before_discovery_instead_of_erasing_it() {
     )
     .unwrap();
     assert_eq!(built.program.node_order().len(), 3);
+    let super::program::Plan::Graph(plan) = super::assess(&built, options).unwrap() else {
+        panic!("expected retained two-stage graph");
+    };
+    assert_eq!(plan.stage_count(), 2);
+    assert_eq!(plan.output(), built.program.input_values()[0]);
+    assert_eq!(
+        plan.stage_identity(0).unwrap().0,
+        built.program.node_order()[1]
+    );
+    assert_eq!(
+        plan.stage_identity(1).unwrap().0,
+        built.program.node_order()[2]
+    );
     let inputs = [PcuTensorInput::host(&[f32::NAN, 1.0], shape)];
+    let options = PcuExecutionPolicy {
+        range_policy: PcuRangePolicy::Clamp,
+        ..options
+    };
     assert!(matches!(
         super::Prepared::prepare(&built, &inputs, options),
         Err(PcuExecutionError::InvalidTensorSourcePlan)

@@ -68,7 +68,7 @@ pub fn inputs<T: Format>(count: usize, phase: u32, op: u32) -> (Vec<T>, Vec<T>) 
                     T::ONE
                 } else {
                     bits
-                } | if i % 3 == 0 { T::SIGN } else { 0 },
+                } | if i.is_multiple_of(3) { T::SIGN } else { 0 },
             )
         })
         .collect::<Vec<_>>();

@@ -47,6 +47,9 @@ use super::{
 
 #[allow(clippy::too_many_lines)] // One pass keeps the supported IR subset's validation rules together.
 pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), CudaLowerError> {
+    if !crate::admission::supported_control_shape(kernel.ops) {
+        return Err(CudaLowerError::UnsupportedRequirements);
+    }
     // Only independently qualified synthesized low-float and exact integer maps opt in.
     // The neutral descriptor supplies structural eligibility, never broad backend conformance.
     if kernel
@@ -58,6 +61,7 @@ pub(super) fn validate_kernel(kernel: &PcuDispatchKernelIr<'_>) -> Result<(), Cu
         && fusion_pcu::describe_portable_v1_integer_map(kernel).is_err()
         && fusion_pcu::describe_portable_v1_integer_div_rem_map(kernel).is_err()
         && fusion_pcu::describe_portable_v1_unary_map(kernel).is_err()
+        && !crate::admission::portable_integer_composed_contract(kernel)
     {
         return Err(CudaLowerError::UnsupportedRequirements);
     }

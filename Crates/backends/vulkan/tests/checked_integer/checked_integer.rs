@@ -201,44 +201,51 @@ fn source_profiles<T: Wide>(backend: &PcuVulkanBackend) {
     let mut output = [sentinel; N + 3];
     macro_rules! operation {
         ($module:ident,$entry:ident,$prepare:ident,$op:ident,$clamp:expr) => {{
-            let mut prepared = source::$module::$prepare::<T, N, _>(backend).unwrap();
-            prepared(&left, &right, &mut output).unwrap();
-            assert_eq!(
-                output[..N],
-                [expected(left[0], right[0], PcuDispatchIntegerBinaryOp::$op).0; N]
-            );
-            source::$module::$entry::<T, N>(&left, &right, &mut output).unwrap();
-            assert_eq!(output[N..], [sentinel; 3]);
-            let before = output;
-            assert!(prepared(&left[..N - 1], &right, &mut output).is_err());
-            assert_eq!(output, before);
-            assert!(prepared(&left, &right, &mut output[..N - 1]).is_err());
-            assert_eq!(output, before);
-            let mut bad = left;
-            bad[2] = if PcuDispatchIntegerBinaryOp::$op == PcuDispatchIntegerBinaryOp::Sub {
-                oracle::minimum()
-            } else {
-                oracle::maximum()
-            };
-            let mut rhs = right;
-            rhs[2] = oracle::small(2);
-            let result = prepared(&bad, &rhs, &mut output)
-                .map_err(fault)
-                .unwrap_err();
-            assert_eq!(result.invocation_id, 2);
-            assert_eq!(result.recovered, $clamp);
-            if $clamp {
-                for lane in 0..N {
-                    assert_eq!(
-                        output[lane],
-                        expected(bad[lane], rhs[lane], PcuDispatchIntegerBinaryOp::$op).0
-                    );
+            fn case<T: Wide>(
+                backend: &PcuVulkanBackend,
+                left: &[T; 65],
+                right: &[T; 65],
+                output: &mut [T; 68],
+            ) {
+                let sentinel = oracle::small::<T>(17);
+                let mut prepared = source::$module::$prepare::<T, N, _>(backend).unwrap();
+                prepared(left, right, output).unwrap();
+                assert_eq!(
+                    output[..N],
+                    [expected(left[0], right[0], PcuDispatchIntegerBinaryOp::$op).0; N]
+                );
+                source::$module::$entry::<T, N>(left, right, output).unwrap();
+                assert_eq!(output[N..], [sentinel; 3]);
+                let before = *output;
+                assert!(prepared(&left[..N - 1], right, output).is_err());
+                assert_eq!(*output, before);
+                assert!(prepared(left, right, &mut output[..N - 1]).is_err());
+                assert_eq!(*output, before);
+                let mut bad = *left;
+                bad[2] = if PcuDispatchIntegerBinaryOp::$op == PcuDispatchIntegerBinaryOp::Sub {
+                    oracle::minimum()
+                } else {
+                    oracle::maximum()
+                };
+                let mut rhs = *right;
+                rhs[2] = oracle::small(2);
+                let result = prepared(&bad, &rhs, output).map_err(fault).unwrap_err();
+                assert_eq!(result.invocation_id, 2);
+                assert_eq!(result.recovered, $clamp);
+                if $clamp {
+                    for lane in 0..N {
+                        assert_eq!(
+                            output[lane],
+                            expected(bad[lane], rhs[lane], PcuDispatchIntegerBinaryOp::$op).0
+                        );
+                    }
+                } else {
+                    assert_eq!(*output, before);
                 }
-            } else {
-                assert_eq!(output, before);
+                prepared(left, right, output).unwrap();
+                assert_eq!(*output, before);
             }
-            prepared(&left, &right, &mut output).unwrap();
-            assert_eq!(output, before);
+            case(backend, &left, &right, &mut output);
         }};
     }
     operation!(reject, add, add_prepare, Add, false);

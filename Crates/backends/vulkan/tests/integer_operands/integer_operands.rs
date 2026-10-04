@@ -163,7 +163,7 @@ fn compare<T: Wide>(
         T::from_bytes(bytes)
     });
     let b = std::array::from_fn::<_, N, _>(|lane| {
-        if lane % 2 == 0 {
+        if lane.is_multiple_of(2) {
             oracle::maximum::<T>()
         } else {
             oracle::minimum::<T>()

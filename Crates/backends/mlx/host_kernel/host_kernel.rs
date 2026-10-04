@@ -247,6 +247,7 @@ impl MlxCheckedUnaryPlan {
     /// # Errors
     /// Rejects unproved types, operations, policies, shapes, interfaces or malformed value flow.
     pub fn assess(kernel: &PcuDispatchKernelIr<'_>) -> Result<Self, MlxError> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         match kernel
             .numerical_requirements
             .numerical_options
@@ -264,6 +265,14 @@ impl PcuHostKernelBackend for MlxSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
+        if crate::MlxCheckedConversionPlan::assess(kernel).is_ok() {
+            return crate::MlxConversionHostBackend::new(self.clone())
+                .prepare_host_kernel(kernel)
+                .map(MlxPreparedDispatchKernel::Conversion)
+                .map_err(PcuHostDispatchError::Backend);
+        }
         if MlxCarrierPlan::assess(kernel).is_ok() {
             return self
                 .prepare_carrier_host_kernel(kernel)
@@ -324,6 +333,8 @@ impl MlxSession {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<MlxPreparedHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCheckedUnaryPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         self.prepare_unary_plan(plan, None, kernel.bindings)
     }
@@ -338,6 +349,8 @@ impl MlxSession {
         kernel: &PcuDispatchKernelIr<'_>,
         extents: &[usize],
     ) -> Result<MlxPreparedHostKernel, MlxHostKernelError> {
+        crate::dispatch_shape::require_non_nested(kernel)
+            .map_err(fusion_pcu::PcuHostDispatchError::Backend)?;
         let plan = MlxCheckedUnaryPlan::assess(kernel).map_err(PcuHostDispatchError::Backend)?;
         let full = plan
             .assess_input_extents(extents)

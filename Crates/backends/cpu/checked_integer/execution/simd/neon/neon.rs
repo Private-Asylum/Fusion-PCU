@@ -5,6 +5,7 @@ use super::Vector;
 pub(super) struct Neon;
 impl Vector for Neon {
     type Bits = arch::uint8x16_t;
+    const BYTES: usize = 16;
     #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn load(p: *const u8) -> Self::Bits {
@@ -97,7 +98,7 @@ impl Vector for Neon {
     }
     #[inline]
     #[target_feature(enable = "neon")]
-    unsafe fn mask(v: Self::Bits) -> u32 {
+    unsafe fn mask(v: Self::Bits) -> u64 {
         let mut bytes = [0u8; 16];
         unsafe {
             arch::vst1q_u8(bytes.as_mut_ptr(), v);
@@ -106,7 +107,35 @@ impl Vector for Neon {
             .into_iter()
             .enumerate()
             .fold(0, |mask, (index, byte)| {
-                mask | (u32::from(byte >> 7) << index)
+                mask | (u64::from(byte >> 7) << index)
             })
+    }
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn execute<
+        T: super::PcuCheckedInteger,
+        const OP: u8,
+        const CLAMP: bool,
+        const LB: bool,
+        const RB: bool,
+    >(
+        left: &[u8],
+        right: &[u8],
+        output: &mut [u8],
+        extent: usize,
+        broadcast_left: &[u8; 64],
+        broadcast_right: &[u8; 64],
+    ) -> Result<(), super::PcuCpuCheckedIntegerError> {
+        // SAFETY: Private cold admission proves this family's ISA and all complete byte spans.
+        unsafe {
+            super::execute::<T, Self, OP, CLAMP, LB, RB>(
+                left,
+                right,
+                output,
+                extent,
+                broadcast_left,
+                broadcast_right,
+            )
+        }
     }
 }

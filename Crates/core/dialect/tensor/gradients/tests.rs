@@ -360,3 +360,131 @@ fn explicitly_requested_loss_derivative_retains_the_observable_seed() {
         &[1.0]
     );
 }
+
+#[test]
+fn grouped_derivatives_share_the_reverse_closure_and_follow_requested_order() {
+    let mut graph = Graph::default();
+    graph.set_numerical_mode(PcuNumericalMode::Strict);
+    let input = graph.input_typed::<f64>([1]).unwrap();
+    let first = graph.input_typed::<f64>([1]).unwrap();
+    let second = graph.input_typed::<f64>([1]).unwrap();
+    let target = graph.input_typed::<f64>([1]).unwrap();
+    let hidden = graph.mul_typed(input, first).unwrap();
+    let prediction = graph.mul_typed(hidden, second).unwrap();
+    let loss = graph.mean_squared_error_typed(prediction, target).unwrap();
+    let before = graph.nodes().len();
+    let gradients = graph
+        .backward_mse_for_targets(
+            loss.erase(),
+            &[second.erase(), first.erase(), second.erase()],
+        )
+        .unwrap();
+    assert_eq!(gradients[0], gradients[2]);
+    let appended = graph.nodes().len() - before;
+    // One MSE derivative (scale/sub/mul), then one path through each multiply.
+    assert_eq!(appended, 6);
+    let inputs = [
+        (
+            input.erase(),
+            TensorValue::F64(Tensor::new([1], vec![2.0]).unwrap()),
+        ),
+        (
+            first.erase(),
+            TensorValue::F64(Tensor::new([1], vec![3.0]).unwrap()),
+        ),
+        (
+            second.erase(),
+            TensorValue::F64(Tensor::new([1], vec![4.0]).unwrap()),
+        ),
+        (
+            target.erase(),
+            TensorValue::F64(Tensor::new([1], vec![1.0]).unwrap()),
+        ),
+    ];
+    let result = graph.evaluate_checked(&inputs).unwrap();
+    assert_eq!(
+        result.value_typed::<f64>(gradients[0]).unwrap().data(),
+        &[276.0]
+    );
+    assert_eq!(
+        result.value_typed::<f64>(gradients[1]).unwrap().data(),
+        &[368.0]
+    );
+    // Separate requests repeat their shared upstream reverse work.
+    let start = graph.nodes().len();
+    graph
+        .backward_mse_for(loss.erase(), second.erase())
+        .unwrap();
+    graph.backward_mse_for(loss.erase(), first.erase()).unwrap();
+    assert!(graph.nodes().len() - start > appended);
+}
+
+#[test]
+fn grouped_targets_preflight_every_identity_before_graph_mutation() {
+    let mut graph = Graph::default();
+    let prediction = graph.input_typed::<f32>([1]).unwrap();
+    let target = graph.input_typed::<f32>([1]).unwrap();
+    let unrelated = graph.input_typed::<f32>([1]).unwrap();
+    let foreign = Graph::default().input_typed::<f32>([1]).unwrap();
+    let loss = graph.mean_squared_error_typed(prediction, target).unwrap();
+    let before = graph.nodes().len();
+    for (targets, expected) in [
+        (vec![], TensorError::EmptyOutputs),
+        (
+            vec![prediction.erase(), foreign.erase()],
+            TensorError::UnknownValue(foreign.erase()),
+        ),
+        (
+            vec![prediction.erase(), unrelated.erase()],
+            TensorError::UnsupportedGradient(unrelated.erase()),
+        ),
+    ] {
+        assert_eq!(
+            graph.backward_mse_for_targets(loss.erase(), &targets),
+            Err(expected)
+        );
+        assert_eq!(graph.nodes().len(), before);
+    }
+}
+
+#[test]
+fn grouped_weight_targets_omit_an_overflowing_unrequested_input_derivative() {
+    let mut graph = Graph::default();
+    graph.set_numerical_mode(PcuNumericalMode::Strict);
+    let input = graph.input_typed::<f32>([1]).unwrap();
+    let first = graph.input_typed::<f32>([1]).unwrap();
+    let second = graph.input_typed::<f32>([1]).unwrap();
+    let target = graph.input_typed::<f32>([1]).unwrap();
+    let intermediate = graph.mul_typed(input, first).unwrap();
+    let prediction = graph.mul_typed(intermediate, second).unwrap();
+    let loss = graph.mean_squared_error_typed(prediction, target).unwrap();
+    let gradients = graph
+        .backward_mse_for_targets(loss.erase(), &[first.erase(), second.erase()])
+        .unwrap();
+    let result = graph
+        .evaluate_checked(&[
+            (
+                input.erase(),
+                TensorValue::F32(Tensor::new([1], vec![0.0]).unwrap()),
+            ),
+            (
+                first.erase(),
+                TensorValue::F32(Tensor::new([1], vec![f32::MAX]).unwrap()),
+            ),
+            (
+                second.erase(),
+                TensorValue::F32(Tensor::new([1], vec![1.0]).unwrap()),
+            ),
+            (
+                target.erase(),
+                TensorValue::F32(Tensor::new([1], vec![1.0]).unwrap()),
+            ),
+        ])
+        .unwrap();
+    for gradient in gradients {
+        assert_eq!(
+            result.value_typed::<f32>(gradient).unwrap().data()[0].to_bits(),
+            (-0.0_f32).to_bits()
+        );
+    }
+}

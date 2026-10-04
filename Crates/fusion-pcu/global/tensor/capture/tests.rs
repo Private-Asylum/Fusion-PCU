@@ -6,6 +6,7 @@ mod unread;
 #[rustfmt::skip]
 use super::{
     __pcu_capture_tensor_program,
+    __pcu_capture_tensor_program_outputs,
     PcuExecutionError,
     PcuFloatUnderflowPolicy,
     PcuNumericalMode,
@@ -118,5 +119,46 @@ fn malformed_host_shapes_reject_before_calling_the_companion() {
     assert!(matches!(
         result,
         Err(PcuExecutionError::InvalidTensorSourcePlan)
+    ));
+}
+
+#[test]
+fn tuple_selection_retains_output_order_shapes_and_only_real_source_bindings() {
+    let captured = __pcu_capture_tensor_program_outputs::<f32, 3, 2, _>(
+        [
+            PcuSourceShape::FixedArray { length: 0 },
+            PcuSourceShape::FixedArray { length: 2 },
+            PcuSourceShape::FixedArray { length: 3 },
+        ],
+        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        PcuNumericalMode::Boundary,
+        PcuNumericalOptions::default(),
+        |capture, [_, left, right]| Ok([capture.relu(right)?, capture.relu(left)?]),
+    )
+    .unwrap();
+    assert_eq!(captured.argument_indices(), [1, 2]);
+    let outputs = captured.program().output_values();
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(captured.program().graph().shape(outputs[0]).unwrap(), [3]);
+    assert_eq!(captured.program().graph().shape(outputs[1]).unwrap(), [2]);
+}
+
+#[test]
+fn duplicate_logical_terminals_are_rejected_before_device_preparation() {
+    let result = __pcu_capture_tensor_program_outputs::<f32, 1, 2, _>(
+        [PcuSourceShape::FixedArray { length: 2 }],
+        PcuFloatUnderflowPolicy::IeeeAfterRounding,
+        PcuNumericalMode::Boundary,
+        PcuNumericalOptions::default(),
+        |capture, [input]| {
+            let alias = capture.identity(input)?;
+            Ok([input, alias])
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(PcuExecutionError::TensorBuild(
+            crate::dialect::tensor::TensorError::DuplicateOutput(_)
+        ))
     ));
 }

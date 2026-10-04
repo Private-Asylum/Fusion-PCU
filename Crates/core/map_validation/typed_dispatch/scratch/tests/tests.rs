@@ -246,3 +246,36 @@ fn additional_capacity_does_not_relax_types_or_allocate_for_empty_regions() {
         Err(Error::ValueOutOfRange(Id(300))),
     );
 }
+
+#[test]
+fn raw_fp8_constants_define_exact_types_without_numeric_conversion() {
+    for (scalar, value) in [
+        (
+            PcuScalarType::F8E4M3FN,
+            crate::PcuParameterValue::from_f8_e4m3fn_bits(0xff),
+        ),
+        (
+            PcuScalarType::F8E5M2,
+            crate::PcuParameterValue::from_f8_e5m2_bits(0x80),
+        ),
+    ] {
+        let bindings = [binding(11, scalar, PcuBindingAccess::WriteOnly)];
+        let ops = [
+            Op::Data(Data::Constant {
+                result: Id(1),
+                value,
+            }),
+            store(Id(1), 11, Index::InvocationId),
+            Op::Control(PcuDispatchControlOp::Return),
+        ];
+        assert_eq!(
+            validate_typed_dispatch_value_flow(&kernel(&bindings, &ops)),
+            Ok(())
+        );
+        let wrong = [binding(11, PcuScalarType::U8, PcuBindingAccess::WriteOnly)];
+        assert!(matches!(
+            validate_typed_dispatch_value_flow(&kernel(&wrong, &ops)),
+            Err(Error::TypeMismatch { .. }),
+        ));
+    }
+}

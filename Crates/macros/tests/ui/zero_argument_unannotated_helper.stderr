@@ -1,0 +1,5 @@
+error[E0433]: cannot find module or crate `runtime_helper` in this scope
+ --> tests/ui/zero_argument_unannotated_helper.rs:7:5
+  |
+7 |     runtime_helper()
+  |     ^^^^^^^^^^^^^^ function `runtime_helper` is not a crate or module

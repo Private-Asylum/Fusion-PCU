@@ -239,6 +239,13 @@ impl TensorStrictFaultDomain {
         // The first dot-product addition is +0 plus a successfully checked
         // product: exact, finite and already admitted by the tiny-result policy.
         match (self.primitive, location.step) {
+            // For one element the final denominator is exactly one. IEEE
+            // 754-2019 division returns the already-admitted finite sum exactly;
+            // neither tiny-inexact underflow nor tightened subnormal rejection
+            // can introduce a new fault after the preceding checked steps.
+            (Primitive::Mse { elements: 1 }, TensorArithmeticStep::Divide) => {
+                return false;
+            }
             (Primitive::MatMul { .. }, TensorArithmeticStep::Add)
                 if location.reduction_index == 0
                     || matches!(kind, PcuExecutionFaultKind::InvalidFloatingOperand) =>

@@ -261,3 +261,8 @@ name = "operand_roles"
 path = "benches/operand_roles/operand_roles.rs"
 harness = false
 required-features = ["benchmark-control"]
+
+[[test]]
+name = "numerical_aggregate_source"
+path = "tests/numerical_aggregate_source/numerical_aggregate_source.rs"
+required-features = ["source-tensor"]

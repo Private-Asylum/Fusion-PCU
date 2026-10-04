@@ -9,6 +9,9 @@ mod source;
 use fusion_pcu_cpu::{PcuCpuHostBackend,PcuCpuPreparedHost,PcuCpuHostError};
 #[rustfmt::skip]
 use pcu_facade::{global,PcuBindingRef,PcuHostArgument,PcuHostKernelBackend,PcuPreparedHostKernel,PcuFloatUnderflowPolicy as Policy,PcuNumericalMode,PcuExecutionFaultKind as Kind,PcuDispatchOp,PcuDispatchDataOp,PcuDispatchKernelIr,PcuImplementationRequirements,PcuRangePolicy};
+// Numerical globals invalidate every thread's prepared cache. Serialize the
+// tests that change them so unrelated policy changes cannot enter a warm census.
+static POLICY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn configure(policy: Policy, mode: PcuNumericalMode) {
     global::configure(global::PcuExecutionPolicy {
         backend: global::PcuBackendChoice::Cpu,
@@ -152,6 +155,7 @@ fn independent_full_bit_rounding_recovery_and_widening() {
 }
 #[test]
 fn source_recovered_fatal_precedence_preflight_tails_retry_and_zero_heap() {
+    let _guard = POLICY_LOCK.lock().unwrap();
     for policy in [
         Policy::IeeeAfterRounding,
         Policy::RejectSubnormalResult,
@@ -365,6 +369,7 @@ fn exact_cast_ids_tuple_offers_and_rejected_header_portable_profiles() {
 
 #[test]
 fn normal_stored_result_still_reports_tiny_unbounded_precision_notice() {
+    let _guard = POLICY_LOCK.lock().unwrap();
     // IEEE7.5(a) checks the unbounded nearest-24-bit result, not final stored exponent.
     let samples = [
         0x380f_ffff_dfff_ffff,

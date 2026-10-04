@@ -153,35 +153,38 @@ fn genuine_eight_width_source_prepared_grid_transaction() {
     .unwrap();
     macro_rules! width {
         ($t:ty,$module:ident) => {{
-            let a = [7 as $t; 65];
-            let mut b = [3 as $t; 65];
-            let mut q = [27 as $t; 68];
-            let mut r = q;
-            let mut prepared = source::$module::direct_prepare::<65, _>(&backend).unwrap();
-            prepared(&a, &b, &mut q, &mut r).unwrap();
-            assert_eq!(q[..65], [2 as $t; 65]);
-            assert_eq!(r[..65], [1 as $t; 65]);
-            source::$module::direct::<65>(&a, &b, &mut q, &mut r).unwrap();
-            source::$module::grid::<65>(&a, &b, &mut q, &mut r).unwrap();
-            source::$module::strict::<65>(&a, &b, &mut q, &mut r).unwrap();
-            let saved = (q, r);
-            b[2] = 0;
-            let e = source::$module::direct::<65>(&a, &b, &mut q, &mut r)
-                .unwrap_err()
-                .arithmetic_fault()
-                .unwrap();
-            assert_eq!(
-                (e.invocation_id, e.kind, e.recovered),
-                (2, Kind::DivideByZero, false)
-            );
-            assert_eq!((q, r), saved);
-            assert!(prepared(&a[..64], &b, &mut q, &mut r).is_err());
-            assert!(prepared(&a, &b, &mut q, &mut r[..64]).is_err());
-            assert_eq!((q, r), saved);
-            b[2] = 3;
-            prepared(&a, &b, &mut q, &mut r).unwrap();
-            assert_eq!(q[65..], [27 as $t; 3]);
-            assert_eq!(r[65..], [27 as $t; 3]);
+            fn case(backend: &PcuVulkanBackend) {
+                let a = [7 as $t; 65];
+                let mut b = [3 as $t; 65];
+                let mut q = [27 as $t; 68];
+                let mut r = q;
+                let mut prepared = source::$module::direct_prepare::<65, _>(backend).unwrap();
+                prepared(&a, &b, &mut q, &mut r).unwrap();
+                assert_eq!(q[..65], [2 as $t; 65]);
+                assert_eq!(r[..65], [1 as $t; 65]);
+                source::$module::direct::<65>(&a, &b, &mut q, &mut r).unwrap();
+                source::$module::grid::<65>(&a, &b, &mut q, &mut r).unwrap();
+                source::$module::strict::<65>(&a, &b, &mut q, &mut r).unwrap();
+                let saved = (q, r);
+                b[2] = 0;
+                let e = source::$module::direct::<65>(&a, &b, &mut q, &mut r)
+                    .unwrap_err()
+                    .arithmetic_fault()
+                    .unwrap();
+                assert_eq!(
+                    (e.invocation_id, e.kind, e.recovered),
+                    (2, Kind::DivideByZero, false)
+                );
+                assert_eq!((q, r), saved);
+                assert!(prepared(&a[..64], &b, &mut q, &mut r).is_err());
+                assert!(prepared(&a, &b, &mut q, &mut r[..64]).is_err());
+                assert_eq!((q, r), saved);
+                b[2] = 3;
+                prepared(&a, &b, &mut q, &mut r).unwrap();
+                assert_eq!(q[65..], [27 as $t; 3]);
+                assert_eq!(r[65..], [27 as $t; 3]);
+            }
+            case(&backend);
         }};
     }
     width!(i8, i8_source);

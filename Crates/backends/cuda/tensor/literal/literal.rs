@@ -1,4 +1,17 @@
 //! Exact dense F64 literal transport; arithmetic policies apply only when consumed.
+#[path = "integer/integer.rs"]
+mod integer;
+#[path = "low_float/low_float.rs"]
+mod low_float;
+pub(super) use low_float::upload_low_float;
+#[cfg(test)]
+pub(super) use low_float::encoded_low_float;
+#[path = "raw_float/raw_float.rs"]
+mod raw_float;
+pub(super) use raw_float::upload_raw_float;
+pub(super) use integer::upload_integer;
+#[cfg(test)]
+pub(super) use integer::encoded_integer;
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuMemoryPoolId,
@@ -14,6 +27,22 @@ use super::{
     CudaPhysicalRepresentation,
     CudaTensorExecutionError,
 };
+
+pub(super) fn upload_dense_bits<P: PcuMemoryProvider<Resource = CudaMemoryResource>>(
+    node: NodeDescriptor<'_>,
+    layout: CudaPhysicalLayout,
+    output: Option<&CudaMemoryResource>,
+    pool: PcuMemoryPoolId,
+    memory: &mut P,
+) -> Result<CudaMemoryResource, CudaTensorExecutionError> {
+    if super::is_low_float_type(node.scalar_type) {
+        upload_low_float(node, layout, output, pool, memory)
+    } else if super::is_raw_float_type(node.scalar_type) {
+        upload_raw_float(node, layout, output, pool, memory)
+    } else {
+        upload_integer(node, layout, output, pool, memory)
+    }
+}
 
 fn encoded_f64(
     node: NodeDescriptor<'_>,

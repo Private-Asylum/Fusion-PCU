@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `&u32: fusion_pcu::global::PcuImmutableTensorPayload<_>` is not satisfied
+ --> tests/ui/immutable_literal_scalar_array.rs:2:1
+  |
+2 | #[pcu(crate_path = ::pcu_alias)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `fusion_pcu::global::PcuImmutableTensorPayload<_>` is not implemented for `&u32`
+  |
+help: the following other types implement trait `fusion_pcu::global::PcuImmutableTensorPayload<T>`
+ --> $WORKSPACE/Crates/fusion-pcu/global/tensor/literals/literals.rs
+  |
+  | impl<T: PcuScalar, const N: usize> PcuImmutableTensorPayload<T> for &[T; N] {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&[T; N]`
+...
+  | impl<T: PcuScalar, const R: usize, const C: usize> PcuImmutableTensorPayload<T> for &[[T; C]; R] {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&[[T; C]; R]`
+note: required by a bound in `global::tensor::literals::<impl fusion_pcu::global::PcuTensorGraphCapture>::constant_array`
+ --> $WORKSPACE/Crates/fusion-pcu/global/tensor/literals/literals.rs
+  |
+  |     pub fn constant_array<T: PcuScalar, P: PcuImmutableTensorPayload<T>>(
+  |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `global::tensor::literals::<impl PcuTensorGraphCapture>::constant_array`
+  = note: this error originates in the attribute macro `pcu` (in Nightly builds, run with -Z macro-backtrace for more info)

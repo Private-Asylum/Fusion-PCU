@@ -1522,3 +1522,26 @@ pub use blas_handle::{
     BlasHandleFunctions,
     retain as retain_blas_handle_functions,
 };
+
+/// Creates a test-only nonblocking stream without coupling it to legacy null-stream work.
+#[cfg(test)]
+pub fn create_nonblocking_stream_for_test(
+    runtime: &HipRuntime,
+) -> Result<hip::HipStream, HipError> {
+    type CreateWithFlags = unsafe extern "C" fn(*mut hip::HipStream, u32) -> hip::HipResult;
+    // SAFETY: Installed HIP ABI takes an output stream pointer and unsigned stream flags.
+    let function = unsafe {
+        symbol::<CreateWithFlags>(&runtime.0.library, b"hipStreamCreateWithFlags\0")
+    }
+    .map_err(|error| HipError::MissingSymbol {
+        symbol: "hipStreamCreateWithFlags",
+        detail: error.to_string(),
+    })?;
+    let retained = Ok(*function);
+    let mut stream = std::ptr::null_mut();
+    hip_call(runtime, "hipStreamCreateWithFlags", &retained, |create| {
+        // SAFETY: Output is writable; flag1 is hipStreamNonBlocking; runtime retains the ABI.
+        unsafe { create(&raw mut stream, 1) }
+    })?;
+    Ok(stream)
+}

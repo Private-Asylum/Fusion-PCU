@@ -1,5 +1,14 @@
 //! Direct syntax remains available without any runtime provider or implicit CPU fallback.
-#![cfg(not(any(feature = "rocm", feature = "cuda")))]
+// This is the provider-free configuration. Enabling any runtime provider is
+// explicit opt-in, including CPU; it is not an implicit fallback.
+#![cfg(not(any(
+    feature = "cpu",
+    feature = "rocm",
+    feature = "cuda",
+    feature = "metal",
+    feature = "mlx",
+    feature = "vulkan"
+)))]
 
 #[rustfmt::skip]
 use fusion_pcu::{

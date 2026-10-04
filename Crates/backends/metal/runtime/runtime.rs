@@ -17,6 +17,17 @@ use fusion_pcu::{
 use crate::ffi;
 #[path = "binary/binary.rs"]
 mod binary;
+#[cfg(feature = "tensor")]
+#[path = "strict_matmul/strict_matmul.rs"]
+mod strict_matmul;
+#[cfg(feature = "tensor")]
+pub use strict_matmul::MetalPreparedStrictMatMul;
+#[path = "relu_backward/relu_backward.rs"]
+mod relu_backward;
+pub use relu_backward::MetalPreparedReluBackward;
+#[path = "conversion/conversion.rs"]
+mod conversion;
+pub use conversion::MetalPreparedFloatConversion;
 #[path = "carrier/carrier.rs"]
 pub mod carrier;
 #[path = "composed/composed.rs"]
@@ -290,6 +301,22 @@ pub struct MetalBuffer {
 }
 
 impl MetalBuffer {
+    /// Prepare a bounded coherent Shared publication with no intervening GPU work.
+    pub(crate) fn prepare_shared_prefix_copy<'a>(
+        &'a self,
+        output: &'a mut Self,
+        bytes: usize,
+    ) -> Result<ffi::SharedPrefixCopy<'a>, MetalError> {
+        if !self.session.same_session(&output.session) {
+            return Err(MetalError::ForeignSession);
+        }
+        self.session.ensure_quiescent()?;
+        if bytes > self.bytes || bytes > output.bytes {
+            return Err(MetalError::InvalidExtent);
+        }
+        self.native
+            .prepare_shared_prefix_copy(&mut output.native, bytes)
+    }
     pub(crate) const fn session(&self) -> &MetalSession {
         &self.session
     }
@@ -1352,3 +1379,15 @@ mod hardware_tests {
 #[path = "div_rem/div_rem.rs"]
 pub mod div_rem;
 pub use div_rem::MetalPreparedDivRemControl;
+
+#[cfg(feature = "tensor")]
+#[path = "strict_sgd/strict_sgd.rs"]
+mod strict_sgd;
+#[cfg(feature = "tensor")]
+pub use strict_sgd::MetalPreparedStrictSgd;
+
+#[cfg(feature = "tensor")]
+#[path = "strict_mse/strict_mse.rs"]
+mod strict_mse;
+#[cfg(feature = "tensor")]
+pub use strict_mse::MetalPreparedStrictMse;

@@ -1,5 +1,4 @@
 //! Opt-in caller-thread Rust heap census, absent from primary builds.
-#![cfg(feature = "allocation-census")]
 
 #[rustfmt::skip]
 use std::{

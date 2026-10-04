@@ -12,7 +12,7 @@ use pcu_facade::{
 use fusion_pcu_spirv::{
     validate_composed_float_map,
     validate_one_effect_float_map,
-    PcuSpirvComposedFloatProfile,
+    PcuSpirvComposedProfile,
     PcuSpirvError,
 };
 
@@ -61,7 +61,7 @@ fn assert_policy(
     }
     assert_eq!(arithmetic, 1);
 }
-struct Captured(PcuSpirvComposedFloatProfile);
+struct Captured(PcuSpirvComposedProfile);
 impl PcuHostKernelBackend for Cold {
     type Prepared = Captured;
     type Error = PcuSpirvError;

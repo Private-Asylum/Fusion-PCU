@@ -23,11 +23,13 @@ pub use unary::{
 };
 #[rustfmt::skip]
 pub use integer::{
+    describe_portable_v1_checked_integer_composed_map,
     describe_portable_v1_integer_map,
     describe_portable_v1_integer_div_rem_map,
     PcuPortableV1IntegerDivRemMapDescription,
     PcuPortableV1IntegerMapDescription,
     PcuPortableV1IntegerMapError,
+    PcuPortableV1IntegerComposedMapError,
 };
 
 #[rustfmt::skip]

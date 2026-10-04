@@ -30,6 +30,7 @@ use crate::types::{
 
 #[derive(Debug)]
 pub enum PcuVulkanError {
+    ShaderArtifact(crate::PcuVulkanShaderArtifactError),
     DispatchAdmission {
         error: PcuError,
     },
@@ -89,6 +90,7 @@ pub enum PcuVulkanError {
 impl fmt::Display for PcuVulkanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ShaderArtifact(error) => write!(formatter, "Vulkan shader artifact: {error}"),
             Self::DispatchAdmission { error } => {
                 write!(formatter, "Vulkan dispatch admission failed: {error}")
             }

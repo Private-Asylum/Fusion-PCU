@@ -36,56 +36,59 @@ fn profile<T: Format>() {
     const N: usize = 65;
     macro_rules! operation {
         ($module:ident,$op:expr) => {{
-            let (mut left, mut right, expected) = oracle::inputs::<T>(N, 37, $op);
-            let mut output = vec![T::sentinel(); N + 2];
-            source::$module::direct::<T, N>(&left, &right, &mut output).unwrap();
-            oracle::verify(&expected, &output);
-            source::$module::grid::<T, N>(&left, &right, &mut output).unwrap();
-            oracle::verify(&expected, &output);
-            source::$module::strict::<T, N>(&left, &right, &mut output).unwrap();
-            oracle::verify(&expected, &output);
-            let before = output.clone();
-            left[5] = T::from(T::MAX + 1);
-            left[41] = T::from(T::MAX + 1);
-            check_fault(
-                source::$module::grid::<T, N>(&left, &right, &mut output),
-                5,
-                PcuExecutionFaultKind::InvalidFloatingOperand,
-                false,
-            );
-            assert_eq!(output, before);
-            let input = source::identity(left.as_slice()).unwrap();
-            let divisor = source::identity(right.as_slice()).unwrap();
-            let mut resident = source::identity(before.as_slice()).unwrap();
-            check_fault(
-                source::$module::direct::<T, N>(&input, &divisor, &mut resident),
-                5,
-                PcuExecutionFaultKind::InvalidFloatingOperand,
-                false,
-            );
-            assert!(matches!(
-                resident.read_into(&mut output),
-                Err(PcuExecutionError::Argument(
-                    global::PcuArgumentError::ResidentValueDiscarded
-                ))
-            ));
-            assert!(source::identity::<T>(&resident).is_err());
-            assert!(source::$module::direct::<T, N>(&input, &divisor, &mut resident).is_err());
-            left.fill(T::one());
-            right.fill(T::one());
-            output.fill(T::sentinel());
-            source::$module::broadcast::<T, N>(&left, &T::one(), &mut output).unwrap();
-            let expected = vec![
-                oracle::expected(
-                    T::one(),
-                    T::one(),
-                    $op,
-                    PcuFloatUnderflowPolicy::IeeeAfterRounding
-                )
-                .0;
-                N
-            ];
-            oracle::verify(&expected, &output);
+            fn case<T: Format>() {
+                let (mut left, mut right, expected) = oracle::inputs::<T>(N, 37, $op);
+                let mut output = vec![T::sentinel(); N + 2];
+                source::$module::direct::<T, N>(&left, &right, &mut output).unwrap();
+                oracle::verify(&expected, &output);
+                source::$module::grid::<T, N>(&left, &right, &mut output).unwrap();
+                oracle::verify(&expected, &output);
+                source::$module::strict::<T, N>(&left, &right, &mut output).unwrap();
+                oracle::verify(&expected, &output);
+                let before = output.clone();
+                left[5] = T::from(T::MAX + 1);
+                left[41] = T::from(T::MAX + 1);
+                check_fault(
+                    source::$module::grid::<T, N>(&left, &right, &mut output),
+                    5,
+                    PcuExecutionFaultKind::InvalidFloatingOperand,
+                    false,
+                );
+                assert_eq!(output, before);
+                let input = source::identity(left.as_slice()).unwrap();
+                let divisor = source::identity(right.as_slice()).unwrap();
+                let mut resident = source::identity(before.as_slice()).unwrap();
+                check_fault(
+                    source::$module::direct::<T, N>(&input, &divisor, &mut resident),
+                    5,
+                    PcuExecutionFaultKind::InvalidFloatingOperand,
+                    false,
+                );
+                assert!(matches!(
+                    resident.read_into(&mut output),
+                    Err(PcuExecutionError::Argument(
+                        global::PcuArgumentError::ResidentValueDiscarded
+                    ))
+                ));
+                assert!(source::identity::<T>(&resident).is_err());
+                assert!(source::$module::direct::<T, N>(&input, &divisor, &mut resident).is_err());
+                left.fill(T::one());
+                right.fill(T::one());
+                output.fill(T::sentinel());
+                source::$module::broadcast::<T, N>(&left, &T::one(), &mut output).unwrap();
+                let expected = vec![
+                    oracle::expected(
+                        T::one(),
+                        T::one(),
+                        $op,
+                        PcuFloatUnderflowPolicy::IeeeAfterRounding
+                    )
+                    .0;
+                    N
+                ];
+                oracle::verify(&expected, &output);
+            }
+            case::<T>();
         }};
     }
     operation!(add, 0);
@@ -176,64 +179,72 @@ fn encoding_pairs<T: Format>() {
     const N: usize = 65536;
     macro_rules! operation {
         ($module:ident,$op:expr) => {{
-            let mut left = Vec::with_capacity(N);
-            let mut right = Vec::with_capacity(N);
-            for i in 0..N {
-                let a = if T::SIGN == 0x80 {
-                    u16::try_from(i / 256).unwrap()
-                } else {
-                    u16::try_from(i).unwrap()
-                };
-                let b = if T::SIGN == 0x80 {
-                    u16::try_from(i % 256).unwrap()
-                } else {
-                    u16::try_from((i.wrapping_mul(32749) + 17) % 65536).unwrap()
-                };
-                let (a, b) = (T::from(a), T::from(b));
-                let (a, b) = if matches!(
-                    oracle::reference(a, b, $op, PcuFloatUnderflowPolicy::AllowGradualUnderflow),
-                    Err(PcuClampedError::Fatal(_))
-                ) {
-                    (T::one(), T::one())
-                } else {
-                    (a, b)
-                };
-                left.push(a);
-                right.push(b);
-            }
-            for policy in [
-                PcuFloatUnderflowPolicy::IeeeAfterRounding,
-                PcuFloatUnderflowPolicy::RejectSubnormalResult,
-                PcuFloatUnderflowPolicy::AllowGradualUnderflow,
-            ] {
-                let mut expected = Vec::with_capacity(N);
-                let mut first = None;
-                for (index, (&a, &b)) in left.iter().zip(&right).enumerate() {
-                    let (v, f) = oracle::expected(a, b, $op, policy);
-                    expected.push(v);
-                    if first.is_none() {
-                        first = f.map(|kind| (u64::try_from(index).unwrap(), kind));
-                    }
+            fn case<T: Format>() {
+                let mut left = Vec::with_capacity(N);
+                let mut right = Vec::with_capacity(N);
+                for i in 0..N {
+                    let a = if T::SIGN == 0x80 {
+                        u16::try_from(i / 256).unwrap()
+                    } else {
+                        u16::try_from(i).unwrap()
+                    };
+                    let b = if T::SIGN == 0x80 {
+                        u16::try_from(i % 256).unwrap()
+                    } else {
+                        u16::try_from((i.wrapping_mul(32749) + 17) % 65536).unwrap()
+                    };
+                    let (a, b) = (T::from(a), T::from(b));
+                    let (a, b) = if matches!(
+                        oracle::reference(
+                            a,
+                            b,
+                            $op,
+                            PcuFloatUnderflowPolicy::AllowGradualUnderflow
+                        ),
+                        Err(PcuClampedError::Fatal(_))
+                    ) {
+                        (T::one(), T::one())
+                    } else {
+                        (a, b)
+                    };
+                    left.push(a);
+                    right.push(b);
                 }
-                let mut output = vec![T::sentinel(); N + 2];
-                let result = match policy {
-                    PcuFloatUnderflowPolicy::IeeeAfterRounding => {
-                        source::$module::clamp::<T, N>(&left, &right, &mut output)
+                for policy in [
+                    PcuFloatUnderflowPolicy::IeeeAfterRounding,
+                    PcuFloatUnderflowPolicy::RejectSubnormalResult,
+                    PcuFloatUnderflowPolicy::AllowGradualUnderflow,
+                ] {
+                    let mut expected = Vec::with_capacity(N);
+                    let mut first = None;
+                    for (index, (&a, &b)) in left.iter().zip(&right).enumerate() {
+                        let (v, f) = oracle::expected(a, b, $op, policy);
+                        expected.push(v);
+                        if first.is_none() {
+                            first = f.map(|kind| (u64::try_from(index).unwrap(), kind));
+                        }
                     }
-                    PcuFloatUnderflowPolicy::RejectSubnormalResult => {
-                        source::$module::clamp_tight::<T, N>(&left, &right, &mut output)
+                    let mut output = vec![T::sentinel(); N + 2];
+                    let result = match policy {
+                        PcuFloatUnderflowPolicy::IeeeAfterRounding => {
+                            source::$module::clamp::<T, N>(&left, &right, &mut output)
+                        }
+                        PcuFloatUnderflowPolicy::RejectSubnormalResult => {
+                            source::$module::clamp_tight::<T, N>(&left, &right, &mut output)
+                        }
+                        PcuFloatUnderflowPolicy::AllowGradualUnderflow => {
+                            source::$module::clamp_allow::<T, N>(&left, &right, &mut output)
+                        }
+                    };
+                    if let Some((index, kind)) = first {
+                        check_fault(result, index, kind, true);
+                    } else {
+                        result.unwrap();
                     }
-                    PcuFloatUnderflowPolicy::AllowGradualUnderflow => {
-                        source::$module::clamp_allow::<T, N>(&left, &right, &mut output)
-                    }
-                };
-                if let Some((index, kind)) = first {
-                    check_fault(result, index, kind, true);
-                } else {
-                    result.unwrap();
+                    oracle::verify(&expected, &output);
                 }
-                oracle::verify(&expected, &output);
             }
+            case::<T>();
         }};
     }
     operation!(add, 0);

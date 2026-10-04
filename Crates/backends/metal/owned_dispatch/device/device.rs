@@ -47,6 +47,7 @@ impl PcuDeviceKernelBackend for MetalOwnedDispatchBackend {
         &self,
         kernel: &PcuDispatchKernelIr<'_>,
     ) -> Result<Self::Prepared, Self::Error> {
+        crate::dispatch_shape::require_non_nested(kernel)?;
         let [width, height, depth] = kernel.entry.logical_shape;
         let width = NonZeroU32::new(width).ok_or(MetalError::InvalidExtent)?;
         if height != 1 || depth != 1 {

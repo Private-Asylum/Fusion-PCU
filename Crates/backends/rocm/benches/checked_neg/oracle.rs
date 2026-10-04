@@ -118,11 +118,11 @@ pub fn input<T: Scalar>(count: usize, phase: u64) -> Vec<T> {
     (0..count).map(|index| T::sample(index, phase)).collect()
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks)] // Stable const arguments cannot use generic size_of::<T>().
 pub fn bytes<T: Scalar>(values: &[T]) -> Vec<u8> {
     let mut bytes = vec![0; size_of_val(values)];
-    for (value, chunk) in values.iter().zip(bytes.chunks_exact_mut(size_of::<T>())) {
-        value.write(chunk);
+    for (index, value) in values.iter().enumerate() {
+        let start = index * size_of::<T>();
+        value.write(&mut bytes[start..start + size_of::<T>()]);
     }
     bytes
 }
@@ -139,16 +139,12 @@ pub fn verify<T: Scalar>(input: &[T], output: &[T]) {
     }
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks)] // Stable const arguments cannot use generic size_of::<T>().
 pub fn verify_bytes<T: Scalar>(input: &[T], output: &[u8]) {
     assert_eq!(size_of_val(input), output.len());
-    for (index, (input, output)) in input
-        .iter()
-        .zip(output.chunks_exact(size_of::<T>()))
-        .enumerate()
-    {
+    for (index, input) in input.iter().enumerate() {
+        let start = index * size_of::<T>();
         assert_eq!(
-            T::read(output),
+            T::read(&output[start..start + size_of::<T>()]),
             input.encoding() ^ T::SIGN,
             "{} native Neg encoding at {index}",
             T::NAME

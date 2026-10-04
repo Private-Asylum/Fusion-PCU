@@ -1,4 +1,13 @@
 //! Typed owned tensor source execution. Graph preparation is cold; escaped results own storage.
+//!
+//! Numerical mode selects exception boundaries inside compound primitives. Scalar
+//! Add/Sub/Mul/Div/ReLU already check their entire single-operation domain and retain
+//! mode None in the neutral IR. Underflow and independent numerical options still
+//! belong to each evaluated operation. Identity and literal transport do not evaluate
+//! payloads or retroactively alter a producer's arithmetic contract.
+//! Unannotated nested helpers use the capture's base/global underflow policy;
+//! an explicit underflow flag is local to operations in its declaring function.
+//! Compound mode and numerical options instead inherit the active caller scope.
 
 use crate::PcuScalar;
 #[rustfmt::skip]
@@ -26,11 +35,16 @@ use alloc::rc::Rc;
 mod capture;
 #[path = "tensor/gradient/gradient.rs"]
 mod gradient;
+#[path = "tensor/literals/literals.rs"]
+mod literals;
+#[doc(hidden)]
+pub use literals::PcuImmutableTensorPayload;
 #[cfg(feature = "tensor")]
 #[doc(hidden)]
 #[rustfmt::skip]
 pub use capture::{
     __pcu_capture_tensor_program,
+    __pcu_capture_tensor_program_outputs,
     PcuCapturedTensorProgram,
 };
 #[cfg(feature = "tensor")]
@@ -865,8 +879,7 @@ impl PcuTensorGraphCapture {
         Ok(())
     }
 
-    #[cfg(feature = "tensor")]
-    #[cfg_attr(not(any(feature = "rocm", feature = "cuda")), allow(dead_code))]
+    #[cfg(all(test, feature = "tensor"))]
     fn finish<T: PcuScalar>(
         self,
         value: PcuTensorGraphValue<T>,
@@ -876,6 +889,28 @@ impl PcuTensorGraphCapture {
             return Err(PcuExecutionError::InvalidTensorSourcePlan);
         }
         Ok((self.graph, value.value.erase()))
+    }
+
+    #[cfg(feature = "tensor")]
+    fn finish_outputs<T: PcuScalar, const M: usize>(
+        self,
+        values: [PcuTensorGraphValue<T>; M],
+    ) -> Result<(Graph, [ValueId; M]), PcuExecutionError> {
+        if M == 0 || !self.active_markers.borrow().is_empty() {
+            return Err(PcuExecutionError::InvalidTensorSourcePlan);
+        }
+        for (index, value) in values.iter().copied().enumerate() {
+            self.validate_value(value)?;
+            if values[..index]
+                .iter()
+                .any(|previous| previous.value == value.value)
+            {
+                return Err(super::tensor_build_error(
+                    crate::dialect::tensor::TensorError::DuplicateOutput(value.value.erase()),
+                ));
+            }
+        }
+        Ok((self.graph, values.map(|value| value.value.erase())))
     }
 }
 
@@ -1453,6 +1488,52 @@ where
     }
 }
 
+/// Generated typed owned-result entry; its graph factory runs only on a cold cache miss.
+///
+/// # Errors
+/// Returns unsupported feature, selection, preparation, allocation or device execution errors.
+#[doc(hidden)]
+#[allow(clippy::needless_pass_by_value)] // Generated calls transfer the validated source carrier into execution.
+#[cfg_attr(
+    not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")),
+    allow(clippy::missing_const_for_fn)
+)] // Enabled providers execute runtime work through the same API.
+pub fn call_owned_tensors_capture<T: PcuScalar, const N: usize, const M: usize, F>(
+    site: &PcuHostCallSite,
+    specialization: TypeId,
+    inputs: [PcuTensorInput<'_, T>; N],
+    build: F,
+) -> Result<[PcuTensor<T>; M], PcuExecutionError>
+where
+    F: FnOnce(
+            &mut PcuTensorGraphCapture,
+            [PcuTensorGraphValue<T>; N],
+        ) -> Result<[PcuTensorGraphValue<T>; M], PcuExecutionError>
+        + 'static,
+{
+    #[cfg(all(
+        feature = "tensor",
+        any(
+            feature = "mlx",
+            feature = "cpu",
+            feature = "vulkan",
+            feature = "metal"
+        )
+    ))]
+    if opaque::selected(&inputs) {
+        return opaque::call_outputs(site, specialization, &inputs, build);
+    }
+    #[cfg(all(any(feature = "rocm", feature = "cuda"), feature = "tensor"))]
+    {
+        execution::call_outputs(site, specialization, &inputs, build)
+    }
+    #[cfg(not(all(any(feature = "rocm", feature = "cuda"), feature = "tensor")))]
+    {
+        let _ = (site, specialization, inputs, build);
+        Err(PcuExecutionError::TensorExecutionUnavailable)
+    }
+}
+
 /// Generated consuming entry. Ownership is retained through terminal execution.
 ///
 /// Identity may transfer unchanged backing without requiring exclusivity. Destructive reuse
@@ -1784,6 +1865,8 @@ mod execution {
         scalar_type: crate::core::PcuScalarType,
         shape_keys: Vec<InputShapeKey>,
         resident_affinity: bool,
+        #[cfg(all(feature = "cuda", target_endian = "little"))]
+        host_staging_eligible: bool,
         session: Rc<Session>,
         prepared: Prepared,
         input_ids: Vec<ValueId>,
@@ -1888,6 +1971,8 @@ mod execution {
                 .map(InputShapeKey::from_witness)
                 .collect(),
             resident_affinity: affinity.is_some(),
+            #[cfg(all(feature = "cuda", target_endian = "little"))]
+            host_staging_eligible: prepared.supports_host_staging(),
             session,
             prepared,
             input_ids: built.input_ids,
@@ -1921,12 +2006,8 @@ mod execution {
 
     fn preflight_shapes<'a, T: PcuScalar, const N: usize>(
         inputs: &'a [PcuTensorInput<'a, T>; N],
-    ) -> Result<[PcuTensorShapeWitness<'a>; N], PcuExecutionError> {
-        if N == 0 {
-            return Err(PcuExecutionError::EmptyTensorInput);
-        }
-        let shapes = core::array::from_fn(|index| inputs[index].shape);
-        Ok(shapes)
+    ) -> [PcuTensorShapeWitness<'a>; N] {
+        core::array::from_fn(|index| inputs[index].shape)
     }
 
     // Admission and warm preflight use the frozen selected input projection.
@@ -1998,6 +2079,61 @@ mod execution {
         Ok(affinity)
     }
 
+    // A successful terminal checked schedule can discharge the provider's private upload
+    // lease. Cold, mixed-resident and unsupported profiles retain synchronous staging.
+    // Native-endian views are qualified only for little-endian device representations.
+    #[cfg(all(feature = "cuda", target_endian = "little"))]
+    fn try_host_staged_entry<T: PcuScalar, const N: usize>(
+        entry: &mut Entry,
+        inputs: &[PcuTensorInput<'_, T>; N],
+    ) -> Result<Option<PcuTensor<T>>, PcuExecutionError> {
+        use crate::global::resident::HostStagingInput;
+        if !entry.host_staging_eligible {
+            return Ok(None);
+        }
+        let mut arguments: [Option<PcuHostArgument<'_>>; N] = core::array::from_fn(|_| None);
+        // Check every endpoint before handing the complete binding set to a provider.
+        for &index in &entry.input_indices {
+            let Some(input) = inputs.get(index) else {
+                return Err(PcuExecutionError::InvalidTensorSourcePlan);
+            };
+            let TensorInputKind::Host(values) = &input.kind else {
+                return Ok(None);
+            };
+            if entry.host_inputs[index].is_none() {
+                return Ok(None);
+            }
+            arguments[index] = Some(PcuHostArgument::read(PcuBindingRef::new(0, 0), values));
+        }
+        let mut bindings: smallvec::SmallVec<[HostStagingInput<'_>; N]> = smallvec::SmallVec::new();
+        for (&value, &index) in entry.input_ids.iter().zip(&entry.input_indices) {
+            bindings.push(HostStagingInput {
+                value,
+                resource: entry.host_inputs[index]
+                    .as_ref()
+                    .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?,
+                shape: &entry.shape_keys[index].dimensions,
+                bytes: arguments[index]
+                    .as_ref()
+                    .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?
+                    .bytes(),
+            });
+        }
+        let assessor = entry.session.tensor_assessor()?;
+        assessor
+            .execute_host_staged_output::<T, N>(
+                &entry.prepared,
+                &bindings,
+                entry.pool,
+                &mut entry.memory,
+            )
+            .map(|output| {
+                output.map(|tensor| {
+                    PcuTensor::from_successful_output(tensor, Rc::clone(&entry.session))
+                })
+            })
+    }
+
     fn execute_entry<T: PcuScalar, const N: usize>(
         entry: &mut Entry,
         inputs: &[PcuTensorInput<'_, T>; N],
@@ -2011,6 +2147,21 @@ mod execution {
             }
         }
         let assessor = entry.session.tensor_assessor()?;
+        if entry.input_ids.is_empty() {
+            // Immutable producer-only schedules have no address or binding to seed the
+            // fixed input array. Keep the empty binding set exact, and retain the output
+            // session just as in schedules with real data inputs.
+            let tensor = assessor.execute_owned_program_output_from_inputs(
+                &entry.prepared,
+                &[],
+                entry.pool,
+                &mut entry.memory,
+            )?;
+            return Ok(PcuTensor::from_successful_output(
+                tensor,
+                Rc::clone(&entry.session),
+            ));
+        }
         let mut sources: [Option<crate::global::resident::InputRef<'_>>; N] =
             core::array::from_fn(|_| None);
         for selected_index in 0..entry.input_indices.len() {
@@ -2065,6 +2216,85 @@ mod execution {
         ))
     }
 
+    fn execute_entry_outputs<T: PcuScalar, const N: usize, const M: usize>(
+        entry: &mut Entry,
+        inputs: &[PcuTensorInput<'_, T>; N],
+    ) -> Result<[PcuTensor<T>; M], PcuExecutionError> {
+        // Resident affinity is checked before staging. Retained shape slices keep borrowed
+        // descriptors stack-only on warm calls.
+        for selected_index in 0..entry.input_indices.len() {
+            let index = entry.input_indices[selected_index];
+            if let TensorInputKind::Host(values) = &inputs[index].kind {
+                stage_host_input(entry, index, values)?;
+            }
+        }
+        let assessor = entry.session.tensor_assessor()?;
+        if entry.input_ids.is_empty() {
+            // Immutable producer-only schedules have no address or binding to seed the
+            // fixed input array. Keep the empty binding set exact, and retain the output
+            // session just as in schedules with real data inputs.
+            let tensor = assessor.execute_owned_program_outputs_from_inputs::<T, M>(
+                &entry.prepared,
+                &[],
+                entry.pool,
+                &mut entry.memory,
+            )?;
+            return Ok(tensor.map(|tensor| {
+                PcuTensor::from_successful_output(tensor, Rc::clone(&entry.session))
+            }));
+        }
+        let mut sources: [Option<crate::global::resident::InputRef<'_>>; N] =
+            core::array::from_fn(|_| None);
+        for selected_index in 0..entry.input_indices.len() {
+            let index = entry.input_indices[selected_index];
+            let input = &inputs[index];
+            let source = match &input.kind {
+                TensorInputKind::Host(_) => assessor.borrow_resource_input_ref(
+                    entry.host_inputs[index]
+                        .as_ref()
+                        .expect("host input staged before bindings"),
+                    &entry.shape_keys[index].dimensions,
+                    T::TYPE,
+                    entry.pool,
+                ),
+                TensorInputKind::Resident(owner) => assessor.borrow_device_input_ref(
+                    owner.device_tensor().map_err(PcuExecutionError::Argument)?,
+                    entry.pool,
+                ),
+            }?;
+            sources[index] = Some(source);
+        }
+        let first_index = *entry
+            .input_indices
+            .first()
+            .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?;
+        let first_binding = (
+            entry.input_ids[0],
+            sources[first_index]
+                .as_ref()
+                .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?,
+        );
+        let mut bindings = [first_binding; N];
+        for (binding_index, (&input_id, &source_index)) in
+            entry.input_ids.iter().zip(&entry.input_indices).enumerate()
+        {
+            bindings[binding_index] = (
+                input_id,
+                sources[source_index]
+                    .as_ref()
+                    .ok_or(PcuExecutionError::InvalidTensorSourcePlan)?,
+            );
+        }
+        let tensor = assessor.execute_owned_program_outputs_from_inputs::<T, M>(
+            &entry.prepared,
+            &bindings[..entry.input_ids.len()],
+            entry.pool,
+            &mut entry.memory,
+        )?;
+        Ok(tensor
+            .map(|tensor| PcuTensor::from_successful_output(tensor, Rc::clone(&entry.session))))
+    }
+
     pub(super) fn call<T: PcuScalar, const N: usize, F>(
         site: &PcuHostCallSite,
         specialization: TypeId,
@@ -2078,7 +2308,7 @@ mod execution {
             ) -> Result<PcuTensorGraphValue<T>, PcuExecutionError>
             + 'static,
     {
-        let shapes = preflight_shapes(inputs)?;
+        let shapes = preflight_shapes(inputs);
         let generation = synchronize_generation()?;
         with_state(|state| {
             let slot = resolve_entry_slot::<T, N, F>(
@@ -2090,7 +2320,46 @@ mod execution {
                 inputs,
                 build,
             )?;
-            execute_entry(&mut state.entries[slot], inputs)
+            let entry = &mut state.entries[slot];
+            // This optimization is currently qualified only for ordinary host borrows.
+            // Pruned consuming routes use execute_entry directly until their own proof.
+            #[cfg(all(feature = "cuda", target_endian = "little"))]
+            if let Some(output) = try_host_staged_entry(entry, inputs)? {
+                return Ok(output);
+            }
+            execute_entry(entry, inputs)
+        })
+    }
+
+    pub(super) fn call_outputs<T: PcuScalar, const N: usize, const M: usize, F>(
+        site: &PcuHostCallSite,
+        specialization: TypeId,
+        inputs: &[PcuTensorInput<'_, T>; N],
+        build: F,
+    ) -> Result<[PcuTensor<T>; M], PcuExecutionError>
+    where
+        F: FnOnce(
+                &mut PcuTensorGraphCapture,
+                [PcuTensorGraphValue<T>; N],
+            ) -> Result<[PcuTensorGraphValue<T>; M], PcuExecutionError>
+            + 'static,
+    {
+        let shapes = preflight_shapes(inputs);
+        let generation = synchronize_generation()?;
+        with_state(|state| {
+            let slot = resolve_outputs_entry_slot::<T, N, M, F>(
+                state,
+                generation,
+                site,
+                specialization,
+                shapes,
+                inputs,
+                build,
+            )?;
+            let entry = &mut state.entries[slot];
+            // This optimization is currently qualified only for ordinary host borrows.
+            // Pruned consuming routes use execute_entry directly until their own proof.
+            execute_entry_outputs(entry, inputs)
         })
     }
 
@@ -2119,8 +2388,8 @@ mod execution {
                 >>::as_tensor_source(&input)
                 .map_err(crate::global::argument_error)?;
                 let inputs = [source];
-                let shapes = preflight_shapes(&inputs)?;
-                resolve_entry_slot::<T, 1, F>(
+                let shapes = preflight_shapes(&inputs);
+                let slot = resolve_entry_slot::<T, 1, F>(
                     state,
                     generation,
                     site,
@@ -2128,7 +2397,13 @@ mod execution {
                     shapes,
                     &inputs,
                     build,
-                )?
+                )?;
+                if state.entries[slot].input_indices.is_empty() {
+                    // A pruned consumed owner is dropped by ordinary Rust ownership. It is
+                    // neither an execution input nor permission to constrain the new session.
+                    return execute_entry(&mut state.entries[slot], &inputs);
+                }
+                slot
             };
             let (tensor, retained_session) = input.into_device_parts()?;
             let entry = &mut state.entries[slot];
@@ -2410,7 +2685,7 @@ mod execution {
             + 'static,
     {
         let inputs = owners.each_ref().map(PcuTensorInput::resident_dynamic);
-        let shapes = preflight_shapes(&inputs)?;
+        let shapes = preflight_shapes(&inputs);
         let slot = resolve_entry_slot::<T, N, F>(
             state,
             request.generation,
@@ -2462,7 +2737,7 @@ mod execution {
             PcuTensorCallInput::Borrowed(source) => *source,
             PcuTensorCallInput::Consumed(owner) => PcuTensorInput::resident_dynamic(owner),
         });
-        let shapes = preflight_shapes(&sources)?;
+        let shapes = preflight_shapes(&sources);
         let slot = resolve_entry_slot::<T, N, F>(
             state,
             request.generation,
@@ -2753,7 +3028,7 @@ mod execution {
         } else {
             [other, donor_source]
         };
-        let shapes = preflight_shapes(&inputs)?;
+        let shapes = preflight_shapes(&inputs);
         let slot = resolve_entry_slot::<T, 2, F>(
             state,
             request.generation,
@@ -2865,6 +3140,98 @@ mod execution {
             return Err(PcuExecutionError::UnsupportedRangePolicy);
         }
         let selected_program = build_program::<T, N, F>(
+            shapes,
+            snapshot.policy.float_underflow,
+            snapshot.policy.numerical_mode,
+            snapshot.policy.numerical_options,
+            build,
+        )?;
+        let affinity = preflight_selected_inputs(inputs, &selected_program.input_indices)?;
+        let (entry, prepared_generation, capacity) = prepare_entry::<T, N>(
+            snapshot,
+            affinity,
+            specialization,
+            factory,
+            shapes,
+            selected_program,
+        )?;
+        if prepared_generation != generation {
+            state.entries.clear();
+            state.generation = prepared_generation;
+        }
+        let slot = if state.entries.len() == capacity {
+            let victim = hint.min(state.entries.len() - 1);
+            state.entries[victim] = entry;
+            victim
+        } else {
+            state.entries.push(entry);
+            state.entries.len() - 1
+        };
+        site.slot.store(slot, Ordering::Relaxed);
+        Ok(slot)
+    }
+
+    fn resolve_outputs_entry_slot<T: PcuScalar, const N: usize, const M: usize, F>(
+        state: &mut State,
+        generation: u64,
+        site: &PcuHostCallSite,
+        specialization: TypeId,
+        shapes: [PcuTensorShapeWitness<'_>; N],
+        inputs: &[PcuTensorInput<'_, T>; N],
+        build: F,
+    ) -> Result<usize, PcuExecutionError>
+    where
+        F: FnOnce(
+                &mut PcuTensorGraphCapture,
+                [PcuTensorGraphValue<T>; N],
+            ) -> Result<[PcuTensorGraphValue<T>; M], PcuExecutionError>
+            + 'static,
+    {
+        let factory = TypeId::of::<F>();
+        if state.generation != generation {
+            state.entries.clear();
+            state.generation = generation;
+        }
+        let matches_base = |entry: &Entry| {
+            entry.specialization == specialization
+                && entry.factory == factory
+                && entry.scalar_type == T::TYPE
+                && entry_matches_shapes(entry, &shapes)
+        };
+        let hint = site.slot.load(Ordering::Relaxed);
+        let candidate = state
+            .entries
+            .get(hint)
+            .filter(|entry| matches_base(entry))
+            .map(|_| hint)
+            .or_else(|| state.entries.iter().position(matches_base));
+        if let Some(candidate) = candidate {
+            let affinity =
+                preflight_selected_inputs(inputs, &state.entries[candidate].input_indices)?;
+            let matches_affinity = |entry: &Entry| {
+                affinity.map_or(!entry.resident_affinity, |root| {
+                    entry.resident_affinity && Rc::ptr_eq(root, &entry.session)
+                })
+            };
+            if matches_affinity(&state.entries[candidate]) {
+                site.slot.store(candidate, Ordering::Relaxed);
+                return Ok(candidate);
+            }
+            if let Some(slot) = state
+                .entries
+                .iter()
+                .position(|entry| matches_base(entry) && matches_affinity(entry))
+            {
+                site.slot.store(slot, Ordering::Relaxed);
+                return Ok(slot);
+            }
+        }
+
+        let snapshot = crate::global::policy::snapshot()?;
+        if snapshot.policy.range_policy == crate::PcuRangePolicy::Clamp {
+            return Err(PcuExecutionError::UnsupportedRangePolicy);
+        }
+        let selected_program = super::capture::build_outputs::<T, N, M, F>(
             shapes,
             snapshot.policy.float_underflow,
             snapshot.policy.numerical_mode,

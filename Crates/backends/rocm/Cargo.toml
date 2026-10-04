@@ -409,6 +409,11 @@ harness = false
 required-features = ["tensor"]
 
 [[bench]]
+name = "host_transfer"
+path = "benches/host_transfer/host_transfer.rs"
+harness = false
+
+[[bench]]
 name = "tensor_train_volume"
 path = "benches/tensor_train_volume/tensor_train_volume.rs"
 harness = false
@@ -862,4 +867,63 @@ required-features = ["tensor"]
 [[example]]
 name = "fusion-rocm-handwritten-integer-product-goldens"
 path = "examples/handwritten_integer_product_goldens/handwritten_integer_product_goldens.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "integer_literals"
+path = "tests/integer_literals/integer_literals.rs"
+
+[[test]]
+name = "wide_composed"
+path = "tests/wide_composed/wide_composed.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "portable_wide_composed"
+path = "tests/portable_wide_composed/portable_wide_composed.rs"
+required-features = ["tensor"]
+
+[[test]]
+name = "cyclic_regions"
+path = "tests/cyclic_regions/cyclic_regions.rs"
+
+[[test]]
+name = "portable_narrow_composed"
+path = "tests/portable_narrow_composed/portable_narrow_composed.rs"
+required-features = ["tensor"]
+
+[[bench]]
+name = "integer_tensor_literals"
+path = "benches/integer_tensor_literals/integer_tensor_literals.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "integer_tensor_producers"
+path = "benches/integer_tensor_producers/integer_tensor_producers.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "low_tensor_producers"
+path = "benches/low_tensor_producers/low_tensor_producers.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "raw_float_tensor_producers"
+path = "benches/raw_float_tensor_producers/raw_float_tensor_producers.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "raw_integer_producers"
+path = "benches/raw_integer_producers/raw_integer_producers.rs"
+harness = false
+required-features = ["tensor"]
+
+[[bench]]
+name = "literal_operators"
+path = "benches/literal_operators/literal_operators.rs"
+harness = false
 required-features = ["tensor"]

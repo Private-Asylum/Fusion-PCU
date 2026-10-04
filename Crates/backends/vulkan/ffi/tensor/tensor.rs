@@ -70,6 +70,8 @@ impl<const N: usize> VulkanPreparedTensorMap<N> {
         lengths: [usize; N],
         status_policy: TensorStatusPolicy,
     ) -> Result<Self, PcuVulkanError> {
+        #[cfg(feature = "insights")]
+        let _api_scope = device.api_scope();
         if !matches!(N, 3 | 4) || extent == 0 || device.poisoned.get() {
             return Err(if device.poisoned.get() {
                 PcuVulkanError::Quarantined
@@ -104,7 +106,7 @@ impl<const N: usize> VulkanPreparedTensorMap<N> {
         // wrap. Wide integer lowering independently proves the full limb byte product.
         validate_device_geometry(&device.limits, [groups, 1, 1], local_size, maximum)?;
         let status = VulkanOwnedBuffer::new(device, lengths[N - 1])?;
-        let shader = create_shader_module(&device.device, words)?;
+        let shader = create_shader_module(device, words)?;
         let descriptor_layout = create_map_descriptor_set_layout::<N>(&device.device)?;
         let pipeline_layout = create_pipeline_layout(&device.device, descriptor_layout.handle)?;
         let pipeline = create_compute_pipeline(
@@ -139,7 +141,7 @@ impl<const N: usize> VulkanPreparedTensorMap<N> {
             groups,
             status_policy,
         };
-        mem::forget((
+        vk_transfer_guards!(
             shader,
             descriptor_layout,
             pipeline_layout,
@@ -147,7 +149,7 @@ impl<const N: usize> VulkanPreparedTensorMap<N> {
             descriptor_pool,
             command_pool,
             fence,
-        ));
+        );
         Ok(result)
     }
 
@@ -226,26 +228,34 @@ impl<const N: usize> VulkanPreparedTensorMap<N> {
         let device = &self.device.device;
         vk_try("reset tensor compute command", unsafe {
             // SAFETY: Every previous submission is terminal, and this pool supports reset.
-            device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+            vk_api_owner!(
+                self.device,
+                ResetCommandBuffer,
+                device.reset_command_buffer(self.command, vk::CommandBufferResetFlags::empty())
+            )
         })?;
         unsafe {
             // SAFETY: All descriptors refer to same-session retained owners through completion.
             // Reset precedes updates: non-update-after-bind descriptor changes invalidate old commands.
-            device.update_descriptor_sets(writes, &[]);
+            vk_api_owner!(
+                self.device,
+                UpdateDescriptorSets,
+                device.update_descriptor_sets(writes, &[])
+            );
         }
         vk_try("reset tensor compute fence", unsafe {
             // SAFETY: Synchronous previous submission is terminal; fence is not pending.
-            device.reset_fences(&[self.fence])
+            vk_api_owner!(self.device, ResetFences, device.reset_fences(&[self.fence]))
         })?;
         record(
-            &self.device.device,
+            &self.device,
             self.command,
             self.pipeline,
             self.pipeline_layout,
             self.descriptors,
             self.groups,
         )?;
-        if let Err(error) = submit_and_wait(device, self.device.queue, self.command, self.fence) {
+        if let Err(error) = submit_and_wait(&self.device, self.command, self.fence) {
             if matches!(error, PcuVulkanError::CompletionUnknown) {
                 // All tensor buffers/submission objects deliberately retain native handles on Drop.
                 self.device.poisoned.set(true);
@@ -258,16 +268,21 @@ impl<const N: usize> VulkanPreparedTensorMap<N> {
 }
 
 fn record(
-    device: &ash::Device,
+    session: &VulkanDevice,
     command: vk::CommandBuffer,
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     descriptors: vk::DescriptorSet,
     groups: u32,
 ) -> Result<(), PcuVulkanError> {
+    let device = &session.device;
     vk_try("begin tensor compute", unsafe {
         // SAFETY: Command was reset, belongs to this device and is not pending.
-        device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+        vk_api_owner!(
+            session,
+            BeginCommandBuffer,
+            device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+        )
     })?;
     unsafe {
         // SAFETY: Compatible pipeline/layout/descriptors and actual initialized owner extents.
@@ -279,43 +294,67 @@ fn record(
                     | vk::AccessFlags::SHADER_WRITE,
             )
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
-        device.cmd_pipeline_barrier(
-            command,
-            vk::PipelineStageFlags::HOST
-                | vk::PipelineStageFlags::TRANSFER
-                | vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &readable,
-            &[],
-            &[],
+        vk_api_owner!(
+            session,
+            PipelineBarrier,
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::HOST
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &readable,
+                &[],
+                &[],
+            )
         );
-        device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
-        device.cmd_bind_descriptor_sets(
-            command,
-            vk::PipelineBindPoint::COMPUTE,
-            layout,
-            0,
-            &[descriptors],
-            &[],
+        vk_api_owner!(
+            session,
+            BindPipeline,
+            device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline)
         );
-        device.cmd_dispatch(command, groups, 1, 1);
+        vk_api_owner!(
+            session,
+            BindDescriptorSets,
+            device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[descriptors],
+                &[],
+            )
+        );
+        vk_api_owner!(
+            session,
+            Dispatch,
+            device.cmd_dispatch(command, groups, 1, 1)
+        );
         let terminal = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)];
-        device.cmd_pipeline_barrier(
-            command,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &terminal,
-            &[],
-            &[],
+        vk_api_owner!(
+            session,
+            PipelineBarrier,
+            device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &terminal,
+                &[],
+                &[],
+            )
         );
     }
     vk_try("end tensor compute", unsafe {
         // SAFETY: Command remains recording and every referenced owner is retained.
-        device.end_command_buffer(command)
+        vk_api_owner!(
+            session,
+            EndCommandBuffer,
+            device.end_command_buffer(command)
+        )
     })
 }
 
@@ -327,13 +366,41 @@ impl<const N: usize> Drop for VulkanPreparedTensorMap<N> {
         unsafe {
             // SAFETY: Every submission completed; all handles are unique and outlive references.
             let device = &self.device.device;
-            device.destroy_fence(self.fence, None);
-            device.destroy_command_pool(self.command_pool, None);
-            device.destroy_descriptor_pool(self.descriptor_pool, None);
-            device.destroy_pipeline(self.pipeline, None);
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_set_layout(self.descriptor_layout, None);
-            device.destroy_shader_module(self.shader, None);
+            vk_api_owner!(
+                self.device,
+                DestroyFence,
+                device.destroy_fence(self.fence, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyCommandPool,
+                device.destroy_command_pool(self.command_pool, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyDescriptorPool,
+                device.destroy_descriptor_pool(self.descriptor_pool, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyPipeline,
+                device.destroy_pipeline(self.pipeline, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyPipelineLayout,
+                device.destroy_pipeline_layout(self.pipeline_layout, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyDescriptorSetLayout,
+                device.destroy_descriptor_set_layout(self.descriptor_layout, None)
+            );
+            vk_api_owner!(
+                self.device,
+                DestroyShaderModule,
+                device.destroy_shader_module(self.shader, None)
+            );
         }
     }
 }

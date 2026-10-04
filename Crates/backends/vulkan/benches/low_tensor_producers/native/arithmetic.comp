@@ -1,0 +1,56 @@
+// Handwritten decoded dyadics/finite midpoint search; no PCU shader helpers.
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) writeonly buffer Output { uint words[]; } output_data;
+layout(set=0,binding=1,std430) readonly buffer Input { uint words[]; } input_data;
+layout(set=0,binding=2,std430) readonly buffer Constant { uint words[]; } constant_data;
+layout(set=0,binding=3,std430) readonly buffer Uniform { uint words[]; } uniform_data;
+layout(set=0,binding=4,std430) writeonly buffer Status { uint words[]; } status_data;
+const uint LANES=32u/BITS;
+const uint MASK=(1u<<BITS)-1u;
+double unpack(uint bits) {
+ uint magnitude=bits&(SIGN-1u),exponent=magnitude>>FRACTION;
+ uint significand=(magnitude&((1u<<FRACTION)-1u))|(exponent!=0u?1u<<FRACTION:0u);
+ int scale=int(exponent!=0u?exponent:1u)-BIAS-int(FRACTION);
+ double power=packDouble2x32(uvec2(0u,uint(scale+1023)<<20u));
+ double value=double(significand)*power;
+ return (bits&SIGN)!=0u?-value:value;
+}
+uint checked(uint a,uint b,bool multiply,out uint result) {
+ result=0u;
+ if((a&(SIGN-1u))>MAXIMUM||(b&(SIGN-1u))>MAXIMUM)return 5u;
+ double left=unpack(a),right=unpack(b);
+ precise double exact=multiply?left*right:left+right;
+ uvec2 exact_bits=unpackDouble2x32(exact);
+ double magnitude=packDouble2x32(uvec2(exact_bits.x,exact_bits.y&0x7fffffffu));
+ double maximum=unpack(MAXIMUM),previous=unpack(MAXIMUM-1u);
+ double overflow=maximum+(maximum-previous)/2.0LF;
+ if(magnitude>overflow||(magnitude==overflow&&(MAXIMUM&1u)!=0u))return 3u;
+ uint low=0u,high=MAXIMUM;
+ while(low<high){uint middle=low+(high-low+1u)/2u;if(unpack(middle)<=magnitude)low=middle;else high=middle-1u;}
+ if(low<MAXIMUM){double midpoint=(unpack(low)+unpack(low+1u))/2.0LF;if(magnitude>midpoint||(magnitude==midpoint&&(low&1u)!=0u))++low;}
+ result=((exact_bits.y>>31u)!=0u?SIGN:0u)|low;
+ double tiny_boundary=unpack(1u<<FRACTION)-unpack(1u)/4.0LF;
+ bool tiny_inexact=exact!=0.0LF&&magnitude<tiny_boundary&&exact!=unpack(result);
+ bool subnormal=low!=0u&&low<(1u<<FRACTION);
+ if((POLICY==0u&&tiny_inexact)||(POLICY==1u&&(tiny_inexact||subnormal)))return 4u;
+ return 0u;
+}
+void main(){
+ uint word=gl_GlobalInvocationID.x;
+ if(word>=EXTENT/LANES+uint(EXTENT%LANES!=0u))return;
+ uint packed=0u;
+ for(uint lane=0u;lane<LANES;lane++){
+  uint index=word*LANES+lane;if(index>=EXTENT)break;
+  uint shift=lane*BITS;
+  uint a=(input_data.words[word]>>shift)&MASK;
+  uint c=(constant_data.words[word]>>shift)&MASK;
+  uint u=(uniform_data.words[word]>>shift)&MASK;
+  uint sum=0u,result=0u;
+  uint add_fault=checked(a,c,false,sum),mul_fault=0u;
+  if(add_fault==0u)mul_fault=checked(sum,u,true,result);
+  status_data.words[2u*index]=add_fault;
+  status_data.words[2u*index+1u]=mul_fault;
+  packed|=(result&MASK)<<shift;
+ }
+ output_data.words[word]=packed;
+}

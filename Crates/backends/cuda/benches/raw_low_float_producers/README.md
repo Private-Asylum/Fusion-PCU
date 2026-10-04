@@ -1,0 +1,9 @@
+# Raw low-format immutable producers
+
+Genuine zero-argument Constant/Uniform producers, explicit graph and independent stable CUDA Driver raw-byte ownership cover F16/BF16/F8E4M3FN/F8E5M2. Actual2x3 matrices and65/4096 vectors preserve independently declared NaN payloads, signed zero, minimum subnormal, maximum finite and infinity where that encoding exists. E4M3FN has no infinity encoding. This target performs no arithmetic or operand classification.
+
+Boundary/Strict requests, Checked/BackendDefined permission, Preserve/BackendOptimized precision and all three underflow headers yield24tuples,288profiles,576lifetime witnesses and1,728 semantic keys. Producers normalize mode/UF to None and retain exact numerical options. RangeReject and Unspecified are fixed; Portable, Compact and GPU zeroextent remain refused. Source selectedinputs/argumentindices are truly empty.
+
+Raw mutation/consumption/original replay/cache-clear, graph-plan-drop, native-control-drop, short-read rollback and tails preserve fresh escaped-owner laws. Independent Driver control shares only the separately qualified raw SDK ownership fixture; it imports no PCU graph/lowering/emission. Unread pending H2D Drop fences the legacy default stream; read completion removes that extra fence, and uncertain ownership is retained.
+
+`PCU_RAW_LOW_FLOAT_PRODUCER_CPU_REFERENCE=1` runs576genuine CPU source/lifetime rows. `PCU_RAW_LOW_FLOAT_PRODUCER_SEMANTICS=1` or `--test` avoids Criterion sampling. Separate `allocation-census` measures1,728scopes of64immutable replays (110,592calls), with caller Rust heap, wrappedPCU APIs and independent Driver vectors kept distinct. This is not changing-input arithmetic and no timing follows. Checked Add/Mul producers and phase fault-order controls use the separate `low_tensor_producers` target. Native gates are pending until reviewed frozen execution.

@@ -5,11 +5,11 @@ use fusion_pcu::{
     PcuExecutionFault,
     PcuExecutionFaultKind,
 };
-use fusion_pcu_spirv::PcuSpirvComposedFloatProfile;
+use fusion_pcu_spirv::PcuSpirvComposedProfile;
 use crate::PcuVulkanError;
 
 pub(super) fn scan(
-    profile: &PcuSpirvComposedFloatProfile,
+    profile: &PcuSpirvComposedProfile,
     read: impl FnMut(usize) -> (u32, u32),
 ) -> Result<Option<PcuExecutionFault>, PcuVulkanError> {
     scan_records(profile.extent(), |step| profile.fault_law(step), read)

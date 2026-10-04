@@ -17,6 +17,9 @@ use core::fmt;
 mod numerical;
 #[cfg(feature = "std")]
 mod policy;
+#[cfg(feature = "vulkan")]
+#[path = "global/vulkan/vulkan.rs"]
+pub mod vulkan;
 #[cfg(any(
     feature = "rocm",
     feature = "cuda",
@@ -63,6 +66,7 @@ mod tensor;
 #[rustfmt::skip]
 pub use tensor::{
     __pcu_capture_tensor_program,
+    __pcu_capture_tensor_program_outputs,
     PcuCapturedTensorProgram,
 };
 pub use arguments::PcuTensor;
@@ -90,10 +94,12 @@ pub use tensor::{
     PcuTensorGraphCapture,
     PcuTensorGraphOwner,
     PcuTensorGraphValue,
+    PcuImmutableTensorPayload,
     call_consumed_owners_tensor_capture,
     call_consumed_pair_tensor_capture,
     call_consumed_tensor_capture,
     call_owned_tensor_capture,
+    call_owned_tensors_capture,
     call_mixed_consumed_tensor_capture,
 };
 

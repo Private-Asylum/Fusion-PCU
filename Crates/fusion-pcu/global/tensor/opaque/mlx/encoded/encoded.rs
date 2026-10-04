@@ -21,7 +21,6 @@ use crate::{
     PcuHostArgument,
     PcuScalar,
     dialect::tensor::{
-        OpDescriptor,
         ValueId,
     },
     global::{
@@ -71,37 +70,12 @@ fn requirements(
     built: &super::super::capture::PcuCapturedTensorProgram,
     options: PcuExecutionPolicy,
 ) -> Result<PcuImplementationRequirements, PcuExecutionError> {
-    let mut requirements = PcuImplementationRequirements {
-        numerical_mode: options.numerical_mode,
-        numerical_options: options.numerical_options,
-        float_underflow: options.float_underflow,
-        range_policy: options.range_policy,
-    };
-    // Input leaves describe storage. Arithmetic retains the helper's local
-    // policy and must agree with the selected implementation's exact assessor.
-    for &value in built.program.node_order() {
-        let node = built
-            .program
-            .graph()
-            .node(value)
-            .map_err(crate::global::tensor_build_error)?;
-        if !matches!(node.op, OpDescriptor::Input) {
-            requirements.numerical_mode = node.numerical_mode.unwrap_or(options.numerical_mode);
-            requirements.numerical_options = node.numerical_options;
-            if let Some(underflow) = node.float_underflow_policy {
-                requirements.float_underflow = underflow;
-            } else if node.scalar_type.binary_float_format().is_some() {
-                return Err(invalid(
-                    "checked MLX floating arithmetic lacks underflow policy",
-                ));
-            }
-            // Integer effects correctly have no floating tininess metadata.
-            // Preserve the caller's frozen request tuple without fabricating a
-            // node policy; the concrete plan still admits type/operation/profile.
-        }
-    }
-    Ok(requirements)
+    super::numerical::requirements(built, options)
 }
+
+#[cfg(test)]
+#[path = "producer_tests/producer_tests.rs"]
+mod producer_tests;
 
 impl Prepared {
     #[allow(clippy::too_many_lines)] // Exact selected closure, offer and activation are one cold transaction.
@@ -115,6 +89,10 @@ impl Prepared {
             PcuBackendChoice::Mlx | PcuBackendChoice::Automatic
         ) {
             return Err(PcuExecutionError::ResidentPolicyConflict);
+        }
+        // Exact backend assessment is the authority for a zero-binding producer graph.
+        if built.input_indices.len() > N || built.input_indices.iter().any(|&index| index >= N) {
+            return Err(PcuExecutionError::InvalidTensorSourcePlan);
         }
         let requirements = assess(built, options)?;
         let plan = program::Plan::assess(&built.program, requirements)?;
@@ -221,9 +199,16 @@ impl Prepared {
                 "retained checked MLX implementation identity changed",
             ));
         }
+        if indices.len() != ids.len()
+            || indices.len() > N
+            || indices.iter().any(|&index| index >= N)
+        {
+            return Err(PcuExecutionError::InvalidTensorSourcePlan);
+        }
         // One or two unique selected inputs are frozen cold. Borrowed views and
         // host descriptors live on this stack; repeated operands bind only once.
         match (indices, ids) {
+            ([], []) => self.program.execute(&[]),
             ([index], [id]) => {
                 let input = bind_input(&inputs[*index])?;
                 self.program.execute(&[(*id, input.as_input::<T>())])
@@ -236,7 +221,20 @@ impl Prepared {
                     (*right_id, right.as_input::<T>()),
                 ])
             }
-            _ => Err(PcuExecutionError::InvalidTensorSourcePlan),
+            _ => {
+                // Bind every selected owner before borrowing descriptors. Four
+                // training inputs fit inline; larger signatures may spill.
+                let mut bound = smallvec::SmallVec::<[_; 4]>::new();
+                for &index in indices {
+                    bound.push(bind_input(&inputs[index])?);
+                }
+                let bindings: smallvec::SmallVec<[_; 4]> = ids
+                    .iter()
+                    .copied()
+                    .zip(bound.iter().map(BoundInput::as_input::<T>))
+                    .collect();
+                self.program.execute(&bindings)
+            }
         }
     }
 }

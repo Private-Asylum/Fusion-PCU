@@ -306,3 +306,87 @@ carrier_prefix_gate!("cuda", cuda_twenty_two_carrier_prefix_contract, Cuda);
 carrier_prefix_gate!("metal", metal_twenty_two_carrier_prefix_contract, Metal);
 carrier_prefix_gate!("mlx", mlx_twenty_two_carrier_prefix_contract, Mlx);
 carrier_prefix_gate!("vulkan", vulkan_twenty_two_carrier_prefix_contract, Vulkan);
+
+#[cfg(any(feature = "cpu", feature = "metal", feature = "mlx"))]
+#[path = "selected_numerical/selected_numerical.rs"]
+mod selected_numerical;
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_selected_numerical_source_contract() {
+    selected_numerical::verify(fusion_pcu::global::PcuBackendChoice::Cpu);
+}
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "required actual M4 ordinary selected numerical facade lift"]
+fn metal_selected_numerical_source_contract() {
+    selected_numerical::verify(fusion_pcu::global::PcuBackendChoice::Metal);
+}
+#[cfg(feature = "mlx")]
+#[test]
+#[ignore = "required actual M4 ordinary selected numerical facade lift"]
+fn mlx_selected_numerical_source_contract() {
+    selected_numerical::verify(fusion_pcu::global::PcuBackendChoice::Mlx);
+}
+
+#[cfg(any(feature = "cpu", feature = "metal", feature = "mlx"))]
+#[path = "selected_graph/selected_graph.rs"]
+mod selected_graph;
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_selected_graph_source_contract() {
+    selected_graph::verify(fusion_pcu::global::PcuBackendChoice::Cpu);
+}
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "required actual M4 ordinary multi-stage graph facade lift"]
+fn metal_selected_graph_source_contract() {
+    selected_graph::verify(fusion_pcu::global::PcuBackendChoice::Metal);
+}
+#[cfg(feature = "mlx")]
+#[test]
+#[ignore = "required actual M4 ordinary multi-stage graph facade lift"]
+fn mlx_selected_graph_source_contract() {
+    selected_graph::verify(fusion_pcu::global::PcuBackendChoice::Mlx);
+}
+
+#[cfg(any(feature = "cpu", feature = "metal", feature = "mlx"))]
+#[path = "scalable_graph/scalable_graph.rs"]
+mod scalable_graph;
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_scalable_graph_source_contract() {
+    scalable_graph::verify(fusion_pcu::global::PcuBackendChoice::Cpu);
+}
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "required actual M4 compact MSE and 1,024-element training facade lift"]
+fn metal_scalable_graph_source_contract() {
+    scalable_graph::verify(fusion_pcu::global::PcuBackendChoice::Metal);
+}
+#[cfg(feature = "mlx")]
+#[test]
+#[ignore = "required actual M4 compact MSE and 1,024-element training facade lift"]
+fn mlx_scalable_graph_source_contract() {
+    scalable_graph::verify(fusion_pcu::global::PcuBackendChoice::Mlx);
+}
+
+#[cfg(any(feature = "cpu", feature = "metal", feature = "mlx"))]
+#[path = "low_graph_source/low_graph_source.rs"]
+mod low_graph_source;
+#[cfg(feature = "cpu")]
+#[test]
+fn cpu_low_graph_source_contract() {
+    low_graph_source::verify(fusion_pcu::global::PcuBackendChoice::Cpu);
+}
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "required actual M4 ordinary six-format pointwise backward graph"]
+fn metal_low_graph_source_contract() {
+    low_graph_source::verify(fusion_pcu::global::PcuBackendChoice::Metal);
+}
+#[cfg(feature = "mlx")]
+#[test]
+#[ignore = "required actual M4 ordinary six-format pointwise backward graph"]
+fn mlx_low_graph_source_contract() {
+    low_graph_source::verify(fusion_pcu::global::PcuBackendChoice::Mlx);
+}

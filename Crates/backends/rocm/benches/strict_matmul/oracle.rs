@@ -73,10 +73,8 @@ pub fn expected<T: Scalar, const R: usize, const K: usize, const C: usize>(
     let mut data = vec![T::default(); R * C];
     for row in 0..R {
         for column in 0..C {
-            for depth in 0..K {
-                let product = left[row][depth]
-                    .pcu_checked_mul(right[depth][column])
-                    .unwrap();
+            for (&lhs, rhs) in left[row].iter().zip(right) {
+                let product = lhs.pcu_checked_mul(rhs[column]).unwrap();
                 data[row * C + column] = data[row * C + column].pcu_checked_add(product).unwrap();
             }
         }
