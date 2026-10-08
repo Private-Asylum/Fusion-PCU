@@ -1453,7 +1453,7 @@ fn expand_pcu_scalar_helper(
 ) -> Result<TokenStream2, Error> {
     if function.sig.asyncness.is_some()
         || function.sig.constness.is_some()
-        || function.sig.unsafety.is_some()
+        || !matches!(function.sig.safety, syn::Safety::Default)
         || function.sig.abi.is_some()
         || !function.sig.generics.params.is_empty()
         || function.sig.generics.where_clause.is_some()
@@ -2435,7 +2435,7 @@ fn project_companion_cfg(attribute: &syn::Attribute) -> Vec<syn::Attribute> {
 fn validate_const_generics(function: &ItemFn) -> Result<Vec<Ident>, Error> {
     if function.sig.asyncness.is_some()
         || function.sig.constness.is_some()
-        || function.sig.unsafety.is_some()
+        || !matches!(function.sig.safety, syn::Safety::Default)
         || function.sig.abi.is_some()
         || !matches!(function.sig.output, ReturnType::Default)
         || function.sig.generics.where_clause.is_some()
@@ -3677,6 +3677,34 @@ mod tests {
         expand_pcu_scalar_helper,
     };
     use syn::ItemFn;
+
+    #[test]
+    fn dispatch_and_scalar_helpers_reject_safety_and_abi_qualifiers() {
+        for qualifier in ["unsafe ", "extern \"Rust\" ", "extern \"C\" "] {
+            let function =
+                syn::parse_str::<ItemFn>(&format!("{qualifier}fn source() {{}}")).unwrap();
+            assert!(super::validate_const_generics(&function).is_err());
+
+            let helper = syn::parse_str::<ItemFn>(&format!(
+                "{qualifier}fn helper(value: f32) -> f32 {{ value }}"
+            ))
+            .unwrap();
+            assert!(super::scalar_helper::parse(&helper).is_err());
+            assert!(expand_pcu_scalar_helper(helper, &syn::parse_quote!(::fusion_pcu)).is_err());
+        }
+        assert!(syn::parse_str::<ItemFn>("safe fn source() {}").is_err());
+        let plain = syn::parse_quote!(
+            fn source() {}
+        );
+        assert!(super::validate_const_generics(&plain).is_ok());
+        let helper = syn::parse_quote!(
+            fn helper(value: f32) -> f32 {
+                value
+            }
+        );
+        assert!(super::scalar_helper::parse(&helper).is_ok());
+        assert!(expand_pcu_scalar_helper(helper, &syn::parse_quote!(::fusion_pcu)).is_ok());
+    }
 
     #[test]
     fn numerical_flags_are_independent_and_unambiguous() {

@@ -36,7 +36,7 @@ fn scalar_kind(ty: &Type) -> Option<ScalarKind> {
 pub fn parse(function: &ItemFn) -> Result<ScalarHelper, Error> {
     if function.sig.asyncness.is_some()
         || function.sig.constness.is_some()
-        || function.sig.unsafety.is_some()
+        || !matches!(function.sig.safety, syn::Safety::Default)
         || function.sig.abi.is_some()
         || !function.sig.generics.params.is_empty()
         || function.sig.generics.where_clause.is_some()

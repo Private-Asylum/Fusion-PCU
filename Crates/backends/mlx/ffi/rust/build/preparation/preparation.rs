@@ -23,7 +23,13 @@ const PREPARED: &str = include_str!("../../../native/patches/prepared.sha256");
 const PATCH: &str = include_str!("../../../native/patches/safety.patch");
 pub type Result<T> = std::result::Result<T, String>;
 pub fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 fn safe_path(s: &str) -> Result<()> {
     if s.is_empty()

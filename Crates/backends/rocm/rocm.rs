@@ -1545,6 +1545,7 @@ pub(crate) struct RetainedHostUploads {
 }
 
 impl RetainedHostUploads {
+    #[cfg(feature = "tensor")]
     pub(crate) const INLINE_CAPACITY: usize = INLINE_KERNEL_PARAMETERS;
 
     pub(crate) fn new(stream: HipStreamHandle) -> Self {

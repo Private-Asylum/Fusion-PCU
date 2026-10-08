@@ -712,7 +712,7 @@ fn validate_owned_function(
 fn validate_owned_signature(function: &ItemFn) -> Result<Vec<syn::ConstParam>, Error> {
     if function.sig.asyncness.is_some()
         || function.sig.constness.is_some()
-        || function.sig.unsafety.is_some()
+        || !matches!(function.sig.safety, syn::Safety::Default)
         || function.sig.abi.is_some()
         || function.sig.generics.params.iter().any(|parameter| {
             !matches!(
@@ -2054,6 +2054,23 @@ fn owned_return_scalar(output: &ReturnType) -> Option<syn::Ident> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_signatures_reject_safety_and_abi_qualifiers() {
+        let signature = "fn source() -> Result<PcuTensor<f32>, PcuExecutionError> { todo!() }";
+        for qualifier in ["unsafe ", "extern \"Rust\" ", "extern \"C\" "] {
+            let function = syn::parse_str::<ItemFn>(&format!("{qualifier}{signature}")).unwrap();
+            let error = validate_owned_signature(&function).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be plain safe Rust functions")
+            );
+        }
+        assert!(syn::parse_str::<ItemFn>(&format!("safe {signature}")).is_err());
+        let plain = syn::parse_str::<ItemFn>(signature).unwrap();
+        assert!(validate_owned_signature(&plain).is_ok());
+    }
 
     #[test]
     fn zero_argument_producers_and_helpers_emit_without_fabricated_inputs() {
