@@ -248,6 +248,13 @@ pub(super) fn clear_thread_cache() -> Result<(), PcuExecutionError> {
                 .try_borrow_mut()
                 .map_err(|_| PcuExecutionError::ReentrantCall)?;
             state.entries.clear();
+            for entry in &state.arena.sessions {
+                entry
+                    .session
+                    .backend()
+                    .release_idle_host_cache()
+                    .map_err(PcuExecutionError::Memory)?;
+            }
             state.arena = SessionArena::default();
             Ok(())
         })
@@ -431,7 +438,7 @@ fn with_entry<R>(
                     state.entries.len() - 1
                 }
             };
-            site.slot.store(slot, Ordering::Relaxed);
+            PcuHostCallSite::remember_hint(&site.slot, hint, slot);
             execute(&mut state.entries[slot])
         })
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?

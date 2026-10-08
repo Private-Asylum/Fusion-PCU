@@ -20,7 +20,7 @@ path = "fusion-pcu.rs"
 [features]
 default = ["embedded-vulkan-composed"]
 embedded-vulkan-composed = ["fusion-pcu-vulkan?/embedded-composed"]
-insights = ["fusion-pcu-core/insights", "fusion-pcu-vulkan?/insights"]
+insights = ["fusion-pcu-core/insights", "fusion-pcu-vulkan?/insights", "fusion-pcu-rocm?/insights", "fusion-pcu-cuda?/insights"]
 std = ["fusion-pcu-core/std"]
 hosted = ["std"]
 tensor = ["fusion-pcu-core/tensor", "fusion-pcu-rocm?/tensor", "fusion-pcu-cuda?/tensor", "fusion-pcu-cpu?/tensor", "fusion-pcu-vulkan?/tensor", "fusion-pcu-metal?/tensor"]
@@ -106,6 +106,11 @@ required-features = ["rocm", "tensor"]
 
 [dev-dependencies]
 criterion.workspace = true
+
+[[example]]
+name = "execution-boundaries"
+path = "examples/execution-boundaries/execution-boundaries.rs"
+required-features = ["tensor"]
 
 [[bench]]
 name = "cpu_source"

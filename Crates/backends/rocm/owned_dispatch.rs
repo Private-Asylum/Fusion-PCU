@@ -12,6 +12,9 @@ use std::{
 
 #[path = "owned_dispatch/fault_law.rs"]
 mod fault_law;
+#[cfg(feature = "tensor")]
+#[path = "owned_dispatch/guarded/guarded.rs"]
+mod guarded;
 
 const INLINE_ARGUMENTS: usize = 8;
 const FAULT_WORD_SENTINEL: u64 = u64::MAX;
@@ -359,6 +362,7 @@ impl From<crate::HipCompileError> for RocmOwnedDispatchError {
 /// Opened owned-dispatch session tied to one generation-bound discovery reference.
 pub struct RocmOwnedDispatchBackend {
     runtime: HipRuntime,
+    publication: std::sync::Arc<crate::HostPublicationWorkspace>,
     device: PcuDeviceIdentity,
     architecture: Option<String>,
     compiler: Option<crate::discovery::DispatchCompiler>,
@@ -448,6 +452,7 @@ impl RocmOwnedDispatchBackend {
         }
         let architecture = runtime_info.architecture;
         Ok(Self {
+            publication: std::sync::Arc::default(),
             runtime,
             device: identity,
             architecture,
@@ -465,10 +470,27 @@ impl RocmOwnedDispatchBackend {
         self.runtime.allocate(bytes)
     }
 
+    /// Release completed idle host publication storage shared by this session's providers.
+    ///
+    /// Live readbacks and quarantined endpoints remain retained. The returned capacity is not
+    /// process RSS, and later transfers may populate the cache again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deferred busy error if the cache is currently locked.
+    pub fn release_idle_host_cache(&self) -> Result<u64, fusion_pcu::PcuMemoryProviderError> {
+        let pool = fusion_pcu::PcuMemoryPoolId(self.device.device_id());
+        fusion_pcu::PcuMemoryProvider::release_idle_host_cache(&self.memory_provider(pool), pool)
+    }
+
     /// Create a memory provider for this same opened HIP device and its caller-assigned pool.
     #[must_use]
     pub fn memory_provider(&self, pool: fusion_pcu::PcuMemoryPoolId) -> RocmMemoryProvider {
-        self.runtime.memory_provider(pool)
+        RocmMemoryProvider::with_publication(
+            self.runtime.clone(),
+            pool,
+            std::sync::Arc::clone(&self.publication),
+        )
     }
 
     /// Create binding metadata from this adapter's device identity and the allocation's true size.
@@ -613,6 +635,8 @@ impl RocmOwnedDispatchBackend {
             scalar_fault_word: false,
             fault_law: Some(fault_law::Retained::Compound(spec.fault_domain())),
             checked_arithmetic: true,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
         })
     }
 
@@ -661,6 +685,8 @@ impl RocmOwnedDispatchBackend {
             scalar_fault_word: false,
             fault_law: Some(fault_law::Retained::Compound(spec.fault_domain())),
             checked_arithmetic: true,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
         })
     }
 
@@ -709,6 +735,8 @@ impl RocmOwnedDispatchBackend {
             scalar_fault_word: true,
             fault_law: spec.fault_law().map(fault_law::Retained::Scalar),
             checked_arithmetic: spec.checked(),
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
         })
     }
 
@@ -757,6 +785,8 @@ impl RocmOwnedDispatchBackend {
             scalar_fault_word: false,
             fault_law: Some(fault_law::Retained::Compound(spec.fault_domain())),
             checked_arithmetic: spec.checked(),
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
         })
     }
 
@@ -906,6 +936,8 @@ impl RocmOwnedDispatchBackend {
             scalar_fault_word: false,
             fault_law: checked_scalar_fault_law(&kernel).map(fault_law::Retained::Scalar),
             checked_arithmetic,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
         })
     }
 }
@@ -935,9 +967,21 @@ pub struct RocmPreparedDispatch {
     scalar_fault_word: bool,
     fault_law: Option<fault_law::Retained>,
     checked_arithmetic: bool,
+    #[cfg(feature = "tensor")]
+    guarded_function: std::cell::RefCell<Option<crate::HipKernel>>,
 }
 
 impl RocmPreparedDispatch {
+    /// Exact queue identity for retained tensor executables; this does not clone the handle.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn uses_stream(&self, stream: &crate::HipStreamHandle) -> bool {
+        std::rc::Rc::ptr_eq(&self.stream.inner, &stream.inner)
+    }
+
+    pub(crate) fn enter_private_runtime_scope(&self) -> Result<crate::ffi::RuntimeScope, HipError> {
+        self.runtime.enter_private_scope()
+    }
+
     pub(crate) const fn requires_checked_fault_word(&self) -> bool {
         self.checked_arithmetic
     }

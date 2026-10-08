@@ -163,19 +163,24 @@ mod dispatch_shape;
 pub use tensor::{MetalTensorSgdPlan, MetalPreparedTensorSgdProgram};
 
 #[cfg(feature = "tensor")]
-pub use tensor::{MetalSelectedNumericalTensorPlan,MetalPreparedSelectedNumericalTensorProgram,MetalSelectedNumericalTensorOperation};
+pub use tensor::{
+    MetalSelectedNumericalTensorPlan, MetalPreparedSelectedNumericalTensorProgram,
+    MetalSelectedNumericalTensorOperation,
+};
 
 #[cfg(feature = "tensor")]
 pub use discovery::MetalSelectedNumericalTensorRequest;
 
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use runtime::MetalPreparedStrictMse;
 
-#[cfg(feature="tensor")]
-pub use tensor::{MetalTensorMsePlan,MetalPreparedTensorMseProgram};
+#[cfg(feature = "tensor")]
+pub use tensor::{MetalTensorMsePlan, MetalPreparedTensorMseProgram};
 
-#[cfg(feature="tensor")]
-pub use tensor::{MetalSelectedTensorGraphPlan, MetalPreparedSelectedTensorGraph, MetalTensorGraphError};
+#[cfg(feature = "tensor")]
+pub use tensor::{
+    MetalSelectedTensorGraphPlan, MetalPreparedSelectedTensorGraph, MetalTensorGraphError,
+};
 
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use discovery::MetalSelectedTensorGraphRequest;

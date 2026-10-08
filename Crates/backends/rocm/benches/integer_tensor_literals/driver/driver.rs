@@ -246,8 +246,40 @@ fn case<T: Format + TensorElement, const N: usize>(
                 .map(|fault| fault.map(|(index, code)| (index, code, false))),
         };
         for phase in 0..2 {
+            #[cfg(feature = "allocation-census")]
+            let before = fusion_pcu_rocm::rocm_api_census();
             assert_eq!(call(&banks[phase], &mut observed), Ok(None));
             verify(&observed, &want[phase], sentinel);
+            #[cfg(feature = "allocation-census")]
+            if route == "closest_source_dense_banks" {
+                let after = fusion_pcu_rocm::rocm_api_census();
+                let guarded = after.guarded_chain_submissions - before.guarded_chain_submissions;
+                assert!(guarded <= 1);
+                assert_eq!(
+                    after.async_host_to_device_copies - before.async_host_to_device_copies,
+                    if phase == 0 { guarded } else { 3 + guarded },
+                );
+            }
+        }
+        #[cfg(feature = "allocation-census")]
+        if route == "closest_source_dense_banks" {
+            let before = fusion_pcu_rocm::rocm_api_census();
+            let resident = source::identity(&banks[0]).unwrap();
+            let identity = fusion_pcu_rocm::rocm_api_census();
+            assert_eq!(
+                identity.async_host_to_device_copies,
+                before.async_host_to_device_copies
+            );
+            let mixed = source::mixed(&resident, &constant, &uniform).unwrap();
+            let after = fusion_pcu_rocm::rocm_api_census();
+            assert_eq!(
+                after.async_host_to_device_copies - identity.async_host_to_device_copies,
+                after.guarded_chain_submissions - identity.guarded_chain_submissions
+            );
+            mixed.read_into(&mut observed).unwrap();
+            verify(&observed, &want[0], sentinel);
+            // Restore the most recent successful source output used by the rollback witness.
+            assert_eq!(call(&banks[1], &mut observed), Ok(None));
         }
         let previous = observed.clone();
         let mut bad = banks[0].clone();
@@ -309,6 +341,53 @@ fn case<T: Format + TensorElement, const N: usize>(
             });
             let after = fusion_pcu_rocm::rocm_api_census();
             let sdk = native_counter.get().delta(sdk_before);
+            if route == "closest_source_dense_banks" {
+                // Genuine all-host #[pcu] execution: either two host-observed checked stages,
+                // or a proved guarded scope with one status-slab reset/readback and final wait.
+                let guarded = after.guarded_chain_submissions - before.guarded_chain_submissions;
+                assert!(guarded == 0 || guarded == 64);
+                if std::env::var_os("PCU_GUARDED_CHAIN_WITNESS").is_some() {
+                    assert_eq!(
+                        guarded, 64,
+                        "source witness must exercise guarded execution"
+                    );
+                }
+                assert_eq!(
+                    after.guarded_kernel_launches - before.guarded_kernel_launches,
+                    2 * guarded
+                );
+                assert_eq!(
+                    after.host_to_device_copies - before.host_to_device_copies,
+                    192 + guarded
+                );
+                assert_eq!(
+                    after.device_to_host_copies - before.device_to_host_copies,
+                    192 - guarded
+                );
+                assert_eq!(after.kernel_launches - before.kernel_launches, 128);
+                assert_eq!(
+                    after.event_creates - before.event_creates,
+                    128 - 2 * guarded
+                );
+                assert_eq!(after.event_records - before.event_records, 128 - guarded);
+                assert_eq!(after.event_waits - before.event_waits, 128 - guarded);
+                assert_eq!(
+                    after.event_destroys - before.event_destroys,
+                    128 - 2 * guarded
+                );
+                assert_eq!(counts.alloc_calls, 64);
+                assert_eq!(counts.realloc_calls, 0);
+                assert_eq!(
+                    after.stream_synchronizations,
+                    before.stream_synchronizations
+                );
+                assert_eq!(
+                    after.device_synchronizations,
+                    before.device_synchronizations
+                );
+                assert_eq!(after.module_loads, before.module_loads);
+                assert_eq!(after.symbol_resolutions, before.symbol_resolutions);
+            }
             if route == "independent_sdk_dense_banks" {
                 assert_eq!(
                     (
@@ -355,7 +434,7 @@ fn case<T: Format + TensorElement, const N: usize>(
             group.warm_up_time(Duration::from_millis(500));
             group.measurement_time(Duration::from_secs(2));
             group.bench_function("full_host_boundary", |b| {
-                b.iter_custom(|n| (0..n).map(|_| warm()).sum::<Duration>())
+                b.iter_custom(|n| (0..n).map(|_| warm()).sum::<Duration>());
             });
             group.finish();
         }
@@ -427,6 +506,32 @@ pub fn run(c: &mut Criterion) {
     }
     let reference = std::env::var_os("PCU_INTEGER_TENSOR_LITERAL_CPU_REFERENCE").is_some();
     let backend = (!reference).then(|| super::selection::selected_device().1);
+    if std::env::var_os("PCU_PHYSICAL_WORK_WITNESS").is_some() {
+        super::physical_work::run(
+            c,
+            backend.as_ref().unwrap().device_identity().device_id(),
+            semantics,
+        );
+        return;
+    }
+    #[cfg(not(feature = "allocation-census"))]
+    if std::env::var_os("PCU_GUARDED_FAULT_WITNESS").is_some() {
+        super::fault_latency::run(c, backend.as_ref().unwrap().device_identity().device_id());
+        return;
+    }
+    // Bounded source/graph/independent-SDK qualification for the queued-upload route.
+    // The full format/policy matrix remains the default benchmark behavior.
+    if std::env::var_os("PCU_ROCM_QUEUED_UPLOAD_WITNESS").is_some()
+        || std::env::var_os("PCU_GUARDED_CHAIN_WITNESS").is_some()
+    {
+        let backend = backend
+            .as_ref()
+            .expect("queued-upload witness requires ROCm");
+        let options = PcuNumericalOptions::default();
+        case::<u32, 65>(c, backend, options, PcuNumericalMode::Strict, semantics);
+        case::<u32, 4096>(c, backend, options, PcuNumericalMode::Strict, semantics);
+        return;
+    }
     for mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
         for compound_arithmetic in [
             PcuCompoundArithmeticPolicy::Checked,

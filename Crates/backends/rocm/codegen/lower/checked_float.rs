@@ -417,7 +417,7 @@ __device__ __forceinline__ void fusion_f32_normalize(unsigned long long* ext, in
     while (*ext < (1ull << 26)) { *ext <<= 1; --*exponent; }
 }
 __device__ __forceinline__ int fusion_f32_round_precision(unsigned long long ext, int exponent) {
-    fusion_f32_normalize(&ext, &exponent);
+    // The sole caller has already normalized ext in fusion_f32_pack.
     unsigned long long discarded = ext & 7ull;
     unsigned long long sig = ext >> 3;
     if (fusion_f32_round_increment(sig, discarded)) ++sig;

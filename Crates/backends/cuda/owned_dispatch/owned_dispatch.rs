@@ -13,6 +13,10 @@ use std::{
 #[path = "fault_law.rs"]
 mod fault_law;
 
+#[cfg(feature = "tensor")]
+#[path = "guarded/guarded.rs"]
+mod guarded;
+
 const INLINE_ARGUMENTS: usize = 8;
 const FAULT_WORD_SENTINEL: u64 = u64::MAX;
 const RECOVERED_FAULT_BIT: u64 = 1 << 63;
@@ -398,6 +402,7 @@ pub struct CudaOwnedDispatchBackend {
     architecture: Option<String>,
     compiler: Option<crate::discovery::DispatchCompiler>,
     block_size: u32,
+    publication: std::sync::Arc<crate::HostPublicationWorkspace>,
 }
 
 impl CudaOwnedDispatchBackend {
@@ -480,6 +485,8 @@ impl CudaOwnedDispatchBackend {
             grid_x,
             block_size: self.block_size,
             function,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
             stream: stream.clone(),
             binding_targets,
             fault_extent: profile.fault_extent(),
@@ -521,6 +528,8 @@ impl CudaOwnedDispatchBackend {
             grid_x,
             block_size: self.block_size,
             function,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
             stream: stream.clone(),
             binding_targets,
             fault_extent: profile.fault_extent(),
@@ -560,6 +569,8 @@ impl CudaOwnedDispatchBackend {
             grid_x,
             block_size: self.block_size,
             function,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
             stream: stream.clone(),
             binding_targets,
             fault_extent: u64::from(shape.invocation_count().get()),
@@ -599,6 +610,8 @@ impl CudaOwnedDispatchBackend {
             grid_x,
             block_size: self.block_size,
             function,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
             stream: stream.clone(),
             binding_targets,
             fault_extent: profile.fault_extent(),
@@ -642,6 +655,8 @@ impl CudaOwnedDispatchBackend {
             grid_x,
             block_size: self.block_size,
             function,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
             stream: stream.clone(),
             binding_targets,
             fault_extent: u64::from(shape.invocation_count().get()),
@@ -691,6 +706,7 @@ impl CudaOwnedDispatchBackend {
             architecture,
             compiler,
             block_size,
+            publication: std::sync::Arc::default(),
         })
     }
 
@@ -703,10 +719,27 @@ impl CudaOwnedDispatchBackend {
         self.runtime.allocate(bytes)
     }
 
+    /// Release completed idle host publication storage shared by this session's providers.
+    ///
+    /// Live readbacks and quarantined endpoints remain retained. The returned capacity is not
+    /// process RSS, and later transfers may populate the cache again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a deferred busy error if the cache is currently locked.
+    pub fn release_idle_host_cache(&self) -> Result<u64, fusion_pcu::PcuMemoryProviderError> {
+        let pool = fusion_pcu::PcuMemoryPoolId(self.device.device_id());
+        fusion_pcu::PcuMemoryProvider::release_idle_host_cache(&self.memory_provider(pool), pool)
+    }
+
     /// Create a memory provider for this same opened CUDA device and its caller-assigned pool.
     #[must_use]
     pub fn memory_provider(&self, pool: fusion_pcu::PcuMemoryPoolId) -> CudaMemoryProvider {
-        self.runtime.memory_provider(pool)
+        CudaMemoryProvider::with_publication(
+            self.runtime.clone(),
+            pool,
+            std::sync::Arc::clone(&self.publication),
+        )
     }
 
     /// Create binding metadata from this adapter's device identity and the allocation's true size.
@@ -949,6 +982,8 @@ impl CudaOwnedDispatchBackend {
             grid_x,
             block_size: self.block_size,
             function,
+            #[cfg(feature = "tensor")]
+            guarded_function: std::cell::RefCell::new(None),
             stream,
             binding_targets,
             fault_extent: u64::from(checked_fault_extent(&kernel)),
@@ -978,6 +1013,8 @@ pub struct CudaPreparedDispatch {
     grid_x: u32,
     block_size: u32,
     function: crate::CudaKernel,
+    #[cfg(feature = "tensor")]
+    guarded_function: std::cell::RefCell<Option<crate::CudaKernel>>,
     stream: crate::CudaStreamHandle,
     binding_targets: Vec<PcuBindingRef>,
     fault_extent: u64,
@@ -987,6 +1024,18 @@ pub struct CudaPreparedDispatch {
 }
 
 impl CudaPreparedDispatch {
+    /// Exact queue identity for retained tensor executables; this does not clone the handle.
+    #[cfg(feature = "tensor")]
+    pub(crate) fn uses_stream(&self, stream: &crate::CudaStreamHandle) -> bool {
+        std::rc::Rc::ptr_eq(&self.stream.inner, &stream.inner)
+    }
+
+    pub(crate) fn enter_private_runtime_scope(
+        &self,
+    ) -> Result<crate::ffi::RuntimeScope, CudaError> {
+        self.runtime.enter_private_scope()
+    }
+
     pub(super) const fn checked_fault_contract(&self) -> Option<CudaPreparedFaultContract> {
         if self.checked_arithmetic {
             Some(CudaPreparedFaultContract {

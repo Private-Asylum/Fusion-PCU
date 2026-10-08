@@ -367,7 +367,7 @@ impl CublasLtMatmulPlan {
         }
         if root.identity.workspace_bytes != 0 {
             let workspace = runtime.allocate(root.identity.workspace_bytes)?;
-            if workspace.allocation.pointer.addr() % 256 != 0 {
+            if !workspace.allocation.pointer.addr().is_multiple_of(256) {
                 return Err(CublasError::InvalidDimensions(
                     "Lt workspace requires 256-byte alignment",
                 ));
@@ -437,7 +437,7 @@ impl CublasLtMatmulPlan {
             } else {
                 4
             };
-            if buffer.allocation.pointer.addr() % alignment != 0 {
+            if !buffer.allocation.pointer.addr().is_multiple_of(alignment) {
                 return Err(CublasError::InvalidDimensions("Lt operand alignment"));
             }
         }

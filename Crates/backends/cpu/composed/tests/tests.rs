@@ -2,6 +2,7 @@
 #[rustfmt::skip]
 use fusion_pcu::{
     PcuBinding,
+    PcuBindingAccess,
     PcuBindingStorageClass,
     PcuDispatchControlOp,
     PcuDispatchDataOp,
@@ -55,7 +56,30 @@ fn width<T: PcuCheckedFloat>(one: T, two: T, sentinel: T, id: u32) {
     }
     let bindings = composed_bindings::<T>();
     composed_ir::<T>(&bindings).unwrap().with_ir(|kernel| {
-        let plan = backend.prepare_host_kernel(kernel).unwrap();
+        let mut plan = backend.prepare_host_kernel(kernel).unwrap();
+        for (input, swap_position) in [(one, 2), (two, 1)] {
+            let input = [input; 4];
+            let right = [one; 4];
+            let mut output = [sentinel; 6];
+            let mut arguments = [
+                PcuHostArgument::read(bindings[0].reference(), &input),
+                PcuHostArgument::read(bindings[1].reference(), &right),
+                PcuHostArgument::read_write(bindings[2].reference(), &mut output),
+            ];
+            arguments.swap(0, swap_position);
+            plan.call(&mut arguments).unwrap();
+            let expected = input[0]
+                .pcu_checked_add(one)
+                .unwrap()
+                .pcu_checked_mul(one)
+                .unwrap();
+            for actual in &output[..4] {
+                assert_eq!(actual.encode_le().as_ref(), expected.encode_le().as_ref());
+            }
+            for actual in &output[4..] {
+                assert_eq!(actual.encode_le().as_ref(), sentinel.encode_le().as_ref());
+            }
+        }
         assert_eq!(plan.local_id(), id);
         assert_eq!(plan.workspace_bytes(), 4 * T::HOST_SIZE);
         assert_eq!(plan.argument_count(), 3);
@@ -369,3 +393,88 @@ fn dual_call(
         PcuHostArgument::read_write(PcuBindingRef::new(0, 3), second),
     ])
 }
+
+#[test]
+fn sparse_ssa_constants_and_changing_inputs_use_dense_initialized_registers() {
+    let range = PcuRangePolicy::Reject;
+    let underflow = PcuFloatUnderflowPolicy::IeeeAfterRounding;
+    let mut call = plan(
+        &[
+            load(255, 0, false),
+            PcuDispatchOp::Data(PcuDispatchDataOp::Constant {
+                result: PcuDispatchValueId(213),
+                value: fusion_pcu::PcuParameterValue::F32(2_f32.to_bits()),
+            }),
+            binary(
+                117,
+                255,
+                213,
+                PcuDispatchFloatBinaryOp::Mul,
+                range,
+                underflow,
+            ),
+            binary(3, 117, 255, PcuDispatchFloatBinaryOp::Add, range, underflow),
+            store(2, 3),
+            PcuDispatchOp::Control(PcuDispatchControlOp::Return),
+        ],
+        false,
+        false,
+        range,
+        underflow,
+    );
+    // Sparse, descending source IDs occupy just four densely assigned slots.
+    assert!(matches!(
+        call.program.steps()[0],
+        Step::Load { result: 0, .. }
+    ));
+    assert!(matches!(
+        call.program.steps()[1],
+        Step::Binary {
+            result: 2,
+            left: 0,
+            right: 1,
+            ..
+        }
+    ));
+    for input in [[1., 2., 3., 4.], [4., 3., 2., 1.]] {
+        let mut output = [99_f32; 6];
+        call.call(&mut [
+            PcuHostArgument::read(PcuBindingRef::new(0, 0), &input),
+            PcuHostArgument::read(PcuBindingRef::new(0, 1), &[] as &[f32]),
+            PcuHostArgument::read_write(PcuBindingRef::new(0, 2), &mut output),
+        ])
+        .unwrap();
+        assert_eq!(&output[..4], &input.map(|value| value * 3.));
+        assert_eq!(&output[4..], &[99.; 2]);
+    }
+}
+
+#[test]
+fn malformed_ssa_is_rejected_before_dense_execution() {
+    let range = PcuRangePolicy::Reject;
+    let underflow = PcuFloatUnderflowPolicy::IeeeAfterRounding;
+    for invalid in [
+        [
+            load(0, 0, false),
+            load(0, 1, false),
+            binary(2, 0, 0, PcuDispatchFloatBinaryOp::Add, range, underflow),
+            store(2, 2),
+        ],
+        [
+            load(0, 0, false),
+            binary(2, 0, 1, PcuDispatchFloatBinaryOp::Add, range, underflow),
+            load(1, 1, false),
+            store(2, 2),
+        ],
+    ] {
+        let mut body = invalid.to_vec();
+        body.push(PcuDispatchOp::Control(PcuDispatchControlOp::Return));
+        assert!(try_plan(&body, false, false, range, underflow).is_err());
+    }
+}
+
+#[path = "arguments/arguments.rs"]
+mod arguments;
+
+#[path = "lane_blocks/lane_blocks.rs"]
+mod lane_blocks;

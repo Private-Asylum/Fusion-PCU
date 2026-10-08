@@ -6,6 +6,10 @@
 
 use crate::PcuMemoryAccess;
 
+#[path = "execution/guarded/guarded.rs"]
+pub mod guarded;
+pub use guarded::*;
+
 /// Identity of a resource within one execution graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PcuExecutionResourceId(pub u32);

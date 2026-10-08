@@ -240,19 +240,28 @@ fn publication<T: PcuCheckedInteger>(
     let mut prepared = crate::PcuCpuHostBackend::scalar()
         .prepare_host_kernel(kernel)
         .unwrap();
-    let mut output = [seed; 10];
-    prepared
-        .call(&mut [
-            PcuHostArgument::read(kernel.bindings[0].reference(), input),
-            PcuHostArgument::read(kernel.bindings[1].reference(), &[seed]),
+    for reverse in [false, true] {
+        let mut input = *input;
+        let mut expected = *expected;
+        if reverse {
+            input.reverse();
+            expected.reverse();
+        }
+        let mut output = [seed; 10];
+        let seed_argument = [seed];
+        let mut arguments = [
+            PcuHostArgument::read(kernel.bindings[0].reference(), &input),
+            PcuHostArgument::read(kernel.bindings[1].reference(), &seed_argument),
             PcuHostArgument::read_write(kernel.bindings[2].reference(), &mut output),
-        ])
-        .unwrap();
-    for (actual, expected) in output[..7].iter().zip(expected) {
-        assert_eq!(actual.encode_le().as_ref(), expected.encode_le().as_ref());
-    }
-    for tail in &output[7..] {
-        assert_eq!(tail.encode_le().as_ref(), seed.encode_le().as_ref());
+        ];
+        arguments.swap(0, if reverse { 1 } else { 2 });
+        prepared.call(&mut arguments).unwrap();
+        for (actual, expected) in output[..7].iter().zip(expected) {
+            assert_eq!(actual.encode_le().as_ref(), expected.encode_le().as_ref());
+        }
+        for tail in &output[7..] {
+            assert_eq!(tail.encode_le().as_ref(), seed.encode_le().as_ref());
+        }
     }
 }
 
@@ -323,4 +332,26 @@ fn cyclic_ir_refuses_normal_and_portable_preparation() {
                 );
             }
         });
+}
+
+#[test]
+fn readonly_broadcast_initializers_refresh_after_each_call() {
+    let backend = crate::PcuCpuHostBackend::scalar();
+    let mut call = integer_composed_prepare::<u64, _>(&backend).unwrap();
+    let input = [1_u64, 2, 3, 4, 5, 6, 7];
+    let mut output = [99_u64; 9];
+    let mut seed = 1_u64;
+    call(&input, &seed, &mut output).unwrap();
+    assert_eq!(&output[..7], &input.map(|value| value * value));
+    seed = 2;
+    call(&input, &seed, &mut output).unwrap();
+    assert_eq!(&output[..7], &input.map(|value| value * value + value));
+    assert_eq!(&output[7..], &[99; 2]);
+    seed = u64::MAX;
+    let old = output;
+    assert!(call(&input, &seed, &mut output).is_err());
+    assert_eq!(output, old);
+    seed = 1;
+    call(&input, &seed, &mut output).unwrap();
+    assert_eq!(&output[..7], &input.map(|value| value * value));
 }

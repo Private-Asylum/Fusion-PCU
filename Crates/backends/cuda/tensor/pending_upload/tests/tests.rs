@@ -60,6 +60,10 @@ fn prepare(
 
 #[test]
 #[ignore = "requires native CUDA; private same-queue input staging checked Add/Mul prototype"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep endpoint authority and repeated terminal census in one resource-lifetime witness."
+)]
 fn pending_upload_preserves_changed_inputs_exact_queue_authority_and_terminal_replay() {
     let (_discovery, session) = cuda_test_session();
     let pool = PcuMemoryPoolId(0x4352_0190);
@@ -136,7 +140,11 @@ fn pending_upload_preserves_changed_inputs_exact_queue_authority_and_terminal_re
                     1
                 );
                 assert_eq!(after.kernel_launches - before.kernel_launches, 2);
-                assert_eq!(after.event_creates - before.event_creates, 2);
+                // Prepared status owners retain their terminal events across warm calls.
+                assert_eq!(after.event_creates, before.event_creates);
+                assert_eq!(after.event_destroys, before.event_destroys);
+                assert_eq!(after.event_records - before.event_records, 2);
+                assert_eq!(after.event_waits - before.event_waits, 2);
                 assert_eq!(
                     after.stream_synchronizations,
                     before.stream_synchronizations
@@ -332,3 +340,237 @@ fn pending_upload_preflights_without_work_and_preserves_add_phase_fault_before_m
 
 #[path = "aggregate/aggregate.rs"]
 mod aggregate;
+
+fn prepare_pure(graph: Graph, outputs: &[ValueId]) -> CudaOwnedPreparedTensorGraph {
+    let data = super::super::tests::prepared_for_request_test(
+        &graph,
+        outputs,
+        TensorPointwiseGroupingPolicy::Disabled,
+    )
+    .data;
+    let program = graph
+        .into_selected_program(
+            outputs,
+            TensorArithmeticRewritePolicy::Disabled,
+            TensorArithmeticCapability::Strict,
+            TensorPointwiseGroupingPolicy::Disabled,
+        )
+        .unwrap();
+    CudaOwnedPreparedTensorGraph::from_parts(Arc::new(program), data).unwrap()
+}
+
+#[test]
+fn staging_terminal_proof_uses_concrete_dispatches_without_arithmetic_whitelist() {
+    let mut graph = Graph::default();
+    let left = graph.input([65], PcuScalarType::F32).unwrap();
+    let right = graph.input([65], PcuScalarType::F32).unwrap();
+    let sub = graph.sub(left, right).unwrap();
+    let div = graph.div(sub, right).unwrap();
+    let output = graph.relu(div).unwrap();
+    let mut prepared = prepare_pure(graph, &[output]);
+    assert!(eligible(&prepared));
+    // Same graph and numerical policy, but losing a concrete implementation fact must refuse
+    // staging before any upload. This is an execution proof, not source-op recognition.
+    let index = prepared.data.index_by_value[&sub];
+    let dispatch = prepared.data.fixed_dispatches[index].take();
+    assert!(!eligible(&prepared));
+    prepared.data.fixed_dispatches[index] = dispatch;
+    assert!(eligible(&prepared));
+    prepared.data.fixed_dispatches[index]
+        .as_mut()
+        .unwrap()
+        .value = output;
+    assert!(!eligible(&prepared));
+}
+
+#[test]
+fn staging_terminal_proof_refuses_source_only_multiple_outputs_and_library_work() {
+    let mut identity = Graph::default();
+    let input = identity.input([65], PcuScalarType::F32).unwrap();
+    assert!(!eligible(&prepare_pure(identity, &[input])));
+
+    let mut multiple = Graph::default();
+    let input = multiple.input([65], PcuScalarType::F32).unwrap();
+    let output = multiple.relu(input).unwrap();
+    assert!(!eligible(&prepare_pure(multiple, &[input, output])));
+
+    let mut library = Graph::default();
+    let left = library.input([2, 2], PcuScalarType::F32).unwrap();
+    let right = library.input([2, 2], PcuScalarType::F32).unwrap();
+    let output = library.matmul(left, right).unwrap();
+    assert!(!eligible(&prepare_pure(library, &[output])));
+}
+
+#[test]
+#[ignore = "requires native CUDA; generic fixed Sub/Div/Relu upload terminal and fault replay"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep changed-input success, fault retry, early failure and retained escaped output in one ownership witness."
+)]
+fn staging_fixed_dispatch_chain_preserves_changed_inputs_and_division_fault_retry() {
+    let (_discovery, session) = cuda_test_session();
+    let pool = PcuMemoryPoolId(0x4352_0195);
+    let assessor = CudaTensorAssessor::new(&session).unwrap();
+    let mut memory = session.memory_provider(pool);
+    let shape = [65];
+    let mut graph = Graph::default();
+    let input = graph.input_typed::<f32>(shape).unwrap();
+    let denominator = graph.input_typed::<f32>(shape).unwrap();
+    let difference = graph.sub_typed(input, denominator).unwrap();
+    let quotient = graph.div_typed(difference, denominator).unwrap();
+    let output = graph.relu_typed(quotient).unwrap();
+    let program = graph
+        .into_selected_program(
+            &[output.erase()],
+            TensorArithmeticRewritePolicy::Disabled,
+            TensorArithmeticCapability::Strict,
+            TensorPointwiseGroupingPolicy::Disabled,
+        )
+        .unwrap();
+    let prepared = assessor.prepare_owned_program(program).unwrap();
+    assert!(eligible(&prepared));
+    let source =
+        PcuDeviceTensor::new(shape, session.upload_buffer(pool, &[8.0_f32; 65]).unwrap()).unwrap();
+    let divisor =
+        PcuDeviceTensor::new(shape, session.upload_buffer(pool, &[2.0_f32; 65]).unwrap()).unwrap();
+    let cold = assessor
+        .execute_owned_program_outputs(
+            &prepared,
+            &[(input.erase(), &source), (denominator.erase(), &divisor)],
+            pool,
+            &mut memory,
+        )
+        .unwrap();
+    for generation in 0_u32..=8 {
+        let source_bytes = [8.0 + f32::from(u16::try_from(generation).unwrap()); 65]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let bad = generation == 4;
+        let mut divisors = [2.0_f32; 65];
+        if bad {
+            divisors[17] = 0.0;
+        }
+        let divisor_bytes = divisors
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let bindings = [
+            super::CudaHostedTensorInput {
+                value: input.erase(),
+                resource: source.buffer().resource(),
+                shape: &shape,
+                source: &source_bytes,
+            },
+            super::CudaHostedTensorInput {
+                value: denominator.erase(),
+                resource: divisor.buffer().resource(),
+                shape: &shape,
+                source: &divisor_bytes,
+            },
+        ];
+        let terminal = assessor.execute_owned_program_output_from_host_staging::<f32, _, 2>(
+            &prepared,
+            &bindings,
+            pool,
+            &mut memory,
+        );
+        assert!(
+            source
+                .buffer()
+                .resource()
+                .validate_access_available()
+                .is_ok()
+        );
+        assert!(
+            divisor
+                .buffer()
+                .resource()
+                .validate_access_available()
+                .is_ok()
+        );
+        if bad {
+            assert!(matches!(terminal,
+                Err(CudaTensorExecutionError::ExecutionFault(fault))
+                    if fault.invocation_id == 17));
+        } else {
+            let result = terminal.unwrap().expect("warm generic dispatch staging");
+            let mut host = [99.0_f32; 66];
+            session
+                .download_buffer(pool, result.buffer(), &mut host[..65])
+                .unwrap();
+            let numerator = 6_u16
+                .checked_add(u16::try_from(generation).unwrap())
+                .unwrap();
+            let expected = f32::from(numerator) / 2.0;
+            assert!(
+                host[..65]
+                    .iter()
+                    .all(|value| value.to_bits() == expected.to_bits())
+            );
+            assert_eq!(host[65].to_bits(), 99.0_f32.to_bits());
+        }
+    }
+    // A provider-domain rejection occurs after uploads but before the first dispatch. Drop
+    // must fence both pending endpoints rather than leaving input leases permanently busy.
+    let mut foreign_memory = session.memory_provider(PcuMemoryPoolId(pool.0 + 1));
+    let bytes = [2.0_f32; 65]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let bindings = [
+        super::CudaHostedTensorInput {
+            value: input.erase(),
+            resource: source.buffer().resource(),
+            shape: &shape,
+            source: &bytes,
+        },
+        super::CudaHostedTensorInput {
+            value: denominator.erase(),
+            resource: divisor.buffer().resource(),
+            shape: &shape,
+            source: &bytes,
+        },
+    ];
+    #[cfg(feature = "allocation-census")]
+    let before = crate::cuda_api_census();
+    assert!(
+        assessor
+            .execute_owned_program_output_from_host_staging::<f32, _, 2>(
+                &prepared,
+                &bindings,
+                pool,
+                &mut foreign_memory,
+            )
+            .is_err()
+    );
+    #[cfg(feature = "allocation-census")]
+    {
+        let after = crate::cuda_api_census();
+        assert_eq!(
+            after.host_to_device_copies - before.host_to_device_copies,
+            2
+        );
+        assert_eq!(after.kernel_launches, before.kernel_launches);
+        assert!(after.stream_synchronizations > before.stream_synchronizations);
+    }
+    assert!(
+        source
+            .buffer()
+            .resource()
+            .validate_access_available()
+            .is_ok()
+    );
+    assert!(
+        divisor
+            .buffer()
+            .resource()
+            .validate_access_available()
+            .is_ok()
+    );
+    let mut original = [0.0_f32; 65];
+    session
+        .download_buffer(pool, cold[0].1.buffer(), &mut original)
+        .unwrap();
+    assert_eq!(original.map(f32::to_bits), [3.0_f32.to_bits(); 65]);
+}

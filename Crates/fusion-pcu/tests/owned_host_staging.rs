@@ -1,5 +1,8 @@
 //! Ordinary host borrows observe fresh inputs without exposing transfer machinery.
-#![cfg(all(feature = "tensor", any(feature = "cpu", feature = "cuda")))]
+#![cfg(all(
+    feature = "tensor",
+    any(feature = "cpu", feature = "cuda", feature = "rocm")
+))]
 #[rustfmt::skip]
 use fusion_pcu::{
     global,
@@ -104,13 +107,19 @@ fn shape(n: usize) {
 }
 
 fn run(backend: global::PcuBackendChoice) {
-    global::configure(global::PcuExecutionPolicy {
-        backend,
-        ..Default::default()
-    })
-    .unwrap();
-    for n in [65, 4096] {
-        shape(n);
+    for observation in [
+        fusion_pcu::PcuExecutionObservationPolicy::Automatic,
+        fusion_pcu::PcuExecutionObservationPolicy::HostObservedStages,
+    ] {
+        global::configure(global::PcuExecutionPolicy {
+            backend,
+            observation,
+            ..Default::default()
+        })
+        .unwrap();
+        for n in [65, 4096] {
+            shape(n);
+        }
     }
     global::clear_thread_cache().unwrap();
 }
@@ -126,4 +135,56 @@ fn cpu_host_borrow_source_contract() {
 #[ignore = "Requires native CUDA; changing host-only and mixed resident source calls"]
 fn cuda_host_borrow_source_contract() {
     run(global::PcuBackendChoice::Cuda);
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+#[ignore = "Requires native ROCm; changing all-host and mixed resident source calls"]
+fn rocm_host_borrow_source_contract() {
+    run(global::PcuBackendChoice::Rocm);
+}
+
+fn source_retention_survives_fifo(backend: global::PcuBackendChoice) {
+    global::clear_thread_cache().unwrap();
+    global::configure(global::PcuExecutionPolicy {
+        backend,
+        cache_capacity: 64,
+        ..Default::default()
+    })
+    .unwrap();
+    // Keep every source specialization alive in the facade cache while admitting 68 distinct
+    // fixed Add/Mul keys into its shared 32-entry backend FIFO. Shape 65 is evicted there.
+    for n in 65..99 {
+        let owner = transform(&vec![1; n], &vec![2; n], &vec![3; n]).unwrap();
+        verify(&owner, &vec![9; n]);
+    }
+    for generation in 1_u32..=64 {
+        let owner = transform(&[generation; 65], &[2; 65], &[3; 65]).unwrap();
+        verify(&owner, &[(generation + 2) * 3; 65]);
+    }
+    let mut overflowing = [1_u32; 65];
+    overflowing[7] = u32::MAX;
+    let fault = transform(&overflowing, &[2; 65], &[3; 65])
+        .unwrap_err()
+        .arithmetic_fault()
+        .unwrap();
+    assert_eq!(fault.invocation_id, 7);
+    let retry = transform(&[4; 65], &[2; 65], &[3; 65]).unwrap();
+    verify(&retry, &[18; 65]);
+    global::clear_thread_cache().unwrap();
+    verify(&retry, &[18; 65]);
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+#[ignore = "Requires native ROCm; genuine source retains fixed kernels across backend FIFO eviction"]
+fn rocm_source_retention_survives_backend_fifo_eviction() {
+    source_retention_survives_fifo(global::PcuBackendChoice::Rocm);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "Requires native CUDA; genuine source retains fixed kernels across backend FIFO eviction"]
+fn cuda_source_retention_survives_backend_fifo_eviction() {
+    source_retention_survives_fifo(global::PcuBackendChoice::Cuda);
 }

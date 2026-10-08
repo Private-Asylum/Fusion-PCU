@@ -103,7 +103,10 @@ fn prepare_with_range_policy(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
-        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements {
+            range_policy,
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: fusion_pcu::PcuKernelId(0xf103),
         entry: PcuDispatchEntryPoint {
             name: "checked_float_acceptance",
@@ -216,7 +219,10 @@ fn prepare_f64_with_range_policy(
         PcuDispatchOp::Control(PcuDispatchControlOp::Return),
     ];
     let kernel = PcuDispatchKernelIr {
-        numerical_requirements: PcuDispatchKernelIr::DEFAULT_REQUIREMENTS,
+        numerical_requirements: fusion_pcu::PcuImplementationRequirements {
+            range_policy,
+            ..PcuDispatchKernelIr::DEFAULT_REQUIREMENTS
+        },
         id: fusion_pcu::PcuKernelId(0xf164),
         entry: PcuDispatchEntryPoint {
             name: "checked_float64_acceptance",

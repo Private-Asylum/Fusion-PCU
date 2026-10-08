@@ -7,18 +7,21 @@ pub struct RocmApiCensus {
     pub allocations: u64,
     pub frees: u64,
     pub host_to_device_copies: u64,
+    pub async_host_to_device_copies: u64,
     pub device_to_host_copies: u64,
     pub device_to_device_copies: u64,
     pub device_synchronizations: u64,
     pub stream_synchronizations: u64,
     pub kernel_launches: u64,
+    pub guarded_chain_submissions: u64,
+    pub guarded_kernel_launches: u64,
     pub event_creates: u64,
     pub event_records: u64,
     pub event_waits: u64,
     pub event_destroys: u64,
     pub module_loads: u64,
 }
-std::thread_local! { static CENSUS: std::cell::Cell<RocmApiCensus> = const { std::cell::Cell::new(RocmApiCensus { symbol_resolutions: 0, runtime_calls: 0, device_selections: 0, allocations: 0, frees: 0, host_to_device_copies: 0, device_to_host_copies: 0, device_to_device_copies: 0, device_synchronizations: 0, stream_synchronizations: 0, kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0 }) }; }
+std::thread_local! { static CENSUS: std::cell::Cell<RocmApiCensus> = const { std::cell::Cell::new(RocmApiCensus { symbol_resolutions: 0, runtime_calls: 0, device_selections: 0, allocations: 0, frees: 0, host_to_device_copies: 0, async_host_to_device_copies: 0, device_to_host_copies: 0, device_to_device_copies: 0, device_synchronizations: 0, stream_synchronizations: 0, kernel_launches: 0, guarded_chain_submissions: 0, guarded_kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0 }) }; }
 #[must_use]
 pub fn rocm_api_census() -> RocmApiCensus {
     CENSUS.get()
@@ -63,6 +66,34 @@ pub(super) fn call(name: &str) {
             "hipStreamSynchronize" => value.stream_synchronizations += 1,
             _ => (),
         }
+        cell.set(value);
+    });
+}
+
+pub(super) fn async_copy(direction: i32) {
+    copy(direction);
+    if direction == 1 {
+        CENSUS.with(|cell| {
+            let mut value = cell.get();
+            value.async_host_to_device_copies += 1;
+            cell.set(value);
+        });
+    }
+}
+
+#[cfg(feature = "tensor")]
+pub fn guarded_chain() {
+    CENSUS.with(|cell| {
+        let mut value = cell.get();
+        value.guarded_chain_submissions += 1;
+        cell.set(value);
+    });
+}
+#[cfg(feature = "tensor")]
+pub fn guarded_kernel() {
+    CENSUS.with(|cell| {
+        let mut value = cell.get();
+        value.guarded_kernel_launches += 1;
         cell.set(value);
     });
 }

@@ -242,6 +242,9 @@ fn run_on(
         selected.name
     );
     for (rows, features) in [(4_usize, 2_usize), (1024, 64), (8192, 1024)] {
+        if std::env::var_os("FUSION_ROCM_TRAINING_BALANCED").is_some() && rows != 1024 {
+            continue;
+        }
         let program = program(rows, features)?;
         let sample_values = (0..rows * features)
             .map(|index| (small_integer(index % 17) - 8.0) / 8.0)
@@ -280,7 +283,9 @@ fn run_on(
 
         // Semantic mode exercises the complete genuine source/graph/native training family.
         // Legacy profiled controls collect host-wall samples and require the guarded statistical run.
-        if std::env::args().any(|arg| arg == "--test") {
+        if std::env::args().any(|arg| arg == "--test")
+            || std::env::var_os("FUSION_ROCM_TRAINING_BALANCED").is_some()
+        {
             continue;
         }
 

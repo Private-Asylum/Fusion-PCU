@@ -214,6 +214,9 @@ pub fn case<const R: usize, const K: usize>(
         .map(|w| assessor.borrow_device_input_ref(w, selected.pool).unwrap());
     let factor = vec![2.0 / f32::from(u16::try_from(R)?); R];
     for kind in 0..3 {
+        if std::env::var_os("FUSION_ROCM_TRAINING_BALANCED").is_some() && kind != 0 {
+            continue;
+        }
         if kind == 2 && R > 4 {
             continue;
         } // Real ordered training has its own bounded family.
@@ -330,6 +333,34 @@ pub fn case<const R: usize, const K: usize>(
                 "census/source_training/{R}x{K}/{kind}/{route}/64-changing-calls: Rust alloc={} realloc={} frees={} bytes={}; API={api:?}; scores={before}",
                 rust.alloc_calls, rust.realloc_calls, rust.dealloc_calls, rust.requested_bytes
             );
+        }
+        if std::env::var_os("FUSION_ROCM_TRAINING_BALANCED").is_some() {
+            let libraries = libraries
+                .as_ref()
+                .ok_or("native training control missing")?;
+            // Rotate the first route each round so clock drift and device residency are balanced.
+            // All three measured calls end with final host readback; native retains its outputs.
+            for round in 0..132 {
+                let bank = round % 2;
+                for offset in 0..3 {
+                    let route = (round + offset) % 3;
+                    let start = std::time::Instant::now();
+                    let output = match route {
+                        0 => sources.two::<R, K>(kind, bank)?,
+                        1 => graph(bank)?,
+                        _ => libraries[bank].execute_two()?,
+                    };
+                    std::hint::black_box(output);
+                    let elapsed = start.elapsed();
+                    if round >= 32 {
+                        println!(
+                            "balanced-training,{R},{K},{round},{route},{}",
+                            elapsed.as_nanos()
+                        );
+                    }
+                }
+            }
+            continue;
         }
         let before = SCORES.load(Ordering::Relaxed);
         let mut phase = 0;

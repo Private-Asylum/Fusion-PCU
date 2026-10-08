@@ -9,11 +9,16 @@ mod activity;
 mod allocations;
 #[path = "driver/driver.rs"]
 mod driver;
+#[cfg(not(feature = "allocation-census"))]
+#[path = "fault_latency/fault_latency.rs"]
+mod fault_latency;
 #[path = "native/native.rs"]
 mod native;
 #[path = "oracle/oracle.rs"]
 #[allow(dead_code)] // This producer target reuses exact integer formats, not staged Sub goldens.
 mod oracle;
+#[path = "physical_work/physical_work.rs"]
+mod physical_work;
 #[path = "../strict_matmul/selection.rs"]
 mod selection;
 #[path = "source/source.rs"]

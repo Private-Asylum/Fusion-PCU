@@ -1,7 +1,5 @@
 //! Actual same-session native pointwise plans; detached graph, faults and owner publication.
 extern crate pcu_facade as fusion_pcu;
-#[path = "producers/producers.rs"]
-mod producers;
 #[path = "../scalar_transport/sample/sample.rs"]
 #[allow(dead_code)] // The bit-only comparison is shared with the existing full transport corpus.
 mod bits;
@@ -14,6 +12,8 @@ mod faults;
 mod integer_oracle;
 #[path = "../../../rocm/benches/low_tensor/oracle/oracle.rs"]
 mod low_oracle;
+#[path = "producers/producers.rs"]
+mod producers;
 #[path = "profiles/profiles.rs"]
 mod profiles;
 #[path = "sample/sample.rs"]

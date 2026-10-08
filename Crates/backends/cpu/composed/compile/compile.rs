@@ -83,7 +83,7 @@ pub(super) fn build(
     realization: (PcuScalarType, u32, usize, Executable),
     lower: fn(PcuDispatchOp<'_>, &[Resource]) -> Result<Step, Error>,
 ) -> Result<Plan, Error> {
-    let (scalar, local_id, size, execute) = realization;
+    let (scalar, local_id, size, _execute) = realization;
     let mut resources = Vec::new();
     resources
         .try_reserve_exact(descriptor.resources().len())
@@ -126,22 +126,50 @@ pub(super) fn build(
     for operation in body {
         steps.push(lower(*operation, &resources)?);
     }
+    densify(&mut steps)?;
+    let invariant = |step: &Step| match *step {
+        Step::Constant { .. } | Step::IntegerConstant { .. } => true,
+        Step::Load {
+            resource,
+            zero: true,
+            ..
+        } => resources[resource].write_bytes == 0,
+        _ => false,
+    };
+    let mut initializers = Vec::new();
+    initializers
+        .try_reserve_exact(steps.iter().filter(|step| invariant(step)).count())
+        .map_err(|_| Error::AllocationFailed)?;
+    // Only literals and loads from immutable, disjoint resources may leave the hot
+    // stream. Runtime values are refreshed after every call's argument preflight.
+    steps.retain(|step| {
+        if invariant(step) {
+            initializers.push(*step);
+            false
+        } else {
+            true
+        }
+    });
     let mut scratch = Vec::new();
     scratch
         .try_reserve_exact(bytes)
         .map_err(|_| Error::AllocationFailed)?;
     scratch.resize(bytes, 0);
-    Ok(Plan {
-        requirements: kernel.numerical_requirements,
+    let program = super::program::ValidatedProgram::new(
         scalar,
         size,
-        local_id,
-        extent: usize::try_from(descriptor.logical_extent).map_err(|_| Error::ExtentOverflow)?,
+        usize::try_from(descriptor.logical_extent).map_err(|_| Error::ExtentOverflow)?,
         schema,
         resources,
+        initializers,
         steps,
+        scratch.len(),
+    )?;
+    Ok(Plan {
+        requirements: kernel.numerical_requirements,
+        local_id,
+        program,
         scratch,
-        execute,
     })
 }
 fn realization(scalar: PcuScalarType) -> Result<(u32, usize, Executable), Error> {
@@ -271,3 +299,52 @@ fn step(operation: PcuDispatchOp<'_>, resources: &[Resource]) -> Result<Step, Er
 
 #[path = "integer/integer.rs"]
 pub(super) mod integer;
+
+// Verify the detached program itself before removing warm register-validity checks.
+// Slots are assigned by definition order, independent of the source SSA numbering.
+fn densify(steps: &mut [Step]) -> Result<(), Error> {
+    // All source slots passed `slot` during lowering and are below REGISTERS.
+    // At most one definition per step makes dense slots strictly below STEPS.
+    let mut slots = [None; REGISTERS];
+    let mut next = 0;
+    for step in steps {
+        let result = match step {
+            Step::Load { result, .. }
+            | Step::Constant { result, .. }
+            | Step::IntegerConstant { result, .. } => Some(result),
+            Step::Binary {
+                result,
+                left,
+                right,
+                ..
+            }
+            | Step::IntegerBinary {
+                result,
+                left,
+                right,
+                ..
+            } => {
+                *left = slots[*left].ok_or(Error::InvalidProgram)?;
+                *right = slots[*right].ok_or(Error::InvalidProgram)?;
+                Some(result)
+            }
+            Step::Unary { result, value, .. } => {
+                *value = slots[*value].ok_or(Error::InvalidProgram)?;
+                Some(result)
+            }
+            Step::Store { value, .. } => {
+                *value = slots[*value].ok_or(Error::InvalidProgram)?;
+                None
+            }
+        };
+        if let Some(result) = result {
+            if slots[*result].is_some() {
+                return Err(Error::InvalidProgram);
+            }
+            slots[*result] = Some(next);
+            *result = next;
+            next += 1;
+        }
+    }
+    Ok(())
+}

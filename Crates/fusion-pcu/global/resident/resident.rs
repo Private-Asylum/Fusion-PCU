@@ -25,7 +25,11 @@ use crate::{
     PcuMemoryProvider,
 };
 use super::PcuExecutionError;
-#[cfg(all(feature = "tensor", feature = "cuda", target_endian = "little"))]
+#[cfg(all(
+    feature = "tensor",
+    any(feature = "cuda", feature = "rocm"),
+    target_endian = "little"
+))]
 pub(in crate::global) use graph::HostStagingInput;
 use super::PcuArgumentError;
 use std::rc::Rc;
@@ -142,6 +146,40 @@ impl<T: PcuScalar> DeviceTensor<T> {
     }
 }
 impl Session {
+    /// Reclaim the completed publication cache without invalidating escaped owners.
+    #[cfg(any(
+        feature = "tensor",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu",
+        feature = "mlx"
+    ))]
+    #[cfg_attr(
+        not(any(feature = "rocm", feature = "cuda")),
+        allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+    )]
+    // Mixed backend builds propagate cache contention through this same static interface.
+    pub(super) fn release_gpu_publication_cache(&self) -> Result<(), PcuExecutionError> {
+        match self {
+            #[cfg(feature = "rocm")]
+            Self::Rocm(session) => session
+                .backend()
+                .release_idle_host_cache()
+                .map(|_| ())
+                .map_err(PcuExecutionError::Memory),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(session) => session
+                .backend
+                .release_idle_host_cache()
+                .map(|_| ())
+                .map_err(PcuExecutionError::Memory),
+            // This maintenance hook concerns the CUDA/ROCm publication cache only.
+            #[cfg(feature = "metal")]
+            Self::Metal(_) => Ok(()),
+        }
+    }
+
     #[cfg(all(feature = "metal", feature = "tensor"))]
     #[cfg_attr(
         not(any(feature = "rocm", feature = "cuda")),
@@ -312,14 +350,15 @@ mod graph {
         #[cfg(feature = "cuda")]
         Cuda(fusion_pcu_cuda::CudaOwnedPreparedTensorGraph),
     }
-    #[cfg(all(feature = "cuda", target_endian = "little"))]
+    #[cfg(all(any(feature = "cuda", feature = "rocm"), target_endian = "little"))]
     impl Prepared {
         /// Cold structural permission; this does not promise retained dispatch-cache entries.
         pub(in crate::global) const fn supports_host_staging(&self) -> bool {
             match self {
+                #[cfg(feature = "cuda")]
                 Self::Cuda(prepared) => prepared.supports_host_staging(),
                 #[cfg(feature = "rocm")]
-                Self::Rocm(_) => false,
+                Self::Rocm(prepared) => prepared.supports_host_staging(),
             }
         }
     }
@@ -349,7 +388,7 @@ mod graph {
     }
     /// Borrowed, initialized host bytes and their retained staging allocation.
     /// The provider copies these bytes into its own endpoint before enqueuing work.
-    #[cfg(all(feature = "cuda", target_endian = "little"))]
+    #[cfg(all(any(feature = "cuda", feature = "rocm"), target_endian = "little"))]
     pub(in crate::global) struct HostStagingInput<'a> {
         pub value: ValueId,
         pub resource: &'a Resource,
@@ -450,7 +489,7 @@ mod graph {
     impl Assessor<'_> {
         /// Attempt a provider-owned same-stream upload for an existing host-only schedule.
         /// None declines before work; an error must never trigger a second execution.
-        #[cfg(all(feature = "cuda", target_endian = "little"))]
+        #[cfg(all(any(feature = "cuda", feature = "rocm"), target_endian = "little"))]
         pub(in crate::global) fn execute_host_staged_output<T: PcuScalar, const N: usize>(
             &self,
             prepared: &Prepared,
@@ -459,6 +498,7 @@ mod graph {
             memory: &mut Memory,
         ) -> Result<Option<DeviceTensor<T>>, PcuExecutionError> {
             match (self, prepared, memory) {
+                #[cfg(feature = "cuda")]
                 (Self::Cuda(assessor), Prepared::Cuda(prepared), Memory::Cuda(memory)) => {
                     if inputs.len() > N {
                         return Err(PcuExecutionError::InvalidTensorSourcePlan);
@@ -485,26 +525,59 @@ mod graph {
                         .map_err(PcuExecutionError::from)
                 }
                 #[cfg(feature = "rocm")]
-                (Self::Rocm(_), Prepared::Rocm(_), Memory::Rocm(_)) => Ok(None),
-                #[cfg(feature = "rocm")]
+                (Self::Rocm(assessor), Prepared::Rocm(prepared), Memory::Rocm(memory)) => {
+                    if inputs.len() > N {
+                        return Err(PcuExecutionError::InvalidTensorSourcePlan);
+                    }
+                    let mut bindings: SmallVec<[fusion_pcu_rocm::RocmHostedTensorInput<'_>; N]> =
+                        SmallVec::new();
+                    for input in inputs {
+                        #[allow(irrefutable_let_patterns)]
+                        let Resource::Rocm(resource) = input.resource else {
+                            return Err(mismatch());
+                        };
+                        bindings.push(fusion_pcu_rocm::RocmHostedTensorInput {
+                            value: input.value,
+                            resource,
+                            shape: input.shape,
+                            source: input.bytes,
+                        });
+                    }
+                    assessor
+                        .execute_owned_program_output_from_host_staging::<T, _, N>(
+                            prepared, &bindings, pool, memory,
+                        )
+                        .map(|output| output.map(DeviceTensor::Rocm))
+                        .map_err(PcuExecutionError::from)
+                }
+                #[cfg(all(feature = "rocm", feature = "cuda"))]
                 _ => Err(mismatch()),
             }
         }
         pub(in crate::global) fn prepare_shared_owned_program(
             &self,
             program: Arc<TensorOwnedSelectedProgram>,
+            observation: crate::PcuExecutionObservationPolicy,
         ) -> Result<Prepared, PcuExecutionError> {
             match self {
                 #[cfg(feature = "rocm")]
-                Self::Rocm(assessor) => assessor
-                    .prepare_shared_owned_program(program)
-                    .map(Prepared::Rocm)
-                    .map_err(PcuExecutionError::from),
+                Self::Rocm(assessor) => {
+                    let mut prepared = assessor.prepare_shared_owned_program(program)?;
+                    assessor.retain_owned_program_fixed_dispatches(&mut prepared)?;
+                    if observation == crate::PcuExecutionObservationPolicy::Automatic {
+                        assessor.prepare_owned_program_guarded_execution(&mut prepared)?;
+                    }
+                    Ok(Prepared::Rocm(prepared))
+                }
                 #[cfg(feature = "cuda")]
-                Self::Cuda(assessor) => assessor
-                    .prepare_shared_owned_program(program)
-                    .map(Prepared::Cuda)
-                    .map_err(PcuExecutionError::from),
+                Self::Cuda(assessor) => {
+                    let mut prepared = assessor.prepare_shared_owned_program(program)?;
+                    assessor.retain_owned_program_fixed_dispatches(&mut prepared)?;
+                    if observation == crate::PcuExecutionObservationPolicy::Automatic {
+                        assessor.prepare_owned_program_guarded_execution(&mut prepared)?;
+                    }
+                    Ok(Prepared::Cuda(prepared))
+                }
             }
         }
         pub(in crate::global) fn borrow_resource_input_ref<'a>(
@@ -998,11 +1071,13 @@ impl Session {
 pub(super) fn clear_roots() -> Result<(), PcuExecutionError> {
     ROOTS
         .try_with(|roots| {
-            roots
+            let mut roots = roots
                 .try_borrow_mut()
-                .map_err(|_| PcuExecutionError::ReentrantCall)?
-                .sessions
-                .clear();
+                .map_err(|_| PcuExecutionError::ReentrantCall)?;
+            for session in &roots.sessions {
+                session.release_gpu_publication_cache()?;
+            }
+            roots.sessions.clear();
             Ok(())
         })
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?

@@ -145,6 +145,7 @@ pub use tensor::{
     RocmTensorFeedbackResources,
     RocmTensorInput,
     RocmTensorInputRef,
+    RocmHostedTensorInput,
     RocmTensorNodeTiming,
     RocmTensorOutputBank,
     RocmTensorOwnedOutput,
@@ -520,9 +521,9 @@ impl HipRuntime {
                 pointer,
                 bytes,
                 host_transfer: RefCell::new(Vec::new()),
-                access: Rc::new(AllocationAccess {
+                access: AllocationAccess {
                     state: Cell::new(AllocationAccessState::Idle),
-                }),
+                },
             }),
         })
     }
@@ -820,7 +821,7 @@ struct DeviceAllocation {
     runtime: HipRuntime,
     pointer: *mut c_void,
     bytes: usize,
-    access: Rc<AllocationAccess>,
+    access: AllocationAccess,
     // The exclusive allocation gate protects this retained native host endpoint.
     host_transfer: RefCell<Vec<u8>>,
 }
@@ -844,22 +845,39 @@ enum AllocationAccessKind {
     Stream(usize),
 }
 
+impl AsRef<Self> for AllocationAccess {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
+impl AsRef<AllocationAccess> for DeviceAllocation {
+    fn as_ref(&self) -> &AllocationAccess {
+        &self.access
+    }
+}
+
 impl AllocationAccess {
-    fn acquire(self: &Rc<Self>) -> Result<AllocationAccessGuard, ()> {
-        if self.state.get() != AllocationAccessState::Idle {
+    fn acquire<T: AsRef<Self>>(owner: &Rc<T>) -> Result<AllocationAccessGuard<T>, ()> {
+        let this = owner.as_ref().as_ref();
+        if this.state.get() != AllocationAccessState::Idle {
             return Err(());
         }
-        self.state.set(AllocationAccessState::Exclusive);
+        this.state.set(AllocationAccessState::Exclusive);
         Ok(AllocationAccessGuard {
-            access: Rc::clone(self),
+            access: Rc::clone(owner),
             kind: AllocationAccessKind::Exclusive,
         })
     }
 
-    fn acquire_stream(self: &Rc<Self>, identity: usize) -> Result<AllocationAccessGuard, ()> {
-        match self.state.get() {
+    fn acquire_stream<T: AsRef<Self>>(
+        owner: &Rc<T>,
+        identity: usize,
+    ) -> Result<AllocationAccessGuard<T>, ()> {
+        let this = owner.as_ref().as_ref();
+        match this.state.get() {
             AllocationAccessState::Idle => {
-                self.state.set(AllocationAccessState::Stream {
+                this.state.set(AllocationAccessState::Stream {
                     identity,
                     leases: 1,
                 });
@@ -869,7 +887,7 @@ impl AllocationAccess {
                 leases,
             } if active == identity => {
                 let leases = leases.checked_add(1).ok_or(())?;
-                self.state
+                this.state
                     .set(AllocationAccessState::Stream { identity, leases });
             }
             AllocationAccessState::Exclusive
@@ -879,14 +897,14 @@ impl AllocationAccess {
             }
         }
         Ok(AllocationAccessGuard {
-            access: Rc::clone(self),
+            access: Rc::clone(owner),
             kind: AllocationAccessKind::Stream(identity),
         })
     }
 }
 
-fn reassign_allocation_access_guards(
-    guards: &mut [&mut AllocationAccessGuard],
+fn reassign_allocation_access_guards<T: AsRef<AllocationAccess>>(
+    guards: &mut [&mut AllocationAccessGuard<T>],
     from: usize,
     to: usize,
 ) -> Result<(), ()> {
@@ -896,7 +914,7 @@ fn reassign_allocation_access_guards(
     if !allocation_access_guards_can_reassign(&read_guards, from, to) {
         return Err(());
     }
-    let mut groups: Vec<(Rc<AllocationAccess>, usize)> = Vec::new();
+    let mut groups: Vec<(Rc<T>, usize)> = Vec::new();
     for guard in guards.iter() {
         if let Some((_, count)) = groups
             .iter_mut()
@@ -908,10 +926,14 @@ fn reassign_allocation_access_guards(
         }
     }
     for (access, count) in groups {
-        access.state.set(AllocationAccessState::Stream {
-            identity: to,
-            leases: count,
-        });
+        access
+            .as_ref()
+            .as_ref()
+            .state
+            .set(AllocationAccessState::Stream {
+                identity: to,
+                leases: count,
+            });
     }
     for guard in guards.iter_mut() {
         guard.kind = AllocationAccessKind::Stream(to);
@@ -919,8 +941,8 @@ fn reassign_allocation_access_guards(
     Ok(())
 }
 
-fn allocation_access_guards_can_reassign(
-    guards: &[&AllocationAccessGuard],
+fn allocation_access_guards_can_reassign<T: AsRef<AllocationAccess>>(
+    guards: &[&AllocationAccessGuard<T>],
     from: usize,
     to: usize,
 ) -> bool {
@@ -931,7 +953,7 @@ fn allocation_access_guards_can_reassign(
     {
         return false;
     }
-    let mut groups: Vec<(&Rc<AllocationAccess>, usize)> = Vec::new();
+    let mut groups: Vec<(&Rc<T>, usize)> = Vec::new();
     for guard in guards {
         if let Some((_, count)) = groups
             .iter_mut()
@@ -943,7 +965,7 @@ fn allocation_access_guards_can_reassign(
         }
     }
     groups.iter().all(|(access, count)| {
-        access.state.get()
+        access.as_ref().as_ref().state.get()
             == (AllocationAccessState::Stream {
                 identity: from,
                 leases: *count,
@@ -951,14 +973,14 @@ fn allocation_access_guards_can_reassign(
     })
 }
 
-struct AllocationAccessGuard {
-    access: Rc<AllocationAccess>,
+struct AllocationAccessGuard<T: AsRef<AllocationAccess> = DeviceAllocation> {
+    access: Rc<T>,
     kind: AllocationAccessKind,
 }
 
-impl Drop for AllocationAccessGuard {
+impl<T: AsRef<AllocationAccess>> Drop for AllocationAccessGuard<T> {
     fn drop(&mut self) {
-        let next = match (self.kind, self.access.state.get()) {
+        let next = match (self.kind, self.access.as_ref().as_ref().state.get()) {
             (AllocationAccessKind::Exclusive, AllocationAccessState::Exclusive) => {
                 AllocationAccessState::Idle
             }
@@ -983,22 +1005,26 @@ impl Drop for AllocationAccessGuard {
             // safe failure mode if internal ownership invariants are ever violated.
             _ => return,
         };
-        self.access.state.set(next);
+        self.access.as_ref().as_ref().state.set(next);
     }
 }
 
-impl AllocationAccessGuard {
+impl<T: AsRef<AllocationAccess>> AllocationAccessGuard<T> {
     fn quarantine_stream(&self) {
         if let AllocationAccessKind::Stream(identity) = self.kind
             && matches!(
-                self.access.state.get(),
+                self.access.as_ref().as_ref().state.get(),
                 AllocationAccessState::Stream {
                     identity: active,
                     ..
                 } if active == identity
             )
         {
-            self.access.state.set(AllocationAccessState::Poisoned);
+            self.access
+                .as_ref()
+                .as_ref()
+                .state
+                .set(AllocationAccessState::Poisoned);
         }
     }
 }
@@ -1140,6 +1166,75 @@ impl Drop for DeviceAllocation {
     }
 }
 
+/// Session-owned RAM cache. A ticket moves RAM out, so sibling/reentrant readbacks cannot alias.
+/// The largest completed RAM capacity persists until idle-cache reclamation or the last owner
+/// drops. Automatic pressure admission and host-memory budget accounting remain separate; no
+/// implicit budget is claimed.
+#[derive(Default)]
+pub(crate) struct HostPublicationWorkspace(std::sync::Mutex<Vec<u8>>);
+
+struct HostPublicationLease {
+    workspace: Arc<HostPublicationWorkspace>,
+    bytes: Vec<u8>,
+}
+
+impl HostPublicationWorkspace {
+    /// Reclaim only idle completed RAM. Live tickets retain their independent endpoints.
+    fn release_idle(&self) -> Option<usize> {
+        let retired = match self.0.try_lock() {
+            Ok(mut cache) => std::mem::take(&mut *cache),
+            // Poison does not make an owned idle Vec unsafe to destroy. Transfers already
+            // fall back to independent RAM; reclamation must not strand this capacity.
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                std::mem::take(&mut *error.into_inner())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let capacity = retired.capacity();
+        // The guard above has ended: allocator destruction never runs under the cache lock.
+        drop(retired);
+        Some(capacity)
+    }
+
+    fn lease(self: &Arc<Self>, bytes: usize) -> HostPublicationLease {
+        let mut owned = self
+            .0
+            .try_lock()
+            .map_or_else(|_| Vec::new(), |mut storage| std::mem::take(&mut *storage));
+        owned.resize(bytes, 0);
+        HostPublicationLease {
+            workspace: Arc::clone(self),
+            bytes: owned,
+        }
+    }
+}
+
+impl HostPublicationLease {
+    const fn retain_after_unknown_completion(self, allocation: DeviceAccessLease) {
+        // Retain the host bytes, cache owner, allocation gate, device bytes and runtime together.
+        std::mem::forget((allocation, self));
+    }
+}
+
+impl Drop for HostPublicationLease {
+    fn drop(&mut self) {
+        // Keep the largest completed workspace. Native work never borrows this cache itself.
+        let retired = if let Ok(mut cache) = self.workspace.0.try_lock() {
+            if self.bytes.capacity() > cache.capacity() {
+                Some(std::mem::replace(
+                    &mut *cache,
+                    std::mem::take(&mut self.bytes),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(retired);
+    }
+}
+
 /// A completed private host readback retaining the allocation's exclusive access lease.
 ///
 /// The bytes remain private until publication; holding this ticket blocks cloned allocation
@@ -1149,6 +1244,7 @@ impl Drop for DeviceAllocation {
 pub struct OwnedHostReadback {
     lease: DeviceAccessLease,
     bytes: usize,
+    workspace: Option<HostPublicationLease>,
 }
 impl OwnedHostReadback {
     /// Copy a completed readback into an exactly sized destination, without an SDK operation.
@@ -1161,8 +1257,12 @@ impl OwnedHostReadback {
             self.bytes,
             "validated readback destination extent"
         );
-        let bytes = self.lease.allocation.host_transfer.borrow();
-        destination.copy_from_slice(&bytes[..self.bytes]);
+        if let Some(workspace) = &self.workspace {
+            destination.copy_from_slice(&workspace.bytes[..self.bytes]);
+        } else {
+            let bytes = self.lease.allocation.host_transfer.borrow();
+            destination.copy_from_slice(&bytes[..self.bytes]);
+        }
     }
 }
 
@@ -1288,8 +1388,59 @@ impl DeviceBuffer {
             lease.finish_synchronous(Err(error))?;
             unreachable!("a failed copy cannot become successful completion");
         }
-        Ok(OwnedHostReadback { lease, bytes })
+        Ok(OwnedHostReadback {
+            lease,
+            bytes,
+            workspace: None,
+        })
     }
+    /// Read into independently leased session RAM, retained with the device on uncertain failure.
+    pub(crate) fn readback_with_workspace(
+        &self,
+        offset: usize,
+        bytes: usize,
+        workspace: &Arc<HostPublicationWorkspace>,
+    ) -> Result<OwnedHostReadback, HipError> {
+        self.check_range(offset, bytes)?;
+        let lease = self.acquire_access()?;
+        let mut host = workspace.lease(bytes);
+        let result = if bytes == 0 {
+            Ok(())
+        } else {
+            // SAFETY: the ticket owns stable initialized host RAM and the device access lease.
+            unsafe {
+                crate::ffi::invoke_hipMemcpy(
+                    &self.allocation.runtime,
+                    host.bytes.as_mut_ptr().cast(),
+                    self.allocation
+                        .pointer
+                        .cast::<u8>()
+                        .wrapping_add(offset)
+                        .cast(),
+                    bytes,
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                )
+            }
+        };
+        if let Err(error) = result {
+            // A failed copy may have queued work. Never recycle either endpoint before quiescence.
+            // SAFETY: null denotes hipMemcpy's legacy default stream in this retained runtime.
+            let completed = unsafe {
+                crate::ffi::invoke_hipStreamSynchronize(&self.allocation.runtime, ptr::null_mut())
+            }
+            .is_ok();
+            if !completed {
+                host.retain_after_unknown_completion(lease);
+            }
+            return Err(error);
+        }
+        Ok(OwnedHostReadback {
+            lease,
+            bytes,
+            workspace: Some(host),
+        })
+    }
+
     /// Copy bytes from another device allocation.
     /// Copy bytes from a different allocation belonging to the same HIP runtime and device.
     /// Success means the copy is complete, including for a subsequent independent stream.
@@ -1336,11 +1487,7 @@ impl DeviceBuffer {
     }
 
     fn acquire_access(&self) -> Result<DeviceAccessLease, HipError> {
-        let guard = self
-            .allocation
-            .access
-            .acquire()
-            .map_err(|()| HipError::Busy)?;
+        let guard = AllocationAccess::acquire(&self.allocation).map_err(|()| HipError::Busy)?;
         Ok(DeviceAccessLease {
             allocation: Rc::clone(&self.allocation),
             guard,
@@ -1371,10 +1518,7 @@ impl DeviceBuffer {
         stream: &HipStreamHandle,
     ) -> Result<DeviceAccessLease, HipError> {
         let identity = Rc::as_ptr(&stream.inner) as usize;
-        let guard = self
-            .allocation
-            .access
-            .acquire_stream(identity)
+        let guard = AllocationAccess::acquire_stream(&self.allocation, identity)
             .map_err(|()| HipError::Busy)?;
         Ok(DeviceAccessLease {
             allocation: Rc::clone(&self.allocation),
@@ -1391,6 +1535,106 @@ impl DeviceAccessLease {
 
     fn quarantine(&self) {
         self.guard.quarantine_stream();
+    }
+}
+
+pub(crate) struct RetainedHostUploads {
+    stream: HipStreamHandle,
+    leases: LaunchAccessLeases,
+    queued: bool,
+}
+
+impl RetainedHostUploads {
+    pub(crate) const INLINE_CAPACITY: usize = INLINE_KERNEL_PARAMETERS;
+
+    pub(crate) fn new(stream: HipStreamHandle) -> Self {
+        Self {
+            stream,
+            leases: LaunchAccessLeases::new(),
+            queued: false,
+        }
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        destination: &DeviceBuffer,
+        source: &[u8],
+    ) -> Result<(), HipError> {
+        self.stream
+            .inner
+            .runtime
+            .ensure_same_runtime(&destination.allocation.runtime)?;
+        destination.check_range(0, source.len())?;
+        if source.is_empty() {
+            return Ok(());
+        }
+        // A same-stream kernel may use these bytes, but a second upload must not overwrite the
+        // retained host endpoint while an earlier transfer can still be reading it.
+        destination.validate_access_available()?;
+        let lease = destination.acquire_stream_access(&self.stream)?;
+        let mut scratch = destination
+            .allocation
+            .host_transfer
+            .try_borrow_mut()
+            .map_err(|_| HipError::Busy)?;
+        if scratch.len() < source.len() {
+            scratch.resize(source.len(), 0);
+        }
+        scratch[..source.len()].copy_from_slice(source);
+        self.leases.push(lease);
+        self.queued = true;
+        // SAFETY: the group retains the allocation, its fixed host staging, stream and runtime.
+        // The allocation gate prevents resizing/overwriting staging until terminal release.
+        unsafe {
+            crate::ffi::invoke_hipMemcpyAsync(
+                &destination.allocation.runtime,
+                destination.allocation.pointer,
+                scratch.as_ptr().cast(),
+                source.len(),
+                HIP_MEMCPY_HOST_TO_DEVICE,
+                self.stream.inner.raw,
+            )
+        }
+    }
+
+    /// Only call after successful completion of a launch queued after every upload on this stream.
+    pub(crate) fn release_after_terminal_launch(&mut self) {
+        self.leases = LaunchAccessLeases::new();
+        self.queued = false;
+    }
+
+    pub(crate) fn synchronize(&mut self) -> Result<(), HipError> {
+        if !self.queued {
+            return Ok(());
+        }
+        match self.stream.synchronize() {
+            Ok(()) => {
+                self.release_after_terminal_launch();
+                Ok(())
+            }
+            Err(error) => {
+                self.quarantine_and_forget();
+                Err(error)
+            }
+        }
+    }
+
+    fn quarantine_and_forget(&mut self) {
+        self.leases.quarantine();
+        // Keep both native endpoints and their queue/context roots when quiescence is
+        // uncertain. An escaped clone can never overwrite the quarantined staging.
+        std::mem::forget(std::mem::replace(
+            &mut self.leases,
+            LaunchAccessLeases::new(),
+        ));
+        std::mem::forget(self.stream.clone());
+        self.queued = false;
+    }
+}
+
+impl Drop for RetainedHostUploads {
+    fn drop(&mut self) {
+        let _ = self.synchronize();
     }
 }
 
@@ -3130,6 +3374,81 @@ mod memory_snapshot_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires HIP GPU; retained queued upload staging and terminal/drop ownership"]
+    fn rocm_gpu_retained_uploads_keep_private_staging_until_terminal_release() {
+        let runtime = HipRuntime::new(0).unwrap();
+        let image = crate::compile_hip_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void copy_word(const unsigned int* input, unsigned int* output) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) output[0] = input[0];
+}
+"#,
+        )
+        .unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"copy_word").unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let input = runtime.allocate(8).unwrap();
+        let output = runtime.allocate(4).unwrap();
+        let mut uploads = RetainedHostUploads::new(stream.clone());
+        let mut original = 42_u32.to_le_bytes();
+        uploads.enqueue(&input, &original).unwrap();
+        original.fill(0);
+        assert_eq!(uploads.enqueue(&input, &[7_u8; 8]), Err(HipError::Busy));
+        assert_eq!(input.validate_access_available(), Err(HipError::Busy));
+        // SAFETY: the independently compiled kernel has two exact u32 pointers. Same-stream
+        // ordering makes its read follow the retained upload; the launch owns both allocations.
+        let mut completion = unsafe {
+            kernel.launch(
+                &stream,
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                &[
+                    HipKernelArgument::Buffer(&input),
+                    HipKernelArgument::Buffer(&output),
+                ],
+            )
+        }
+        .unwrap();
+        completion.wait().unwrap();
+        uploads.release_after_terminal_launch();
+        assert!(input.validate_access_available().is_ok());
+        let mut actual = [0_u8; 4];
+        output.copy_to(&mut actual).unwrap();
+        assert_eq!(u32::from_le_bytes(actual), 42);
+        // Without a following launch, dropping the group proves upload completion itself.
+        uploads.enqueue(&input, &43_u32.to_le_bytes()).unwrap();
+        drop(uploads);
+        input.copy_to(&mut actual).unwrap();
+        assert_eq!(u32::from_le_bytes(actual), 43);
+    }
+
+    #[test]
+    #[ignore = "requires HIP GPU; controlled known-terminal queued-upload quarantine witness"]
+    fn rocm_gpu_retained_upload_quarantine_keeps_staging_device_and_context_roots() {
+        let runtime = HipRuntime::new(0).unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let input = runtime.allocate(4).unwrap();
+        let allocation_owner = Rc::downgrade(&input.allocation);
+        let stream_owner = Rc::downgrade(&stream.inner);
+        let runtime_owner = Arc::downgrade(&runtime.0);
+        let mut uploads = RetainedHostUploads::new(stream.clone());
+        uploads.enqueue(&input, &42_u32.to_le_bytes()).unwrap();
+        stream.synchronize().unwrap(); // This tests retention policy, without inducing driver loss.
+        uploads.quarantine_and_forget();
+        assert_eq!(input.validate_access_available(), Err(HipError::Busy));
+        drop(uploads);
+        drop(input);
+        drop(stream);
+        drop(runtime);
+        assert!(allocation_owner.upgrade().is_some());
+        assert!(stream_owner.upgrade().is_some());
+        assert!(runtime_owner.upgrade().is_some());
+    }
+
+    #[test]
     fn batch_wait_error_stays_sticky_until_a_full_wait_succeeds() {
         let mut observed = false;
         assert_eq!(track_wait_error(&mut observed, Ok::<_, ()>(())), Ok(()));
@@ -3345,16 +3664,110 @@ mod memory_snapshot_tests {
     }
 
     #[test]
+    fn publication_workspace_recycles_only_dropped_terminal_tickets() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let mut first = workspace.lease(65);
+        first.bytes.fill(7);
+        let pointer = first.bytes.as_ptr();
+        let second = workspace.lease(17);
+        assert_ne!(pointer, second.bytes.as_ptr());
+        assert_eq!(first.bytes, [7; 65]);
+        drop(second);
+        drop(first);
+        let reused = workspace.lease(65);
+        assert_eq!(pointer, reused.bytes.as_ptr());
+    }
+
+    #[test]
+    fn publication_cache_release_preserves_live_tickets_and_allows_refill() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let mut live = workspace.lease(65);
+        live.bytes.fill(7);
+        let pointer = live.bytes.as_ptr();
+        let idle = workspace.lease(129);
+        let capacity = idle.bytes.capacity();
+        drop(idle);
+        assert_eq!(workspace.release_idle(), Some(capacity));
+        assert_eq!(workspace.release_idle(), Some(0));
+        assert_eq!(live.bytes.as_ptr(), pointer);
+        assert_eq!(live.bytes, [7; 65]);
+        drop(live);
+        assert!(workspace.release_idle().unwrap() >= 65);
+    }
+
+    #[test]
+    fn publication_cache_release_never_waits_for_cache_lock() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        drop(workspace.lease(65));
+        let held = workspace.0.lock().unwrap();
+        assert_eq!(workspace.release_idle(), None);
+        assert!(held.capacity() >= 65);
+        drop(held);
+        assert!(workspace.release_idle().unwrap() >= 65);
+    }
+
+    #[test]
+    fn publication_cache_release_recovers_idle_poisoned_storage() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        drop(workspace.lease(65));
+        let poisoned = Arc::clone(&workspace);
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poisoned.0.lock().unwrap();
+                panic!("controlled cache poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(workspace.release_idle().unwrap() >= 65);
+        assert_eq!(workspace.release_idle(), Some(0));
+        let fallback = workspace.lease(17);
+        assert_eq!(fallback.bytes.len(), 17);
+    }
+
+    #[test]
+    fn publication_workspace_busy_cache_uses_independent_storage() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let borrowed = workspace.0.lock().unwrap();
+        let ticket = workspace.lease(17);
+        assert_eq!(ticket.bytes.len(), 17);
+        drop(ticket); // Reentrant cache borrow never makes terminal ticket destruction panic.
+        drop(borrowed);
+        assert!(workspace.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires HIP device; controlled unknown completion retention after known quiescence"]
+    fn publication_unknown_completion_retains_workspace_allocation_and_runtime() {
+        let runtime = HipRuntime::new(0).unwrap();
+        let buffer = runtime.allocate(65).unwrap();
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let weak_allocation = Rc::downgrade(&buffer.allocation);
+        let weak_workspace = Arc::downgrade(&workspace);
+        let host = workspace.lease(65);
+        let lease = buffer.acquire_access().unwrap();
+        // No DMA is pending: exercise exactly the production retention branch without device loss.
+        host.retain_after_unknown_completion(lease);
+        assert!(buffer.validate_access_available().is_err());
+        assert!(workspace.0.lock().unwrap().is_empty());
+        drop(workspace);
+        drop(buffer);
+        drop(runtime);
+        assert!(weak_workspace.upgrade().is_some());
+        assert!(weak_allocation.upgrade().is_some());
+    }
+
+    #[test]
     fn cloned_allocation_gate_rejects_busy_access_and_releases_with_lease() {
         let state = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
         let clone = Rc::clone(&state);
-        let lease = state.acquire().unwrap();
+        let lease = AllocationAccess::acquire(&state).unwrap();
 
-        assert!(clone.acquire().is_err());
+        assert!(AllocationAccess::acquire(&clone).is_err());
         drop(lease);
-        assert!(clone.acquire().is_ok());
+        assert!(AllocationAccess::acquire(&clone).is_ok());
     }
 
     #[test]
@@ -3363,10 +3776,10 @@ mod memory_snapshot_tests {
             state: Cell::new(AllocationAccessState::Idle),
         });
         let clone = Rc::clone(&state);
-        let lease = state.acquire().unwrap();
+        let lease = AllocationAccess::acquire(&state).unwrap();
 
         std::mem::forget(lease);
-        assert!(clone.acquire().is_err());
+        assert!(AllocationAccess::acquire(&clone).is_err());
     }
 
     #[test]
@@ -3374,16 +3787,16 @@ mod memory_snapshot_tests {
         let state = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
-        let first = state.acquire_stream(11).unwrap();
-        let second = state.acquire_stream(11).unwrap();
+        let first = AllocationAccess::acquire_stream(&state, 11).unwrap();
+        let second = AllocationAccess::acquire_stream(&state, 11).unwrap();
 
-        assert!(state.acquire().is_err());
-        assert!(state.acquire_stream(12).is_err());
+        assert!(AllocationAccess::acquire(&state).is_err());
+        assert!(AllocationAccess::acquire_stream(&state, 12).is_err());
         drop(first);
-        assert!(state.acquire().is_err());
-        assert!(state.acquire_stream(11).is_ok());
+        assert!(AllocationAccess::acquire(&state).is_err());
+        assert!(AllocationAccess::acquire_stream(&state, 11).is_ok());
         drop(second);
-        assert!(state.acquire().is_ok());
+        assert!(AllocationAccess::acquire(&state).is_ok());
     }
 
     #[test]
@@ -3391,7 +3804,7 @@ mod memory_snapshot_tests {
         let state = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
-        let mut producer_lease = state.acquire_stream(11).unwrap();
+        let mut producer_lease = AllocationAccess::acquire_stream(&state, 11).unwrap();
         let eligibility = [&producer_lease];
         assert!(allocation_access_guards_can_reassign(&eligibility, 11, 12));
         let mut guards = [&mut producer_lease];
@@ -3404,8 +3817,8 @@ mod memory_snapshot_tests {
                 leases: 1,
             }
         );
-        assert!(state.acquire_stream(11).is_err());
-        let consumer_lease = state.acquire_stream(12).unwrap();
+        assert!(AllocationAccess::acquire_stream(&state, 11).is_err());
+        let consumer_lease = AllocationAccess::acquire_stream(&state, 12).unwrap();
         drop(producer_lease);
         assert_eq!(
             state.state.get(),
@@ -3426,9 +3839,9 @@ mod memory_snapshot_tests {
         let shared = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
-        let mut sole_lease = sole.acquire_stream(11).unwrap();
-        let mut shared_lease = shared.acquire_stream(11).unwrap();
-        let other_shared_lease = shared.acquire_stream(11).unwrap();
+        let mut sole_lease = AllocationAccess::acquire_stream(&sole, 11).unwrap();
+        let mut shared_lease = AllocationAccess::acquire_stream(&shared, 11).unwrap();
+        let other_shared_lease = AllocationAccess::acquire_stream(&shared, 11).unwrap();
         let sole_guard = [&sole_lease];
         let shared_guard = [&shared_lease];
         let whole_batch_guards = [&sole_lease, &shared_lease];
@@ -3473,8 +3886,8 @@ mod memory_snapshot_tests {
         let shared = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
-        let mut first_lease = shared.acquire_stream(11).unwrap();
-        let mut second_lease = shared.acquire_stream(11).unwrap();
+        let mut first_lease = AllocationAccess::acquire_stream(&shared, 11).unwrap();
+        let mut second_lease = AllocationAccess::acquire_stream(&shared, 11).unwrap();
         let batch_guards = [&first_lease, &second_lease];
         assert!(allocation_access_guards_can_reassign(&batch_guards, 11, 12));
         let mut guards = [&mut first_lease, &mut second_lease];
@@ -3487,8 +3900,8 @@ mod memory_snapshot_tests {
                 leases: 2,
             }
         );
-        assert!(shared.acquire_stream(11).is_err());
-        let third_lease = shared.acquire_stream(12).unwrap();
+        assert!(AllocationAccess::acquire_stream(&shared, 11).is_err());
+        let third_lease = AllocationAccess::acquire_stream(&shared, 12).unwrap();
         drop(first_lease);
         drop(second_lease);
         assert_eq!(
@@ -3507,7 +3920,7 @@ mod memory_snapshot_tests {
         let state = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
-        let mut producer_lease = state.acquire_stream(11).unwrap();
+        let mut producer_lease = AllocationAccess::acquire_stream(&state, 11).unwrap();
         let mut guards = [&mut producer_lease];
 
         reassign_allocation_access_guards(&mut guards, 11, 12).unwrap();
@@ -3515,8 +3928,8 @@ mod memory_snapshot_tests {
         drop(producer_lease);
 
         assert_eq!(state.state.get(), AllocationAccessState::Poisoned);
-        assert!(state.acquire_stream(11).is_err());
-        assert!(state.acquire_stream(12).is_err());
+        assert!(AllocationAccess::acquire_stream(&state, 11).is_err());
+        assert!(AllocationAccess::acquire_stream(&state, 12).is_err());
     }
 
     #[test]
@@ -3525,14 +3938,14 @@ mod memory_snapshot_tests {
             state: Cell::new(AllocationAccessState::Idle),
         });
         let mut retained_by_batch = vec![
-            state.acquire_stream(11).unwrap(),
-            state.acquire_stream(11).unwrap(),
+            AllocationAccess::acquire_stream(&state, 11).unwrap(),
+            AllocationAccess::acquire_stream(&state, 11).unwrap(),
         ];
 
         drop(retained_by_batch.pop());
-        assert!(state.acquire().is_err());
+        assert!(AllocationAccess::acquire(&state).is_err());
         drop(retained_by_batch);
-        assert!(state.acquire().is_ok());
+        assert!(AllocationAccess::acquire(&state).is_ok());
     }
 
     #[test]
@@ -3540,11 +3953,11 @@ mod memory_snapshot_tests {
         let state = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
-        let exclusive = state.acquire().unwrap();
+        let exclusive = AllocationAccess::acquire(&state).unwrap();
 
-        assert!(state.acquire_stream(11).is_err());
+        assert!(AllocationAccess::acquire_stream(&state, 11).is_err());
         drop(exclusive);
-        assert!(state.acquire_stream(11).is_ok());
+        assert!(AllocationAccess::acquire_stream(&state, 11).is_ok());
     }
 
     #[test]
@@ -3552,11 +3965,11 @@ mod memory_snapshot_tests {
         let state = Rc::new(AllocationAccess {
             state: Cell::new(AllocationAccessState::Idle),
         });
-        let lease = state.acquire_stream(11).unwrap();
+        let lease = AllocationAccess::acquire_stream(&state, 11).unwrap();
 
         lease.quarantine_stream();
-        assert!(state.acquire_stream(11).is_err());
-        assert!(state.acquire().is_err());
+        assert!(AllocationAccess::acquire_stream(&state, 11).is_err());
+        assert!(AllocationAccess::acquire(&state).is_err());
         std::mem::forget(lease);
     }
 
@@ -4271,3 +4684,10 @@ extern "C" __global__ void consume(unsigned int* value) {
 #[cfg(test)]
 #[path = "public_copy_readiness/public_copy_readiness.rs"]
 mod public_copy_readiness;
+
+#[cfg(feature = "tensor")]
+#[path = "guarded_batch/guarded_batch.rs"]
+mod guarded_batch;
+
+#[cfg(all(feature = "tensor", feature = "insights"))]
+pub use tensor::RocmGuardedExecutionReport;

@@ -5,12 +5,13 @@ use core::marker::PhantomData;
 mod compile;
 #[path = "execution/execution.rs"]
 mod execution;
+#[path = "program/program.rs"]
+mod program;
 #[rustfmt::skip]
 use fusion_pcu::{
     CheckedFloatMapValidationError,
     CheckedIntegerMapValidationError,
     CheckedScalarMapResourceError,
-    PcuBindingAccess,
     PcuBindingRef,
     PcuCheckedFloat,
     PcuDispatchFloatBinaryOp,
@@ -146,21 +147,20 @@ type Executable = fn(
 /// separately admitted Unspecified profile. No portable float support is inferred.
 ///
 /// Cloning duplicates the cold program/scratch allocation. Calls never clone, allocate,
-/// lower IR or discover an ISA. All loads/stores execute in logical lane and program order.
+/// lower IR or discover an ISA. Constants and readonly broadcasts are initialized anew
+/// each call. Observable results and faults retain logical lane/program order. Cold-proven
+/// independent integer work may execute in bounded operation-major lane blocks against
+/// private outputs. Any exceptional result, including Clamp, replays its block in scalar
+/// lane/program order to determine the exact fault and complete recovered outputs.
+/// Programs with mutable loads and small extents use the scalar executor.
 /// Every public output is committed only after the entire call is fatal-free; complete
 /// recovered Clamp output is committed together with the earliest recovered error.
 #[derive(Debug, Clone)]
 pub struct PcuCpuPreparedComposedMap {
     requirements: PcuImplementationRequirements,
-    scalar: PcuScalarType,
-    size: usize,
     local_id: u32,
-    extent: usize,
-    schema: Vec<(PcuBindingRef, usize, PcuBindingAccess)>,
-    resources: Vec<Resource>,
-    steps: Vec<Step>,
+    program: program::ValidatedProgram,
     scratch: Vec<u8>,
-    execute: Executable,
 }
 impl PcuCpuPreparedComposedMap {
     #[must_use]
@@ -173,7 +173,7 @@ impl PcuCpuPreparedComposedMap {
     }
     #[must_use]
     pub const fn scalar_type(&self) -> PcuScalarType {
-        self.scalar
+        self.program.scalar()
     }
     #[must_use]
     pub const fn local_id(&self) -> u32 {
@@ -181,7 +181,7 @@ impl PcuCpuPreparedComposedMap {
     }
     #[must_use]
     pub const fn argument_count(&self) -> usize {
-        self.schema.len()
+        self.program.schema().len()
     }
     /// Retained private byte workspace, excluding cold metadata allocation.
     #[must_use]
@@ -242,9 +242,25 @@ impl<T: PcuCheckedFloat> PcuHostKernelBackend for PcuCpuCheckedComposedMap<T> {
 impl PcuPreparedHostKernel for PcuCpuPreparedComposedMap {
     type Error = PcuCpuComposedMapError;
     fn call(&mut self, arguments: &mut [PcuHostArgument<'_>]) -> Result<(), Self::Error> {
-        crate::host::validate_arguments(arguments, &self.schema, self.scalar, self.size)
-            .map_err(PcuCpuComposedMapError::InvalidArguments)?;
-        (self.execute)(self, arguments)
+        (self.program.executor())(self, arguments)
+    }
+}
+
+impl PcuCpuPreparedComposedMap {
+    fn validate_arguments(
+        &self,
+        arguments: &[PcuHostArgument<'_>],
+    ) -> Result<[usize; BINDINGS], PcuCpuComposedMapError> {
+        let mut indices = [0; BINDINGS];
+        crate::host::validate_arguments_with_indices(
+            arguments,
+            self.program.schema(),
+            self.program.scalar(),
+            self.program.size(),
+            |declaration, position| indices[declaration] = position,
+        )
+        .map_err(PcuCpuComposedMapError::InvalidArguments)?;
+        Ok(indices)
     }
 }
 

@@ -155,15 +155,10 @@ const fn round_increment(significand: u64, discarded: u64) -> bool {
     discarded > 4 || (discarded == 4 && significand & 1 != 0)
 }
 
-fn round_to_precision(mut ext: u64, mut exponent: i32) -> (u64, i32, bool) {
-    while ext >= NORMALIZED_LIMIT {
-        ext = shift_right_jam(ext, 1);
-        exponent += 1;
-    }
-    while ext < 1_u64 << NORMALIZED_EXTENT {
-        ext <<= 1;
-        exponent -= 1;
-    }
+// Called only by pack, which already established the normalized significand range.
+// Unbounded-exponent rounding for IEEE 754-2019 clause 7.5(a) needs no second normalization.
+fn round_to_precision(ext: u64, mut exponent: i32) -> (u64, i32, bool) {
+    debug_assert!((1_u64 << NORMALIZED_EXTENT..NORMALIZED_LIMIT).contains(&ext));
     let discarded = ext & 7;
     let mut significand = ext >> 3;
     let inexact = discarded != 0;

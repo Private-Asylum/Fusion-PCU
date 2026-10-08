@@ -45,3 +45,33 @@ pub fn activity_guard() {
         "whole-cohort entry idle <=10%; independent physical-host ownership certificate required"
     );
 }
+
+/// Diagnostic cohorts wait for three consecutive nominal samples before the final guard.
+/// The bounded wait does not relax admission; timeout refuses the timing group.
+#[allow(dead_code)] // Shared activity module; only normal physical-work diagnostics use this wait.
+pub fn wait_for_idle() {
+    let mut consecutive = 0;
+    for _ in 0..60 {
+        foreign_owners();
+        let utilization: Vec<u32> = fs::read_dir("/sys/class/drm")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                fs::read_to_string(entry.path().join("device/gpu_busy_percent")).ok()
+            })
+            .map(|value| value.trim().parse().unwrap())
+            .collect();
+        assert!(!utilization.is_empty());
+        if utilization.iter().all(|&value| value <= 10) {
+            consecutive += 1;
+            if consecutive == 3 {
+                activity_guard();
+                return;
+            }
+        } else {
+            consecutive = 0;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    panic!("AMD diagnostic cohort did not reach three consecutive idle samples");
+}

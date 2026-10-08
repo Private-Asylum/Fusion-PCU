@@ -319,8 +319,8 @@ mod selected_numerical_offers;
 #[cfg(feature = "tensor")]
 pub use selected_numerical_offers::MlxSelectedNumericalTensorRequest;
 
-#[cfg(feature="tensor")]
-#[path="selected_graph_offers/selected_graph_offers.rs"]
+#[cfg(feature = "tensor")]
+#[path = "selected_graph_offers/selected_graph_offers.rs"]
 mod selected_graph_offers;
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use selected_graph_offers::MlxSelectedTensorGraphRequest;

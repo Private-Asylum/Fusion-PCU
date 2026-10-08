@@ -26,6 +26,8 @@ type Resource = CudaMemoryResource;
 pub(super) struct State {
     plan: Plan,
     banks: RefCell<Vec<Bank>>,
+    #[cfg(feature = "insights")]
+    guarded_report_epoch: std::cell::Cell<u64>,
 }
 
 struct Plan {
@@ -101,7 +103,41 @@ impl State {
                 alignment: usize::try_from(alignment).map_err(|_| Error::SizeOverflow)?,
             },
             banks: RefCell::new(Vec::new()),
+            #[cfg(feature = "insights")]
+            guarded_report_epoch: std::cell::Cell::new(0),
         })
+    }
+
+    #[cfg(feature = "insights")]
+    pub(super) fn begin_guarded_attempt(&self) {
+        self.guarded_report_epoch
+            .set(self.guarded_report_epoch.get().wrapping_add(1));
+    }
+    #[cfg(feature = "insights")]
+    pub(super) const fn guarded_epoch(&self) -> u64 {
+        self.guarded_report_epoch.get()
+    }
+
+    #[cfg(feature = "insights")]
+    pub(super) fn guarded_report(
+        &self,
+        stream: &crate::CudaStreamHandle,
+        pool: PcuMemoryPoolId,
+    ) -> Option<super::guarded::CudaGuardedExecutionReport> {
+        let banks = self.banks.try_borrow().ok()?;
+        let bank = banks
+            .iter()
+            .find(|bank| bank.pool == pool && bank.runtime.same_instance(&stream.inner.runtime))?;
+        if bank.poisoned {
+            return None;
+        }
+        let storage = bank.guarded.as_ref()?;
+        if !storage.uses_stream(stream) {
+            return None;
+        }
+        (storage.report_epoch == self.guarded_epoch())
+            .then_some(storage.report)
+            .flatten()
     }
 
     /// Validate an existing bank without allocation or device work before pending uploads.
@@ -272,6 +308,7 @@ impl Plan {
             resources,
             mse_squared,
             statuses,
+            guarded: None,
             physical: slots,
             poisoned: false,
         })
@@ -326,6 +363,7 @@ fn validate_resource(
 }
 
 pub(super) struct Bank {
+    pub(super) guarded: Option<Box<super::guarded::Storage>>,
     runtime: CudaRuntime,
     pool: PcuMemoryPoolId,
     pub(super) resources: Vec<Option<Resource>>,

@@ -12,10 +12,10 @@
 //! safety before opting in. This descriptor does not enable a provider, CPU fallback or
 //! an arithmetic implementation. Wrapping, `DivRem`, reductions, tensors and RNG are separate.
 
-#[path = "div_rem/div_rem.rs"]
-mod div_rem;
 #[path = "composed/composed.rs"]
 mod composed;
+#[path = "div_rem/div_rem.rs"]
+mod div_rem;
 #[rustfmt::skip]
 pub use composed::{
     describe_portable_v1_checked_integer_composed_map,

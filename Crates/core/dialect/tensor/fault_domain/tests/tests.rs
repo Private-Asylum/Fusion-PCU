@@ -256,12 +256,14 @@ fn empty_arithmetic_domains_have_no_reportable_fault_positions() {
     let b = graph.constant_typed(Tensor::<f32>::new([0, 3], [].to_vec()).unwrap());
     let output = graph.matmul_typed(a, b).unwrap();
     let execution = graph.evaluate_checked(&[]).unwrap();
-    assert!(execution
-        .value_typed::<f32>(output.erase())
-        .unwrap()
-        .data()
-        .iter()
-        .all(|value| value.to_bits() == 0));
+    assert!(
+        execution
+            .value_typed::<f32>(output.erase())
+            .unwrap()
+            .data()
+            .iter()
+            .all(|value| value.to_bits() == 0)
+    );
 }
 
 #[test]

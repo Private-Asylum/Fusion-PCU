@@ -672,6 +672,8 @@ fn prepare_outputs<T: PcuScalar, const N: usize>(
     Err(PcuExecutionError::TensorExecutionUnavailable)
 }
 
+// CPU multi-output execution mutates prepared scratch; retain one signature in mixed builds.
+#[cfg_attr(not(feature = "cpu"), allow(clippy::needless_pass_by_ref_mut))]
 fn execute_outputs<T: PcuScalar, const N: usize, const M: usize>(
     entry: &mut Entry,
     inputs: &[PcuTensorInput<'_, T>; N],

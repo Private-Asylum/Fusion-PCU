@@ -381,7 +381,7 @@ impl Preparation {
 struct Entry {
     specialization: TypeId,
     layout: CallLayout,
-    _session: Session,
+    session: Session,
     affinity: Option<ResidentAffinity>,
     prepared: Prepared,
 }
@@ -546,7 +546,7 @@ fn with_entry<R>(
                     state.entries.iter().position(matches)
                 };
                 if let Some(slot) = slot {
-                    site.provider_slot.store(slot, Ordering::Relaxed);
+                    PcuHostCallSite::remember_hint(&site.provider_slot, hint, slot);
                     return execute(&mut state.entries[slot].prepared);
                 }
             }
@@ -606,7 +606,7 @@ fn with_entry<R>(
                 state.entries[victim] = Entry {
                     specialization,
                     layout,
-                    _session: session,
+                    session,
                     affinity: affinity.map(affinity::retain),
                     prepared,
                 };
@@ -615,13 +615,13 @@ fn with_entry<R>(
                 state.entries.push(Entry {
                     specialization,
                     layout,
-                    _session: session,
+                    session,
                     affinity: affinity.map(affinity::retain),
                     prepared,
                 });
                 state.entries.len() - 1
             };
-            site.provider_slot.store(slot, Ordering::Relaxed);
+            PcuHostCallSite::remember_hint(&site.provider_slot, hint, slot);
             execute(&mut state.entries[slot].prepared)
         })
         .map_err(|_| PcuExecutionError::ThreadUnavailable)?
@@ -633,6 +633,32 @@ pub(super) fn clear_thread_cache() -> Result<(), PcuExecutionError> {
             let mut state = state
                 .try_borrow_mut()
                 .map_err(|_| PcuExecutionError::ReentrantCall)?;
+            for entry in &state.entries {
+                match &entry.session {
+                    #[cfg(feature = "cuda")]
+                    Session::Cuda(backend) => {
+                        backend
+                            .release_idle_host_cache()
+                            .map_err(PcuExecutionError::Memory)?;
+                    }
+                    #[cfg(feature = "rocm")]
+                    Session::Rocm(backend) => {
+                        backend
+                            .release_idle_host_cache()
+                            .map_err(PcuExecutionError::Memory)?;
+                    }
+                    #[cfg(any(feature = "rocm", feature = "cuda", feature = "metal"))]
+                    Session::Resident(session) => session.release_gpu_publication_cache()?,
+                    #[cfg(feature = "metal")]
+                    Session::Metal(_) => {}
+                    #[cfg(feature = "mlx")]
+                    Session::Mlx(_) => {}
+                    #[cfg(feature = "vulkan")]
+                    Session::Vulkan(_) => {}
+                    #[cfg(feature = "cpu")]
+                    Session::Cpu(_) => {}
+                }
+            }
             state.entries.clear();
             state.realm = None;
             Ok(())

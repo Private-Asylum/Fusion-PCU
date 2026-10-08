@@ -29,9 +29,8 @@ __device__ __forceinline__ unsigned long long fusion_f64_pair_shift_jam(unsigned
 __device__ __forceinline__ bool fusion_f64_round_increment(unsigned long long significand, unsigned int discarded) {
     return discarded > 4u || (discarded == 4u && (significand & 1ull) != 0ull);
 }
+// Private to fusion_f64_pack, which has already normalized ext and exponent.
 __device__ __forceinline__ void fusion_f64_round_precision(unsigned long long* ext, int* exponent) {
-    while (*ext >= 0x0100000000000000ull) { *ext = fusion_f64_shift_jam(*ext, 1u); ++*exponent; }
-    while (*ext < 0x0080000000000000ull) { *ext <<= 1; --*exponent; }
     unsigned int discarded = static_cast<unsigned int>(*ext & 7ull);
     unsigned long long significand = *ext >> 3;
     if (fusion_f64_round_increment(significand, discarded)) ++significand;

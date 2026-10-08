@@ -1103,14 +1103,61 @@ pub unsafe fn invoke_cudaGraphExecDestroy(
     )
 }
 
+thread_local! {
+    // Valid only during private backend execution with no caller callbacks. Every new scope
+    // selects explicitly, so foreign CUDA clients can change the current context between calls.
+    static SELECTED_RUNTIME_SCOPE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub struct RuntimeScope {
+    _runtime: CudaRuntime,
+    _selection: SelectedRuntimeScope,
+}
+
+struct SelectedRuntimeScope {
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl SelectedRuntimeScope {
+    fn enter(identity: usize) -> Self {
+        SELECTED_RUNTIME_SCOPE.set(identity);
+        Self {
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for SelectedRuntimeScope {
+    fn drop(&mut self) {
+        // A nested different runtime may have changed the native context. Clearing instead of
+        // restoring an assumed selection makes subsequent outer operations select explicitly.
+        SELECTED_RUNTIME_SCOPE.set(0);
+    }
+}
+
 impl CudaRuntime {
+    /// Enter a private synchronous call boundary. No foreign/user callback may run in the scope.
+    pub(crate) fn enter_private_scope(&self) -> Result<RuntimeScope, CudaError> {
+        self.cuda_set_device(self.0.ordinal)?;
+        Ok(RuntimeScope {
+            _runtime: self.clone(),
+            _selection: SelectedRuntimeScope::enter(std::sync::Arc::as_ptr(&self.0) as usize),
+        })
+    }
+
+    fn private_scope_selected(&self) -> bool {
+        SELECTED_RUNTIME_SCOPE.get() == std::sync::Arc::as_ptr(&self.0) as usize
+    }
+
     fn driver_call<T: Copy>(
         &self,
         symbol: &'static str,
         function: T,
         invoke: impl FnOnce(T) -> CudaResult,
     ) -> Result<(), CudaError> {
-        self.cuda_set_device(self.0.ordinal)?;
+        if !self.private_scope_selected() {
+            self.cuda_set_device(self.0.ordinal)?;
+        }
         let status = invoke(function);
         if status == CUDA_SUCCESS {
             Ok(())
@@ -1146,7 +1193,12 @@ impl CudaRuntime {
         function: T,
         invoke: impl FnOnce(T) -> CudaResult,
     ) -> Result<(), CudaError> {
-        if symbol != "cudaSetDevice" {
+        if symbol == "cudaSetDevice" {
+            // Explicit selection, including a nested operation on another runtime, invalidates
+            // the enclosing scope before touching native state, even when selection fails.
+            SELECTED_RUNTIME_SCOPE.set(0);
+        }
+        if symbol != "cudaSetDevice" && !self.private_scope_selected() {
             // CUDA's current device is thread-local, so select this runtime's device before each
             // operation. This keeps cloned handles valid when used from another host thread.
             let setter = self
@@ -1158,6 +1210,7 @@ impl CudaRuntime {
                 .map_err(Clone::clone)?;
             #[cfg(feature = "allocation-census")]
             census::call("cudaSetDevice", None);
+            SELECTED_RUNTIME_SCOPE.set(0);
             let status = unsafe { setter(self.0.ordinal) };
             if status != CUDA_SUCCESS {
                 return Err(self.error("cudaSetDevice", status));
@@ -1194,7 +1247,9 @@ impl CudaRuntime {
         function: T,
         invoke: impl FnOnce(T) -> CudaResult,
     ) -> Result<CudaReadiness, CudaError> {
-        self.cuda_set_device(self.0.ordinal)?;
+        if !self.private_scope_selected() {
+            self.cuda_set_device(self.0.ordinal)?;
+        }
         let status = invoke(function);
         classify_readiness(status).ok_or_else(|| self.error(operation, status))
     }
@@ -2489,3 +2544,80 @@ pub use blas_handle::{
     BlasHandleFunctions,
     retain as retain_blas_handle_functions,
 };
+
+#[cfg(all(feature = "allocation-census", feature = "tensor"))]
+#[rustfmt::skip]
+pub use census::{
+    guarded_chain,
+    guarded_kernel,
+};
+
+#[cfg(test)]
+mod private_scope_tests {
+    use super::{CudaRuntime, SelectedRuntimeScope, SELECTED_RUNTIME_SCOPE};
+
+    #[test]
+    #[ignore = "requires CUDA GPU; nested runtime and explicit selection scope invalidation"]
+    fn cuda_gpu_private_scopes_invalidate_nested_and_explicit_selections() {
+        let first = CudaRuntime::new(0).unwrap();
+        let second = CudaRuntime::new(0).unwrap();
+        let outer = first.enter_private_scope().unwrap();
+        assert!(first.private_scope_selected());
+        {
+            let _inner = second.enter_private_scope().unwrap();
+            assert!(second.private_scope_selected());
+            assert!(!first.private_scope_selected());
+        }
+        assert!(!first.private_scope_selected());
+        assert!(!second.private_scope_selected());
+        drop(outer);
+        let scope = first.enter_private_scope().unwrap();
+        assert!(first.private_scope_selected());
+        super::invoke_cudaSetDevice(&second, 0).unwrap();
+        assert!(!first.private_scope_selected());
+        drop(scope);
+        // Emulate a foreign Runtime client between PCU calls. Even selecting the same ordinal
+        // cannot leave a cached assumption: every call boundary makes a fresh selection.
+        let setter = second.0.api.cuda_set_device.as_ref().unwrap();
+        // SAFETY: the retained Runtime entrypoint has its declared ABI and ordinal zero was
+        // successfully initialized above. No PCU private scope is active during this call.
+        assert_eq!(unsafe { setter(0) }, super::CUDA_SUCCESS);
+        let _next = first.enter_private_scope().unwrap();
+        assert!(first.private_scope_selected());
+    }
+
+    #[test]
+    fn nested_selection_clears_outer_assumptions_and_new_calls_select_again() {
+        let outer = SelectedRuntimeScope::enter(1);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 1);
+        {
+            let _inner = SelectedRuntimeScope::enter(2);
+            assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 2);
+        }
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+        drop(outer);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+        // A foreign selection between calls is never cached. The next private boundary
+        // installs its identity only after the real CUDA selection has succeeded.
+        let next = SelectedRuntimeScope::enter(1);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 1);
+        drop(next);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+    }
+
+    #[test]
+    fn error_and_unwind_release_private_selection() {
+        let fail = || -> Result<(), ()> {
+            let _scope = SelectedRuntimeScope::enter(3);
+            Err(())
+        };
+        assert_eq!(fail(), Err(()));
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+        let unwind = std::panic::catch_unwind(|| {
+            let _scope = SelectedRuntimeScope::enter(4);
+            panic!("controlled private scope unwind");
+        });
+        assert!(unwind.is_err());
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+    }
+}

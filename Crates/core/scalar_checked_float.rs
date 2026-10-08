@@ -355,15 +355,11 @@ const fn round_increment(significand: u64, discarded: u64) -> bool {
     discarded > 4 || (discarded == 4 && significand & 1 != 0)
 }
 
-fn round_to_precision(mut ext: u64, mut exponent: i32) -> (u64, i32, bool) {
-    while ext >= (1_u64 << 27) {
-        ext = shift_right_jam(ext, 1);
-        exponent += 1;
-    }
-    while ext < (1_u64 << 26) {
-        ext <<= 1;
-        exponent -= 1;
-    }
+// pack has already normalized this nonzero significand, before any subnormal shift.
+// This helper only applies destination precision with an unbounded exponent for IEEE
+// 754-2019 clause 7.5(a); repeating normalization here cannot change its input.
+fn round_to_precision(ext: u64, mut exponent: i32) -> (u64, i32, bool) {
+    debug_assert!((1_u64 << 26..1_u64 << 27).contains(&ext));
     let discarded = ext & 7;
     let mut significand = ext >> 3;
     let inexact = discarded != 0;

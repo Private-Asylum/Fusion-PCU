@@ -675,6 +675,7 @@ pub enum PcuMemoryProviderOperation {
     TransferTo,
     TransferFrom,
     CopyResource,
+    ReleaseIdleHostCache,
 }
 
 /// Reason a provider operation failed. Backends should map native failures to the closest honest
@@ -747,6 +748,32 @@ pub trait PcuMemoryProvider {
         &self,
         pool: PcuMemoryPoolId,
     ) -> Result<PcuMemoryPoolSnapshot, PcuMemoryProviderError>;
+
+    /// Releases completed, idle provider-owned host cache storage, returning its byte capacity.
+    ///
+    /// This maintenance operation never waits for device work or invalidates live resources,
+    /// transfers, mappings or quarantined endpoints. The pool identifies the provider domain;
+    /// providers may share a host cache across several pool labels in that domain. Returned
+    /// capacity excludes live tickets, device storage, allocator overhead and unknown caches.
+    /// It is not a process-RSS measurement or a promise that all hidden workspace was released.
+    /// Concurrent transfers may refill the cache after this point-in-time release. This does not
+    /// install a retention limit or release admission reservations for unrelated resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unsupported` unless the provider implements this operation. A provider that
+    /// cannot obtain its cache without waiting returns `Busy` with `Defer`.
+    fn release_idle_host_cache(
+        &self,
+        pool: PcuMemoryPoolId,
+    ) -> Result<u64, PcuMemoryProviderError> {
+        Err(PcuMemoryProviderError {
+            pool,
+            operation: PcuMemoryProviderOperation::ReleaseIdleHostCache,
+            disposition: PcuMemoryDisposition::Reject,
+            failure: PcuMemoryProviderFailure::Unsupported,
+        })
+    }
 
     /// Allocates a provider-owned resource in the requested pool.
     ///
@@ -1654,6 +1681,22 @@ mod tests {
         assert_eq!(ledger.reserved_bytes(PcuMemoryPoolId(3)), Some(10));
         admitted.release(&mut ledger).unwrap();
         assert_eq!(ledger.reserved_bytes(PcuMemoryPoolId(3)), Some(0));
+    }
+
+    #[test]
+    fn idle_host_cache_release_is_honestly_unsupported_by_default() {
+        let provider = mock_provider(40, 20, false);
+        let pool = PcuMemoryPoolId(3);
+        assert_eq!(
+            provider.release_idle_host_cache(pool),
+            Err(PcuMemoryProviderError {
+                pool,
+                operation: PcuMemoryProviderOperation::ReleaseIdleHostCache,
+                disposition: PcuMemoryDisposition::Reject,
+                failure: PcuMemoryProviderFailure::Unsupported,
+            })
+        );
+        assert_eq!(provider.allocate_calls, 0);
     }
 
     #[test]

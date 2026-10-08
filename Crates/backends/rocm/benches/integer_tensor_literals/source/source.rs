@@ -18,3 +18,13 @@ pub fn identity<T: PcuScalar>(input: &[T]) -> Result<PcuTensor<T>, PcuExecutionE
 pub fn consume<T: PcuScalar>(input: PcuTensor<T>) -> Result<PcuTensor<T>, PcuExecutionError> {
     pcu::identity(input)
 }
+
+#[pcu(crate_path=::pcu_facade)]
+pub fn mixed<T: PcuScalar>(
+    input: &PcuTensor<T>,
+    constant: &[T],
+    uniform: &[T],
+) -> Result<PcuTensor<T>, PcuExecutionError> {
+    let sum = pcu::add(input, constant)?;
+    pcu::mul(&sum, uniform)
+}

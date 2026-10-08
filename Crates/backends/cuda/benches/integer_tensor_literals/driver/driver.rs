@@ -309,6 +309,43 @@ fn case<T: Format + TensorElement, const N: usize>(
             });
             let after = fusion_pcu_cuda::cuda_api_census();
             let sdk = native_counter.get().delta(sdk_before);
+            if route == "closest_source_dense_banks" {
+                let guarded = after.guarded_chain_submissions - before.guarded_chain_submissions;
+                assert!(guarded == 0 || guarded == 64);
+                if std::env::var_os("PCU_GUARDED_CHAIN_WITNESS").is_some() {
+                    assert_eq!(
+                        guarded, 64,
+                        "source witness must exercise guarded execution"
+                    );
+                }
+                assert_eq!(
+                    after.guarded_kernel_launches - before.guarded_kernel_launches,
+                    2 * guarded
+                );
+                assert_eq!(after.kernel_launches - before.kernel_launches, 128);
+                assert_eq!(
+                    after.host_to_device_copies - before.host_to_device_copies,
+                    192 + guarded
+                );
+                assert_eq!(
+                    after.device_to_host_copies - before.device_to_host_copies,
+                    192 - guarded
+                );
+                assert_eq!(after.event_records - before.event_records, 128 - guarded);
+                assert_eq!(after.event_waits - before.event_waits, 128 - guarded);
+                assert_eq!(after.module_loads, before.module_loads);
+                assert_eq!(after.symbol_resolutions, before.symbol_resolutions);
+                assert_eq!(
+                    after.stream_synchronizations,
+                    before.stream_synchronizations
+                );
+                assert_eq!(
+                    after.device_synchronizations,
+                    before.device_synchronizations
+                );
+                assert_eq!(counts.alloc_calls, 64);
+                assert_eq!(counts.realloc_calls, 0);
+            }
             if route == "independent_sdk_dense_banks" {
                 assert_eq!(
                     (
@@ -427,6 +464,26 @@ pub fn run(c: &mut Criterion) {
     }
     let reference = std::env::var_os("PCU_INTEGER_TENSOR_LITERAL_CPU_REFERENCE").is_some();
     let backend = (!reference).then(|| super::selection::selected_device().1);
+    #[cfg(not(feature = "allocation-census"))]
+    if std::env::var_os("PCU_GUARDED_FAULT_WITNESS").is_some() {
+        let backend = backend.as_ref().expect("fault witness requires CUDA");
+        super::fault_latency::run(c, backend.device_identity().device_id());
+        return;
+    }
+    if std::env::var_os("PCU_PHYSICAL_WORK_WITNESS").is_some() {
+        let backend = backend
+            .as_ref()
+            .expect("physical work witness requires CUDA");
+        super::physical_work::run(c, backend.device_identity().device_id(), semantics);
+        return;
+    }
+    if std::env::var_os("PCU_GUARDED_CHAIN_WITNESS").is_some() {
+        let backend = backend.as_ref().expect("guarded witness requires CUDA");
+        let options = PcuNumericalOptions::default();
+        case::<u32, 65>(c, backend, options, PcuNumericalMode::Strict, semantics);
+        case::<u32, 4096>(c, backend, options, PcuNumericalMode::Strict, semantics);
+        return;
+    }
     for mode in [PcuNumericalMode::Boundary, PcuNumericalMode::Strict] {
         for compound_arithmetic in [
             PcuCompoundArithmeticPolicy::Checked,

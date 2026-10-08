@@ -30,8 +30,7 @@ __device__ __forceinline__ bool fusion_f64_round_increment(unsigned long long si
     return discarded > 4u || (discarded == 4u && (significand & 1ull) != 0ull);
 }
 __device__ __forceinline__ void fusion_f64_round_precision(unsigned long long* ext, int* exponent) {
-    while (*ext >= 0x0100000000000000ull) { *ext = fusion_f64_shift_jam(*ext, 1u); ++*exponent; }
-    while (*ext < 0x0080000000000000ull) { *ext <<= 1; --*exponent; }
+    // The sole caller has already normalized ext in fusion_f64_pack.
     unsigned int discarded = static_cast<unsigned int>(*ext & 7ull);
     unsigned long long significand = *ext >> 3;
     if (fusion_f64_round_increment(significand, discarded)) ++significand;

@@ -588,9 +588,9 @@ impl CudaRuntime {
                 pointer,
                 bytes,
                 host_transfer: RefCell::new(Vec::new()),
-                access: Rc::new(AllocationAccess {
+                access: AllocationAccess {
                     state: Cell::new(AllocationAccessState::Idle),
-                }),
+                },
             }),
         })
     }
@@ -635,6 +635,7 @@ impl CudaRuntime {
             inner: Rc::new(StreamInner {
                 runtime: self.clone(),
                 raw: stream,
+                idle_completion_event: Cell::new(None),
             }),
         })
     }
@@ -806,7 +807,7 @@ struct DeviceAllocation {
     runtime: CudaRuntime,
     pointer: *mut c_void,
     bytes: usize,
-    access: Rc<AllocationAccess>,
+    access: AllocationAccess,
     // The exclusive allocation gate protects this retained native host endpoint.
     host_transfer: RefCell<Vec<u8>>,
 }
@@ -830,32 +831,54 @@ enum AllocationAccessKind {
     Stream(usize),
 }
 
-impl AllocationAccess {
-    fn acquire(self: &Rc<Self>) -> Result<AllocationAccessGuard, ()> {
-        if self.state.get() != AllocationAccessState::Idle {
+impl AsRef<AllocationAccess> for DeviceAllocation {
+    fn as_ref(&self) -> &AllocationAccess {
+        &self.access
+    }
+}
+
+impl AsRef<Self> for AllocationAccess {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
+impl<T: AsRef<AllocationAccess>> AllocationAccessOwner for T {}
+
+trait AllocationAccessOwner: AsRef<AllocationAccess> + Sized {
+    fn acquire(self: &Rc<Self>) -> Result<AllocationAccessGuard<Self>, ()> {
+        if self.as_ref().as_ref().state.get() != AllocationAccessState::Idle {
             return Err(());
         }
-        self.state.set(AllocationAccessState::Exclusive);
+        self.as_ref()
+            .as_ref()
+            .state
+            .set(AllocationAccessState::Exclusive);
         Ok(AllocationAccessGuard {
             access: Rc::clone(self),
             kind: AllocationAccessKind::Exclusive,
         })
     }
 
-    fn acquire_stream(self: &Rc<Self>, identity: usize) -> Result<AllocationAccessGuard, ()> {
-        match self.state.get() {
+    fn acquire_stream(self: &Rc<Self>, identity: usize) -> Result<AllocationAccessGuard<Self>, ()> {
+        match self.as_ref().as_ref().state.get() {
             AllocationAccessState::Idle => {
-                self.state.set(AllocationAccessState::Stream {
-                    identity,
-                    leases: 1,
-                });
+                self.as_ref()
+                    .as_ref()
+                    .state
+                    .set(AllocationAccessState::Stream {
+                        identity,
+                        leases: 1,
+                    });
             }
             AllocationAccessState::Stream {
                 identity: active,
                 leases,
             } if active == identity => {
                 let leases = leases.checked_add(1).ok_or(())?;
-                self.state
+                self.as_ref()
+                    .as_ref()
+                    .state
                     .set(AllocationAccessState::Stream { identity, leases });
             }
             AllocationAccessState::Exclusive
@@ -871,8 +894,8 @@ impl AllocationAccess {
     }
 }
 
-fn reassign_allocation_access_guards(
-    guards: &mut [&mut AllocationAccessGuard],
+fn reassign_allocation_access_guards<T: AsRef<AllocationAccess>>(
+    guards: &mut [&mut AllocationAccessGuard<T>],
     from: usize,
     to: usize,
 ) -> Result<(), ()> {
@@ -882,7 +905,7 @@ fn reassign_allocation_access_guards(
     if !allocation_access_guards_can_reassign(&read_guards, from, to) {
         return Err(());
     }
-    let mut groups: Vec<(Rc<AllocationAccess>, usize)> = Vec::new();
+    let mut groups: Vec<(Rc<T>, usize)> = Vec::new();
     for guard in guards.iter() {
         if let Some((_, count)) = groups
             .iter_mut()
@@ -894,10 +917,14 @@ fn reassign_allocation_access_guards(
         }
     }
     for (access, count) in groups {
-        access.state.set(AllocationAccessState::Stream {
-            identity: to,
-            leases: count,
-        });
+        access
+            .as_ref()
+            .as_ref()
+            .state
+            .set(AllocationAccessState::Stream {
+                identity: to,
+                leases: count,
+            });
     }
     for guard in guards.iter_mut() {
         guard.kind = AllocationAccessKind::Stream(to);
@@ -905,8 +932,8 @@ fn reassign_allocation_access_guards(
     Ok(())
 }
 
-fn allocation_access_guards_can_reassign(
-    guards: &[&AllocationAccessGuard],
+fn allocation_access_guards_can_reassign<T: AsRef<AllocationAccess>>(
+    guards: &[&AllocationAccessGuard<T>],
     from: usize,
     to: usize,
 ) -> bool {
@@ -917,7 +944,7 @@ fn allocation_access_guards_can_reassign(
     {
         return false;
     }
-    let mut groups: Vec<(&Rc<AllocationAccess>, usize)> = Vec::new();
+    let mut groups: Vec<(&Rc<T>, usize)> = Vec::new();
     for guard in guards {
         if let Some((_, count)) = groups
             .iter_mut()
@@ -929,7 +956,7 @@ fn allocation_access_guards_can_reassign(
         }
     }
     groups.iter().all(|(access, count)| {
-        access.state.get()
+        access.as_ref().as_ref().state.get()
             == (AllocationAccessState::Stream {
                 identity: from,
                 leases: *count,
@@ -937,14 +964,14 @@ fn allocation_access_guards_can_reassign(
     })
 }
 
-struct AllocationAccessGuard {
-    access: Rc<AllocationAccess>,
+struct AllocationAccessGuard<T: AsRef<AllocationAccess> = DeviceAllocation> {
+    access: Rc<T>,
     kind: AllocationAccessKind,
 }
 
-impl Drop for AllocationAccessGuard {
+impl<T: AsRef<AllocationAccess>> Drop for AllocationAccessGuard<T> {
     fn drop(&mut self) {
-        let next = match (self.kind, self.access.state.get()) {
+        let next = match (self.kind, self.access.as_ref().as_ref().state.get()) {
             (AllocationAccessKind::Exclusive, AllocationAccessState::Exclusive) => {
                 AllocationAccessState::Idle
             }
@@ -969,22 +996,26 @@ impl Drop for AllocationAccessGuard {
             // safe failure mode if internal ownerscuda invariants are ever violated.
             _ => return,
         };
-        self.access.state.set(next);
+        self.access.as_ref().as_ref().state.set(next);
     }
 }
 
-impl AllocationAccessGuard {
+impl<T: AsRef<AllocationAccess>> AllocationAccessGuard<T> {
     fn quarantine_stream(&self) {
         if let AllocationAccessKind::Stream(identity) = self.kind
             && matches!(
-                self.access.state.get(),
+                self.access.as_ref().as_ref().state.get(),
                 AllocationAccessState::Stream {
                     identity: active,
                     ..
                 } if active == identity
             )
         {
-            self.access.state.set(AllocationAccessState::Poisoned);
+            self.access
+                .as_ref()
+                .as_ref()
+                .state
+                .set(AllocationAccessState::Poisoned);
         }
     }
 }
@@ -1126,6 +1157,68 @@ impl Drop for DeviceAllocation {
     }
 }
 
+/// Session-owned RAM cache. A ticket moves RAM out, so sibling/reentrant readbacks cannot alias.
+/// Retains the largest terminal readback capacity until idle-cache reclamation or the last
+/// session/provider owner drops, independently of escaped device owners. Automatic pressure
+/// admission and host-memory budget accounting remain separate; no implicit budget is claimed.
+#[derive(Default)]
+pub(crate) struct HostPublicationWorkspace(std::sync::Mutex<Vec<u8>>);
+
+struct HostPublicationLease {
+    workspace: Arc<HostPublicationWorkspace>,
+    bytes: Vec<u8>,
+}
+
+impl HostPublicationWorkspace {
+    /// Reclaim only idle completed RAM. Live tickets retain their independent endpoints.
+    fn release_idle(&self) -> Option<usize> {
+        let retired = match self.0.try_lock() {
+            Ok(mut cache) => std::mem::take(&mut *cache),
+            // Poison does not make an owned idle Vec unsafe to destroy. Transfers already
+            // fall back to independent RAM; reclamation must not strand this capacity.
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                std::mem::take(&mut *error.into_inner())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        let capacity = retired.capacity();
+        // The guard above has ended: allocator destruction never runs under the cache lock.
+        drop(retired);
+        Some(capacity)
+    }
+
+    fn lease(self: &Arc<Self>, bytes: usize) -> HostPublicationLease {
+        let mut owned = self
+            .0
+            .try_lock()
+            .map_or_else(|_| Vec::new(), |mut storage| std::mem::take(&mut *storage));
+        owned.resize(bytes, 0);
+        HostPublicationLease {
+            workspace: Arc::clone(self),
+            bytes: owned,
+        }
+    }
+}
+
+impl Drop for HostPublicationLease {
+    fn drop(&mut self) {
+        // Keep the largest completed workspace. Native work never borrows this cache itself.
+        let retired = if let Ok(mut cache) = self.workspace.0.try_lock() {
+            if self.bytes.capacity() > cache.capacity() {
+                Some(std::mem::replace(
+                    &mut *cache,
+                    std::mem::take(&mut self.bytes),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(retired);
+    }
+}
+
 /// A completed private host readback retaining the allocation's exclusive access lease.
 ///
 /// The bytes remain private until publication; holding this ticket blocks cloned allocation
@@ -1135,6 +1228,7 @@ impl Drop for DeviceAllocation {
 pub struct OwnedHostReadback {
     lease: DeviceAccessLease,
     bytes: usize,
+    workspace: Option<HostPublicationLease>,
 }
 impl OwnedHostReadback {
     /// Copy a completed readback into an exactly sized destination, without an SDK operation.
@@ -1147,8 +1241,12 @@ impl OwnedHostReadback {
             self.bytes,
             "validated readback destination extent"
         );
-        let bytes = self.lease.allocation.host_transfer.borrow();
-        destination.copy_from_slice(&bytes[..self.bytes]);
+        if let Some(workspace) = &self.workspace {
+            destination.copy_from_slice(&workspace.bytes[..self.bytes]);
+        } else {
+            let bytes = self.lease.allocation.host_transfer.borrow();
+            destination.copy_from_slice(&bytes[..self.bytes]);
+        }
     }
 }
 
@@ -1275,8 +1373,59 @@ impl DeviceBuffer {
             lease.finish_synchronous(Err(error))?;
             unreachable!("a failed copy cannot become successful completion");
         }
-        Ok(OwnedHostReadback { lease, bytes })
+        Ok(OwnedHostReadback {
+            lease,
+            bytes,
+            workspace: None,
+        })
     }
+    /// Read into independently leased session RAM, retained with the device on uncertain failure.
+    pub(crate) fn readback_with_workspace(
+        &self,
+        offset: usize,
+        bytes: usize,
+        workspace: &Arc<HostPublicationWorkspace>,
+    ) -> Result<OwnedHostReadback, CudaError> {
+        self.check_range(offset, bytes)?;
+        let lease = self.acquire_access()?;
+        let mut host = workspace.lease(bytes);
+        let result = if bytes == 0 {
+            Ok(())
+        } else {
+            // SAFETY: the ticket owns stable initialized host RAM and the device access lease.
+            unsafe {
+                crate::ffi::invoke_cudaMemcpy(
+                    &self.allocation.runtime,
+                    host.bytes.as_mut_ptr().cast(),
+                    self.allocation
+                        .pointer
+                        .cast::<u8>()
+                        .wrapping_add(offset)
+                        .cast(),
+                    bytes,
+                    CUDA_MEMCPY_DEVICE_TO_HOST,
+                )
+            }
+        };
+        if let Err(error) = result {
+            // A failed copy may have queued work. Never recycle either endpoint before quiescence.
+            // SAFETY: null denotes cudaMemcpy's legacy default stream in this retained runtime.
+            let completed = unsafe {
+                crate::ffi::invoke_cudaStreamSynchronize(&self.allocation.runtime, ptr::null_mut())
+            }
+            .is_ok();
+            if !completed {
+                std::mem::forget((lease, host));
+            }
+            return Err(error);
+        }
+        Ok(OwnedHostReadback {
+            lease,
+            bytes,
+            workspace: Some(host),
+        })
+    }
+
     /// Copy bytes from another device allocation.
     /// Copy bytes from a different allocation belonging to the same CUDA runtime and device.
     /// Successful return completes the copy before either allocation's access lease is released.
@@ -1323,11 +1472,7 @@ impl DeviceBuffer {
     }
 
     fn acquire_access(&self) -> Result<DeviceAccessLease, CudaError> {
-        let guard = self
-            .allocation
-            .access
-            .acquire()
-            .map_err(|()| CudaError::Busy)?;
+        let guard = self.allocation.acquire().map_err(|()| CudaError::Busy)?;
         Ok(DeviceAccessLease {
             allocation: Rc::clone(&self.allocation),
             guard,
@@ -1360,7 +1505,6 @@ impl DeviceBuffer {
         let identity = Rc::as_ptr(&stream.inner) as usize;
         let guard = self
             .allocation
-            .access
             .acquire_stream(identity)
             .map_err(|()| CudaError::Busy)?;
         Ok(DeviceAccessLease {
@@ -1384,12 +1528,118 @@ impl DeviceAccessLease {
     }
 }
 
+/// Internal uploads whose private host staging and device leases survive enqueue. Consumers on
+/// the same stream may acquire additional leases; staging cannot be overwritten until release.
+pub(crate) struct RetainedHostUploads {
+    stream: CudaStreamHandle,
+    leases: LaunchAccessLeases,
+    queued: bool,
+}
+
+impl RetainedHostUploads {
+    pub(crate) fn new(stream: CudaStreamHandle) -> Self {
+        Self {
+            stream,
+            leases: LaunchAccessLeases::new(),
+            queued: false,
+        }
+    }
+
+    pub(crate) fn enqueue(
+        &mut self,
+        destination: &DeviceBuffer,
+        source: &[u8],
+    ) -> Result<(), CudaError> {
+        self.stream
+            .inner
+            .runtime
+            .ensure_same_runtime(&destination.allocation.runtime)?;
+        destination.check_range(0, source.len())?;
+        if source.is_empty() {
+            return Ok(());
+        }
+        // A same-stream kernel may use these bytes, but a second upload must not overwrite the
+        // retained host endpoint while an earlier transfer can still be reading it.
+        destination.validate_access_available()?;
+        let lease = destination.acquire_stream_access(&self.stream)?;
+        let mut scratch = destination
+            .allocation
+            .host_transfer
+            .try_borrow_mut()
+            .map_err(|_| CudaError::Busy)?;
+        if scratch.len() < source.len() {
+            scratch.resize(source.len(), 0);
+        }
+        scratch[..source.len()].copy_from_slice(source);
+        self.leases.push(lease);
+        self.queued = true;
+        // SAFETY: the group retains the allocation, its fixed host staging, stream and runtime.
+        // The allocation gate prevents resizing/overwriting staging until terminal release.
+        unsafe {
+            crate::ffi::invoke_cudaMemcpyAsync(
+                &destination.allocation.runtime,
+                destination.allocation.pointer,
+                scratch.as_ptr().cast(),
+                source.len(),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                self.stream.inner.raw,
+            )
+        }
+    }
+
+    /// Only call after successful completion of a launch queued after every upload on this stream.
+    pub(crate) fn release_after_terminal_launch(&mut self) {
+        self.leases = LaunchAccessLeases::new();
+        self.queued = false;
+    }
+
+    pub(crate) fn synchronize(&mut self) -> Result<(), CudaError> {
+        if !self.queued {
+            return Ok(());
+        }
+        match self.stream.synchronize() {
+            Ok(()) => {
+                self.release_after_terminal_launch();
+                Ok(())
+            }
+            Err(error) => {
+                self.quarantine_and_forget();
+                Err(error)
+            }
+        }
+    }
+
+    fn quarantine_and_forget(&mut self) {
+        self.leases.quarantine();
+        // Keep both native endpoints and their queue/context roots when quiescence is
+        // uncertain. An escaped clone can never overwrite the quarantined staging.
+        std::mem::forget(std::mem::replace(
+            &mut self.leases,
+            LaunchAccessLeases::new(),
+        ));
+        std::mem::forget(self.stream.clone());
+        self.queued = false;
+    }
+}
+
+impl Drop for RetainedHostUploads {
+    fn drop(&mut self) {
+        let _ = self.synchronize();
+    }
+}
+
 struct StreamInner {
     runtime: CudaRuntime,
     raw: CudaStream,
+    // At most one terminal, timing-disabled launch event is retained. Pending events are
+    // exclusively owned by their completion tokens and never enter this slot.
+    idle_completion_event: Cell<Option<CudaEvent>>,
 }
 impl Drop for StreamInner {
     fn drop(&mut self) {
+        if let Some(event) = self.idle_completion_event.take() {
+            let _ = unsafe { crate::ffi::invoke_cudaEventDestroy(&self.runtime, event) };
+        }
         let _ = unsafe { crate::ffi::invoke_cudaStreamDestroy(&self.runtime, self.raw) };
     }
 }
@@ -1399,6 +1649,27 @@ pub struct CudaStreamHandle {
     inner: Rc<StreamInner>,
 }
 impl CudaStreamHandle {
+    fn completion_event(&self) -> Result<EventInner, CudaError> {
+        self.inner.idle_completion_event.take().map_or_else(
+            || self.inner.runtime.create_owned_event(),
+            |raw| {
+                Ok(EventInner {
+                    runtime: self.inner.runtime.clone(),
+                    raw,
+                })
+            },
+        )
+    }
+
+    // The caller must have observed successful event synchronization. Reuse is bounded and
+    // local to this stream; separate outstanding launches still own separate native events.
+    fn retain_terminal_event(&self, mut event: EventInner) {
+        if self.inner.idle_completion_event.get().is_none() {
+            self.inner.idle_completion_event.set(Some(event.raw));
+            event.raw = ptr::null_mut();
+        }
+    }
+
     /// Return the raw stream pointer for internal backend FFI integration.
     #[allow(dead_code)] // Used by asynchronous library integrations in sibling modules.
     pub(crate) fn raw_stream(&self) -> *mut c_void {
@@ -1460,7 +1731,9 @@ impl EventInner {
 }
 impl Drop for EventInner {
     fn drop(&mut self) {
-        let _ = unsafe { crate::ffi::invoke_cudaEventDestroy(&self.runtime, self.raw) };
+        if !self.raw.is_null() {
+            let _ = unsafe { crate::ffi::invoke_cudaEventDestroy(&self.runtime, self.raw) };
+        }
     }
 }
 /// Shared owner for a CUDA event.
@@ -1759,9 +2032,17 @@ impl CudaCompletion {
         } else {
             return Ok(());
         }
-        self.resources.take();
-        self.event.take();
+        self.release_terminal_resources();
         Ok(())
+    }
+
+    fn release_terminal_resources(&mut self) {
+        if let Some(event) = self.event.take()
+            && let Some(resources) = self.resources.as_ref()
+        {
+            resources.stream.retain_terminal_event(event);
+        }
+        self.resources.take();
     }
 }
 impl Drop for CudaCompletion {
@@ -1774,8 +2055,7 @@ impl Drop for CudaCompletion {
             .as_ref()
             .is_some_and(|event| event.synchronize().is_ok());
         if completed {
-            self.resources.take();
-            self.event.take();
+            self.release_terminal_resources();
         } else {
             // CUDA reported an error and did not confirm that the queued kernel has stopped using
             // these resources. Leak the owners rather than risk a device use-after-free.
@@ -3041,7 +3321,7 @@ impl CudaKernel {
         let completion_event = if direct_batch {
             None
         } else {
-            Some(self.module.runtime.create_owned_event()?)
+            Some(stream.completion_event()?)
         };
         if let Some(batch) = batch.as_deref_mut()
             && let Some(timing) = &mut batch.timing
@@ -3128,6 +3408,81 @@ impl CudaKernel {
 #[cfg(test)]
 mod memory_snapshot_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires CUDA GPU; retained queued upload staging and terminal/drop ownership"]
+    fn cuda_gpu_retained_uploads_keep_private_staging_until_terminal_release() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let image = crate::compile_cuda_source_for_device(
+            &runtime,
+            r#"
+extern "C" __global__ void copy_word(const unsigned int* input, unsigned int* output) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) output[0] = input[0];
+}
+"#,
+        )
+        .unwrap();
+        let module = runtime.load_module(&image).unwrap();
+        let kernel = module.function(c"copy_word").unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let input = runtime.allocate(8).unwrap();
+        let output = runtime.allocate(4).unwrap();
+        let mut uploads = RetainedHostUploads::new(stream.clone());
+        let mut original = 42_u32.to_le_bytes();
+        uploads.enqueue(&input, &original).unwrap();
+        original.fill(0);
+        assert_eq!(uploads.enqueue(&input, &[7_u8; 8]), Err(CudaError::Busy));
+        assert_eq!(input.validate_access_available(), Err(CudaError::Busy));
+        // SAFETY: the independently compiled kernel has two exact u32 pointers. Same-stream
+        // ordering makes its read follow the retained upload; the launch owns both allocations.
+        let mut completion = unsafe {
+            kernel.launch(
+                &stream,
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                &[
+                    CudaKernelArgument::Buffer(&input),
+                    CudaKernelArgument::Buffer(&output),
+                ],
+            )
+        }
+        .unwrap();
+        completion.wait().unwrap();
+        uploads.release_after_terminal_launch();
+        assert!(input.validate_access_available().is_ok());
+        let mut actual = [0_u8; 4];
+        output.copy_to(&mut actual).unwrap();
+        assert_eq!(u32::from_le_bytes(actual), 42);
+        // Without a following launch, dropping the group proves upload completion itself.
+        uploads.enqueue(&input, &43_u32.to_le_bytes()).unwrap();
+        drop(uploads);
+        input.copy_to(&mut actual).unwrap();
+        assert_eq!(u32::from_le_bytes(actual), 43);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU; controlled known-terminal queued-upload quarantine witness"]
+    fn cuda_gpu_retained_upload_quarantine_keeps_staging_device_and_context_roots() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let stream = runtime.create_stream().unwrap();
+        let input = runtime.allocate(4).unwrap();
+        let allocation_owner = Rc::downgrade(&input.allocation);
+        let stream_owner = Rc::downgrade(&stream.inner);
+        let runtime_owner = Arc::downgrade(&runtime.0);
+        let mut uploads = RetainedHostUploads::new(stream.clone());
+        uploads.enqueue(&input, &42_u32.to_le_bytes()).unwrap();
+        stream.synchronize().unwrap(); // This tests retention policy, without inducing driver loss.
+        uploads.quarantine_and_forget();
+        assert_eq!(input.validate_access_available(), Err(CudaError::Busy));
+        drop(uploads);
+        drop(input);
+        drop(stream);
+        drop(runtime);
+        assert!(allocation_owner.upgrade().is_some());
+        assert!(stream_owner.upgrade().is_some());
+        assert!(runtime_owner.upgrade().is_some());
+    }
 
     #[test]
     fn batch_wait_error_stays_sticky_until_a_full_wait_succeeds() {
@@ -3309,6 +3664,151 @@ mod memory_snapshot_tests {
         let nine: [CudaKernelArgument<'_>; 9] =
             std::array::from_fn(|_| CudaKernelArgument::Bytes(&[]));
         assert!(!can_inline_kernel_parameters(&nine));
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU; independently leased private publication workspace"]
+    fn cuda_gpu_publication_workspace_reuses_after_terminal_drop_and_isolates_tickets() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let mut first = runtime.allocate(8).unwrap();
+        let mut second = runtime.allocate(8).unwrap();
+        first.copy_from(&[11; 8]).unwrap();
+        second.copy_from(&[22; 8]).unwrap();
+        let ticket = first.readback_with_workspace(0, 8, &workspace).unwrap();
+        let pointer = ticket.workspace.as_ref().unwrap().bytes.as_ptr();
+        assert_eq!(first.copy_from(&[33; 8]), Err(CudaError::Busy));
+        let sibling = second.readback_with_workspace(0, 8, &workspace).unwrap();
+        let mut actual = [0; 8];
+        ticket.publish_to(&mut actual);
+        assert_eq!(actual, [11; 8]);
+        sibling.publish_to(&mut actual);
+        assert_eq!(actual, [22; 8]);
+        drop(ticket);
+        drop(sibling);
+        first.copy_from(&[33; 8]).unwrap();
+        let again = first.readback_with_workspace(0, 8, &workspace).unwrap();
+        assert_eq!(pointer, again.workspace.as_ref().unwrap().bytes.as_ptr());
+        again.publish_to(&mut actual);
+        assert_eq!(actual, [33; 8]);
+        drop(again);
+        assert!(first.readback_with_workspace(7, 2, &workspace).is_err());
+        first.copy_from(&[44; 8]).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU; controlled known-terminal readback quarantine witness"]
+    fn cuda_gpu_publication_quarantine_retains_workspace_device_and_runtime() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let mut buffer = runtime.allocate(8).unwrap();
+        buffer.copy_from(&[11; 8]).unwrap();
+        let allocation_owner = Rc::downgrade(&buffer.allocation);
+        let workspace_owner = Arc::downgrade(&workspace);
+        let runtime_owner = Arc::downgrade(&runtime.0);
+        let ticket = buffer.readback_with_workspace(0, 8, &workspace).unwrap();
+        // Deliberately retain a known-terminal ticket: proves the uncertain-path owner set
+        // without inducing a driver failure or asserting completion on real device loss.
+        std::mem::forget(ticket);
+        assert_eq!(buffer.validate_access_available(), Err(CudaError::Busy));
+        drop(buffer);
+        drop(workspace);
+        drop(runtime);
+        assert!(allocation_owner.upgrade().is_some());
+        assert!(workspace_owner.upgrade().is_some());
+        assert!(runtime_owner.upgrade().is_some());
+    }
+
+    #[test]
+    fn memory_provider_preserves_send_and_sync() {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CudaMemoryProvider>();
+    }
+
+    #[test]
+    fn publication_workspace_recycles_only_dropped_terminal_tickets() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let mut first = workspace.lease(65);
+        first.bytes.fill(7);
+        let pointer = first.bytes.as_ptr();
+        let second = workspace.lease(17);
+        assert_ne!(pointer, second.bytes.as_ptr());
+        assert_eq!(first.bytes, [7; 65]);
+        drop(second);
+        drop(first);
+        let reused = workspace.lease(65);
+        assert_eq!(pointer, reused.bytes.as_ptr());
+    }
+
+    #[test]
+    fn publication_cache_release_preserves_live_tickets_and_allows_refill() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let mut live = workspace.lease(65);
+        live.bytes.fill(7);
+        let pointer = live.bytes.as_ptr();
+        let idle = workspace.lease(129);
+        let capacity = idle.bytes.capacity();
+        drop(idle);
+        assert_eq!(workspace.release_idle(), Some(capacity));
+        assert_eq!(workspace.release_idle(), Some(0));
+        assert_eq!(live.bytes.as_ptr(), pointer);
+        assert_eq!(live.bytes, [7; 65]);
+        drop(live);
+        assert!(workspace.release_idle().unwrap() >= 65);
+    }
+
+    #[test]
+    fn publication_cache_release_never_waits_for_cache_lock() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        drop(workspace.lease(65));
+        let held = workspace.0.lock().unwrap();
+        assert_eq!(workspace.release_idle(), None);
+        assert!(held.capacity() >= 65);
+        drop(held);
+        assert!(workspace.release_idle().unwrap() >= 65);
+    }
+
+    #[test]
+    fn publication_cache_release_recovers_idle_poisoned_storage() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        drop(workspace.lease(65));
+        let poisoned = Arc::clone(&workspace);
+        assert!(
+            std::thread::spawn(move || {
+                let _held = poisoned.0.lock().unwrap();
+                panic!("controlled cache poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(workspace.release_idle().unwrap() >= 65);
+        assert_eq!(workspace.release_idle(), Some(0));
+        let fallback = workspace.lease(17);
+        assert_eq!(fallback.bytes.len(), 17);
+    }
+
+    #[test]
+    fn publication_workspace_poisoned_cache_uses_independent_storage() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let _ = std::panic::catch_unwind(|| {
+            let _held = workspace.0.lock().unwrap();
+            panic!("controlled cache poison");
+        });
+        let ticket = workspace.lease(17);
+        assert_eq!(ticket.bytes.len(), 17);
+        drop(ticket);
+        assert!(workspace.0.is_poisoned());
+    }
+
+    #[test]
+    fn publication_workspace_busy_cache_uses_independent_storage() {
+        let workspace = Arc::new(HostPublicationWorkspace::default());
+        let borrowed = workspace.0.lock().unwrap();
+        let ticket = workspace.lease(17);
+        assert_eq!(ticket.bytes.len(), 17);
+        drop(ticket); // Reentrant cache borrow never makes terminal ticket destruction panic.
+        drop(borrowed);
+        assert!(workspace.0.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3717,9 +4217,29 @@ extern "C" __global__ void retained_word(unsigned int* value) {
         assert!(result.is_err());
         assert!(completion.resources.is_some());
         assert!(buffer.validate_access_available().is_err());
+        assert!(stream.inner.idle_completion_event.get().is_none());
         completion.wait().unwrap();
         assert!(completion.event.is_none());
         assert!(completion.resources.is_none());
+        assert_eq!(stream.inner.idle_completion_event.get(), Some(raw));
+        // A terminal event may serve the next invocation; no outstanding token can observe its
+        // re-recording. The failed wait above must never have made it available for reuse.
+        // SAFETY: the compiled kernel still receives the same exact writable u32 allocation;
+        // the earlier launch has reached terminal completion and released its access lease.
+        let mut retry = unsafe {
+            kernel.launch(
+                &stream,
+                [1, 1, 1],
+                [1, 1, 1],
+                0,
+                &[CudaKernelArgument::Buffer(&buffer)],
+            )
+        }
+        .unwrap();
+        assert_eq!(retry.event.as_ref().unwrap().raw, raw);
+        assert!(stream.inner.idle_completion_event.get().is_none());
+        retry.wait().unwrap();
+        assert_eq!(stream.inner.idle_completion_event.get(), Some(raw));
         let mut actual = [0_u8; size_of::<u32>()];
         buffer.copy_to(&mut actual).unwrap();
         assert_eq!(u32::from_ne_bytes(actual), 42);
@@ -4210,3 +4730,10 @@ extern "C" __global__ void consume(unsigned int* value) {
         }
     }
 }
+
+#[cfg(feature = "tensor")]
+#[path = "guarded_batch/guarded_batch.rs"]
+mod guarded_batch;
+
+#[cfg(all(feature = "tensor", feature = "insights"))]
+pub use tensor::CudaGuardedExecutionReport;

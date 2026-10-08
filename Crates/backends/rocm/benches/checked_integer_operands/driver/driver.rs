@@ -171,7 +171,7 @@ fn case<T: Format, const N: usize>(
         }
         #[cfg(not(feature = "allocation-census"))]
         group.bench_function(route, |bench| {
-            bench.iter_custom(|iterations| (0..iterations).map(|_| call()).sum::<Duration>())
+            bench.iter_custom(|iterations| (0..iterations).map(|_| call()).sum::<Duration>());
         });
     }
     group.finish();

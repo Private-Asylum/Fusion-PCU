@@ -27,6 +27,8 @@ pub unsafe fn symbol<'library, T>(
 mod census;
 #[cfg(feature = "allocation-census")]
 pub use census::{RocmApiCensus, rocm_api_census, reset_rocm_api_census};
+#[cfg(all(feature = "allocation-census", feature = "tensor"))]
+pub use census::{guarded_chain, guarded_kernel};
 #[path = "retained/retained.rs"]
 mod retained;
 pub use retained::RetainedApi;
@@ -404,6 +406,54 @@ use crate::{
     HipError,
 };
 use std::ffi::CStr;
+thread_local! {
+    // A private synchronous backend call contains no foreign or caller callbacks. New calls
+    // select explicitly, because foreign HIP clients may select freely between calls.
+    static SELECTED_RUNTIME_SCOPE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub struct RuntimeScope {
+    _runtime: HipRuntime,
+    _selection: SelectedRuntimeScope,
+}
+
+struct SelectedRuntimeScope {
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl SelectedRuntimeScope {
+    fn enter(identity: usize) -> Self {
+        SELECTED_RUNTIME_SCOPE.set(identity);
+        Self {
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for SelectedRuntimeScope {
+    fn drop(&mut self) {
+        // A nested different runtime may have changed native selection. Never restore an
+        // assumed outer selection: subsequent outer operations must select explicitly.
+        SELECTED_RUNTIME_SCOPE.set(0);
+    }
+}
+
+impl HipRuntime {
+    /// Only private synchronous execution without caller/foreign callbacks may use this scope.
+    pub(crate) fn enter_private_scope(&self) -> Result<RuntimeScope, HipError> {
+        // SAFETY: the retained runtime and selected ordinal belong to this runtime instance.
+        unsafe { invoke_hipSetDevice(self, self.0.device) }?;
+        Ok(RuntimeScope {
+            _runtime: self.clone(),
+            _selection: SelectedRuntimeScope::enter(std::sync::Arc::as_ptr(&self.0) as usize),
+        })
+    }
+
+    fn private_scope_selected(&self) -> bool {
+        SELECTED_RUNTIME_SCOPE.get() == std::sync::Arc::as_ptr(&self.0) as usize
+    }
+}
+
 fn hip_call<T: Copy>(
     runtime: &HipRuntime,
     symbol: &'static str,
@@ -412,9 +462,12 @@ fn hip_call<T: Copy>(
 ) -> Result<(), HipError> {
     // Resolve failures stay cold-owned but retain the same operation-specific error when used.
     let function = *retained.as_ref().map_err(Clone::clone)?;
-    if symbol != "hipSetDevice" {
-        // HIP current-device state remains thread-local. Pointer retention removes resolution,
-        // never this per-operation selection required by cloned runtimes on another thread.
+    if symbol == "hipSetDevice" {
+        SELECTED_RUNTIME_SCOPE.set(0);
+    }
+    if symbol != "hipSetDevice" && !runtime.private_scope_selected() {
+        // Selecting another runtime invalidates any enclosing scope, even if selection fails.
+        SELECTED_RUNTIME_SCOPE.set(0);
         let setter = runtime.0.api.set_device.as_ref().map_err(Clone::clone)?;
         #[cfg(feature = "allocation-census")]
         census::call("hipSetDevice");
@@ -430,6 +483,9 @@ fn hip_call<T: Copy>(
     if status == hip::HIP_SUCCESS {
         Ok(())
     } else {
+        // Error cleanup must re-establish selection rather than carrying an assumption across
+        // a failed native boundary.
+        SELECTED_RUNTIME_SCOPE.set(0);
         Err(runtime.error(symbol, status))
     }
 }
@@ -939,7 +995,7 @@ pub unsafe fn invoke_hipMemcpyAsync(
         &runtime.0.api.memcpy_async,
         |f: hip::MemcpyAsync| unsafe {
             #[cfg(feature = "allocation-census")]
-            census::copy(direction);
+            census::async_copy(direction);
             f(destination, source, bytes, direction, stream)
         },
     )
@@ -1530,13 +1586,12 @@ pub fn create_nonblocking_stream_for_test(
 ) -> Result<hip::HipStream, HipError> {
     type CreateWithFlags = unsafe extern "C" fn(*mut hip::HipStream, u32) -> hip::HipResult;
     // SAFETY: Installed HIP ABI takes an output stream pointer and unsigned stream flags.
-    let function = unsafe {
-        symbol::<CreateWithFlags>(&runtime.0.library, b"hipStreamCreateWithFlags\0")
-    }
-    .map_err(|error| HipError::MissingSymbol {
-        symbol: "hipStreamCreateWithFlags",
-        detail: error.to_string(),
-    })?;
+    let function =
+        unsafe { symbol::<CreateWithFlags>(&runtime.0.library, b"hipStreamCreateWithFlags\0") }
+            .map_err(|error| HipError::MissingSymbol {
+                symbol: "hipStreamCreateWithFlags",
+                detail: error.to_string(),
+            })?;
     let retained = Ok(*function);
     let mut stream = std::ptr::null_mut();
     hip_call(runtime, "hipStreamCreateWithFlags", &retained, |create| {
@@ -1544,4 +1599,44 @@ pub fn create_nonblocking_stream_for_test(
         unsafe { create(&raw mut stream, 1) }
     })?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod private_scope_tests {
+    use super::{SelectedRuntimeScope, SELECTED_RUNTIME_SCOPE};
+
+    #[test]
+    fn nested_selection_clears_outer_assumptions_and_new_calls_select_again() {
+        let outer = SelectedRuntimeScope::enter(1);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 1);
+        {
+            let _inner = SelectedRuntimeScope::enter(2);
+            assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 2);
+        }
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+        drop(outer);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+        // A foreign selection between calls is never cached. The next private boundary
+        // installs its identity only after the real HIP selection has succeeded.
+        let next = SelectedRuntimeScope::enter(1);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 1);
+        drop(next);
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+    }
+
+    #[test]
+    fn error_and_unwind_release_private_selection() {
+        let fail = || -> Result<(), ()> {
+            let _scope = SelectedRuntimeScope::enter(3);
+            Err(())
+        };
+        assert_eq!(fail(), Err(()));
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+        let unwind = std::panic::catch_unwind(|| {
+            let _scope = SelectedRuntimeScope::enter(4);
+            panic!("controlled private scope unwind");
+        });
+        assert!(unwind.is_err());
+        assert_eq!(SELECTED_RUNTIME_SCOPE.get(), 0);
+    }
 }

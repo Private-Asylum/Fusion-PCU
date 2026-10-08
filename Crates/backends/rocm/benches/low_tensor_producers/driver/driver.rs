@@ -88,6 +88,19 @@ fn case<T: ProducerSource + TensorElement, const N: usize, const HALF: bool>(
     semantics: bool,
     policy: PcuFloatUnderflowPolicy,
 ) {
+    // Optional exact profile substring selects setup as well as timing; every selected case
+    // still runs its complete independent oracle, ownership, fault, retry and tail checks.
+    if let Ok(filter) = std::env::var("PCU_LOW_TENSOR_PRODUCER_CASE_FILTER") {
+        let profile = format!(
+            "{mode:?}/{:?}/{:?}/{policy:?}/half={HALF}/{}/{N}",
+            options.compound_arithmetic,
+            options.precision,
+            T::LABEL,
+        );
+        if !profile.contains(&filter) {
+            return;
+        }
+    }
     #[cfg(feature = "allocation-census")]
     let _ = (&mut *c, semantics);
     verify_capture::<T, N, HALF>(mode, options, policy);

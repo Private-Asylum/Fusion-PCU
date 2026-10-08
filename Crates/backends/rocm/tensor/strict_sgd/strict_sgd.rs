@@ -246,7 +246,7 @@ impl RocmTensorAssessor<'_> {
         if evicted {
             cache.pop_front();
         }
-        cache.push_back((key, prepared));
+        cache.push_back((key, prepared.into()));
         Ok(TensorDispatchCacheAdmission {
             compiled: true,
             evicted,

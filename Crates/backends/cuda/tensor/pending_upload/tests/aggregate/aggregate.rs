@@ -27,7 +27,7 @@ fn aggregate_staging_changed_inputs_and_cold_foreign_identity_refusals() {
     let mut memory = session.memory_provider(pool);
     for n in [65, 4096] {
         let shape = [n];
-        let (input, prepared) = prepare(&assessor, n, true);
+        let (input, mut prepared) = prepare(&assessor, n, true);
         let owner =
             PcuDeviceTensor::new(shape, session.upload_buffer(pool, &vec![0_u32; n]).unwrap())
                 .unwrap();
@@ -74,6 +74,26 @@ fn aggregate_staging_changed_inputs_and_cold_foreign_identity_refusals() {
         );
         #[cfg(feature = "allocation-census")]
         assert_eq!(before, crate::cuda_api_census());
+        assessor
+            .retain_owned_program_fixed_dispatches(&mut prepared)
+            .unwrap();
+        assessor.state().add_dispatches.borrow_mut().clear();
+        #[cfg(feature = "allocation-census")]
+        let before = crate::cuda_api_census();
+        assert!(
+            foreign
+                .execute_owned_program_output_from_host_staging::<u32, _, 2>(
+                    &prepared,
+                    &binding,
+                    pool,
+                    &mut memory,
+                )
+                .unwrap()
+                .is_none()
+        );
+        #[cfg(feature = "allocation-census")]
+        assert_eq!(before, crate::cuda_api_census());
+        let held_cache = assessor.state().add_dispatches.borrow_mut();
         for generation in 1_u32..=64 {
             for (index, word) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 word.copy_from_slice(
@@ -105,7 +125,11 @@ fn aggregate_staging_changed_inputs_and_cold_foreign_identity_refusals() {
                     1
                 );
                 assert_eq!(after.kernel_launches - before.kernel_launches, 2);
-                assert_eq!(after.event_creates - before.event_creates, 2);
+                // Prepared status owners retain their terminal events across warm calls.
+                assert_eq!(after.event_creates, before.event_creates);
+                assert_eq!(after.event_destroys, before.event_destroys);
+                assert_eq!(after.event_records - before.event_records, 2);
+                assert_eq!(after.event_waits - before.event_waits, 2);
                 assert_eq!(
                     after.stream_synchronizations,
                     before.stream_synchronizations
@@ -130,6 +154,32 @@ fn aggregate_staging_changed_inputs_and_cold_foreign_identity_refusals() {
             }
             assert_eq!(actual[n], 999);
         }
+        drop(held_cache);
+        // Explicit foreign rebinding preserves the original staging anchor: refuse before enqueue.
+        foreign
+            .retain_owned_program_fixed_dispatches(&mut prepared)
+            .unwrap();
+        let binding = [CudaHostedTensorInput {
+            value: input,
+            resource,
+            shape: &shape,
+            source: &bytes,
+        }];
+        #[cfg(feature = "allocation-census")]
+        let before = crate::cuda_api_census();
+        assert!(
+            foreign
+                .execute_owned_program_output_from_host_staging::<u32, _, 2>(
+                    &prepared,
+                    &binding,
+                    pool,
+                    &mut memory,
+                )
+                .unwrap()
+                .is_none()
+        );
+        #[cfg(feature = "allocation-census")]
+        assert_eq!(before, crate::cuda_api_census());
         let (_, identity) = prepare(&assessor, n, false);
         let binding = [CudaHostedTensorInput {
             value: input,
@@ -180,7 +230,10 @@ fn aggregate_preflights_every_input_before_enqueue_and_preserves_phase_fault_ret
             TensorPointwiseGroupingPolicy::Disabled,
         )
         .unwrap();
-    let prepared = assessor.prepare_owned_program(program).unwrap();
+    let mut prepared = assessor.prepare_owned_program(program).unwrap();
+    assessor
+        .retain_owned_program_fixed_dispatches(&mut prepared)
+        .unwrap();
     let left_owner =
         PcuDeviceTensor::new([65], session.upload_buffer(pool, &[3_u32; 65]).unwrap()).unwrap();
     let right_owner =

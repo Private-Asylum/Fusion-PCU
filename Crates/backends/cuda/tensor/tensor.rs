@@ -33,12 +33,16 @@ pub mod native_mse;
 mod native_sgd;
 pub use native_sgd::lower_native_sgd_to_cuda_source;
 pub use native_mse::lower_native_mse_to_cuda_source;
+#[path = "guarded/guarded.rs"]
+mod guarded;
+#[cfg(feature = "insights")]
+pub use guarded::CudaGuardedExecutionReport;
 #[path = "literal/literal.rs"]
 mod literal;
-#[path = "owned_scratch/owned_scratch.rs"]
-mod owned_scratch;
 #[path = "output_array/output_array.rs"]
 mod output_array;
+#[path = "owned_scratch/owned_scratch.rs"]
+mod owned_scratch;
 
 #[path = "pending_upload/pending_upload.rs"]
 mod pending_upload;
@@ -757,7 +761,7 @@ enum TensorDispatchCacheKey {
     },
 }
 
-type TensorDispatchCache = VecDeque<(TensorDispatchCacheKey, CudaPreparedDispatch)>;
+type TensorDispatchCache = VecDeque<(TensorDispatchCacheKey, Rc<CudaPreparedDispatch>)>;
 
 /// Fixed per-node kernel and binding facts selected during graph preparation.
 #[derive(Clone, Debug)]
@@ -771,6 +775,21 @@ struct PreparedFixedTensorDispatch {
     left_binding: PcuBindingRef,
     right_binding: Option<PcuBindingRef>,
     output_binding: PcuBindingRef,
+}
+
+/// Borrowed per-node executable selection; dense indices preserve metadata-only graph traits.
+#[derive(Clone, Copy)]
+struct PreparedFixedTensorDispatchRef<'a> {
+    dispatch: &'a PreparedFixedTensorDispatch,
+    retained: Option<&'a CudaPreparedDispatch>,
+}
+
+impl Deref for PreparedFixedTensorDispatchRef<'_> {
+    type Target = PreparedFixedTensorDispatch;
+
+    fn deref(&self) -> &Self::Target {
+        self.dispatch
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1984,7 +2003,7 @@ impl<'session> CudaTensorAssessor<'session> {
         if evicted {
             cache.pop_front();
         }
-        cache.push_back((key, prepared));
+        cache.push_back((key, Rc::new(prepared)));
         Ok(TensorDispatchCacheAdmission {
             compiled: true,
             evicted,
@@ -2441,6 +2460,62 @@ impl<'session> CudaTensorAssessor<'session> {
         self.prepare_shared_owned_program(Arc::new(program))
     }
 
+    /// Retain the fixed elementwise executables for an owning prepared program on this queue.
+    ///
+    /// This explicit cold step compiles missing fixed kernels without binding or allocating tensor
+    /// resources. Retained kernels survive FIFO cache eviction until the prepared program drops.
+    /// Other assessors keep their normal cache/compilation route when executing this program.
+    /// The cache still owns at most 32 entries; live prepared programs may retain more kernels.
+    /// Dynamic and strict operator executables are outside this fixed-kernel retention step.
+    /// Rebinding retains the original host-staging anchor, so another assessor's staging route
+    /// conservatively refuses this program even after its fixed executables have been rebound.
+    ///
+    /// # Errors
+    /// Returns backend compilation errors. Earlier successful kernels remain retained on failure.
+    pub fn retain_owned_program_fixed_dispatches(
+        &self,
+        prepared: &mut CudaOwnedPreparedTensorGraph,
+    ) -> Result<(), CudaTensorExecutionError> {
+        if prepared
+            .guarded
+            .as_ref()
+            .is_some_and(|plan| !plan.uses_stream(&self.state().stream))
+        {
+            #[cfg(feature = "insights")]
+            prepared.begin_guarded_attempt();
+            prepared.guarded = None;
+        }
+        if prepared.retained_fixed.is_empty() {
+            prepared
+                .retained_fixed
+                .resize_with(prepared.data.fixed_dispatches.len(), || None);
+        }
+        for (index, dispatch) in prepared.data.fixed_dispatches.iter().enumerate() {
+            let Some(dispatch) = dispatch else { continue };
+            if prepared.retained_fixed[index]
+                .as_ref()
+                .is_some_and(|retained| retained.uses_stream(&self.state().stream))
+            {
+                continue;
+            }
+            self.ensure_dispatch_cached(
+                dispatch.cache_key.clone(),
+                dispatch.kernel,
+                dispatch.invocation_shape,
+                false,
+            )?;
+            // Capture before the next admission can evict this key, including graphs > capacity.
+            let cache = self.state().add_dispatches.borrow();
+            let executable = cache
+                .iter()
+                .find(|(key, _)| *key == dispatch.cache_key)
+                .map(|(_, executable)| Rc::clone(executable))
+                .ok_or(CudaTensorExecutionError::SizeOverflow)?;
+            prepared.retained_fixed[index] = Some(executable);
+        }
+        Ok(())
+    }
+
     /// Prepares an immutable captured program shared across cold device-admission attempts.
     ///
     /// Each candidate derives its own backend facts; rejection leaves the caller's program
@@ -2481,6 +2556,8 @@ impl<'session> CudaTensorAssessor<'session> {
     where
         P: PcuMemoryProvider<Resource = CudaMemoryResource>,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         let mut borrowed_inputs = SmallVec::<[_; 8]>::with_capacity(inputs.len());
         for &(value, tensor) in inputs {
             borrowed_inputs.push((value, self.borrow_device_input_ref(tensor, pool)?));
@@ -2506,6 +2583,7 @@ impl<'session> CudaTensorAssessor<'session> {
     ///
     /// Returns ordinary input, allocation, provider, dispatch, or completion errors. No tensor is
     /// returned after an unsuccessful in-place dispatch.
+    #[allow(clippy::too_many_lines)] // Optional report invalidation precedes the full ownership flow.
     pub fn execute_owned_program_consuming_input<T, P>(
         &self,
         prepared: &CudaOwnedPreparedTensorGraph,
@@ -2517,6 +2595,8 @@ impl<'session> CudaTensorAssessor<'session> {
         T: fusion_pcu::PcuScalar,
         P: PcuMemoryProvider<Resource = CudaMemoryResource>,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         if prepared.data.input_values.len() != 1 || prepared.data.outputs.len() != 1 {
             return Err(CudaTensorExecutionError::InvalidPlan(prepared.data.output));
         }
@@ -2693,6 +2773,8 @@ impl<'session> CudaTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = CudaMemoryResource>,
         'session: 'input,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         with_single_output_plan(prepared, || {
             let mut outputs = self
                 .execute_owned_program_outputs_inline_from_inputs(prepared, inputs, pool, memory)?;
@@ -2711,6 +2793,7 @@ impl<'session> CudaTensorAssessor<'session> {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Fresh output admission and terminal publication share one scope.
     fn execute_owned_program_outputs_inline_from_inputs<'input, T, P>(
         &'input self,
         prepared: &CudaOwnedPreparedTensorGraph,
@@ -2723,6 +2806,8 @@ impl<'session> CudaTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = CudaMemoryResource>,
         'session: 'input,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         if !is_checked_float_type(T::TYPE)
             && !prepared.data.transport_only_inputs
             && !is_checked_integer_scalar(T::TYPE)
@@ -2780,6 +2865,18 @@ impl<'session> CudaTensorAssessor<'session> {
         }
 
         validate_owned_storage(&view, inputs, &outputs, &bank.resources)?;
+
+        if let Some(guarded) = prepared
+            .guarded
+            .as_ref()
+            .filter(|guarded| guarded.uses_stream(&self.state().stream))
+        {
+            let execution = self.execute_guarded_owned_program(
+                prepared, guarded, inputs, &outputs, &mut bank, pool, memory,
+            );
+            bank.finish(execution.as_ref().err())?;
+            return execution;
+        }
 
         let bank_view = &mut *bank;
         let mut scratch_view = CudaExecutionScratch {
@@ -5264,7 +5361,7 @@ impl<'session> CudaTensorAssessor<'session> {
     }
     fn execute_relu(
         &self,
-        dispatch: &PreparedFixedTensorDispatch,
+        dispatch: PreparedFixedTensorDispatchRef<'_>,
         input: &CudaMemoryResource,
         output: &CudaMemoryResource,
         batch: Option<&mut CudaCompletionBatch>,
@@ -5559,7 +5656,7 @@ impl<'session> CudaTensorAssessor<'session> {
     #[allow(clippy::too_many_lines)] // Keeps the cache, owned bindings, and completion lifetime explicit.
     fn execute_elementwise<T: ElementwiseTimingSink>(
         &self,
-        dispatch: &PreparedFixedTensorDispatch,
+        dispatch: PreparedFixedTensorDispatchRef<'_>,
         operands: ElementwiseOperands<'_>,
         batch: Option<&mut CudaCompletionBatch>,
         timing: &mut T,
@@ -5578,12 +5675,17 @@ impl<'session> CudaTensorAssessor<'session> {
             return Err(CudaTensorExecutionError::InvalidPlan(dispatch.value));
         }
         let setup_mark = timing.begin(ElementwisePhase::CacheAndBind);
-        self.ensure_dispatch_cached(
-            dispatch.cache_key.clone(),
-            dispatch.kernel,
-            dispatch.invocation_shape,
-            false,
-        )?;
+        let retained = dispatch
+            .retained
+            .filter(|retained| retained.uses_stream(&self.state().stream));
+        if retained.is_none() {
+            self.ensure_dispatch_cached(
+                dispatch.cache_key.clone(),
+                dispatch.kernel,
+                dispatch.invocation_shape,
+                false,
+            )?;
+        }
         let left_binding = self
             .session
             .bind(
@@ -5622,11 +5724,19 @@ impl<'session> CudaTensorAssessor<'session> {
         timing.finish(ElementwisePhase::CacheAndBind, setup_mark);
         let submit_mark = timing.begin(ElementwisePhase::Submit);
         let dispatch_result = {
-            let cache = self.state().add_dispatches.borrow();
-            let prepared = cache
-                .iter()
-                .find(|(key, _)| *key == dispatch.cache_key)
-                .map(|(_, prepared)| prepared)
+            // The retained route borrows directly: no cache search, allocation or Rc clone.
+            let cache = retained
+                .is_none()
+                .then(|| self.state().add_dispatches.borrow());
+            let prepared = retained
+                .or_else(|| {
+                    cache.as_ref().and_then(|cache| {
+                        cache
+                            .iter()
+                            .find(|(key, _)| *key == dispatch.cache_key)
+                            .map(|(_, prepared)| prepared.as_ref())
+                    })
+                })
                 .ok_or(CudaTensorExecutionError::SizeOverflow)?;
             if let Some(batch) = batch {
                 prepared
@@ -5885,10 +5995,13 @@ impl CudaOwnedPreparedTensorGraph {
         let view = CudaPreparedGraphView {
             graph: program.graph(),
             data: &data,
+            retained_fixed: &[],
             selected: SelectedPlanRef::Owned(&program),
         };
         let scratch = owned_scratch::State::new(&view)?;
         let mut prepared = Self {
+            retained_fixed: Vec::new(),
+            guarded: None,
             scratch,
             staging: pending_upload::StagingEligibility::disabled(),
             program,
@@ -5898,7 +6011,7 @@ impl CudaOwnedPreparedTensorGraph {
         Ok(prepared)
     }
 
-    /// Whether the cold selected schedule structurally permits checked host staging.
+    /// Whether the cold selected schedule structurally proves terminal-dispatch host staging.
     ///
     /// This cached fact performs no graph scan. It does not prove current endpoint, scratch,
     /// queue or native dispatch-cache readiness. Endpoint/scratch/queue checks remain required;
@@ -5977,6 +6090,8 @@ fn validate_tensor_scalar_tag<T: fusion_pcu::PcuScalar>(
 /// Owning prepared tensor schedule. The selected graph and all backend indexes live together;
 /// there are no references from the schedule back into its graph.
 pub struct CudaOwnedPreparedTensorGraph {
+    guarded: Option<guarded::Plan>,
+    retained_fixed: Vec<Option<Rc<CudaPreparedDispatch>>>,
     scratch: owned_scratch::State,
     staging: pending_upload::StagingEligibility,
     program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
@@ -6003,6 +6118,7 @@ enum SelectedPlanRef<'a, 'graph> {
 }
 
 struct CudaPreparedGraphView<'a, 'graph> {
+    retained_fixed: &'a [Option<Rc<CudaPreparedDispatch>>],
     graph: &'a Graph,
     data: &'a CudaPreparedGraphData,
     selected: SelectedPlanRef<'a, 'graph>,
@@ -6058,11 +6174,15 @@ impl CudaPreparedGraphView<'_, '_> {
     fn fixed_dispatch(
         &self,
         index: usize,
-    ) -> Result<&PreparedFixedTensorDispatch, CudaTensorExecutionError> {
+    ) -> Result<PreparedFixedTensorDispatchRef<'_>, CudaTensorExecutionError> {
         self.data
             .fixed_dispatches
             .get(index)
             .and_then(Option::as_ref)
+            .map(|dispatch| PreparedFixedTensorDispatchRef {
+                dispatch,
+                retained: self.retained_fixed.get(index).and_then(Option::as_deref),
+            })
             .ok_or_else(|| {
                 let value = self
                     .data
@@ -6096,6 +6216,7 @@ impl<'graph> CudaPreparedTensorGraph<'graph> {
         CudaPreparedGraphView {
             graph: self.graph,
             data: &self.data,
+            retained_fixed: &[],
             selected: SelectedPlanRef::Borrowed(&self.lowering_plan),
         }
     }
@@ -6106,6 +6227,7 @@ impl CudaOwnedPreparedTensorGraph {
         CudaPreparedGraphView {
             graph: self.program.graph(),
             data: &self.data,
+            retained_fixed: &self.retained_fixed,
             selected: SelectedPlanRef::Owned(&self.program),
         }
     }
@@ -10866,6 +10988,7 @@ mod tests {
             );
             let view = prepared.view();
             let index = view.index_of(output).unwrap();
+            assert!(prepared.view().retained_fixed.is_empty());
             let dispatch = view.fixed_dispatch(index).unwrap();
             kernel_ids.push(dispatch.kernel.id);
             cache_keys.push(dispatch.cache_key.clone());
@@ -12792,3 +12915,7 @@ mod integer_literal_tests;
 #[cfg(test)]
 #[path = "low_float_producers/low_float_producers.rs"]
 mod low_float_producer_tests;
+
+#[cfg(test)]
+#[path = "retained_fixed_tests/retained_fixed_tests.rs"]
+mod retained_fixed_tests;

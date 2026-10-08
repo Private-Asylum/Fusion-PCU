@@ -126,8 +126,8 @@ mod strict_sgd;
 #[cfg(feature = "tensor")]
 pub use strict_sgd::StrictSgd;
 
-#[cfg(feature="tensor")]
-#[path="strict_mse/strict_mse.rs"]
+#[cfg(feature = "tensor")]
+#[path = "strict_mse/strict_mse.rs"]
 mod strict_mse;
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use strict_mse::StrictMse;

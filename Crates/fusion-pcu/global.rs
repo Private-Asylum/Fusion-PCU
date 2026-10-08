@@ -153,6 +153,11 @@ pub struct PcuExecutionPolicy {
     /// Function-local overrides inherit unrelated fields. Library/API failures remain errors
     /// even under explicitly backend-defined compound numerical arithmetic.
     pub numerical_options: crate::PcuNumericalOptions,
+    /// Host observation of internal checked stages, independent of numerical policy.
+    /// Automatic permits backend-proven guarded execution within a synchronous function call;
+    /// the call still resolves its promised errors before returning. Host-observed stages
+    /// preserve intermediate checked submission boundaries without forcing payload readback.
+    pub observation: crate::PcuExecutionObservationPolicy,
     /// Cold candidate scoring after explicit device filtering; higher scores rank first.
     pub score_device: fn(&crate::PcuDeviceDescriptor<'_>, u64) -> i128,
     /// Optional cold invocation ranking with actual IR and directly reported physical facts.
@@ -172,6 +177,7 @@ impl Default for PcuExecutionPolicy {
             range_policy: crate::PcuRangePolicy::Reject,
             numerical_mode: crate::PcuNumericalMode::Boundary,
             numerical_options: crate::PcuNumericalOptions::default(),
+            observation: crate::PcuExecutionObservationPolicy::Automatic,
             score_device: default_device_score,
             score_invocation: None,
         }
@@ -532,6 +538,10 @@ impl From<fusion_pcu_rocm::RocmTensorExecutionError> for PcuExecutionError {
 }
 
 /// Per-source-function cache hint. A hint is never trusted without checking specialization identity.
+///
+/// Warm hits leave an already matching hint untouched, avoiding shared cache-line writes across
+/// calling threads. Concurrent changes are harmless: entries live in thread-local caches and
+/// every lookup validates the observed hint before use; the atomic never publishes entry state.
 #[doc(hidden)]
 pub struct PcuHostCallSite {
     #[cfg(any(feature = "rocm", all(feature = "cuda", feature = "tensor")))]
@@ -546,6 +556,20 @@ pub struct PcuHostCallSite {
     provider_slot: AtomicUsize,
 }
 impl PcuHostCallSite {
+    #[cfg(any(
+        feature = "rocm",
+        feature = "cuda",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "cpu",
+        feature = "mlx"
+    ))]
+    fn remember_hint(hint: &AtomicUsize, observed: usize, selected: usize) {
+        if selected != observed {
+            hint.store(selected, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -704,11 +728,13 @@ pub fn use_defaults() -> Result<(), PcuExecutionError> {
 
 /// Clear this thread's prepared entries, provider session roots and discovery snapshots.
 ///
-/// Direct hosted calls complete synchronously, so no command or device-resource lease escapes
-/// this cache today.
+/// Escaped resident values retain their execution roots independently and remain valid. Known
+/// CUDA/ROCm sessions release completed idle host publication caches while retaining live tickets
+/// and quarantined endpoints. Later transfers may refill those caches. This does not trim every
+/// backend workspace or impose a persistent memory limit.
 ///
 /// # Errors
-/// Rejects clearing during a nested active call.
+/// Rejects clearing during a nested active call or while an idle publication cache is locked.
 #[allow(clippy::missing_const_for_fn)] // Hosted implementations perform runtime IO/state mutation.
 pub fn clear_thread_cache() -> Result<(), PcuExecutionError> {
     #[cfg(any(
@@ -1007,6 +1033,23 @@ mod tests {
             PcuExecutionPolicy::default().numerical_mode,
             crate::PcuNumericalMode::Boundary
         );
+    }
+
+    #[test]
+    fn stage_observation_is_independent_of_numerical_defaults() {
+        let automatic = PcuExecutionPolicy::default();
+        let observed = PcuExecutionPolicy {
+            observation: crate::PcuExecutionObservationPolicy::HostObservedStages,
+            ..automatic
+        };
+        assert_eq!(
+            automatic.observation,
+            crate::PcuExecutionObservationPolicy::Automatic
+        );
+        assert_eq!(observed.numerical_mode, automatic.numerical_mode);
+        assert_eq!(observed.numerical_options, automatic.numerical_options);
+        assert_eq!(observed.range_policy, automatic.range_policy);
+        assert_eq!(observed.float_underflow, automatic.float_underflow);
     }
 
     #[cfg(feature = "rocm")]

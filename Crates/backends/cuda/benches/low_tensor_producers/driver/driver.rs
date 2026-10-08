@@ -486,13 +486,13 @@ fn case<T: ProducerSource + TensorElement, const N: usize, const HALF: bool>(
             ];
             assert_eq!(
                 pcusdk,
+                // Prepared private terminal events are retained across these warm calls.
                 match route {
                     "actual_source_immutable_producers" => [
-                        0, 2048, 1024, 64, 64, 64, 192, 128, 128, 128, 128, 128, 0, 0, 0, 0, 0, 0
+                        0, 1536, 768, 64, 64, 64, 192, 128, 0, 128, 128, 0, 0, 0, 0, 0, 0, 0
                     ],
                     "explicit_graph_cold_producers" => [
-                        0, 2432, 1216, 128, 128, 64, 192, 128, 128, 128, 128, 128, 0, 0, 0, 0, 64,
-                        0
+                        0, 1920, 960, 128, 128, 64, 192, 128, 0, 128, 128, 0, 0, 0, 0, 0, 64, 0
                     ],
                     _ => [0; 18],
                 }

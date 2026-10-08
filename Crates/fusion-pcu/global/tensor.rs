@@ -1865,7 +1865,7 @@ mod execution {
         scalar_type: crate::core::PcuScalarType,
         shape_keys: Vec<InputShapeKey>,
         resident_affinity: bool,
-        #[cfg(all(feature = "cuda", target_endian = "little"))]
+        #[cfg(all(any(feature = "cuda", feature = "rocm"), target_endian = "little"))]
         host_staging_eligible: bool,
         session: Rc<Session>,
         prepared: Prepared,
@@ -1954,9 +1954,10 @@ mod execution {
     ) -> Result<(Entry, u64, usize), PcuExecutionError> {
         let (session, prepared, generation, capacity) =
             crate::global::resident::prepare_tensor(snapshot, affinity, |session| {
-                let prepared = session
-                    .tensor_assessor()?
-                    .prepare_shared_owned_program(Arc::clone(&built.program))?;
+                let prepared = session.tensor_assessor()?.prepare_shared_owned_program(
+                    Arc::clone(&built.program),
+                    snapshot.policy.observation,
+                )?;
                 Ok(prepared)
             })?;
         let pool = PcuMemoryPoolId(session.device_id());
@@ -1971,7 +1972,7 @@ mod execution {
                 .map(InputShapeKey::from_witness)
                 .collect(),
             resident_affinity: affinity.is_some(),
-            #[cfg(all(feature = "cuda", target_endian = "little"))]
+            #[cfg(all(any(feature = "cuda", feature = "rocm"), target_endian = "little"))]
             host_staging_eligible: prepared.supports_host_staging(),
             session,
             prepared,
@@ -2082,7 +2083,7 @@ mod execution {
     // A successful terminal checked schedule can discharge the provider's private upload
     // lease. Cold, mixed-resident and unsupported profiles retain synchronous staging.
     // Native-endian views are qualified only for little-endian device representations.
-    #[cfg(all(feature = "cuda", target_endian = "little"))]
+    #[cfg(all(any(feature = "cuda", feature = "rocm"), target_endian = "little"))]
     fn try_host_staged_entry<T: PcuScalar, const N: usize>(
         entry: &mut Entry,
         inputs: &[PcuTensorInput<'_, T>; N],
@@ -2323,7 +2324,7 @@ mod execution {
             let entry = &mut state.entries[slot];
             // This optimization is currently qualified only for ordinary host borrows.
             // Pruned consuming routes use execute_entry directly until their own proof.
-            #[cfg(all(feature = "cuda", target_endian = "little"))]
+            #[cfg(all(any(feature = "cuda", feature = "rocm"), target_endian = "little"))]
             if let Some(output) = try_host_staged_entry(entry, inputs)? {
                 return Ok(output);
             }
@@ -3122,7 +3123,7 @@ mod execution {
                 })
             };
             if matches_affinity(&state.entries[candidate]) {
-                site.slot.store(candidate, Ordering::Relaxed);
+                PcuHostCallSite::remember_hint(&site.slot, hint, candidate);
                 return Ok(candidate);
             }
             if let Some(slot) = state
@@ -3130,7 +3131,7 @@ mod execution {
                 .iter()
                 .position(|entry| matches_base(entry) && matches_affinity(entry))
             {
-                site.slot.store(slot, Ordering::Relaxed);
+                PcuHostCallSite::remember_hint(&site.slot, hint, slot);
                 return Ok(slot);
             }
         }
@@ -3167,7 +3168,7 @@ mod execution {
             state.entries.push(entry);
             state.entries.len() - 1
         };
-        site.slot.store(slot, Ordering::Relaxed);
+        PcuHostCallSite::remember_hint(&site.slot, hint, slot);
         Ok(slot)
     }
 
@@ -3214,7 +3215,7 @@ mod execution {
                 })
             };
             if matches_affinity(&state.entries[candidate]) {
-                site.slot.store(candidate, Ordering::Relaxed);
+                PcuHostCallSite::remember_hint(&site.slot, hint, candidate);
                 return Ok(candidate);
             }
             if let Some(slot) = state
@@ -3222,7 +3223,7 @@ mod execution {
                 .iter()
                 .position(|entry| matches_base(entry) && matches_affinity(entry))
             {
-                site.slot.store(slot, Ordering::Relaxed);
+                PcuHostCallSite::remember_hint(&site.slot, hint, slot);
                 return Ok(slot);
             }
         }
@@ -3259,7 +3260,7 @@ mod execution {
             state.entries.push(entry);
             state.entries.len() - 1
         };
-        site.slot.store(slot, Ordering::Relaxed);
+        PcuHostCallSite::remember_hint(&site.slot, hint, slot);
         Ok(slot)
     }
 

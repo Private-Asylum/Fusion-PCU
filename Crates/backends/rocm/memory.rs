@@ -36,11 +36,28 @@ use crate::{
 pub struct RocmMemoryProvider {
     runtime: HipRuntime,
     pool: PcuMemoryPoolId,
+    publication: std::sync::Arc<crate::HostPublicationWorkspace>,
 }
 
 impl RocmMemoryProvider {
-    pub(crate) const fn new(runtime: HipRuntime, pool: PcuMemoryPoolId) -> Self {
-        Self { runtime, pool }
+    pub(crate) fn new(runtime: HipRuntime, pool: PcuMemoryPoolId) -> Self {
+        Self {
+            runtime,
+            pool,
+            publication: std::sync::Arc::default(),
+        }
+    }
+
+    pub(crate) const fn with_publication(
+        runtime: HipRuntime,
+        pool: PcuMemoryPoolId,
+        publication: std::sync::Arc<crate::HostPublicationWorkspace>,
+    ) -> Self {
+        Self {
+            runtime,
+            pool,
+            publication,
+        }
     }
 
     const fn error(
@@ -344,6 +361,30 @@ impl PcuMemoryProvider for RocmMemoryProvider {
     type ImportDescriptor = RocmImportDescriptor;
     type Mapping<'a> = RocmMemoryMapping;
 
+    fn release_idle_host_cache(
+        &self,
+        pool: PcuMemoryPoolId,
+    ) -> Result<u64, PcuMemoryProviderError> {
+        let operation = PcuMemoryProviderOperation::ReleaseIdleHostCache;
+        if pool != self.pool {
+            return Err(self.error(
+                operation,
+                PcuMemoryProviderFailure::PoolUnavailable,
+                PcuMemoryDisposition::Reject,
+            ));
+        }
+        self.publication
+            .release_idle()
+            .map(|bytes| bytes as u64)
+            .ok_or_else(|| {
+                self.error(
+                    operation,
+                    PcuMemoryProviderFailure::Busy,
+                    PcuMemoryDisposition::Defer,
+                )
+            })
+    }
+
     fn snapshot(
         &self,
         pool: PcuMemoryPoolId,
@@ -539,9 +580,13 @@ impl PcuMemoryProvider for RocmMemoryProvider {
                 PcuMemoryDisposition::Reject,
             )
         })?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
         resource
             .buffer
-            .copy_to_at(offset, bytes)
+            .readback_with_workspace(offset, bytes.len(), &self.publication)
+            .map(|ticket| ticket.publish_to(bytes))
             .map_err(|error| hip_failure(self, op, &error))
     }
 
@@ -728,6 +773,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires device; shared session cache reclamation preserves live readback leases"]
+    fn rocm_idle_host_cache_release_is_shared_and_preserves_live_storage() {
+        let session = selected_rocm_session();
+        let pool = PcuMemoryPoolId(0x484f_5354);
+        let mut provider = session.memory_provider(pool);
+        let mut resource = provider
+            .allocate(PcuMemoryAllocationRequest {
+                pool,
+                size_bytes: 65,
+                alignment_bytes: 8,
+                access: PcuMemoryAccess::ReadWrite,
+                host_access: PcuMemoryHostAccess::TransferOnly,
+                require_device_local: false,
+            })
+            .unwrap();
+        provider.transfer_to(&mut resource, 0, &[7; 65]).unwrap();
+        let mut destination = [99; 67];
+        provider
+            .transfer_from(&resource, 0, &mut destination[..65])
+            .unwrap();
+        let clone = provider.clone();
+        assert!(session.release_idle_host_cache().unwrap() >= 65);
+        assert_eq!(clone.release_idle_host_cache(pool).unwrap(), 0);
+        let wrong_pool = PcuMemoryPoolId(pool.0 + 1);
+        assert_eq!(
+            clone.release_idle_host_cache(wrong_pool),
+            Err(PcuMemoryProviderError {
+                pool,
+                operation: PcuMemoryProviderOperation::ReleaseIdleHostCache,
+                disposition: PcuMemoryDisposition::Reject,
+                failure: PcuMemoryProviderFailure::PoolUnavailable,
+            })
+        );
+        let ticket = resource
+            .buffer
+            .readback_with_workspace(0, 65, &provider.publication)
+            .unwrap();
+        assert_eq!(session.release_idle_host_cache().unwrap(), 0);
+        assert!(resource.validate_access_available().is_err());
+        drop(ticket);
+        assert!(clone.release_idle_host_cache(pool).unwrap() >= 65);
+        resource.validate_access_available().unwrap();
+        provider
+            .transfer_from(&resource, 0, &mut destination[..65])
+            .unwrap();
+        assert_eq!(destination[..65], [7; 65]);
+        assert_eq!(destination[65..], [99; 2]);
+        let held = provider.publication.0.lock().unwrap();
+        assert_eq!(
+            clone.release_idle_host_cache(pool),
+            Err(PcuMemoryProviderError {
+                pool,
+                operation: PcuMemoryProviderOperation::ReleaseIdleHostCache,
+                disposition: PcuMemoryDisposition::Defer,
+                failure: PcuMemoryProviderFailure::Busy,
+            })
+        );
+        drop(held);
+        assert!(session.release_idle_host_cache().unwrap() >= 65);
+    }
+
+    #[test]
     #[ignore = "requires an explicitly visible ROCm device"]
     fn rocm_resource_ownership_tracks_alias_and_access_leases() {
         let session = selected_rocm_session();
@@ -788,6 +895,68 @@ mod tests {
         resource
             .validate_access_available()
             .expect("completed operation lease releases quiescence");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly visible ROCm device"]
+    fn provider_publication_workspace_isolates_live_tickets_and_reuses_completed_ram() {
+        let session = selected_rocm_session();
+        let pool = PcuMemoryPoolId(0x524f_434e);
+        let mut provider = session.memory_provider(pool);
+        let request = PcuMemoryAllocationRequest {
+            pool,
+            size_bytes: 65,
+            alignment_bytes: 1,
+            access: PcuMemoryAccess::ReadWrite,
+            host_access: PcuMemoryHostAccess::TransferOnly,
+            require_device_local: false,
+        };
+        let mut first = provider.allocate(request).unwrap();
+        let mut second = provider.allocate(request).unwrap();
+        provider.transfer_to(&mut first, 0, &[7; 65]).unwrap();
+        provider.transfer_to(&mut second, 0, &[9; 65]).unwrap();
+        let first_ticket = first
+            .buffer
+            .readback_with_workspace(0, 65, &provider.publication)
+            .unwrap();
+        let first_pointer = first_ticket.workspace.as_ref().unwrap().bytes.as_ptr();
+        assert!(provider.transfer_to(&mut first, 0, &[3; 65]).is_err());
+        provider.transfer_from(&first, 65, &mut []).unwrap();
+        let second_ticket = second
+            .buffer
+            .readback_with_workspace(0, 17, &provider.publication)
+            .unwrap();
+        assert_ne!(
+            first_pointer,
+            second_ticket.workspace.as_ref().unwrap().bytes.as_ptr()
+        );
+        let mut published = [0x55; 67];
+        first_ticket.publish_to(&mut published[..65]);
+        assert_eq!(&published[..65], &[7; 65]);
+        assert_eq!(&published[65..], &[0x55; 2]);
+        second_ticket.publish_to(&mut published[..17]);
+        assert_eq!(&published[..17], &[9; 17]);
+        drop(second_ticket);
+        drop(first_ticket);
+        let fresh = provider.allocate(request).unwrap();
+        let ticket = fresh
+            .buffer
+            .readback_with_workspace(0, 65, &provider.publication)
+            .unwrap();
+        assert_eq!(
+            first_pointer,
+            ticket.workspace.as_ref().unwrap().bytes.as_ptr()
+        );
+        // Fresh output publication uses session RAM without growing the allocation's upload RAM.
+        assert!(fresh.buffer.allocation.host_transfer.borrow().is_empty());
+        drop(ticket);
+        fresh.validate_access_available().unwrap();
+    }
+
+    #[test]
+    fn provider_remains_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RocmMemoryProvider>();
     }
 
     #[test]

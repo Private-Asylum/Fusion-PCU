@@ -238,12 +238,17 @@ pub use sgd::{MetalTensorSgdPlan, MetalPreparedTensorSgdProgram};
 
 #[path = "selected_numerical/selected_numerical.rs"]
 mod selected_numerical;
-pub use selected_numerical::{MetalSelectedNumericalTensorPlan,MetalPreparedSelectedNumericalTensorProgram,MetalSelectedNumericalTensorOperation};
+pub use selected_numerical::{
+    MetalSelectedNumericalTensorPlan, MetalPreparedSelectedNumericalTensorProgram,
+    MetalSelectedNumericalTensorOperation,
+};
 
-#[path="mse/mse.rs"]
+#[path = "mse/mse.rs"]
 mod mse;
-pub use mse::{MetalTensorMsePlan,MetalPreparedTensorMseProgram};
+pub use mse::{MetalTensorMsePlan, MetalPreparedTensorMseProgram};
 
-#[path="selected_graph/selected_graph.rs"]
+#[path = "selected_graph/selected_graph.rs"]
 mod selected_graph;
-pub use selected_graph::{MetalSelectedTensorGraphPlan, MetalPreparedSelectedTensorGraph, MetalTensorGraphError};
+pub use selected_graph::{
+    MetalSelectedTensorGraphPlan, MetalPreparedSelectedTensorGraph, MetalTensorGraphError,
+};

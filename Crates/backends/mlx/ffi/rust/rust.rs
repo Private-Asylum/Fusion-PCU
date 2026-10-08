@@ -106,5 +106,5 @@ pub use c_api::StrictMatMul;
 #[cfg(feature = "tensor")]
 pub use c_api::StrictSgd;
 
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use c_api::StrictMse;

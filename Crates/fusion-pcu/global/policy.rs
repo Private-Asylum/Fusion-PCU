@@ -104,6 +104,7 @@ static POLICY: RwLock<PolicyState> = RwLock::new(PolicyState {
                 precision: crate::PcuPrecisionPolicy::Preserve,
                 reproducibility: crate::PcuReproducibility::Unspecified,
             },
+            observation: crate::PcuExecutionObservationPolicy::Automatic,
             score_device: super::default_device_score,
             score_invocation: None,
         },

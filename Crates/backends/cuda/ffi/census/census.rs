@@ -12,6 +12,8 @@ pub struct CudaApiCensus {
     pub device_to_host_copies: u64,
     pub device_to_device_copies: u64,
     pub kernel_launches: u64,
+    pub guarded_chain_submissions: u64,
+    pub guarded_kernel_launches: u64,
     pub event_creates: u64,
     pub event_records: u64,
     pub event_waits: u64,
@@ -22,7 +24,7 @@ pub struct CudaApiCensus {
     /// Explicit device/stream wait time, measured only in the separate instrumentation build.
     pub completion_wait_nanoseconds: u64,
 }
-std::thread_local! { static CENSUS: std::cell::Cell<CudaApiCensus> = const { std::cell::Cell::new(CudaApiCensus { symbol_resolutions: 0, runtime_driver_calls: 0, device_selections: 0, cublas_calls: 0, cublaslt_matmul_calls: 0, allocations: 0, frees: 0, host_to_device_copies: 0, device_to_host_copies: 0, device_to_device_copies: 0, kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0, device_synchronizations: 0, stream_synchronizations: 0, completion_wait_nanoseconds: 0 }) }; }
+std::thread_local! { static CENSUS: std::cell::Cell<CudaApiCensus> = const { std::cell::Cell::new(CudaApiCensus { symbol_resolutions: 0, runtime_driver_calls: 0, device_selections: 0, cublas_calls: 0, cublaslt_matmul_calls: 0, allocations: 0, frees: 0, host_to_device_copies: 0, device_to_host_copies: 0, device_to_device_copies: 0, kernel_launches: 0, guarded_chain_submissions: 0, guarded_kernel_launches: 0, event_creates: 0, event_records: 0, event_waits: 0, event_destroys: 0, module_loads: 0, device_synchronizations: 0, stream_synchronizations: 0, completion_wait_nanoseconds: 0 }) }; }
 #[must_use]
 pub fn cuda_api_census() -> CudaApiCensus {
     CENSUS.get()
@@ -86,6 +88,23 @@ pub(super) fn lt_matmul() {
     CENSUS.with(|cell| {
         let mut value = cell.get();
         value.cublaslt_matmul_calls += 1;
+        cell.set(value);
+    });
+}
+
+#[cfg(feature = "tensor")]
+pub fn guarded_chain() {
+    CENSUS.with(|cell| {
+        let mut value = cell.get();
+        value.guarded_chain_submissions += 1;
+        cell.set(value);
+    });
+}
+#[cfg(feature = "tensor")]
+pub fn guarded_kernel() {
+    CENSUS.with(|cell| {
+        let mut value = cell.get();
+        value.guarded_kernel_launches += 1;
         cell.set(value);
     });
 }

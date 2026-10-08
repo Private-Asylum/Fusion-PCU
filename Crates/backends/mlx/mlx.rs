@@ -213,27 +213,32 @@ pub use sgd_tensor::MlxCheckedTensorSgdPlan;
 pub use runtime::MlxPreparedTensorSgdProgram;
 
 #[cfg(feature = "tensor")]
-pub use runtime::{MlxSelectedNumericalTensorPlan,MlxPreparedSelectedNumericalTensorProgram,MlxSelectedNumericalTensorOperation};
+pub use runtime::{
+    MlxSelectedNumericalTensorPlan, MlxPreparedSelectedNumericalTensorProgram,
+    MlxSelectedNumericalTensorOperation,
+};
 
 #[cfg(feature = "tensor")]
 pub use discovery::MlxSelectedNumericalTensorRequest;
 
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use runtime::MlxPreparedStrictMse;
 
-#[cfg(feature="tensor")]
-#[path="admission/mse_tensor/mse_tensor.rs"]
+#[cfg(feature = "tensor")]
+#[path = "admission/mse_tensor/mse_tensor.rs"]
 mod mse_tensor;
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use mse_tensor::MlxCheckedTensorMsePlan;
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use runtime::MlxPreparedTensorMseProgram;
 
-#[cfg(feature="tensor")]
-#[path="runtime/selected_graph/selected_graph.rs"]
+#[cfg(feature = "tensor")]
+#[path = "runtime/selected_graph/selected_graph.rs"]
 mod selected_graph;
-#[cfg(feature="tensor")]
-pub use selected_graph::{MlxSelectedTensorGraphPlan, MlxPreparedSelectedTensorGraph, MlxTensorGraphError};
+#[cfg(feature = "tensor")]
+pub use selected_graph::{
+    MlxSelectedTensorGraphPlan, MlxPreparedSelectedTensorGraph, MlxTensorGraphError,
+};
 
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use discovery::MlxSelectedTensorGraphRequest;

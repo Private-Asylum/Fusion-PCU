@@ -164,7 +164,18 @@ fn exercise<T: Format>(backend: &RocmOwnedDispatchBackend, ir: &PcuDispatchKerne
     assert_eq!(output, before_output);
     assert!(!prepared.last_call_may_have_written());
     slots::<T>(&prepared, 94);
+    #[cfg(feature = "allocation-census")]
+    crate::ffi::reset_rocm_api_census();
     call(&mut prepared, &input, &mut stage, &mut output).unwrap();
+    #[cfg(feature = "allocation-census")]
+    {
+        let census = crate::ffi::rocm_api_census();
+        assert_eq!(census.device_selections, 1);
+        assert_eq!(census.device_synchronizations, 0);
+        assert_eq!(census.stream_synchronizations, 0);
+        assert_eq!(census.allocations, 0);
+        assert!(census.runtime_calls > 1);
+    }
     values(&stage, &expected_stage);
     values(&output, &expected_output);
 }

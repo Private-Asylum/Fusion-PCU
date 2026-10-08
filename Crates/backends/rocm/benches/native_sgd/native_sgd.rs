@@ -2,6 +2,7 @@
 extern crate pcu_facade as fusion_pcu;
 
 mod activity;
+#[cfg(feature = "allocation-census")]
 #[path = "../native_mse/allocations.rs"]
 #[allow(unsafe_code)] // Optional caller-thread System allocator census.
 mod allocations;

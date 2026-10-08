@@ -111,6 +111,7 @@ impl CudaRuntime {
             inner: Rc::new(StreamInner {
                 runtime: self.clone(),
                 raw: stream,
+                idle_completion_event: std::cell::Cell::new(None),
             }),
         })
     }

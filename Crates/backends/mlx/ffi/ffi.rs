@@ -70,5 +70,5 @@ pub use rust::StrictMatMul;
 #[cfg(feature = "tensor")]
 pub use rust::StrictSgd;
 
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use rust::StrictMse;

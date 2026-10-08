@@ -36,11 +36,28 @@ use crate::{
 pub struct CudaMemoryProvider {
     runtime: CudaRuntime,
     pool: PcuMemoryPoolId,
+    publication: std::sync::Arc<crate::HostPublicationWorkspace>,
 }
 
 impl CudaMemoryProvider {
-    pub(crate) const fn new(runtime: CudaRuntime, pool: PcuMemoryPoolId) -> Self {
-        Self { runtime, pool }
+    pub(crate) fn new(runtime: CudaRuntime, pool: PcuMemoryPoolId) -> Self {
+        Self {
+            runtime,
+            pool,
+            publication: std::sync::Arc::default(),
+        }
+    }
+
+    pub(crate) const fn with_publication(
+        runtime: CudaRuntime,
+        pool: PcuMemoryPoolId,
+        publication: std::sync::Arc<crate::HostPublicationWorkspace>,
+    ) -> Self {
+        Self {
+            runtime,
+            pool,
+            publication,
+        }
     }
 
     const fn error(
@@ -344,6 +361,30 @@ impl PcuMemoryProvider for CudaMemoryProvider {
     type ImportDescriptor = CudaImportDescriptor;
     type Mapping<'a> = CudaMemoryMapping;
 
+    fn release_idle_host_cache(
+        &self,
+        pool: PcuMemoryPoolId,
+    ) -> Result<u64, PcuMemoryProviderError> {
+        let operation = PcuMemoryProviderOperation::ReleaseIdleHostCache;
+        if pool != self.pool {
+            return Err(self.error(
+                operation,
+                PcuMemoryProviderFailure::PoolUnavailable,
+                PcuMemoryDisposition::Reject,
+            ));
+        }
+        self.publication
+            .release_idle()
+            .map(|bytes| bytes as u64)
+            .ok_or_else(|| {
+                self.error(
+                    operation,
+                    PcuMemoryProviderFailure::Busy,
+                    PcuMemoryDisposition::Defer,
+                )
+            })
+    }
+
     fn snapshot(
         &self,
         pool: PcuMemoryPoolId,
@@ -539,9 +580,13 @@ impl PcuMemoryProvider for CudaMemoryProvider {
                 PcuMemoryDisposition::Reject,
             )
         })?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
         resource
             .buffer
-            .copy_to_at(offset, bytes)
+            .readback_with_workspace(offset, bytes.len(), &self.publication)
+            .map(|readback| readback.publish_to(bytes))
             .map_err(|error| cuda_failure(self, op, &error))
     }
 
@@ -725,6 +770,101 @@ mod tests {
         discovery.devices(target, &mut devices).unwrap();
         crate::CudaOwnedDispatchBackend::open(&discovery, devices[0].reference, 64)
             .expect("open selected CUDA device")
+    }
+
+    #[test]
+    #[ignore = "requires CUDA GPU; provider workspace no-op and transactional publication"]
+    fn cuda_provider_publication_preserves_empty_busy_noop_and_host_rollback() {
+        let runtime = CudaRuntime::new(0).unwrap();
+        let pool = PcuMemoryPoolId(0x4350_5753);
+        let mut provider = runtime.memory_provider(pool);
+        let mut resource = CudaMemoryResource {
+            pool,
+            buffer: runtime.allocate(8).unwrap(),
+            alignment: 8,
+            access: PcuMemoryAccess::ReadWrite,
+        };
+        provider.transfer_to(&mut resource, 0, &[11; 8]).unwrap();
+        let ticket = resource
+            .buffer
+            .readback_with_workspace(0, 8, &provider.publication)
+            .unwrap();
+        provider.transfer_from(&resource, 8, &mut []).unwrap();
+        assert!(provider.transfer_from(&resource, 9, &mut []).is_err());
+        let mut destination = [99; 10];
+        assert!(
+            provider
+                .transfer_from(&resource, 0, &mut destination[..8])
+                .is_err()
+        );
+        assert_eq!(destination, [99; 10]);
+        drop(ticket);
+        provider
+            .transfer_from(&resource, 0, &mut destination[..8])
+            .unwrap();
+        assert_eq!(destination, [11, 11, 11, 11, 11, 11, 11, 11, 99, 99]);
+    }
+
+    #[test]
+    #[ignore = "requires device; shared session cache reclamation preserves live readback leases"]
+    fn cuda_idle_host_cache_release_is_shared_and_preserves_live_storage() {
+        let session = selected_cuda_session();
+        let pool = PcuMemoryPoolId(0x484f_5354);
+        let mut provider = session.memory_provider(pool);
+        let mut resource = provider
+            .allocate(PcuMemoryAllocationRequest {
+                pool,
+                size_bytes: 65,
+                alignment_bytes: 8,
+                access: PcuMemoryAccess::ReadWrite,
+                host_access: PcuMemoryHostAccess::TransferOnly,
+                require_device_local: false,
+            })
+            .unwrap();
+        provider.transfer_to(&mut resource, 0, &[7; 65]).unwrap();
+        let mut destination = [99; 67];
+        provider
+            .transfer_from(&resource, 0, &mut destination[..65])
+            .unwrap();
+        let clone = provider.clone();
+        assert!(session.release_idle_host_cache().unwrap() >= 65);
+        assert_eq!(clone.release_idle_host_cache(pool).unwrap(), 0);
+        let wrong_pool = PcuMemoryPoolId(pool.0 + 1);
+        assert_eq!(
+            clone.release_idle_host_cache(wrong_pool),
+            Err(PcuMemoryProviderError {
+                pool,
+                operation: PcuMemoryProviderOperation::ReleaseIdleHostCache,
+                disposition: PcuMemoryDisposition::Reject,
+                failure: PcuMemoryProviderFailure::PoolUnavailable,
+            })
+        );
+        let ticket = resource
+            .buffer
+            .readback_with_workspace(0, 65, &provider.publication)
+            .unwrap();
+        assert_eq!(session.release_idle_host_cache().unwrap(), 0);
+        assert!(resource.validate_access_available().is_err());
+        drop(ticket);
+        assert!(clone.release_idle_host_cache(pool).unwrap() >= 65);
+        resource.validate_access_available().unwrap();
+        provider
+            .transfer_from(&resource, 0, &mut destination[..65])
+            .unwrap();
+        assert_eq!(destination[..65], [7; 65]);
+        assert_eq!(destination[65..], [99; 2]);
+        let held = provider.publication.0.lock().unwrap();
+        assert_eq!(
+            clone.release_idle_host_cache(pool),
+            Err(PcuMemoryProviderError {
+                pool,
+                operation: PcuMemoryProviderOperation::ReleaseIdleHostCache,
+                disposition: PcuMemoryDisposition::Defer,
+                failure: PcuMemoryProviderFailure::Busy,
+            })
+        );
+        drop(held);
+        assert!(session.release_idle_host_cache().unwrap() >= 65);
     }
 
     #[test]

@@ -864,16 +864,19 @@ pub use tensor_sgd::MlxPreparedTensorSgdProgram;
 #[path = "selected_numerical/selected_numerical.rs"]
 mod selected_numerical;
 #[cfg(feature = "tensor")]
-pub use selected_numerical::{MlxSelectedNumericalTensorPlan,MlxPreparedSelectedNumericalTensorProgram,MlxSelectedNumericalTensorOperation};
+pub use selected_numerical::{
+    MlxSelectedNumericalTensorPlan, MlxPreparedSelectedNumericalTensorProgram,
+    MlxSelectedNumericalTensorOperation,
+};
 
-#[cfg(feature="tensor")]
-#[path="strict_mse/strict_mse.rs"]
+#[cfg(feature = "tensor")]
+#[path = "strict_mse/strict_mse.rs"]
 mod strict_mse;
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use strict_mse::MlxPreparedStrictMse;
 
-#[cfg(feature="tensor")]
-#[path="tensor_mse/tensor_mse.rs"]
+#[cfg(feature = "tensor")]
+#[path = "tensor_mse/tensor_mse.rs"]
 mod tensor_mse;
-#[cfg(feature="tensor")]
+#[cfg(feature = "tensor")]
 pub use tensor_mse::MlxPreparedTensorMseProgram;

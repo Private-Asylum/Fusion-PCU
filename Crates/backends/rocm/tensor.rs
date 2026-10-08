@@ -33,15 +33,22 @@ pub(crate) mod strict_mse;
 pub use strict_mse::lower_strict_mse_to_hip_source;
 pub use relu_backward::lower_relu_backward_to_hip_source;
 use native_sgd::SgdUpdateMode;
+#[path = "tensor/guarded/guarded.rs"]
+mod guarded;
+#[cfg(feature = "insights")]
+pub use guarded::RocmGuardedExecutionReport;
 #[path = "tensor/literal/literal.rs"]
 mod literal;
 #[cfg(test)]
 #[path = "tensor/low_literals/low_literals.rs"]
 mod low_literals;
-#[path = "tensor/owned_scratch/owned_scratch.rs"]
-mod owned_scratch;
 #[path = "tensor/output_array/output_array.rs"]
 mod output_array;
+#[path = "tensor/owned_scratch/owned_scratch.rs"]
+mod owned_scratch;
+#[path = "tensor/pending_upload/pending_upload.rs"]
+mod pending_upload;
+pub use pending_upload::RocmHostedTensorInput;
 
 #[path = "tensor/pointwise.rs"]
 mod pointwise;
@@ -741,7 +748,7 @@ enum TensorDispatchCacheKey {
     },
 }
 
-type TensorDispatchCache = VecDeque<(TensorDispatchCacheKey, RocmPreparedDispatch)>;
+type TensorDispatchCache = VecDeque<(TensorDispatchCacheKey, Rc<RocmPreparedDispatch>)>;
 
 /// Fixed per-node kernel and binding facts selected during graph preparation.
 #[derive(Clone, Debug)]
@@ -755,6 +762,21 @@ struct PreparedFixedTensorDispatch {
     left_binding: PcuBindingRef,
     right_binding: Option<PcuBindingRef>,
     output_binding: PcuBindingRef,
+}
+
+/// Borrowed per-node executable selection; dense indices preserve metadata-only graph traits.
+#[derive(Clone, Copy)]
+struct PreparedFixedTensorDispatchRef<'a> {
+    dispatch: &'a PreparedFixedTensorDispatch,
+    retained: Option<&'a RocmPreparedDispatch>,
+}
+
+impl Deref for PreparedFixedTensorDispatchRef<'_> {
+    type Target = PreparedFixedTensorDispatch;
+
+    fn deref(&self) -> &Self::Target {
+        self.dispatch
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1803,7 +1825,7 @@ impl<'session> RocmTensorAssessor<'session> {
         if evicted {
             cache.pop_front();
         }
-        cache.push_back((key, prepared));
+        cache.push_back((key, Rc::new(prepared)));
         Ok(TensorDispatchCacheAdmission {
             compiled: true,
             evicted,
@@ -2274,6 +2296,63 @@ impl<'session> RocmTensorAssessor<'session> {
         self.prepare_shared_owned_program(Arc::new(program))
     }
 
+    /// Retain the fixed elementwise executables for an owning prepared program on this queue.
+    ///
+    /// This explicit cold step compiles missing fixed kernels without binding or allocating tensor
+    /// resources. Retained kernels survive FIFO cache eviction until the prepared program drops.
+    /// Other assessors keep their normal cache/compilation route when executing this program.
+    /// The cache still owns at most 32 entries; live prepared programs may retain more kernels.
+    /// Dynamic and strict operator executables are outside this fixed-kernel retention step.
+    /// Rebinding retains the original host-staging anchor, so another assessor's staging route
+    /// conservatively refuses this program even after its fixed executables have been rebound.
+    ///
+    /// # Errors
+    /// Returns backend compilation errors. Earlier successful kernels remain retained on failure.
+    pub fn retain_owned_program_fixed_dispatches(
+        &self,
+        prepared: &mut RocmOwnedPreparedTensorGraph,
+    ) -> Result<(), RocmTensorExecutionError> {
+        // A fixed-owner rebind invalidates the original guarded scope before any partial change.
+        if prepared
+            .guarded
+            .as_ref()
+            .is_some_and(|plan| !plan.uses_stream(&self.state().stream))
+        {
+            #[cfg(feature = "insights")]
+            prepared.begin_guarded_attempt();
+            prepared.guarded = None;
+        }
+        if prepared.retained_fixed.is_empty() {
+            prepared
+                .retained_fixed
+                .resize_with(prepared.data.fixed_dispatches.len(), || None);
+        }
+        for (index, dispatch) in prepared.data.fixed_dispatches.iter().enumerate() {
+            let Some(dispatch) = dispatch else { continue };
+            if prepared.retained_fixed[index]
+                .as_ref()
+                .is_some_and(|retained| retained.uses_stream(&self.state().stream))
+            {
+                continue;
+            }
+            self.ensure_dispatch_cached(
+                dispatch.cache_key.clone(),
+                dispatch.kernel,
+                dispatch.invocation_shape,
+                false,
+            )?;
+            // Capture before the next admission can evict this key, including graphs > capacity.
+            let cache = self.state().add_dispatches.borrow();
+            let executable = cache
+                .iter()
+                .find(|(key, _)| *key == dispatch.cache_key)
+                .map(|(_, executable)| Rc::clone(executable))
+                .ok_or(RocmTensorExecutionError::SizeOverflow)?;
+            prepared.retained_fixed[index] = Some(executable);
+        }
+        Ok(())
+    }
+
     /// Prepares an immutable captured program shared across cold device-admission attempts.
     ///
     /// Each candidate derives its own backend facts; rejection leaves the caller's program
@@ -2308,7 +2387,9 @@ impl<'session> RocmTensorAssessor<'session> {
                 )?;
             }
         }
-        RocmOwnedPreparedTensorGraph::from_parts(program, data)
+        let mut prepared = RocmOwnedPreparedTensorGraph::from_parts(program, data)?;
+        prepared.staging.anchor_stream(&self.state().stream);
+        Ok(prepared)
     }
 
     /// Executes a graph-owning selected program from typed device inputs and returns fresh,
@@ -2332,6 +2413,8 @@ impl<'session> RocmTensorAssessor<'session> {
     where
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         let mut borrowed_inputs =
             SmallVec::<[(ValueId, RocmTensorInputRef<'_>); 8]>::with_capacity(inputs.len());
         for &(value, tensor) in inputs {
@@ -2358,6 +2441,7 @@ impl<'session> RocmTensorAssessor<'session> {
     ///
     /// Returns ordinary input, allocation, provider, dispatch, or completion errors. No tensor is
     /// returned after an unsuccessful in-place dispatch.
+    #[allow(clippy::too_many_lines)] // Optional report invalidation precedes the full ownership flow.
     pub fn execute_owned_program_consuming_input<T, P>(
         &self,
         prepared: &RocmOwnedPreparedTensorGraph,
@@ -2369,6 +2453,8 @@ impl<'session> RocmTensorAssessor<'session> {
         T: fusion_pcu::PcuScalar,
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         if prepared.data.input_values.len() != 1 || prepared.data.outputs.len() != 1 {
             return Err(RocmTensorExecutionError::InvalidPlan(prepared.data.output));
         }
@@ -2484,6 +2570,8 @@ impl<'session> RocmTensorAssessor<'session> {
         T: fusion_pcu::PcuScalar,
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         let borrowed = self.borrow_device_input_ref(input, pool)?;
         self.execute_owned_program_output_from_inputs(
             prepared,
@@ -2514,6 +2602,8 @@ impl<'session> RocmTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
         'session: 'input,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         let outputs =
             self.execute_owned_program_outputs_inline_from_inputs(prepared, inputs, pool, memory)?;
         if outputs.spilled() {
@@ -2547,6 +2637,8 @@ impl<'session> RocmTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
         'session: 'input,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         with_single_output_plan(prepared, || {
             let mut outputs = self
                 .execute_owned_program_outputs_inline_from_inputs(prepared, inputs, pool, memory)?;
@@ -2565,6 +2657,7 @@ impl<'session> RocmTensorAssessor<'session> {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // Keep common preflight, guarded admission and terminal bank release together.
     fn execute_owned_program_outputs_inline_from_inputs<'input, T, P>(
         &'input self,
         prepared: &RocmOwnedPreparedTensorGraph,
@@ -2634,6 +2727,18 @@ impl<'session> RocmTensorAssessor<'session> {
         }
 
         validate_owned_storage(&view, inputs, &outputs, &bank.resources)?;
+
+        if let Some(guarded) = prepared
+            .guarded
+            .as_ref()
+            .filter(|guarded| guarded.uses_stream(&self.state().stream))
+        {
+            let execution = self.execute_guarded_owned_program(
+                prepared, guarded, inputs, &outputs, &mut bank, pool, memory,
+            );
+            bank.finish(execution.as_ref().err())?;
+            return execution;
+        }
 
         let bank_view = &mut *bank;
         let mut scratch_view = RocmExecutionScratch {
@@ -5056,7 +5161,7 @@ impl<'session> RocmTensorAssessor<'session> {
     }
     fn execute_relu(
         &self,
-        dispatch: &PreparedFixedTensorDispatch,
+        dispatch: PreparedFixedTensorDispatchRef<'_>,
         input: &RocmMemoryResource,
         output: &RocmMemoryResource,
         batch: Option<&mut HipCompletionBatch>,
@@ -5093,7 +5198,7 @@ impl<'session> RocmTensorAssessor<'session> {
         if evicted {
             cache.pop_front();
         }
-        cache.push_back((key, prepared));
+        cache.push_back((key, Rc::new(prepared)));
         Ok(TensorDispatchCacheAdmission {
             compiled: true,
             evicted,
@@ -5338,7 +5443,7 @@ impl<'session> RocmTensorAssessor<'session> {
     #[allow(clippy::too_many_lines)] // Keeps the cache, owned bindings, and completion lifetime explicit.
     fn execute_elementwise<T: ElementwiseTimingSink>(
         &self,
-        dispatch: &PreparedFixedTensorDispatch,
+        dispatch: PreparedFixedTensorDispatchRef<'_>,
         operands: ElementwiseOperands<'_>,
         batch: Option<&mut HipCompletionBatch>,
         timing: &mut T,
@@ -5357,12 +5462,17 @@ impl<'session> RocmTensorAssessor<'session> {
             return Err(RocmTensorExecutionError::InvalidPlan(dispatch.value));
         }
         let setup_mark = timing.begin(ElementwisePhase::CacheAndBind);
-        self.ensure_dispatch_cached(
-            dispatch.cache_key.clone(),
-            dispatch.kernel,
-            dispatch.invocation_shape,
-            false,
-        )?;
+        let retained = dispatch
+            .retained
+            .filter(|retained| retained.uses_stream(&self.state().stream));
+        if retained.is_none() {
+            self.ensure_dispatch_cached(
+                dispatch.cache_key.clone(),
+                dispatch.kernel,
+                dispatch.invocation_shape,
+                false,
+            )?;
+        }
         let left_binding = self
             .session
             .bind(
@@ -5401,11 +5511,19 @@ impl<'session> RocmTensorAssessor<'session> {
         timing.finish(ElementwisePhase::CacheAndBind, setup_mark);
         let submit_mark = timing.begin(ElementwisePhase::Submit);
         let dispatch_result = {
-            let cache = self.state().add_dispatches.borrow();
-            let prepared = cache
-                .iter()
-                .find(|(key, _)| *key == dispatch.cache_key)
-                .map(|(_, prepared)| prepared)
+            // The retained route borrows directly: no cache search, allocation or Rc clone.
+            let cache = retained
+                .is_none()
+                .then(|| self.state().add_dispatches.borrow());
+            let prepared = retained
+                .or_else(|| {
+                    cache.as_ref().and_then(|cache| {
+                        cache
+                            .iter()
+                            .find(|(key, _)| *key == dispatch.cache_key)
+                            .map(|(_, prepared)| prepared.as_ref())
+                    })
+                })
                 .ok_or(RocmTensorExecutionError::SizeOverflow)?;
             if let Some(batch) = batch {
                 prepared
@@ -5707,6 +5825,9 @@ fn validate_tensor_scalar_tag<T: fusion_pcu::PcuScalar>(
 /// Owning prepared tensor schedule. The selected graph and all backend indexes live together;
 /// there are no references from the schedule back into its graph.
 pub struct RocmOwnedPreparedTensorGraph {
+    guarded: Option<guarded::Plan>,
+    retained_fixed: Vec<Option<Rc<RocmPreparedDispatch>>>,
+    staging: pending_upload::StagingEligibility,
     scratch: owned_scratch::State,
     program: Arc<fusion_pcu::dialect::tensor::TensorOwnedSelectedProgram>,
     data: RocmPreparedGraphData,
@@ -5732,6 +5853,7 @@ enum SelectedPlanRef<'a, 'graph> {
 }
 
 struct RocmPreparedGraphView<'a, 'graph> {
+    retained_fixed: &'a [Option<Rc<RocmPreparedDispatch>>],
     graph: &'a Graph,
     data: &'a RocmPreparedGraphData,
     selected: SelectedPlanRef<'a, 'graph>,
@@ -5787,11 +5909,15 @@ impl RocmPreparedGraphView<'_, '_> {
     fn fixed_dispatch(
         &self,
         index: usize,
-    ) -> Result<&PreparedFixedTensorDispatch, RocmTensorExecutionError> {
+    ) -> Result<PreparedFixedTensorDispatchRef<'_>, RocmTensorExecutionError> {
         self.data
             .fixed_dispatches
             .get(index)
             .and_then(Option::as_ref)
+            .map(|dispatch| PreparedFixedTensorDispatchRef {
+                dispatch,
+                retained: self.retained_fixed.get(index).and_then(Option::as_deref),
+            })
             .ok_or_else(|| {
                 let value = self
                     .data
@@ -5825,6 +5951,7 @@ impl<'graph> RocmPreparedTensorGraph<'graph> {
         RocmPreparedGraphView {
             graph: self.graph,
             data: &self.data,
+            retained_fixed: &[],
             selected: SelectedPlanRef::Borrowed(&self.lowering_plan),
         }
     }
@@ -5838,22 +5965,35 @@ impl RocmOwnedPreparedTensorGraph {
         let view = RocmPreparedGraphView {
             graph: program.graph(),
             data: &data,
+            retained_fixed: &[],
             selected: SelectedPlanRef::Owned(&program),
         };
         let scratch = owned_scratch::State::new(&view)?;
-        Ok(Self {
+        let mut prepared = Self {
+            retained_fixed: Vec::new(),
+            guarded: None,
+            staging: pending_upload::StagingEligibility::disabled(),
             scratch,
             program,
             data,
-        })
+        };
+        prepared.staging = pending_upload::StagingEligibility::new(&prepared);
+        Ok(prepared)
     }
 
     fn view(&self) -> RocmPreparedGraphView<'_, '_> {
         RocmPreparedGraphView {
             graph: self.program.graph(),
             data: &self.data,
+            retained_fixed: &self.retained_fixed,
             selected: SelectedPlanRef::Owned(&self.program),
         }
+    }
+
+    /// Whether the selected implementation proves a terminal dispatch for owned uploads.
+    #[must_use]
+    pub const fn supports_host_staging(&self) -> bool {
+        self.staging.supported()
     }
 
     /// Selected graph outputs in their requested order.
@@ -10381,7 +10521,7 @@ mod tests {
         assert_eq!(kernel.entry.logical_shape, [17, 1, 1]);
     }
 
-    struct PureRocmAssessor;
+    pub(super) struct PureRocmAssessor;
 
     struct DenseOnlyAssessor;
 
@@ -10594,6 +10734,7 @@ mod tests {
             );
             let view = prepared.view();
             let index = view.index_of(output).unwrap();
+            assert!(prepared.view().retained_fixed.is_empty());
             let dispatch = view.fixed_dispatch(index).unwrap();
             kernel_ids.push(dispatch.kernel.id);
             cache_keys.push(dispatch.cache_key.clone());
@@ -12526,3 +12667,7 @@ mod tests {
 #[cfg(test)]
 #[path = "tensor/integer_literals/integer_literals.rs"]
 mod integer_literals;
+
+#[cfg(test)]
+#[path = "tensor/retained_fixed_tests/retained_fixed_tests.rs"]
+mod retained_fixed_tests;

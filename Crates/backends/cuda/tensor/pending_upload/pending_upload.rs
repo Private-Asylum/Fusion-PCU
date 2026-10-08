@@ -16,8 +16,6 @@ use super::{
     CudaTensorExecutionError,
     CudaTensorInputRef,
     CudaOwnedPreparedTensorGraph,
-    TensorDispatchCacheKey,
-    TensorDispatchKind,
     byte_len_for_size,
     scalar_layout,
 };
@@ -47,18 +45,18 @@ struct PendingUpload {
 }
 
 pub(super) struct StagingEligibility {
-    checked_terminal: bool,
+    terminal_dispatch: bool,
     stream: Option<CudaStreamHandle>,
 }
 
 impl StagingEligibility {
     pub(super) const fn supported(&self) -> bool {
-        self.checked_terminal
+        self.terminal_dispatch
     }
 
     pub(super) const fn disabled() -> Self {
         Self {
-            checked_terminal: false,
+            terminal_dispatch: false,
             stream: None,
         }
     }
@@ -69,7 +67,7 @@ impl StagingEligibility {
 
     pub(super) fn new(prepared: &CudaOwnedPreparedTensorGraph) -> Self {
         Self {
-            checked_terminal: eligible(prepared),
+            terminal_dispatch: eligible(prepared),
             stream: None,
         }
     }
@@ -82,7 +80,15 @@ fn eligible(prepared: &CudaOwnedPreparedTensorGraph) -> bool {
     {
         return false;
     }
-    let mut checked = false;
+    // Prepared fixed dispatches run on the assessor stream and, with batching disabled,
+    // execute_elementwise waits their completion before returning success. Their numerical
+    // operation/policy is irrelevant to upload lifetime: the terminal queue event orders all
+    // earlier copies. Non-source nodes without this concrete implementation proof are refused.
+    // In particular, identity/source-only schedules never establish a consumer terminal event.
+    if prepared.data.native_matmul_batch {
+        return false;
+    }
+    let mut terminal_dispatch = false;
     for (&value, dispatch) in prepared
         .data
         .node_values
@@ -92,29 +98,21 @@ fn eligible(prepared: &CudaOwnedPreparedTensorGraph) -> bool {
         let Ok(node) = prepared.program.graph().node(value) else {
             return false;
         };
-        match node.op {
-            OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. } => (),
-            OpDescriptor::Add { .. } | OpDescriptor::Mul { .. } => {
-                if !dispatch.as_ref().is_some_and(|dispatch| {
-                    matches!(
-                        dispatch.cache_key,
-                        TensorDispatchCacheKey::Fixed(
-                            TensorDispatchKind::CheckedIntegerAdd
-                                | TensorDispatchKind::CheckedIntegerMul
-                                | TensorDispatchKind::CheckedFloatAdd
-                                | TensorDispatchKind::CheckedFloatMul,
-                            ..
-                        )
-                    )
-                }) {
-                    return false;
-                }
-                checked = true;
-            }
-            _ => return false,
+        if matches!(
+            node.op,
+            OpDescriptor::Input | OpDescriptor::Constant(_) | OpDescriptor::Uniform { .. }
+        ) {
+            continue;
         }
+        let Some(dispatch) = dispatch else {
+            return false;
+        };
+        if dispatch.value != value {
+            return false;
+        }
+        terminal_dispatch = true;
     }
-    checked
+    terminal_dispatch
 }
 
 impl PendingUpload {
@@ -188,7 +186,7 @@ impl PendingUpload {
                 Rc::ptr_eq(&lease.allocation, &destination.allocation)
                     && lease.guard.kind
                         == AllocationAccessKind::Stream(Rc::as_ptr(&stream.inner) as usize)
-                    && matches!(lease.guard.access.state.get(),
+                    && matches!(lease.guard.access.access.state.get(),
                         AllocationAccessState::Stream { identity, .. }
                             if identity == Rc::as_ptr(&stream.inner) as usize)
             })
@@ -216,10 +214,10 @@ impl PendingUpload {
         eligibility: &StagingEligibility,
         terminal: &Result<T, CudaTensorExecutionError>,
     ) {
-        // Called only inside the proposed aggregate after synchronous checked execution on
+        // Called only inside the proposed aggregate after synchronous fixed-dispatch execution on
         // this exact assessor queue. Success is its documented terminal publication proof.
         // Identity/no-dispatch and error routes cannot use this shortcut: Drop fences them.
-        if eligibility.checked_terminal && terminal.is_ok() {
+        if eligibility.terminal_dispatch && terminal.is_ok() {
             self.lease.take();
         }
     }
@@ -258,7 +256,7 @@ pub struct CudaHostedTensorInput<'input> {
 }
 
 impl<'session> CudaTensorAssessor<'session> {
-    /// Orders owned host endpoints and executes one eligible checked Add/Mul schedule.
+    /// Orders owned host endpoints and executes a cold-proved terminal-dispatch schedule.
     ///
     /// `None` means an unsupported schedule or cold endpoint/scratch bank, before any work.
     /// All input metadata, graph roles, spans, access and aliases are checked before upload.
@@ -267,6 +265,7 @@ impl<'session> CudaTensorAssessor<'session> {
     /// # Errors
     /// Returns input/preflight, allocation, arithmetic, backend or completion errors. An error
     /// after enqueue is terminal for this attempt and must never trigger a fallback execution.
+    #[allow(clippy::too_many_lines)] // Optional report invalidation precedes the full ownership flow.
     pub fn execute_owned_program_output_from_host_staging<'input, T, P, const N: usize>(
         &'input self,
         prepared: &CudaOwnedPreparedTensorGraph,
@@ -279,7 +278,9 @@ impl<'session> CudaTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = CudaMemoryResource>,
         'session: 'input,
     {
-        if !prepared.staging.checked_terminal
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
+        if !prepared.staging.terminal_dispatch
             || inputs.is_empty()
             || !prepared
                 .staging

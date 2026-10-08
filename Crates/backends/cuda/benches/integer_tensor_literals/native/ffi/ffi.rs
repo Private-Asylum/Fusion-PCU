@@ -35,6 +35,8 @@ type Launch = unsafe extern "C" fn(
 #[cfg(feature = "allocation-census")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Api {
+    pub allocations: u64,
+    pub frees: u64,
     pub uploads: u64,
     pub downloads: u64,
     pub resets: u64,
@@ -48,6 +50,8 @@ pub struct Api {
 impl Api {
     pub const fn delta(self, before: Self) -> Self {
         Self {
+            allocations: self.allocations - before.allocations,
+            frees: self.frees - before.frees,
             uploads: self.uploads - before.uploads,
             downloads: self.downloads - before.downloads,
             resets: self.resets - before.resets,
@@ -219,6 +223,7 @@ struct State {
     stage: Option<Endpoint>,
     output: Endpoint,
     status: Endpoint,
+    fresh_output: Option<DeviceOwner>,
     grid: [u32; 3],
     block: [u32; 3],
     extent: u32,
@@ -229,6 +234,66 @@ struct State {
     #[cfg(feature = "allocation-census")]
     api: std::rc::Rc<std::cell::Cell<Api>>,
     _runtime: fusion_pcu_cuda::CudaRuntime,
+}
+impl State {
+    /// Read private pinned shadows, then prove all queued work terminal before host access.
+    fn readback<const PAYLOAD: bool, const STATUS: bool>(&mut self) -> bool {
+        let s = self;
+        let mut failed = false;
+        for (enabled, e) in [(PAYLOAD, &s.output), (STATUS, &s.status)] {
+            if !enabled {
+                continue;
+            }
+            #[cfg(feature = "allocation-census")]
+            {
+                let mut a = s.api.get();
+                a.downloads += 1;
+                a.downloaded_bytes += u64::try_from(e.device.bytes).unwrap();
+                s.api.set(a);
+            }
+            // SAFETY: private pinned shadows remain inaccessible until the following event completes.
+            if unsafe {
+                (s.program.download)(
+                    e.host.pointer,
+                    if PAYLOAD && std::ptr::eq(e, &raw const s.output) {
+                        s.fresh_output.as_ref().unwrap_or(&e.device).pointer
+                    } else {
+                        e.device.pointer
+                    },
+                    e.device.bytes,
+                    s.program.stream,
+                )
+            } != 0
+            {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            return false;
+        }
+        #[cfg(feature = "allocation-census")]
+        {
+            let mut a = s.api.get();
+            a.event_records += 1;
+            s.api.set(a);
+        }
+        // SAFETY: retained event records after all uploads/kernel/private readbacks on this stream.
+        if unsafe { (s.program.record)(s.program.event, s.program.stream) } != 0 {
+            return false;
+        }
+        #[cfg(feature = "allocation-census")]
+        {
+            let mut a = s.api.get();
+            a.event_waits += 1;
+            s.api.set(a);
+        }
+        // SAFETY: success proves the complete private resource set is terminal.
+        if unsafe { (s.program.wait)(s.program.event) } != 0 {
+            return false;
+        }
+        true
+    }
 }
 pub struct Owner {
     state: Option<Box<State>>,
@@ -253,6 +318,7 @@ impl Owner {
             stage: Some(Endpoint::new(&program, bytes)),
             output: Endpoint::new(&program, bytes),
             status: Endpoint::new(&program, 16),
+            fresh_output: None,
             grid,
             block,
             extent,
@@ -274,9 +340,48 @@ impl Owner {
         std::mem::forget(self.state.take().unwrap());
         panic!("independent arithmetic owner retained after uncertain SDK completion");
     }
+    pub fn call(
+        &mut self,
+        input: &[u8],
+        seed: &[u8],
+        uniform: &[u8],
+        output: &mut [u8],
+    ) -> Result<Option<(u32, u32)>, ()> {
+        self.call_inner::<false, false>(input, seed, uniform, output)
+    }
+    #[allow(dead_code)] // Shared by sibling producer benches; only the physical-work witness uses this variant.
+    pub fn call_fresh_output(
+        &mut self,
+        input: &[u8],
+        seed: &[u8],
+        uniform: &[u8],
+        output: &mut [u8],
+    ) -> Result<Option<(u32, u32)>, ()> {
+        self.call_inner::<true, false>(input, seed, uniform, output)
+    }
+    #[allow(dead_code)] // Shared by sibling producer benches; only the physical-work witness uses this variant.
+    pub fn call_split_completion(
+        &mut self,
+        input: &[u8],
+        seed: &[u8],
+        uniform: &[u8],
+        output: &mut [u8],
+    ) -> Result<Option<(u32, u32)>, ()> {
+        self.call_inner::<false, true>(input, seed, uniform, output)
+    }
+    #[allow(dead_code)] // Shared by sibling producer benches; only the physical-work witness uses this variant.
+    pub fn call_fresh_split_completion(
+        &mut self,
+        input: &[u8],
+        seed: &[u8],
+        uniform: &[u8],
+        output: &mut [u8],
+    ) -> Result<Option<(u32, u32)>, ()> {
+        self.call_inner::<true, true>(input, seed, uniform, output)
+    }
     /// Synchronously publish useful prefixes only after terminal status validation.
     #[allow(clippy::too_many_lines)] // Enqueue failures and whole-owner retention stay visible together.
-    pub fn call(
+    fn call_inner<const FRESH_OUTPUT: bool, const SPLIT_COMPLETION: bool>(
         &mut self,
         input: &[u8],
         seed: &[u8],
@@ -290,6 +395,16 @@ impl Owner {
             || uniform.len() != s.stage.as_ref().unwrap().device.bytes
         {
             return Err(());
+        }
+        if FRESH_OUTPUT {
+            assert!(s.terminal && s.fresh_output.is_none());
+            s.fresh_output = Some(DeviceOwner::new(&s.program, s.output.device.bytes));
+            #[cfg(feature = "allocation-census")]
+            {
+                let mut a = s.api.get();
+                a.allocations += 1;
+                s.api.set(a);
+            }
         }
         s.input
             .host
@@ -353,7 +468,7 @@ impl Owner {
             s.input.device.pointer,
             s.seed.device.pointer,
             s.stage.as_ref().map_or(0, |e| e.device.pointer),
-            s.output.device.pointer,
+            s.fresh_output.as_ref().unwrap_or(&s.output.device).pointer,
             s.status.device.pointer,
         ];
         let mut scalars = [s.extent, s.invocations, s.clamp, s.dead];
@@ -397,53 +512,12 @@ impl Owner {
         if failed {
             self.retire();
         }
-        let s = self.state.as_mut().unwrap();
-        let mut failed = false;
-        for e in [&s.output, &s.status] {
-            #[cfg(feature = "allocation-census")]
-            {
-                let mut a = s.api.get();
-                a.downloads += 1;
-                a.downloaded_bytes += u64::try_from(e.device.bytes).unwrap();
-                s.api.set(a);
-            }
-            // SAFETY: private pinned shadows remain inaccessible until the following event completes.
-            if unsafe {
-                (s.program.download)(
-                    e.host.pointer,
-                    e.device.pointer,
-                    e.device.bytes,
-                    s.program.stream,
-                )
-            } != 0
-            {
-                failed = true;
-                break;
-            }
-        }
-        if failed {
-            self.retire();
-        }
-        let s = self.state.as_mut().unwrap();
-        #[cfg(feature = "allocation-census")]
-        {
-            let mut a = s.api.get();
-            a.event_records += 1;
-            s.api.set(a);
-        }
-        // SAFETY: retained event records after all uploads/kernel/private readbacks on this stream.
-        if unsafe { (s.program.record)(s.program.event, s.program.stream) } != 0 {
-            self.retire();
-        }
-        let s = self.state.as_mut().unwrap();
-        #[cfg(feature = "allocation-census")]
-        {
-            let mut a = s.api.get();
-            a.event_waits += 1;
-            s.api.set(a);
-        }
-        // SAFETY: success proves the complete private resource set is terminal.
-        if unsafe { (s.program.wait)(s.program.event) } != 0 {
+        let observed = if SPLIT_COMPLETION {
+            self.state.as_mut().unwrap().readback::<false, true>()
+        } else {
+            self.state.as_mut().unwrap().readback::<true, true>()
+        };
+        if !observed {
             self.retire();
         }
         let s = self.state.as_mut().unwrap();
@@ -458,8 +532,26 @@ impl Owner {
                 u32::try_from(word & u64::from(u32::MAX)).unwrap(),
             )
         });
-        if fault.is_none() || s.clamp != 0 {
+        let publish = fault.is_none() || s.clamp != 0;
+        if SPLIT_COMPLETION && publish {
+            s.terminal = false;
+            if !s.readback::<true, false>() {
+                self.retire();
+            }
+        }
+        let s = self.state.as_mut().unwrap();
+        s.terminal = true;
+        if publish {
             output[..s.output.device.bytes].copy_from_slice(s.output.host.bytes());
+        }
+        if FRESH_OUTPUT {
+            drop(s.fresh_output.take().unwrap());
+            #[cfg(feature = "allocation-census")]
+            {
+                let mut a = s.api.get();
+                a.frees += 1;
+                s.api.set(a);
+            }
         }
         Ok(fault)
     }

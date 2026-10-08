@@ -42,6 +42,8 @@ impl<'session> RocmTensorAssessor<'session> {
         P: PcuMemoryProvider<Resource = RocmMemoryResource>,
         'session: 'input,
     {
+        #[cfg(feature = "insights")]
+        prepared.begin_guarded_attempt();
         validate_output_array_plan::<T, M>(prepared)?;
         let outputs =
             self.execute_owned_program_outputs_inline_from_inputs(prepared, inputs, pool, memory)?;

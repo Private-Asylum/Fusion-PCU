@@ -231,7 +231,8 @@ fn compact_matmul_reference_covers_original_late_steps_and_cell_order() {
                     ),
                 ] {
                     let fault = reference(&cases[case].0, &cases[case].1, inner, values[0], policy)
-                        .err().unwrap();
+                        .err()
+                        .unwrap();
                     assert_eq!(fault.kind, kind);
                     assert_eq!(fault.invocation_id, u64::try_from(ordinal).unwrap());
                     assert!(!fault.recovered);

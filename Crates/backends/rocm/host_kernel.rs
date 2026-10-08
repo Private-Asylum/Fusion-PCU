@@ -444,6 +444,12 @@ impl RocmPreparedHostKernel {
 
         let requirements = self.dispatch.binding_schema();
         validate_call_arguments(&self.argument_requirements, arguments, Some(&self.memory))?;
+        // The remaining path uses concrete backend-owned arguments and memory; no caller or
+        // foreign callback can change current-device selection until the synchronous call ends.
+        let _runtime_scope = self
+            .dispatch
+            .enter_private_runtime_scope()
+            .map_err(RocmOwnedDispatchError::Hip)?;
 
         // Grow every host slot before any transfer. Resident resources are borrowed directly and
         // do not consume a staging allocation.
@@ -486,10 +492,12 @@ impl RocmPreparedHostKernel {
             self.slots[slot].resource = Some(resource);
         }
 
+        let mut uploads = crate::RetainedHostUploads::new(self.dispatch.stream_handle());
+
         // Upload only host arguments. A complete writer may elide the incoming copy exactly as
-        // the host-only adapter did; resident buffers are already the device-side value. Finish
-        // uploads before cloning resident handles into persistent submission storage, so any
-        // transfer failure returns without retaining caller-owned resident allocations.
+        // the host-only adapter did; resident buffers are already the device-side value. Queue
+        // uploads before cloning resident handles into persistent submission storage. Their
+        // private host/device endpoints remain leased through the following launch event.
         for (slot, requirement) in requirements.iter().enumerate() {
             let Some(argument) = arguments
                 .iter()
@@ -503,29 +511,23 @@ impl RocmPreparedHostKernel {
             if self.slots[slot].fully_written_prefix.is_some() {
                 continue;
             }
-            let transfer = self.memory.transfer_to(
+            let transfer = uploads.enqueue(
                 self.slots[slot]
                     .resource
-                    .as_mut()
-                    .expect("host slot allocated above"),
-                0,
+                    .as_ref()
+                    .expect("host slot allocated above")
+                    .device_buffer(),
                 bytes,
             );
             if let Err(error) = transfer {
-                // If the synchronous copy could not prove quiescence, dropping this owner leaves
-                // the existing allocation lease quarantined. A later call allocates a fresh
-                // staging slot instead of repeatedly hitting that quarantined gate.
-                if self.slots[slot].resource.as_ref().is_some_and(|resource| {
-                    resource
-                        .device_buffer()
-                        .validate_access_available()
-                        .is_err()
-                }) {
+                // An enqueue error may follow partial native work. Release staging only after
+                // stream synchronization; failure quarantines its host/device endpoints.
+                if uploads.synchronize().is_err() {
                     self.poisoned = true;
                     self.last_call_completion_uncertain = true;
                 }
                 self.slots[slot].resource = None;
-                return Err(RocmHostKernelError::Memory(error));
+                return Err(RocmOwnedDispatchError::Hip(error).into());
             }
         }
 
@@ -568,9 +570,15 @@ impl RocmPreparedHostKernel {
             Err(error) => {
                 if is_certain_prelaunch_error(&error) {
                     self.last_call_may_have_written = false;
-                    self.bindings.clear();
+                    if uploads.synchronize().is_err() {
+                        self.poisoned = true;
+                        self.last_call_completion_uncertain = true;
+                    } else {
+                        self.bindings.clear();
+                    }
                     return Err(error.into());
                 }
+                let _ = uploads.synchronize();
                 self.poisoned = true;
                 self.last_call_completion_uncertain = true;
                 return Err(error.into());
@@ -579,11 +587,15 @@ impl RocmPreparedHostKernel {
         let outcome = match completion.wait() {
             Ok(outcome) => outcome,
             Err(error) => {
+                let _ = uploads.synchronize();
                 self.poisoned = true;
                 self.last_call_completion_uncertain = true;
                 return Err(RocmOwnedDispatchError::Hip(error).into());
             }
         };
+        // The launch event follows every input upload on the same stream. Its successful wait
+        // proves both host staging and device leases may now be released without another sync.
+        uploads.release_after_terminal_launch();
         self.bindings.clear();
         if self.fault_word.is_some() {
             self.fault_word_state = FaultWordState::after_terminal(outcome);

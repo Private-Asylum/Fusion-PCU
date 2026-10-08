@@ -599,6 +599,18 @@ pub fn validate_arguments(
     scalar: PcuScalarType,
     size: usize,
 ) -> Result<(), PcuCpuHostArgumentError> {
+    validate_arguments_with_indices(arguments, schema, scalar, size, |_, _| {})
+}
+
+// Resolve declaration positions while checking the existing argument contract. The
+// callback observes only declarations that passed all checks; positions are call-local.
+pub fn validate_arguments_with_indices(
+    arguments: &[PcuHostArgument<'_>],
+    schema: &[(PcuBindingRef, usize, PcuBindingAccess)],
+    scalar: PcuScalarType,
+    size: usize,
+    mut resolved: impl FnMut(usize, usize),
+) -> Result<(), PcuCpuHostArgumentError> {
     if arguments.len() != schema.len() {
         return Err(PcuCpuHostArgumentError::Count {
             expected: schema.len(),
@@ -613,10 +625,11 @@ pub fn validate_arguments(
             return Err(PcuCpuHostArgumentError::DuplicateBinding(argument.target()));
         }
     }
-    for &(binding, elements, expected_access) in schema {
-        let argument = arguments
+    for (declaration, &(binding, elements, expected_access)) in schema.iter().enumerate() {
+        let (position, argument) = arguments
             .iter()
-            .find(|argument| argument.target() == binding)
+            .enumerate()
+            .find(|(_, argument)| argument.target() == binding)
             .ok_or(PcuCpuHostArgumentError::MissingBinding(binding))?;
         if argument.scalar() != scalar {
             return Err(PcuCpuHostArgumentError::TypeMismatch {
@@ -642,6 +655,7 @@ pub fn validate_arguments(
                 actual_bytes: argument.bytes().len(),
             });
         }
+        resolved(declaration, position);
     }
     Ok(())
 }
